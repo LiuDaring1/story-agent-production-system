@@ -62,6 +62,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
 
     def test_failure_classifier_blocks_login_but_retries_network_failures(self) -> None:
         self.assertEqual(classify_command_failure("Suno CAPTCHA / login required"), "blocked")
+        self.assertEqual(classify_command_failure("No browser is available: browser discovery returned an empty list"), "blocked")
         self.assertEqual(classify_command_failure("HTTP 502 connection reset"), "failed")
 
     def test_long_task_heartbeat_observes_cancel_request(self) -> None:

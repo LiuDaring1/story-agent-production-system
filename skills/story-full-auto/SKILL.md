@@ -45,6 +45,8 @@ python3 story_agent.py resume --job "<job_id>"
 python3 story_agent.py start --job "<job_id>"
 ```
 
+If `music/suno_cli_blocker.md` says the background Codex process has no Browser tool, execute the generated Suno handoff from the primary Codex task using an authenticated browser. Save every named download in `suno_downloads`; then resume. Do not keep restarting the background child and do not bypass login or CAPTCHA.
+
 Cancel without deleting products or source material:
 
 ```bash

@@ -170,6 +170,9 @@ def classify_command_failure(output: str) -> str:
         "api key",
         "missing credential",
         "账号风控",
+        "no browser is available",
+        "browser discovery returned an empty",
+        "没有可用浏览器",
     )
     return "blocked" if any(marker in text for marker in external_markers) else "failed"
 
@@ -773,6 +776,24 @@ class StoryAgent:
             prompt=prompt,
             images=[contact_sheet],
         )
+        if result.status == "blocked":
+            blocker = self._music_dir() / "suno_cli_blocker.md"
+            blocker.write_text(
+                "\n".join(
+                    [
+                        "# Suno 外部阻塞",
+                        "",
+                        f"- 时间：{now()}",
+                        f"- 子任务结果：{result.message}",
+                        "- 原因：后台 codex exec 没有可用 Browser 工具，或浏览器登录态不可用。",
+                        "- 恢复：在 Codex 主任务中登录 Suno（或明确批准使用已登录 Chrome），按 handoff 生成并下载音乐到 suno_downloads，然后执行 resume/start。",
+                        "- 安全边界：不得绕过验证码、付费弹窗或账号风控。",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return StageResult("blocked", f"Suno 需要在 Codex 主任务恢复浏览器能力：{blocker}", blocker)
         if result.status != "done":
             return result
         try:

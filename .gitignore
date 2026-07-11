@@ -1,0 +1,60 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+_work/
+
+# Python and local environments
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.codex_tmp/
+.skill-work/
+
+# Local app/build artifacts
+build/
+dist/
+*.app/
+*.spec.tmp
+
+# Generated story outputs and working scratch
+output/
+tmp/
+backups/
+story_scoring_v1_render/
+tools/video-subtitle-remover/
+
+# Model weights and downloaded ML assets
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+models/
+
+# Media and generated image/video artifacts
+*.mp3
+*.mp4
+*.mov
+*.wav
+*.m4a
+*.jpg
+*.jpeg
+*.png
+*.webp
+*.docx
+*.pdf
+*.skill
+
+# Local secrets/config overrides
+.env
+.env.*
+secrets.*
+pipeline_config.local.json
+
+# Historical one-off analysis/output artifacts unrelated to the story Agent
+杨霞求职分析_*/
+故事评价体系3_extracted.txt
+story_music_plan.csv
+story_suno_prompts.md

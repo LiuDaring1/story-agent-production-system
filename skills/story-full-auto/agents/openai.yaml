@@ -1,0 +1,4 @@
+interface:
+  display_name: "全自动故事生产"
+  short_description: "从单个绿幕原片启动、续跑并审核完整故事视频与资料包交付"
+  default_prompt: "Use $story-full-auto to submit this green-screen story video and run it to verified delivery."

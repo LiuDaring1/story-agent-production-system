@@ -1,0 +1,101 @@
+{
+  "latest_episode": 101,
+  "default_story_type": "童话故事",
+  "default_image_style": "自动",
+  "story_type_options": [
+    "寓言故事",
+    "成语故事",
+    "童话故事",
+    "民间故事",
+    "神话故事",
+    "红色故事",
+    "历史故事",
+    "科普故事"
+  ],
+  "age_range_options": [
+    "3-5岁",
+    "6-8岁",
+    "9-11岁",
+    "12-14岁",
+    "15岁以上"
+  ],
+  "default_age_range": "6-8岁",
+  "brand_assets": {
+    "assets_dir": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材",
+    "logo": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材/标题初级版本.png",
+    "watermark_logo": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材/标题初级版本.png",
+    "story_logo": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材/标题初级版本.png",
+    "antipiracy_logo": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材/标题初级版本.png",
+    "frame_reference": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材/矩形边框 3.png",
+    "cover_reference": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材/封面参考图/狐狸分奶酪_202603301924 (1).jpeg"
+  },
+  "release_defaults": {
+    "video_box": "0,416,1080,608",
+    "story_box": "210,270,910,512",
+    "story_bleed": 0,
+    "background_blur": 14,
+    "b_story_box": "356,180,1209,680",
+    "b_windows": "auto",
+    "c_windows": "auto",
+    "person_height": 900,
+    "person_x": 755,
+    "person_y": 108,
+    "person_crop": "",
+    "person_grade": "log-soft",
+    "person_beauty": "light",
+    "keyer": "colorkey",
+    "chroma_color": "0x00FF00",
+    "chroma_similarity": 0.095,
+    "chroma_blend": 0.04,
+    "watermark_width": 190,
+    "watermark_opacity": 0.78,
+    "watermark_speed": 1.0,
+    "story_logo_width_a": 150,
+    "story_logo_width_b": 175,
+    "story_logo_x": 42,
+    "story_logo_y": 44,
+    "output_scale": 2,
+    "crf": 17,
+    "preset": "medium",
+    "subtitle_font_size": 42,
+    "subtitle_margin_v": 72
+  },
+  "product_defaults": {
+    "music_volume": 0.22,
+    "narration_volume": 1.0
+  },
+  "external_tools": {
+    "suno_story_score_skill": "~/Downloads/suno-story-score.skill",
+    "story_performance_script_skill": "~/Downloads/story-performance-script.skill"
+  },
+  "video_api": {
+    "provider": "qingyun_api",
+    "fallback_provider": "browser",
+    "browser_provider_name": "Flow",
+    "adapters": {
+      "qingyun_api": {
+        "runner": "run_image_video_jobs.py",
+        "base_url": "https://api.qingyuntop.top/v1",
+        "model": "grok-video-3-10s",
+        "api_key_env": "QINGYUN_API_KEY",
+        "estimated_cost_cny_per_clip": 3.0
+      },
+      "mock_local": {
+        "runner": "mock_video_provider.py",
+        "model": "ffmpeg-still-frame",
+        "api_key_env": "",
+        "estimated_cost_cny_per_clip": 0.0
+      }
+    }
+  },
+  "agent_defaults": {
+    "soft_budget_cny": 50.0,
+    "hard_budget_cny": 100.0,
+    "deadline_hours": 10.0,
+    "min_free_disk_gb": 10.0,
+    "review_pass_score": 85,
+    "max_attempts": 2,
+    "max_critical_attempts": 3,
+    "whisper_model": "small"
+  }
+}

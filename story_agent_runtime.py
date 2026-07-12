@@ -22,6 +22,76 @@ DEFAULT_DEADLINE_HOURS = 10.0
 DEFAULT_MIN_FREE_DISK_GB = 10.0
 PASS_SCORE = 85
 STAGE_STATUSES = {"pending", "running", "reviewing", "retrying", "passed", "blocked", "failed", "cancelled"}
+STORY_STAGE_SEQUENCE = (
+    "import_inbox",
+    "source_edit",
+    "source_text_correction",
+    "source_edit_review",
+    "setup_project",
+    "codex_story_images",
+    "story_images_review",
+    "prepare_jobs",
+    "timing",
+    "video_prompt_review",
+    "generate_videos",
+    "video_qa",
+    "video_review",
+    "apply_review",
+    "music_request",
+    "suno_generate",
+    "assemble_music",
+    "music_qa",
+    "assemble_final",
+    "release_assets",
+    "release_preview",
+    "package_release",
+    "release_qa",
+    "release_video_review",
+    "publish_package",
+    "publish_package_review",
+    "product_preflight",
+    "product_annotation",
+    "product_annotation_review",
+    "product_package",
+    "product_package_review",
+    "final_delivery",
+    "doctor",
+)
+STAGE_ESTIMATES_MINUTES = {
+    "import_inbox": 1,
+    "source_edit": 25,
+    "source_text_correction": 8,
+    "source_edit_review": 8,
+    "setup_project": 2,
+    "codex_story_images": 45,
+    "story_images_review": 12,
+    "prepare_jobs": 2,
+    "timing": 8,
+    "video_prompt_review": 10,
+    "generate_videos": 120,
+    "video_qa": 8,
+    "video_review": 12,
+    "apply_review": 3,
+    "music_request": 8,
+    "suno_generate": 30,
+    "assemble_music": 5,
+    "music_qa": 3,
+    "assemble_final": 25,
+    "release_assets": 25,
+    "release_preview": 12,
+    "package_release": 30,
+    "release_qa": 5,
+    "release_video_review": 12,
+    "publish_package": 35,
+    "publish_package_review": 12,
+    "product_preflight": 5,
+    "product_annotation": 25,
+    "product_annotation_review": 10,
+    "product_package": 20,
+    "product_package_review": 10,
+    "final_delivery": 5,
+    "doctor": 3,
+}
 
 
 class AgentRuntimeError(RuntimeError):
@@ -138,7 +208,25 @@ def ensure_manifest_v2(
     budget.setdefault("reserved", 0.0)
     budget.setdefault("entries", [])
     agent.setdefault("source", {})
-    agent.setdefault("stages", {})
+    stages = agent.setdefault("stages", {})
+    for stage in STORY_STAGE_SEQUENCE:
+        record = stages.setdefault(stage, {})
+        for key, default in (
+            ("status", "pending"),
+            ("attempts", 0),
+            ("started_at", ""),
+            ("finished_at", ""),
+            ("message", ""),
+            ("artifacts", []),
+            ("input_hashes", {}),
+            ("output_hashes", {}),
+            ("provider", ""),
+            ("request_id", ""),
+            ("actual_cost", 0.0),
+            ("retry_reason", ""),
+            ("review", {}),
+        ):
+            record.setdefault(key, default)
     agent.setdefault("events", [])
     return manifest
 
@@ -448,8 +536,19 @@ def submit_video_job(
 def job_lock(project_dir: Path, *, stale_seconds: int = 12 * 3600) -> Iterator[Path]:
     lock = project_paths(project_dir).status / "story_agent.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
-    if lock.exists() and time.time() - lock.stat().st_mtime > stale_seconds:
-        lock.unlink(missing_ok=True)
+    if lock.exists():
+        stale = time.time() - lock.stat().st_mtime > stale_seconds
+        alive = False
+        try:
+            payload = json.loads(lock.read_text(encoding="utf-8"))
+            pid = int(payload.get("pid", 0))
+            if pid > 0:
+                os.kill(pid, 0)
+                alive = True
+        except (OSError, ValueError, json.JSONDecodeError):
+            alive = False
+        if stale or not alive:
+            lock.unlink(missing_ok=True)
     try:
         descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError as exc:
@@ -506,11 +605,44 @@ def assert_runnable(manifest: dict[str, Any], project_dir: Path | None = None) -
             )
 
 
+def recovery_guidance(manifest: dict[str, Any]) -> str:
+    ensure_manifest_v2(manifest)
+    agent = manifest["agent"]
+    reason = str(agent.get("blocked_reason", ""))
+    combined = reason.lower()
+    job_id = str(agent.get("job_id") or "<job_id>")
+    if agent.get("cancel_requested") or agent.get("status") == "cancelled":
+        return f"依次运行 resume 和 start 恢复任务：job={job_id}。"
+    if "suno" in combined or "browser" in combined or "登录" in reason or "captcha" in combined:
+        return "在 Codex 主任务恢复 Suno 登录/浏览器能力，完成 handoff 下载后再 resume/start。"
+    if "磁盘" in reason:
+        return "释放磁盘空间至最低阈值以上，再 resume/start。"
+    if "api key" in combined or "credential" in combined or "鉴权" in reason:
+        return "在环境变量中配置供应商密钥，确认不写入 manifest 后再 resume/start。"
+    if "预算" in reason or "上限" in reason:
+        return "查看成本报告；只有用户明确调整预算或切换零费用供应商后才能恢复。"
+    if agent.get("status") in {"blocked", "failed"}:
+        return "查看最新阶段日志，处理记录的原因后运行 resume/start。"
+    return "无需人工恢复；后台 supervisor 可继续推进。"
+
+
 def render_job_report(project_dir: Path) -> Path:
     paths = project_paths(project_dir)
     manifest = ensure_manifest_v2(load_manifest(paths) or {})
     agent = manifest["agent"]
     budget = agent["budget"]
+    started_text = str(agent.get("started_at", ""))
+    elapsed_hours = 0.0
+    if started_text:
+        try:
+            elapsed_hours = max(0.0, (time.time() - time.mktime(time.strptime(started_text, "%Y-%m-%d %H:%M:%S"))) / 3600)
+        except ValueError:
+            pass
+    deadline_hours = float(agent.get("deadline_hours", DEFAULT_DEADLINE_HOURS))
+    stages = agent.get("stages", {}) if isinstance(agent.get("stages"), dict) else {}
+    remaining = [name for name in STORY_STAGE_SEQUENCE if stages.get(name, {}).get("status") != "passed"]
+    nominal_minutes = sum(STAGE_ESTIMATES_MINUTES.get(name, 10) for name in remaining)
+    open_reservations = [entry for entry in budget.get("entries", []) if entry.get("status") == "open"]
     lines = [
         "# 故事生产 Agent 交付摘要",
         "",
@@ -518,17 +650,33 @@ def render_job_report(project_dir: Path) -> Path:
         f"- 项目：{project_dir}",
         f"- 状态：{agent.get('status', 'pending')}",
         f"- 最后检查点：{agent.get('last_checkpoint') or '无'}",
+        f"- 心跳：{agent.get('heartbeat_at') or '无'}",
+        f"- 已运行/剩余时限：{elapsed_hours:.2f} / {max(0.0, deadline_hours - elapsed_hours):.2f} 小时",
         f"- 成本：¥{float(budget.get('spent', 0)):.2f} / 软上限 ¥{float(budget.get('soft_limit', 0)):.2f} / 硬上限 ¥{float(budget.get('hard_limit', 0)):.2f}",
+        f"- 预算预留：¥{float(budget.get('reserved', 0)):.2f}（开放 {len(open_reservations)} 笔）",
         f"- 阻塞原因：{agent.get('blocked_reason') or '无'}",
+        f"- 恢复动作：{recovery_guidance(manifest)}",
+        f"- 剩余阶段：{len(remaining)}；经验估算约 {nominal_minutes} 分钟（不含外部排队/登录等待）",
         "",
         "## 阶段",
         "",
-        "| 阶段 | 状态 | 尝试 | 分数 | 说明 |",
-        "| --- | --- | ---: | ---: | --- |",
+        "| 阶段 | 状态 | 尝试 | 供应商 | 阶段成本 | 分数 | 重试/说明 |",
+        "| --- | --- | ---: | --- | ---: | ---: | --- |",
     ]
-    for name, record in agent.get("stages", {}).items():
+    for name in STORY_STAGE_SEQUENCE:
+        record = stages.get(name, {})
         score = record.get("review", {}).get("score", "")
-        lines.append(f"| {name} | {record.get('status', '')} | {record.get('attempts', 0)} | {score} | {str(record.get('message', '')).replace('|', '/')} |")
+        detail = record.get("retry_reason") or record.get("message", "")
+        lines.append(
+            f"| {name} | {record.get('status', 'pending')} | {record.get('attempts', 0)} | {record.get('provider', '')} | "
+            f"¥{float(record.get('actual_cost', 0.0)):.2f} | {score} | {str(detail).replace('|', '/')} |"
+        )
+    lines.extend(["", "## 剩余工作", ""])
+    if remaining:
+        for name in remaining:
+            lines.append(f"- `{name}`：经验值约 {STAGE_ESTIMATES_MINUTES.get(name, 10)} 分钟")
+    else:
+        lines.append("- 无")
     lines.extend(["", "## 已登记输出", ""])
     for key, value in manifest.get("outputs", {}).items():
         if value:

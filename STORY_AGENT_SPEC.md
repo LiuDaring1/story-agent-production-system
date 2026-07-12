@@ -47,7 +47,7 @@ Agent 的职责分三层：
 | music_qa | local | 时长覆盖、响度、削波、长静音、分段结构通过，输入哈希仍有效 |
 | assemble_final | local | 背景成片三件套存在 |
 | release_assets | codex_native | 发布底板、背景图、故事框、keying 参数存在 |
-| release_preview | local/codex_native | 发布预览总览存在，视觉参数合格 |
+| release_preview | local/codex_native | 站立/大手势双帧的 3×3 抠像候选搜索完成，发布预览与最终参数通过独立审核 |
 | package_release / release_video_review | local/codex_native | 主账号/宝库号成片存在并通过五点抽帧独立审核 |
 | publish_package / publish_package_review | local/codex_native | 两份文案、六张封面存在并通过独立版式审核 |
 | product_preflight | local | 第 16 步前置审查文件和示范预览帧存在 |
@@ -85,6 +85,7 @@ Agent 必须以“可续跑”为默认：
 - 默认软预算 ¥50、硬预算 ¥100、运行时限 10 小时。
 - 图生视频供应商由 `video_api.adapters` 选择；`qingyun_api` 是当前生产适配器，`mock_local` 用于零费用端到端与故障注入，模型不写死在状态机中。
 - manifest 每阶段记录输入/输出上下文指纹、供应商、实际阶段成本、尝试次数和重试原因。
+- `status` 返回剩余阶段、三档经验 ETA、运行/剩余时限、心跳、预算预留、重试/失败明细和具体恢复动作；ETA 不把外部排队或登录等待伪装成确定承诺。
 - 智能/视觉阶段必须有独立审核 JSON：至少 85 分、无关键错误、产物哈希一致。
 - 图片和视频审核失败时保留失败版本并按镜头重排队；发布预览、终片、朗读标注和资料包同样支持限次回退。
 - 发布物料固定为两份账号文案和六张封面（两账号各 3:4、4:3、16:9）。
@@ -136,3 +137,5 @@ python3 story_agent.py report --job "<job_id>"
 ```
 
 `submit` 对原片做 SHA-256 去重并创建 manifest v2；`start` 在后台运行 supervisor；`cancel` 不删除任何素材；`report` 生成早晨交付摘要。项目级入口 Skill 位于 `skills/story-full-auto/`。
+
+故障注入回归覆盖死进程锁回收、活锁保护、API 无进展、目标镜头缺失、Codex 子任务失败、Suno 浏览器/登录失效、磁盘不足和取消/续跑。额外 MP4 不得掩盖 jobs CSV 中命名目标的缺失。

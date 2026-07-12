@@ -38,6 +38,8 @@ Check durable state:
 python3 story_agent.py status --job "<job_id>"
 ```
 
+Use the returned `remaining_work`, ETA range, `retries_and_failures`, deadline, heartbeat, and `recovery_action`; do not replace these durable fields with guesses from terminal output.
+
 If a run stops, read `99_项目状态/agent_morning_report.md` and the newest log before acting. Resume only after resolving the named external state:
 
 ```bash

@@ -7,6 +7,7 @@ import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import time
 import uuid
@@ -1489,15 +1490,52 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
             stderr=subprocess.DEVNULL,
         )
         frames.append(frame)
-    color = sample_green(frames[len(frames) // 2])
+    color, green_variation = sample_green_across_frames(frames)
     person_crop = detect_person_crop(frames, color)
+    standing_frame, gesture_frame = select_keying_representative_frames(frames, color)
+    base_similarity = 0.075 if green_variation < 10 else (0.095 if green_variation < 24 else 0.115)
+    candidates = [
+        {
+            "id": f"s{similarity:.3f}_b{blend:.3f}",
+            "similarity": round(similarity, 3),
+            "blend": round(blend, 3),
+        }
+        for similarity in (max(0.04, base_similarity - 0.02), base_similarity, min(0.16, base_similarity + 0.02))
+        for blend in (0.02, 0.04, 0.06)
+    ]
+    recommended = min(candidates, key=lambda item: abs(item["similarity"] - base_similarity) + abs(item["blend"] - 0.04))
+    candidate_sheet = output_dir / "keying_candidates.jpg"
+    render_keying_candidate_sheet(
+        standing_frame,
+        gesture_frame,
+        color,
+        candidates,
+        candidate_sheet,
+    )
+    search_path = output_dir / "keying_search.json"
+    save_json(
+        search_path,
+        {
+            "version": 1,
+            "source_video": str(video),
+            "source_sha256": sha256_file(video),
+            "chroma_color": color,
+            "green_variation": round(green_variation, 3),
+            "standing_frame": str(standing_frame),
+            "gesture_frame": str(gesture_frame),
+            "candidates": candidates,
+            "recommended_candidate": recommended["id"],
+            "candidate_sheet": str(candidate_sheet),
+            "selection_policy": "背景绿幕波动决定初始 similarity；站立与大手势双帧由独立视觉审核最终确认。",
+        },
+    )
     # Default for current horizontal 16:9 green-screen shoots: presenter centered
     # in the source, full body visible, then placed in the right-side open area.
     preset = {
         "keyer": "colorkey",
         "chroma_color": color,
-        "chroma_similarity": 0.095,
-        "chroma_blend": 0.04,
+        "chroma_similarity": recommended["similarity"],
+        "chroma_blend": recommended["blend"],
         "person_crop": person_crop,
         "person_grade": "log-soft",
         "person_beauty": "light",
@@ -1507,6 +1545,8 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
         "bottom_margin": 0,
         "auto_selected": True,
         "source_video": str(video),
+        "keying_search": str(search_path),
+        "keying_candidate": recommended["id"],
     }
     preset_path = output_dir / "keying_preset.json"
     save_json(preset_path, preset)
@@ -1514,6 +1554,8 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
     render_contact_sheet(frames, sheet, "绿幕自动采样帧")
     manifest["outputs"]["keying_preset"] = str(preset_path)
     manifest["qa"]["keying_samples"] = str(sheet)
+    manifest["qa"]["keying_candidates"] = str(candidate_sheet)
+    manifest["qa"]["keying_search"] = str(search_path)
     write_manifest(paths, manifest)
     return preset_path
 
@@ -1543,6 +1585,135 @@ def sample_green(frame: Path) -> str:
         samples.sort(key=lambda rgb: rgb[1])
         r, g, b = samples[len(samples) // 2]
         return f"0x{r:02X}{g:02X}{b:02X}"
+
+
+def sample_green_across_frames(frames: list[Path]) -> tuple[str, float]:
+    samples: list[tuple[int, int, int]] = []
+    for frame in frames:
+        with Image.open(frame).convert("RGB") as image:
+            width, height = image.size
+            for x_ratio in (0.04, 0.12, 0.88, 0.96):
+                for y_ratio in (0.08, 0.22, 0.45, 0.68):
+                    rgb = image.getpixel((int(width * x_ratio), int(height * y_ratio)))
+                    if rgb[1] > rgb[0] * 1.15 and rgb[1] > rgb[2] * 1.05:
+                        samples.append(rgb)
+    if not samples:
+        return "0x00FF00", 30.0
+    channels = list(zip(*samples))
+    median = tuple(round(statistics.median(channel)) for channel in channels)
+    variation = sum(statistics.pstdev(channel) for channel in channels) / 3
+    return f"0x{median[0]:02X}{median[1]:02X}{median[2]:02X}", variation
+
+
+def select_keying_representative_frames(frames: list[Path], chroma_color: str) -> tuple[Path, Path]:
+    try:
+        green = tuple(int(chroma_color[index : index + 2], 16) for index in (2, 4, 6))
+    except Exception:
+        green = (0, 255, 0)
+    scored: list[tuple[float, float, Path]] = []
+    for frame in frames:
+        with Image.open(frame).convert("RGB") as image:
+            sample = image.resize((160, 90), Image.Resampling.BILINEAR)
+            points = [
+                (x, y)
+                for y in range(sample.height)
+                for x in range(sample.width)
+                if is_presenter_pixel(sample.getpixel((x, y)), green)
+            ]
+        if not points:
+            continue
+        xs = [point[0] for point in points]
+        ys = [point[1] for point in points]
+        width_ratio = (max(xs) - min(xs) + 1) / 160
+        area_ratio = ((max(xs) - min(xs) + 1) * (max(ys) - min(ys) + 1)) / (160 * 90)
+        scored.append((width_ratio, area_ratio, frame))
+    if not scored:
+        return frames[0], frames[-1]
+    standing = min(scored, key=lambda item: (item[0], item[1]))[2]
+    gesture = max(scored, key=lambda item: (item[0], item[1]))[2]
+    return standing, gesture
+
+
+def render_keying_candidate_sheet(
+    standing_frame: Path,
+    gesture_frame: Path,
+    chroma_color: str,
+    candidates: list[dict[str, Any]],
+    output: Path,
+) -> None:
+    try:
+        green = tuple(int(chroma_color[index : index + 2], 16) for index in (2, 4, 6))
+    except Exception:
+        green = (0, 255, 0)
+    tiles: list[Image.Image] = []
+    for candidate in candidates:
+        panels = []
+        for frame in (standing_frame, gesture_frame):
+            with Image.open(frame).convert("RGB") as image:
+                image.thumbnail((300, 180), Image.Resampling.LANCZOS)
+                panels.append(
+                    preview_chromakey(
+                        image,
+                        green,
+                        float(candidate["similarity"]),
+                        float(candidate["blend"]),
+                    )
+                )
+        tile = Image.new("RGB", (620, 218), (34, 32, 42))
+        tile.paste(panels[0], (8, 30))
+        tile.paste(panels[1], (312, 30))
+        draw = ImageDraw.Draw(tile)
+        draw.text(
+            (12, 5),
+            f"{candidate['id']}  similarity={candidate['similarity']:.3f}  blend={candidate['blend']:.3f}",
+            fill=(245, 245, 245),
+            font=load_font(18),
+        )
+        tiles.append(tile)
+    columns = 3
+    rows = math.ceil(len(tiles) / columns)
+    sheet = Image.new("RGB", (columns * 620, 54 + rows * 218), (238, 236, 232))
+    draw = ImageDraw.Draw(sheet)
+    draw.text((18, 12), "抠像参数搜索：左=站立帧，右=大手势帧（候选预览仅供选参）", fill=(25, 25, 25), font=load_font(24))
+    for index, tile in enumerate(tiles):
+        sheet.paste(tile, ((index % columns) * 620, 54 + (index // columns) * 218))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output, quality=92)
+
+
+def preview_chromakey(
+    image: Image.Image,
+    green: tuple[int, int, int],
+    similarity: float,
+    blend: float,
+) -> Image.Image:
+    source = image.convert("RGB")
+    rgba = Image.new("RGBA", source.size)
+    src_pixels = source.load()
+    dst_pixels = rgba.load()
+    lower = max(1.0, similarity * 442)
+    upper = max(lower + 1.0, (similarity + blend) * 442)
+    for y in range(source.height):
+        for x in range(source.width):
+            r, g, b = src_pixels[x, y]
+            distance = math.sqrt((r - green[0]) ** 2 + (g - green[1]) ** 2 + (b - green[2]) ** 2)
+            green_dominant = g > r * 1.02 and g > b * 1.01
+            if not green_dominant or distance >= upper:
+                alpha = 255
+            elif distance <= lower:
+                alpha = 0
+            else:
+                alpha = round(255 * (distance - lower) / (upper - lower))
+            dst_pixels[x, y] = (r, g, b, alpha)
+    background = Image.new("RGB", source.size, (92, 73, 112))
+    checker = ImageDraw.Draw(background)
+    block = 24
+    for y in range(0, source.height, block):
+        for x in range(0, source.width, block):
+            if (x // block + y // block) % 2:
+                checker.rectangle((x, y, x + block - 1, y + block - 1), fill=(128, 111, 145))
+    background.paste(rgba, mask=rgba.getchannel("A"))
+    return background
 
 
 def detect_person_crop(frames: list[Path], chroma_color: str) -> list[int] | None:
@@ -1720,8 +1891,20 @@ def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) ->
             "product_annotation_review": paths.status / "reviews" / "product_annotation_review.json",
             "product_package_review": paths.status / "reviews" / "product_package_review.json",
         }
+        review_artifacts = {
+            "source_edit_review": Path(str(manifest.get("outputs", {}).get("source_edit_decisions", ""))),
+            "story_images_review": paths.status / "reviews" / "story_images_bundle.json",
+            "video_prompt_review": paths.status / "reviews" / "video_prompt_bundle.json",
+            "video_review": paths.status / "reviews" / "video_bundle.json",
+            "release_preview": paths.status / "reviews" / "release_preview_bundle.json",
+            "release_video_review": paths.status / "reviews" / "release_video_bundle.json",
+            "publish_package_review": paths.status / "reviews" / "publish_package_bundle.json",
+            "product_annotation_review": paths.status / "reviews" / "product_annotation_bundle.json",
+            "product_package_review": paths.status / "reviews" / "product_package_bundle.json",
+        }
         if not manifest.get("outputs", {}).get("source_edit_decisions"):
             review_paths.pop("source_edit_review", None)
+            review_artifacts.pop("source_edit_review", None)
         for name, review_path in review_paths.items():
             try:
                 review = json.loads(review_path.read_text(encoding="utf-8"))
@@ -1730,6 +1913,16 @@ def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) ->
                 continue
             if not review.get("approved") or float(review.get("score", 0)) < 85 or review.get("critical_errors"):
                 review_failures.append(f"{name}: 未达到 85 分无关键错误门槛")
+                continue
+            artifact = review_artifacts.get(name)
+            if artifact is None or not artifact.is_file():
+                review_failures.append(f"{name}: 缺少被审核产物或 bundle")
+                continue
+            if review.get("artifact_sha256") != sha256_file(artifact):
+                review_failures.append(f"{name}: 审核哈希与当前 artifact 不匹配")
+                continue
+            if artifact.name.endswith("_bundle.json") and not review_bundle_current_local(artifact):
+                review_failures.append(f"{name}: bundle 中的产物已经变化")
         music_qa_path = paths.status / "qa_music_report.json"
         try:
             music_qa = json.loads(music_qa_path.read_text(encoding="utf-8"))
@@ -1787,6 +1980,23 @@ def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) ->
     if update_latest_episode:
         maybe_update_latest_episode(manifest)
     return report
+
+
+def review_bundle_current_local(bundle: Path) -> bool:
+    try:
+        payload = json.loads(bundle.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, list) or not artifacts:
+        return False
+    for item in artifacts:
+        if not isinstance(item, dict):
+            return False
+        target = Path(str(item.get("path", "")))
+        if not target.is_file() or item.get("sha256") != sha256_file(target):
+            return False
+    return True
 
 
 def qa_release(project_dir: Path) -> Path:

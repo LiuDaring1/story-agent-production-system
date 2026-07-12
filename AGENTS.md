@@ -16,6 +16,8 @@
 - 默认软预算 ¥50、硬预算 ¥100、运行时限 10 小时；超过硬预算不得发起新付费调用。
 - 图生视频必须通过 `video_provider_adapter.py` 解析供应商；不要在 `story_agent.py` 或 `story_workflow.py` 写死供应商、模型或密钥。
 - 配乐必须通过带输入哈希的 `qa_music_report.json`，不能仅凭音频文件存在进入最终合成。
+- 抠像必须保存 `keying_search.json` 和站立/大手势候选图；独立审核通过前不得渲染全片。
+- 视频片段完成条件必须逐一匹配 jobs CSV 的 `target_video_filename`，不能用目录 MP4 数量代替。
 
 ## 修改与验证
 

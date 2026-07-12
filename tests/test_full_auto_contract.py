@@ -9,6 +9,7 @@ from pathlib import Path
 from PIL import Image
 
 from story_agent import canonical_video_prompt_rows, video_prompt_review_matches_current
+from story_agent_runtime import file_sha256, write_review_bundle
 from story_project import final_delivery, init_project, load_manifest, project_paths, sha256_file, write_manifest
 from tests.test_release_qa import make_vertical_video
 
@@ -106,25 +107,32 @@ class FullAutoContractTests(unittest.TestCase):
             self.assertNotIn("completed_at", incomplete)
             self.assertIn("审核失败", first_report.read_text(encoding="utf-8"))
 
-            review_paths = [
-                paths.status / "source_edit" / "source_edit_review.json",
-                *[
-                    paths.status / "reviews" / f"{name}.json"
-                    for name in (
-                        "story_images_review",
-                        "video_prompt_review",
-                        "video_review",
-                        "release_preview_review",
-                        "release_video_review",
-                        "publish_package_review",
-                        "product_annotation_review",
-                        "product_package_review",
-                    )
-                ],
-            ]
-            for review in review_paths:
-                review.parent.mkdir(parents=True, exist_ok=True)
-                review.write_text(json.dumps({"approved": True, "score": 92, "critical_errors": []}), encoding="utf-8")
+            source_review = paths.status / "source_edit" / "source_edit_review.json"
+            source_review.write_text(
+                json.dumps({"approved": True, "score": 92, "critical_errors": [], "artifact_sha256": file_sha256(decisions)}),
+                encoding="utf-8",
+            )
+            review_dir = paths.status / "reviews"
+            review_dir.mkdir(parents=True, exist_ok=True)
+            bundles = {
+                "story_images_review": ("story_images_bundle.json", [paths.publish / "main" / "covers" / "cover_3x4.png"]),
+                "video_prompt_review": ("video_prompt_bundle.json", [decisions]),
+                "video_review": ("video_bundle.json", [paths.release / "主账号发布视频.mp4"]),
+                "release_preview_review": ("release_preview_bundle.json", [paths.release / "主账号发布视频.mp4"]),
+                "release_video_review": (
+                    "release_video_bundle.json",
+                    [paths.release / "主账号发布视频.mp4", paths.release / "宝库号发布视频.mp4"],
+                ),
+                "publish_package_review": ("publish_package_bundle.json", [paths.publish]),
+                "product_annotation_review": ("product_annotation_bundle.json", [next(base.glob("朗读标注*"))]),
+                "product_package_review": ("product_package_bundle.json", [base, advanced]),
+            }
+            for review_name, (bundle_name, artifacts) in bundles.items():
+                bundle = write_review_bundle(review_dir / bundle_name, artifacts)
+                (review_dir / f"{review_name}.json").write_text(
+                    json.dumps({"approved": True, "score": 92, "critical_errors": [], "artifact_sha256": file_sha256(bundle)}),
+                    encoding="utf-8",
+                )
             music_artifact = next(base.glob("故事配乐*"))
             music_qa = paths.status / "qa_music_report.json"
             music_qa.write_text(
@@ -160,6 +168,14 @@ class FullAutoContractTests(unittest.TestCase):
             assert complete is not None
             self.assertTrue(complete.get("completed_at"), second_report.read_text(encoding="utf-8"))
             self.assertIn("必备交付物和独立审核均已满足", second_report.read_text(encoding="utf-8"))
+
+            changed_cover = paths.publish / "main" / "covers" / "cover_3x4.png"
+            Image.new("RGB", (900, 1200), (180, 80, 80)).save(changed_cover)
+            stale_report = final_delivery(project)
+            stale_manifest = load_manifest(paths)
+            assert stale_manifest is not None
+            self.assertNotIn("completed_at", stale_manifest)
+            self.assertIn("bundle 中的产物已经变化", stale_report.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

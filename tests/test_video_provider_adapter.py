@@ -6,13 +6,40 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image
 
 from video_provider_adapter import VideoProviderConfigError, resolve_video_provider
+from story_workflow import run_generate_until_complete
 
 
 class VideoProviderAdapterTests(unittest.TestCase):
+    def test_api_timeout_or_no_progress_stops_without_infinite_loop(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as directory:
+            work = Path(directory)
+            jobs = work / "jobs.csv"
+            videos = work / "videos"
+            videos.mkdir()
+            jobs.write_text(
+                "scene,target_video_filename,status\n1,01.mp4,todo\n",
+                encoding="utf-8-sig",
+            )
+            with patch("story_workflow.run_script") as runner:
+                with self.assertRaisesRegex(RuntimeError, "没有减少待处理任务"):
+                    run_generate_until_complete(
+                        [],
+                        runner=root / "mock_video_provider.py",
+                        jobs_csv=jobs,
+                        videos_dir=videos,
+                        start_scene=1,
+                        end_scene=9999,
+                        scenes="",
+                        limit=0,
+                    )
+            runner.assert_called_once()
+
     def test_mock_provider_runs_through_real_workflow_without_paid_api(self) -> None:
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:

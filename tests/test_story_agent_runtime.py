@@ -1,14 +1,18 @@
 from __future__ import annotations
 
+import io
 import json
+import os
 import shutil
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from unittest.mock import patch
 from pathlib import Path
 
-from story_agent import AgentContext, StoryAgent, classify_command_failure
+from story_agent import AgentContext, StageResult, StoryAgent, classify_command_failure
 from story_agent_runtime import (
+    AgentRuntimeError,
     BudgetExceeded,
     BudgetLedger,
     JobRegistry,
@@ -21,6 +25,7 @@ from story_agent_runtime import (
     review_passes,
     manifest_context_sha256,
     mark_stage,
+    job_lock,
     submit_video_job,
     assert_runnable,
 )
@@ -29,6 +34,165 @@ from story_project import final_delivery, init_project
 
 
 class StoryAgentRuntimeTests(unittest.TestCase):
+    def test_transient_stage_failure_retries_and_then_checkpoints(self) -> None:
+        class TransientAgent(StoryAgent):
+            calls = 0
+
+            def _next_stage(self, manifest):
+                if manifest["agent"]["stages"]["generate_videos"]["status"] == "passed":
+                    return "done", lambda _manifest: StageResult("done", "done")
+
+                def action(_manifest):
+                    self.calls += 1
+                    return StageResult("failed", "HTTP 502 temporary") if self.calls == 1 else StageResult("done", "recovered")
+
+                return "generate_videos", action
+
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：重试"
+            init_project(project, story_name="重试", slug="retry")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="重试",
+                slug="retry",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = TransientAgent(context)
+            self.assertEqual(agent.run(max_steps=4), 0)
+            manifest = load_manifest(project_paths(project))
+            assert manifest is not None
+            record = manifest["agent"]["stages"]["generate_videos"]
+            self.assertEqual(record["status"], "passed")
+            self.assertEqual(record["attempts"], 2)
+            self.assertEqual(agent.calls, 2)
+
+    def test_codex_subtask_failure_retries_in_a_new_attempt(self) -> None:
+        class CodexFailOnceAgent(StoryAgent):
+            calls = 0
+
+            def _next_stage(self, manifest):
+                stage = "codex_story_images"
+                if manifest["agent"]["stages"][stage]["status"] == "passed":
+                    return "done", lambda _manifest: StageResult("done", "done")
+
+                def action(_manifest):
+                    self.calls += 1
+                    return StageResult("failed", "Codex CLI 子任务失败") if self.calls == 1 else StageResult("done", "Codex recovered")
+
+                return stage, action
+
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：Codex重试"
+            init_project(project, story_name="Codex重试", slug="codex-retry")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="Codex重试",
+                slug="codex-retry",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="cli",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = CodexFailOnceAgent(context)
+            self.assertEqual(agent.run(max_steps=4), 0)
+            manifest = load_manifest(project_paths(project))
+            assert manifest is not None
+            record = manifest["agent"]["stages"]["codex_story_images"]
+            self.assertEqual(record["status"], "passed")
+            self.assertEqual(record["attempts"], 2)
+
+    def test_dead_process_lock_is_reclaimed_but_live_lock_is_preserved(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：锁恢复"
+            init_project(project, story_name="锁恢复", slug="lock")
+            lock = project_paths(project).status / "story_agent.lock"
+            lock.write_text(json.dumps({"pid": 99999999}), encoding="utf-8")
+            with job_lock(project):
+                self.assertTrue(lock.exists())
+            self.assertFalse(lock.exists())
+
+            lock.write_text(json.dumps({"pid": os.getpid()}), encoding="utf-8")
+            with self.assertRaises(AgentRuntimeError):
+                with job_lock(project):
+                    pass
+            lock.unlink()
+
+    def test_missing_target_video_is_not_hidden_by_unrelated_mp4(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：缺帧"
+            manifest = init_project(project, story_name="缺帧", slug="missing-frame")
+            paths = project_paths(project)
+            jobs = paths.video_jobs / "missing-frame_image_video_jobs.csv"
+            jobs.write_text(
+                "scene,target_video_filename\n1,01.mp4\n2,02.mp4\n",
+                encoding="utf-8-sig",
+            )
+            manifest["outputs"]["jobs_csv"] = str(jobs)
+            from story_project import write_manifest
+
+            write_manifest(paths, manifest)
+            videos = paths.video_jobs / "videos"
+            videos.mkdir()
+            (videos / "01.mp4").write_bytes(b"one")
+            (videos / "unrelated.mp4").write_bytes(b"extra")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="缺帧",
+                slug="missing-frame",
+                execute=False,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context, read_only=True)
+            self.assertFalse(agent._has_generated_videos(manifest))
+            (videos / "02.mp4").write_bytes(b"two")
+            self.assertTrue(agent._has_generated_videos(manifest))
+
+    def test_suno_login_or_browser_loss_writes_recoverable_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：Suno阻塞"
+            manifest = init_project(project, story_name="Suno阻塞", slug="suno-block")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="Suno阻塞",
+                slug="suno-block",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="cli",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context)
+            with patch.object(agent, "_codex_task", return_value=StageResult("blocked", "No browser is available")):
+                result = agent._stage_suno_generate(manifest)
+            self.assertEqual(result.status, "blocked")
+            blocker = project / "02_图生视频" / "music" / "suno_cli_blocker.md"
+            self.assertTrue(blocker.exists())
+            self.assertIn("Codex 主任务", blocker.read_text(encoding="utf-8"))
+
     def test_stage_record_tracks_context_output_provider_cost_and_retry_reason(self) -> None:
         manifest = ensure_manifest_v2({"story": {"name": "证据测试"}})
         input_sha = manifest_context_sha256(manifest)
@@ -91,9 +255,43 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             request_cancel(project)
             self.assertTrue(agent._heartbeat_and_cancelled())
 
+    def test_status_reports_remaining_work_eta_and_recovery_without_writes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：状态"
+            init_project(project, story_name="状态", slug="status")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="状态",
+                slug="status",
+                execute=False,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context, read_only=True)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                agent.status()
+            payload = json.loads(output.getvalue())
+            self.assertTrue(payload["remaining_work"])
+            remaining_names = [item["stage"] for item in payload["remaining_work"]]
+            self.assertIn("source_text_correction", remaining_names)
+            self.assertIn("source_edit_review", remaining_names)
+            self.assertGreater(payload["estimated_remaining_minutes"]["nominal"], 0)
+            self.assertIn("supervisor", payload)
+            self.assertFalse(payload["completion_valid"])
+            self.assertFalse((project / "02_图生视频" / "music").exists())
+
     def test_manifest_v2_and_budget_limits(self) -> None:
         manifest = ensure_manifest_v2({}, soft_budget_cny=50, hard_budget_cny=100)
         self.assertEqual(manifest["version"], 2)
+        self.assertEqual(manifest["agent"]["stages"]["source_edit"]["status"], "pending")
+        self.assertEqual(manifest["agent"]["stages"]["doctor"]["attempts"], 0)
         ledger = BudgetLedger(manifest)
         reservation = ledger.authorize(40, label="first")
         ledger.settle(reservation, 35, provider="stub", request_id="r1")
@@ -149,7 +347,10 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertFalse(resumed["agent"]["cancel_requested"])
             report = render_job_report(project)
             self.assertTrue(report.exists())
-            self.assertIn(job_id, report.read_text(encoding="utf-8"))
+            report_text = report.read_text(encoding="utf-8")
+            self.assertIn(job_id, report_text)
+            self.assertIn("## 剩余工作", report_text)
+            self.assertIn("恢复动作", report_text)
 
     def test_final_delivery_does_not_mark_incomplete_project_complete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

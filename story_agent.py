@@ -29,6 +29,8 @@ from story_agent_runtime import (
     BudgetLedger,
     JobCancelled,
     JobRegistry,
+    STORY_STAGE_SEQUENCE,
+    STAGE_ESTIMATES_MINUTES,
     assert_runnable,
     ensure_manifest_v2,
     existing_artifact_hashes,
@@ -203,6 +205,8 @@ class StoryAgent:
                 manifest = self._manifest()
                 assert_runnable(manifest, self.context.project_dir)
                 stage_name, action = self._next_stage(manifest)
+                if self.context.execute:
+                    self._reconcile_completed_stage_records(manifest, stage_name)
                 if stage_name == "done":
                     if self.context.execute:
                         manifest["agent"]["status"] = "completed"
@@ -251,6 +255,26 @@ class StoryAgent:
     def status(self) -> None:
         manifest = self._manifest()
         stage_name, _ = self._next_stage(manifest)
+        remaining_work: list[dict[str, Any]] = []
+        if stage_name != "done":
+            start_index = STORY_STAGE_SEQUENCE.index(stage_name)
+            for name in STORY_STAGE_SEQUENCE[start_index:]:
+                remaining_work.append({"stage": name, "estimated_minutes": STAGE_ESTIMATES_MINUTES.get(name, 10)})
+        estimate_total = sum(int(item["estimated_minutes"]) for item in remaining_work)
+        agent_data = manifest.get("agent", {})
+        timing = self._timing_status(agent_data)
+        stage_records = agent_data.get("stages", {}) if isinstance(agent_data.get("stages"), dict) else {}
+        retries = {
+            name: {
+                "status": record.get("status", "pending"),
+                "attempts": int(record.get("attempts", 0)),
+                "provider": record.get("provider", ""),
+                "actual_cost": float(record.get("actual_cost", 0.0)),
+                "retry_reason": record.get("retry_reason", ""),
+            }
+            for name, record in stage_records.items()
+            if isinstance(record, dict) and (int(record.get("attempts", 0)) > 1 or record.get("status") in {"retrying", "blocked", "failed"})
+        }
         storyboard = self._storyboard_path(manifest)
         image_dir = self._image_dir()
         safe_project = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.context.slug) or "story"
@@ -269,8 +293,21 @@ class StoryAgent:
             "job_id": manifest.get("agent", {}).get("job_id", ""),
             "project_dir": str(self.context.project_dir),
             "next_stage": stage_name,
-            "agent_status": manifest.get("agent", {}).get("status", "pending"),
-            "budget": manifest.get("agent", {}).get("budget", {}),
+            "agent_status": agent_data.get("status", "pending"),
+            "last_checkpoint": agent_data.get("last_checkpoint", ""),
+            "heartbeat_at": agent_data.get("heartbeat_at", ""),
+            "blocked_reason": agent_data.get("blocked_reason", ""),
+            "recovery_action": self._recovery_action(manifest, stage_name),
+            "budget": agent_data.get("budget", {}),
+            "timing": timing,
+            "retries_and_failures": retries,
+            "remaining_work": remaining_work,
+            "estimated_remaining_minutes": {
+                "optimistic": round(estimate_total * 0.65),
+                "nominal": estimate_total,
+                "conservative": round(estimate_total * 1.8),
+                "note": "按阶段经验值估算；外部生成队列、登录阻塞和重试不包含在确定性承诺内。",
+            },
             "supervisor": supervisor,
             "state_file": str(self.state_path),
             "codex_mode": self.context.codex_mode,
@@ -286,7 +323,44 @@ class StoryAgent:
             },
             "final_delivery": manifest.get("outputs", {}).get("final_delivery_checklist", ""),
             "completed_at": manifest.get("completed_at", ""),
+            "completion_valid": stage_name == "done" and bool(manifest.get("completed_at")),
         }, ensure_ascii=False, indent=2))
+
+    def _timing_status(self, agent_data: dict[str, Any]) -> dict[str, Any]:
+        deadline_hours = float(agent_data.get("deadline_hours", 10.0))
+        started_text = str(agent_data.get("started_at", ""))
+        elapsed_hours = 0.0
+        if started_text:
+            try:
+                elapsed_hours = max(0.0, (time.time() - time.mktime(time.strptime(started_text, "%Y-%m-%d %H:%M:%S"))) / 3600)
+            except ValueError:
+                pass
+        return {
+            "started_at": started_text,
+            "elapsed_hours": round(elapsed_hours, 3),
+            "deadline_hours": deadline_hours,
+            "remaining_deadline_hours": round(max(0.0, deadline_hours - elapsed_hours), 3),
+        }
+
+    def _recovery_action(self, manifest: dict[str, Any], next_stage: str) -> str:
+        agent_data = manifest.get("agent", {})
+        status = str(agent_data.get("status", ""))
+        reason = str(agent_data.get("blocked_reason", ""))
+        combined = f"{next_stage} {reason}".lower()
+        job_id = str(agent_data.get("job_id", "<job_id>"))
+        if status == "cancelled" or agent_data.get("cancel_requested"):
+            return f"依次运行 `python3 story_agent.py resume --job {job_id}` 和 `python3 story_agent.py start --job {job_id}`。"
+        if "suno" in combined or "browser" in combined or "登录" in reason or "captcha" in combined:
+            return "在 Codex 主任务恢复 Suno 登录/浏览器能力，完成 handoff 下载后执行 resume 和 start。"
+        if "磁盘" in reason:
+            return "释放项目磁盘空间至最低阈值以上，再执行 resume 和 start。"
+        if "api key" in combined or "credential" in combined or "鉴权" in reason:
+            return "在环境变量中配置对应供应商密钥，确认不写入 manifest 后执行 resume 和 start。"
+        if "预算" in reason or "上限" in reason:
+            return "查看成本报告；只有用户明确调整预算或改用零费用供应商后才能 resume。"
+        if status in {"blocked", "failed"}:
+            return f"查看最新阶段日志和 agent_morning_report.md，处理原因后执行 python3 story_agent.py resume --job {job_id}。"
+        return "无需人工恢复；后台 supervisor 会继续推进。"
 
     def _manifest(self) -> dict[str, Any]:
         if self.read_only:
@@ -303,6 +377,12 @@ class StoryAgent:
         return ensure_manifest_v2(manifest)
 
     def _next_stage(self, manifest: dict[str, Any]) -> tuple[str, Callable[[dict[str, Any]], StageResult]]:
+        for name, done, action in self._stage_checks():
+            if not done(manifest):
+                return name, action
+        return "done", lambda _: StageResult("done", "完成")
+
+    def _stage_checks(self) -> list[tuple[str, Callable[[dict[str, Any]], bool], Callable[[dict[str, Any]], StageResult]]]:
         checks: list[tuple[str, Callable[[dict[str, Any]], bool], Callable[[dict[str, Any]], StageResult]]] = [
             ("import_inbox", self._has_imported_inbox, self._stage_import_inbox),
             ("source_edit", self._has_source_edit, self._stage_source_edit),
@@ -338,10 +418,28 @@ class StoryAgent:
             ("final_delivery", self._has_final_delivery, self._stage_final_delivery),
             ("doctor", self._has_doctor_report, self._stage_doctor),
         ]
-        for name, done, action in checks:
-            if not done(manifest):
-                return name, action
-        return "done", lambda _: StageResult("done", "完成")
+        names = tuple(item[0] for item in checks)
+        if names != STORY_STAGE_SEQUENCE:
+            raise AgentRuntimeError("状态机阶段顺序与 runtime 清单不一致")
+        return checks
+
+    def _reconcile_completed_stage_records(self, manifest: dict[str, Any], next_stage: str) -> None:
+        from story_project import write_manifest
+
+        limit = len(STORY_STAGE_SEQUENCE) if next_stage == "done" else STORY_STAGE_SEQUENCE.index(next_stage)
+        checks = {name: done for name, done, _action in self._stage_checks()}
+        changed = False
+        for name in STORY_STAGE_SEQUENCE[:limit]:
+            record = manifest.get("agent", {}).get("stages", {}).get(name, {})
+            try:
+                complete = checks[name](manifest)
+            except Exception:
+                complete = False
+            if record.get("status") == "pending" and complete:
+                mark_stage(manifest, name, "passed", message="由当前输入/已验证产物满足，或按配置安全跳过。")
+                changed = True
+        if changed:
+            write_manifest(self.context.paths, manifest)
 
     def _stage_import_inbox(self, manifest: dict[str, Any]) -> StageResult:
         if self.context.inbox is None:
@@ -776,24 +874,6 @@ class StoryAgent:
             prompt=prompt,
             images=[contact_sheet],
         )
-        if result.status == "blocked":
-            blocker = self._music_dir() / "suno_cli_blocker.md"
-            blocker.write_text(
-                "\n".join(
-                    [
-                        "# Suno 外部阻塞",
-                        "",
-                        f"- 时间：{now()}",
-                        f"- 子任务结果：{result.message}",
-                        "- 原因：后台 codex exec 没有可用 Browser 工具，或浏览器登录态不可用。",
-                        "- 恢复：在 Codex 主任务中登录 Suno（或明确批准使用已登录 Chrome），按 handoff 生成并下载音乐到 suno_downloads，然后执行 resume/start。",
-                        "- 安全边界：不得绕过验证码、付费弹窗或账号风控。",
-                    ]
-                )
-                + "\n",
-                encoding="utf-8",
-            )
-            return StageResult("blocked", f"Suno 需要在 Codex 主任务恢复浏览器能力：{blocker}", blocker)
         if result.status != "done":
             return result
         try:
@@ -902,6 +982,24 @@ class StoryAgent:
                 f"请写入 `{self._music_dir() / 'suno_cli_blocker.md'}` 说明原因，不要假装完成。"
             ),
         )
+        if result.status == "blocked":
+            blocker = self._music_dir() / "suno_cli_blocker.md"
+            blocker.write_text(
+                "\n".join(
+                    [
+                        "# Suno 外部阻塞",
+                        "",
+                        f"- 时间：{now()}",
+                        f"- 子任务结果：{result.message}",
+                        "- 原因：后台 Codex 没有可用 Browser 工具，或 Suno 登录态不可用。",
+                        "- 恢复：在 Codex 主任务中登录 Suno（或明确批准使用已登录 Chrome），按 handoff 生成并下载音乐到 suno_downloads，然后执行 resume/start。",
+                        "- 安全边界：不得绕过验证码、付费弹窗或账号风控。",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            return StageResult("blocked", f"Suno 需要在 Codex 主任务恢复浏览器能力：{blocker}", blocker)
         if result.status != "done":
             return result
         if self._has_suno_audio(self._manifest()):
@@ -1005,9 +1103,13 @@ class StoryAgent:
         handoff = preview_dir / "release_preview_feedback_to_codex.md"
         images = self._release_preview_images()
         preset = self.context.paths.release / "keying" / "keying_preset.json"
+        keying_search = self.context.paths.release / "keying" / "keying_search.json"
+        keying_candidates = self.context.paths.release / "keying" / "keying_candidates.jpg"
+        if keying_candidates.exists():
+            images = [keying_candidates, *images]
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "release_preview_bundle.json",
-            [preset, preview_dir],
+            [preset, keying_search, keying_candidates, preview_dir],
         )
         result, payload = self._structured_review(
             stage="release_preview",
@@ -1015,9 +1117,10 @@ class StoryAgent:
             bundle=bundle,
             images=images,
             rubric=(
-                "检查主账号和宝库号预览中的抠像边缘、头发和手部、绿色溢出、人物比例与位置、故事框覆盖、"
+                "先比较 keying_candidates.jpg 中站立帧与大手势帧的 3×3 参数候选，再检查主账号和宝库号预览中的"
+                "抠像边缘、头发和手部、绿色溢出、透明孔洞、人物比例与位置、故事框覆盖、"
                 "字幕安全区以及 A（人物+故事框）、B（故事框）、C（人物+主题背景）三种构图。抠像截断、人物被框遮挡、框体露缝属于关键错误。"
-                "失败时在 retry_instructions 中给出可执行的 keying_preset 参数修订建议。"
+                "失败时在 retry_instructions 中明确给出候选 id 或可执行的 keying_preset 参数修订建议。"
             ),
         )
         if result.status == "done":
@@ -1029,8 +1132,11 @@ class StoryAgent:
                 [
                     "你是发布布局与抠像参数修订生产者。根据独立审核意见最小化修改 keying_preset.json。",
                     f"参数文件：`{preset}`",
+                    f"候选搜索记录：`{keying_search}`",
+                    f"候选对照图：`{keying_candidates}`",
                     f"独立审核：`{review_path}`",
                     f"预览说明：`{handoff}`",
+                    "优先从候选中选择最能兼顾头发、手部和大手势的 similarity/blend，并同步写入 keying_candidate；"
                     "只修改参数文件，不得伪造批准文件；完成后下一轮会重新渲染并由新上下文审核。",
                 ]
             )
@@ -1849,9 +1955,13 @@ class StoryAgent:
         videos = self.context.paths.video_jobs / "videos"
         if jobs is None or not videos.exists():
             return False
-        expected = self._job_count(jobs)
-        actual = len([path for path in videos.glob("*.mp4") if path.is_file()])
-        return expected > 0 and actual >= expected
+        try:
+            with jobs.open(encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.DictReader(file))
+        except Exception:
+            return False
+        targets = [(row.get("target_video_filename") or "").strip() for row in rows]
+        return bool(targets) and all(name and (videos / name).is_file() and (videos / name).stat().st_size > 0 for name in targets)
 
     def _has_video_prompt_review(self, manifest: dict[str, Any]) -> bool:
         review_dir = self.context.paths.status / "reviews"
@@ -2122,7 +2232,8 @@ class StoryAgent:
 
     def _music_dir(self) -> Path:
         path = self.context.paths.video_jobs / "music"
-        path.mkdir(parents=True, exist_ok=True)
+        if not self.read_only:
+            path.mkdir(parents=True, exist_ok=True)
         return path
 
     def _music_plan(self) -> Path:

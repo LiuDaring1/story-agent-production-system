@@ -2121,6 +2121,25 @@ def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) ->
                         break
             if not release_qa.get("passed") or not release_current:
                 review_failures.append("release_qa: 未通过或发布视频哈希已变化")
+        product_qa_path = paths.status / "qa_product_report.json"
+        try:
+            product_qa = json.loads(product_qa_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            review_failures.append("product_qa: 缺少有效资料包机器 QA JSON")
+        else:
+            product_artifacts = product_qa.get("artifacts")
+            product_current = isinstance(product_artifacts, dict) and bool(product_artifacts)
+            if product_current:
+                for item in product_artifacts.values():
+                    if not isinstance(item, dict):
+                        product_current = False
+                        break
+                    artifact_path = Path(str(item.get("path", "")))
+                    if not artifact_path.is_file() or item.get("sha256") != sha256_file(artifact_path):
+                        product_current = False
+                        break
+            if not product_qa.get("passed") or not product_current:
+                review_failures.append("product_qa: 未通过或资料包文件哈希已变化")
     lines.extend(["", "## Agent 完成门槛"])
     if missing_delivery:
         lines.extend(f"- 缺失：`{path}`" for path in missing_delivery)
@@ -2272,8 +2291,18 @@ def qa_product(project_dir: Path) -> Path:
     discover_outputs(paths, manifest)
     rows = []
     issues = []
-    required_base = ("故事文稿", "故事配乐", "朗读标注", "示范表演", "背景图片")
-    required_advanced = ("故事文稿", "故事配乐", "朗读标注", "示范表演", "背景视频", "故事PPT")
+    required_base = (("故事文稿",), ("故事配乐",), ("朗读标注",), ("示范表演",), ("背景图片",))
+    required_advanced = (
+        ("故事文稿",),
+        ("故事配乐",),
+        ("朗读标注",),
+        ("示范表演",),
+        ("背景视频", "含字幕"),
+        ("背景视频", "无字幕"),
+        ("故事PPT", "含字幕"),
+        ("故事PPT", "无字幕"),
+    )
+    artifacts: dict[str, dict[str, str]] = {}
     for label, key, required in (
         ("基础版资料包", "product_base", required_base),
         ("进阶版资料包", "product_advanced", required_advanced),
@@ -2284,14 +2313,38 @@ def qa_product(project_dir: Path) -> Path:
             issues.append(f"- {label}：未找到")
             continue
         directory = Path(value)
-        names = [path.name for path in directory.iterdir() if path.is_file()]
-        missing = [token for token in required if not any(token in name for name in names)]
-        rows.append({"index": str(len(rows) + 1), "file": str(directory), "status": "warning" if missing else "ok", "notes": "缺少：" + "、".join(missing) if missing else "文件齐全"})
-        if missing:
-            issues.append(f"- {label}：缺少 {'、'.join(missing)}")
+        files = [path for path in directory.iterdir() if path.is_file()]
+        names = [path.name for path in files]
+        missing_groups = ["+".join(group) for group in required if not any(all(token in name for token in group) for name in names)]
+        empty = [path.name for path in files if path.stat().st_size <= 0]
+        leaked = [name for name in names if any(token in name for token in ("成本报告", "QA汇总", "异常说明", "agent_morning_report"))]
+        notes: list[str] = []
+        if missing_groups:
+            notes.append("缺少：" + "、".join(missing_groups))
+        if empty:
+            notes.append("空文件：" + "、".join(empty))
+        if leaked:
+            notes.append("混入内部报告：" + "、".join(leaked))
+        rows.append({"index": str(len(rows) + 1), "file": str(directory), "status": "warning" if notes else "ok", "notes": "；".join(notes) if notes else "文件齐全"})
+        if notes:
+            issues.append(f"- {label}：{'；'.join(notes)}")
+        for path in files:
+            artifacts[f"{key}:{path.name}"] = {"path": str(path), "sha256": sha256_file(path)}
     report = paths.status / "qa_product_report.md"
     write_qa_report(report, "资料包结构机器审查", paths.product, rows, issues, expected="基础版/进阶版目录存在且必备文件齐全")
     manifest["qa"]["product"] = str(report)
+    report_json = paths.status / "qa_product_report.json"
+    save_json(
+        report_json,
+        {
+            "version": 1,
+            "passed": not issues,
+            "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "artifacts": artifacts,
+            "issues": issues,
+        },
+    )
+    manifest["qa"]["product_json"] = str(report_json)
     write_manifest(paths, manifest)
     return report
 

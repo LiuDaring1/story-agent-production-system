@@ -1378,7 +1378,17 @@ class StoryAgent:
         if qa.status != "done":
             return qa
         report = self.context.paths.status / "qa_product_report.md"
-        bundle = write_review_bundle(self.context.paths.status / "reviews" / "product_package_bundle.json", [base, advanced, report])
+        report_json = self.context.paths.status / "qa_product_report.json"
+        if not self._json_qa_report_passes(report_json):
+            if self._can_retry_stage("product_package_review", critical=True):
+                archive = self.context.paths.status / "rejected" / "product_packages" / time.strftime("%Y%m%d-%H%M%S")
+                archive.mkdir(parents=True, exist_ok=True)
+                for directory in (base, advanced):
+                    if directory.exists():
+                        shutil.move(str(directory), str(archive / directory.name))
+                return StageResult("retrying", f"资料包机器 QA 未通过，已保留失败包并排队重新打包：{report_json}", report_json)
+            return StageResult("blocked", f"资料包机器 QA 未通过且已达到重做上限：{report_json}", report_json)
+        bundle = write_review_bundle(self.context.paths.status / "reviews" / "product_package_bundle.json", [base, advanced, report, report_json])
         result, payload = self._structured_review(
             stage="product_package_review",
             label="资料包独立审核",

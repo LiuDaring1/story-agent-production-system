@@ -67,11 +67,18 @@ class FullAutoContractTests(unittest.TestCase):
             for account in ("main", "library"):
                 copy_path = paths.publish / account / "copy.md"
                 copy_path.parent.mkdir(parents=True, exist_ok=True)
-                copy_path.write_text("# 标题\n\n正文\n\n#故事 #儿童表演\n", encoding="utf-8")
+                copy_path.write_text(
+                    "# 发布标题\n\n这是一段完整的发布正文，介绍故事内容、观看亮点和适龄信息。\n\n#儿童故事 #亲子阅读 #故事表演\n",
+                    encoding="utf-8",
+                )
+                palette = {
+                    "main": {"3x4": (80, 120, 180), "4x3": (130, 90, 170), "16x9": (70, 155, 120)},
+                    "library": {"3x4": (175, 110, 70), "4x3": (70, 135, 175), "16x9": (155, 75, 115)},
+                }
                 for ratio, size in (("3x4", (900, 1200)), ("4x3", (1200, 900)), ("16x9", (1280, 720))):
                     cover = paths.publish / account / "covers" / f"cover_{ratio}.png"
                     cover.parent.mkdir(parents=True, exist_ok=True)
-                    Image.new("RGB", size, (80, 120, 180)).save(cover)
+                    Image.new("RGB", size, palette[account][ratio]).save(cover)
 
             base = paths.product / "绵羊故事锦囊：模拟供应商闭环（基础版）"
             advanced = paths.product / "绵羊故事锦囊：模拟供应商闭环（进阶版）"
@@ -166,7 +173,12 @@ class FullAutoContractTests(unittest.TestCase):
             second_report = final_delivery(project)
             complete = load_manifest(paths)
             assert complete is not None
-            self.assertTrue(complete.get("completed_at"), second_report.read_text(encoding="utf-8"))
+            self.assertTrue(
+                complete.get("completed_at"),
+                second_report.read_text(encoding="utf-8")
+                + "\nPUBLISH QA:\n"
+                + (paths.status / "qa_publish_report.json").read_text(encoding="utf-8"),
+            )
             self.assertIn("必备交付物和独立审核均已满足", second_report.read_text(encoding="utf-8"))
             for name in ("成本报告.md", "QA汇总.md", "异常说明.md"):
                 self.assertTrue((paths.status / name).exists())

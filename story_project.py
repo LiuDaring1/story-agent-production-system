@@ -2140,6 +2140,25 @@ def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) ->
                         break
             if not product_qa.get("passed") or not product_current:
                 review_failures.append("product_qa: 未通过或资料包文件哈希已变化")
+        publish_qa_path = paths.status / "qa_publish_report.json"
+        try:
+            publish_qa = json.loads(publish_qa_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            review_failures.append("publish_qa: 缺少有效发布物料机器 QA JSON")
+        else:
+            publish_artifacts = publish_qa.get("artifacts")
+            publish_current = isinstance(publish_artifacts, dict) and bool(publish_artifacts)
+            if publish_current:
+                for item in publish_artifacts.values():
+                    if not isinstance(item, dict):
+                        publish_current = False
+                        break
+                    artifact_path = Path(str(item.get("path", "")))
+                    if not artifact_path.is_file() or item.get("sha256") != sha256_file(artifact_path):
+                        publish_current = False
+                        break
+            if not publish_qa.get("passed") or not publish_current:
+                review_failures.append("publish_qa: 未通过或发布物料文件哈希已变化")
     lines.extend(["", "## Agent 完成门槛"])
     if missing_delivery:
         lines.extend(f"- 缺失：`{path}`" for path in missing_delivery)
@@ -2353,57 +2372,135 @@ def qa_publish(project_dir: Path) -> Path:
     paths = project_paths(project_dir)
     manifest = init_project(paths.root)
     discover_outputs(paths, manifest)
-    rows = []
-    issues = []
+    rows: list[dict[str, str]] = []
+    issues: list[str] = []
+    retry_files: list[str] = []
+    artifacts: dict[str, dict[str, str]] = {}
     value = manifest["outputs"].get("publish_package", "")
     publish_dir = Path(value) if value else paths.publish
-    required = [
+    support_files = [
         ("Codex发布物料交接", publish_dir / "publish_package_codex_handoff.md"),
         ("主账号候选帧索引", publish_dir / "frame_candidates" / "main_候选帧索引.jpg"),
         ("宝库号候选帧索引", publish_dir / "frame_candidates" / "library_候选帧索引.jpg"),
-    ]
-    for index, (label, path) in enumerate(required, start=1):
-        ok = path.exists()
-        status = "ok" if ok else "missing"
-        notes = "存在" if ok else "未找到"
-        rows.append({"index": str(index), "file": str(path), "status": status, "notes": notes})
-        if not ok:
-            issues.append(f"- {label}：未找到")
-    cover_requirements = [
         ("主账号三比例封面任务", publish_dir / "main" / "covers" / "main_cover_design_request.md"),
         ("主账号三比例封面参考帧", publish_dir / "main" / "covers" / "reference_3x4.png"),
         ("宝库号三比例封面参考帧", publish_dir / "library" / "covers" / "reference_3x4.png"),
         ("宝库号参考帧选择说明", publish_dir / "library" / "covers" / "reference_choice.md"),
         ("宝库号三比例衍生提示", publish_dir / "library" / "covers" / "cover_derivative_prompts.md"),
-        ("主账号发布文案", publish_dir / "main" / "copy.md"),
-        ("宝库号发布文案", publish_dir / "library" / "copy.md"),
     ]
+    for label, path in support_files:
+        rows.append(
+            {
+                "index": str(len(rows) + 1),
+                "file": str(path),
+                "status": "ok" if path.exists() else "support-missing",
+                "notes": f"{label}：{'存在' if path.exists() else '缺少支持材料；不单独阻断正式交付'}",
+            }
+        )
+
+    expected_ratios = {"3x4": 3 / 4, "4x3": 4 / 3, "16x9": 16 / 9}
+    account_covers: dict[str, list[Path]] = {}
     for account_label, account_key in (("主账号", "main"), ("宝库号", "library")):
-        for ratio in ("3x4", "4x3", "16x9"):
-            cover_requirements.append((f"{account_label}{ratio}封面", publish_dir / account_key / "covers" / f"cover_{ratio}.png"))
-    cover_ok = True
-    cover_notes = []
-    for label, path in cover_requirements:
-        if path.exists():
-            cover_notes.append(f"{label}存在")
+        covers: list[Path] = []
+        for ratio, expected_ratio in expected_ratios.items():
+            path = publish_dir / account_key / "covers" / f"cover_{ratio}.png"
+            covers.append(path)
+            notes: list[str] = []
+            if not path.is_file():
+                notes.append("缺失")
+            else:
+                try:
+                    with Image.open(path) as image:
+                        width, height = image.size
+                        if min(width, height) < 600:
+                            notes.append(f"尺寸过小：{width}x{height}")
+                        if abs(width / max(1, height) - expected_ratio) > 0.025:
+                            notes.append(f"比例错误：{width}x{height}")
+                except Exception:
+                    notes.append("无法读取图像")
+                artifacts[f"{account_key}:cover_{ratio}"] = {"path": str(path), "sha256": sha256_file(path)}
+            if notes:
+                issues.append(f"- {account_label}{ratio}封面：{'；'.join(notes)}")
+                retry_files.append(str(path.relative_to(publish_dir)))
+            rows.append(
+                {
+                    "index": str(len(rows) + 1),
+                    "file": str(path),
+                    "status": "warning" if notes else "ok",
+                    "notes": "；".join(notes) if notes else f"{ratio} 比例与尺寸通过",
+                }
+            )
+        account_covers[account_key] = covers
+
+    for account_key, covers in account_covers.items():
+        if all(path.is_file() for path in covers):
+            for left_index in range(len(covers)):
+                for right_index in range(left_index + 1, len(covers)):
+                    difference = normalized_cover_difference(covers[left_index], covers[right_index])
+                    if difference < 2.0:
+                        pair = f"{covers[left_index].name}/{covers[right_index].name}"
+                        issues.append(f"- {account_key}封面疑似机械缩放同一母版：{pair}，差异 {difference:.2f}")
+                        for path in (covers[left_index], covers[right_index]):
+                            relative = str(path.relative_to(publish_dir))
+                            if relative not in retry_files:
+                                retry_files.append(relative)
+
+    for account_label, account_key in (("主账号", "main"), ("宝库号", "library")):
+        copy_path = publish_dir / account_key / "copy.md"
+        copy_notes: list[str] = []
+        if not copy_path.is_file():
+            copy_notes.append("缺失")
         else:
-            cover_ok = False
-            cover_notes.append(f"{label}缺失")
-    rows.append(
-        {
-            "index": str(len(rows) + 1),
-            "file": str(publish_dir),
-            "status": "ok" if cover_ok else "warning",
-            "notes": "；".join(cover_notes) if cover_notes else "发布文案或六张封面尚未生成",
-        }
-    )
-    if not cover_ok:
-        issues.append("- 发布物料：两份文案、六张封面或封面参考尚未完整生成")
+            text = copy_path.read_text(encoding="utf-8-sig", errors="ignore")
+            nonempty = [line.strip() for line in text.splitlines() if line.strip()]
+            if len(nonempty) < 3 or len(text.strip()) < 20:
+                copy_notes.append("文案内容过短，未形成标题/正文/话题结构")
+            if "#" not in text and "话题" not in text:
+                copy_notes.append("缺少话题建议")
+            artifacts[f"{account_key}:copy"] = {"path": str(copy_path), "sha256": sha256_file(copy_path)}
+        if copy_notes:
+            issues.append(f"- {account_label}发布文案：{'；'.join(copy_notes)}")
+            retry_files.append(str(copy_path.relative_to(publish_dir)))
+        rows.append(
+            {
+                "index": str(len(rows) + 1),
+                "file": str(copy_path),
+                "status": "warning" if copy_notes else "ok",
+                "notes": "；".join(copy_notes) if copy_notes else "标题/正文/话题结构通过",
+            }
+        )
     report = paths.status / "qa_publish_report.md"
-    write_qa_report(report, "发布物料机器审查", publish_dir, rows, issues, expected="候选帧、两账号发布文案及主/宝库各 3:4、4:3、16:9 三张封面完整")
+    write_qa_report(report, "发布物料机器审查", publish_dir, rows, issues, expected="两账号文案结构完整；六张封面比例/尺寸正确且不是机械缩放同一母版")
     manifest["qa"]["publish"] = str(report)
+    report_json = paths.status / "qa_publish_report.json"
+    save_json(
+        report_json,
+        {
+            "version": 1,
+            "passed": not issues,
+            "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "artifacts": artifacts,
+            "issues": issues,
+            "retry_files": sorted(set(retry_files)),
+        },
+    )
+    manifest["qa"]["publish_json"] = str(report_json)
     write_manifest(paths, manifest)
     return report
+
+
+def normalized_cover_difference(left: Path, right: Path) -> float:
+    with Image.open(left).convert("RGB") as left_image, Image.open(right).convert("RGB") as right_image:
+        left_sample = left_image.resize((64, 64), Image.Resampling.BILINEAR)
+        right_sample = right_image.resize((64, 64), Image.Resampling.BILINEAR)
+        total = 0
+        count = 0
+        left_pixels = left_sample.get_flattened_data() if hasattr(left_sample, "get_flattened_data") else left_sample.getdata()
+        right_pixels = right_sample.get_flattened_data() if hasattr(right_sample, "get_flattened_data") else right_sample.getdata()
+        for left_pixel, right_pixel in zip(left_pixels, right_pixels):
+            total += sum(abs(int(a) - int(b)) for a, b in zip(left_pixel, right_pixel))
+            count += 3
+    return total / max(1, count)
 
 
 def discover_outputs(paths: ProjectPaths, manifest: dict[str, Any]) -> None:

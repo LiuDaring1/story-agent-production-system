@@ -1249,10 +1249,26 @@ class StoryAgent:
         copy_files = [publish / "main" / "copy.md", publish / "library" / "copy.md"]
         if not all(path.exists() for path in [*covers, *copy_files]):
             return StageResult("blocked", "发布物料不完整，无法开始独立审核。")
+        qa = self._workflow(["qa-publish", "--project-dir", str(self.context.project_dir)], "发布物料比例、尺寸与文案结构 QA")
+        if qa.status != "done":
+            return qa
+        qa_report = self.context.paths.status / "qa_publish_report.md"
+        qa_json = self.context.paths.status / "qa_publish_report.json"
+        if not self._json_qa_report_passes(qa_json):
+            try:
+                qa_payload = json.loads(qa_json.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                qa_payload = {}
+            retry_files = qa_payload.get("retry_files", [])
+            if isinstance(retry_files, list) and self._can_retry_stage("publish_package_review", critical=True):
+                moved = self._quarantine_publish_files([str(item) for item in retry_files])
+                if moved:
+                    return StageResult("retrying", f"发布物料机器 QA 未通过，已保留并排队重做 {len(moved)} 个文件。", qa_json)
+            return StageResult("blocked", f"发布物料机器 QA 未通过或已达到重做上限：{qa_json}", qa_json)
         contact_sheet = self._make_contact_sheet(covers, self.context.paths.status / "reviews" / "publish_covers_contact_sheet.jpg", columns=3)
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "publish_package_bundle.json",
-            [*covers, *copy_files],
+            [*covers, *copy_files, qa_report, qa_json],
         )
         result, payload = self._structured_review(
             stage="publish_package_review",

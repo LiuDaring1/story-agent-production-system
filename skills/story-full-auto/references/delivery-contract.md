@@ -15,6 +15,7 @@
 - Raw transcript, edit decisions, kept intervals, clean script, and subtitles
 - Stage attempts, timestamps, artifact paths, reviewer score, and critical-error list
 - Cost ledger with soft limit ¥50 and hard limit ¥100
+- `99_项目状态/成本报告.md`, `QA汇总.md`, and `异常说明.md`; none may appear inside either customer package
 - Final QA summary, exception report, and total delivery checklist
 
 ## Completion gate

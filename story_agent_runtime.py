@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-from story_project import init_project, load_manifest, project_paths, save_json, slugify, write_manifest
+from story_project import init_project, load_manifest, project_paths, save_json, slugify, write_internal_agent_reports, write_manifest
 
 
 MANIFEST_VERSION = 2
@@ -628,6 +628,7 @@ def recovery_guidance(manifest: dict[str, Any]) -> str:
 
 def render_job_report(project_dir: Path) -> Path:
     paths = project_paths(project_dir)
+    write_internal_agent_reports(project_dir)
     manifest = ensure_manifest_v2(load_manifest(paths) or {})
     agent = manifest["agent"]
     budget = agent["budget"]

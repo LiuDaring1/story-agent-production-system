@@ -351,6 +351,9 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertIn(job_id, report_text)
             self.assertIn("## 剩余工作", report_text)
             self.assertIn("恢复动作", report_text)
+            self.assertTrue((project_paths(project).status / "成本报告.md").exists())
+            self.assertTrue((project_paths(project).status / "QA汇总.md").exists())
+            self.assertTrue((project_paths(project).status / "异常说明.md").exists())
 
     def test_final_delivery_does_not_mark_incomplete_project_complete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

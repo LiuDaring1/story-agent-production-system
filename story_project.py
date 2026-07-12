@@ -1812,6 +1812,162 @@ def render_contact_sheet(images: list[Path], output: Path, title: str) -> None:
     sheet.save(output, quality=92)
 
 
+def write_internal_agent_reports(project_dir: Path) -> dict[str, Path]:
+    """Write internal-only cost, QA and exception reports under 99_项目状态."""
+    paths = project_paths(project_dir)
+    manifest = load_manifest(paths) or init_project(project_dir)
+    agent = manifest.get("agent", {}) if isinstance(manifest.get("agent"), dict) else {}
+    budget = agent.get("budget", {}) if isinstance(agent.get("budget"), dict) else {}
+    entries = budget.get("entries", []) if isinstance(budget.get("entries"), list) else []
+    provider_totals: dict[str, float] = {}
+    for entry in entries:
+        if not isinstance(entry, dict) or entry.get("status") != "settled":
+            continue
+        provider = str(entry.get("provider") or "未记录")
+        provider_totals[provider] = round(provider_totals.get(provider, 0.0) + float(entry.get("actual_amount", 0.0)), 4)
+    cost_json = paths.status / "成本报告.json"
+    cost_payload = {
+        "currency": budget.get("currency", "CNY"),
+        "spent": float(budget.get("spent", 0.0)),
+        "reserved": float(budget.get("reserved", 0.0)),
+        "soft_limit": float(budget.get("soft_limit", 0.0)),
+        "hard_limit": float(budget.get("hard_limit", 0.0)),
+        "provider_totals": provider_totals,
+        "entries": entries,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    save_json(cost_json, cost_payload)
+    cost_md = paths.status / "成本报告.md"
+    cost_lines = [
+        "# 成本报告（内部）",
+        "",
+        f"- 已结算：¥{cost_payload['spent']:.2f}",
+        f"- 预留中：¥{cost_payload['reserved']:.2f}",
+        f"- 软/硬上限：¥{cost_payload['soft_limit']:.2f} / ¥{cost_payload['hard_limit']:.2f}",
+        "",
+        "## 供应商汇总",
+        *(f"- {provider}：¥{amount:.2f}" for provider, amount in sorted(provider_totals.items())),
+        "",
+        "## 明细",
+        "| 时间 | 标签 | 状态 | 预留 | 实际 | 供应商 | 请求编号 |",
+        "| --- | --- | --- | ---: | ---: | --- | --- |",
+    ]
+    if not provider_totals:
+        cost_lines.insert(cost_lines.index("## 明细") - 1, "- 暂无已结算供应商费用")
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        cost_lines.append(
+            f"| {entry.get('time', '')} | {str(entry.get('label', '')).replace('|', '/')} | {entry.get('status', '')} | "
+            f"¥{float(entry.get('amount', 0.0)):.2f} | ¥{float(entry.get('actual_amount', 0.0)):.2f} | "
+            f"{entry.get('provider', '')} | {entry.get('request_id', '')} |"
+        )
+    cost_md.write_text("\n".join(cost_lines) + "\n", encoding="utf-8")
+
+    reviews: list[dict[str, Any]] = []
+    review_files = sorted((paths.status / "reviews").glob("*_review.json")) if (paths.status / "reviews").exists() else []
+    source_review = paths.status / "source_edit" / "source_edit_review.json"
+    if source_review.exists():
+        review_files.insert(0, source_review)
+    for review_path in review_files:
+        try:
+            payload = json.loads(review_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            reviews.append({"name": review_path.stem, "path": str(review_path), "valid_json": False, "passed": False})
+            continue
+        reviews.append(
+            {
+                "name": review_path.stem,
+                "path": str(review_path),
+                "valid_json": True,
+                "approved": bool(payload.get("approved")),
+                "score": float(payload.get("score", 0)),
+                "critical_errors": payload.get("critical_errors", []),
+                "artifact_sha256": payload.get("artifact_sha256", ""),
+                "passed": bool(payload.get("approved")) and float(payload.get("score", 0)) >= 85 and not payload.get("critical_errors"),
+            }
+        )
+    qa_files = {
+        key: str(value)
+        for key, value in manifest.get("qa", {}).items()
+        if value and Path(str(value)).exists()
+    }
+    qa_json = paths.status / "QA汇总.json"
+    qa_payload = {
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        "reviews": reviews,
+        "machine_qa": qa_files,
+        "all_review_scores_pass": bool(reviews) and all(item.get("passed") for item in reviews),
+    }
+    save_json(qa_json, qa_payload)
+    qa_md = paths.status / "QA汇总.md"
+    qa_lines = [
+        "# QA 汇总（内部）",
+        "",
+        "| 审核 | 通过 | 分数 | 关键错误 | 文件 |",
+        "| --- | --- | ---: | --- | --- |",
+    ]
+    for item in reviews:
+        critical = "；".join(str(value) for value in item.get("critical_errors", []))
+        qa_lines.append(
+            f"| {item.get('name', '')} | {'✅' if item.get('passed') else '❌'} | {item.get('score', '')} | "
+            f"{critical or '无'} | `{item.get('path', '')}` |"
+        )
+    if not reviews:
+        qa_lines.append("| 尚无审核 | ❌ |  |  |  |")
+    qa_lines.extend(["", "## 机器 QA", *(f"- {key}：`{value}`" for key, value in sorted(qa_files.items()))])
+    qa_md.write_text("\n".join(qa_lines) + "\n", encoding="utf-8")
+
+    stage_records = agent.get("stages", {}) if isinstance(agent.get("stages"), dict) else {}
+    exceptions: list[dict[str, Any]] = []
+    for name, record in stage_records.items():
+        if not isinstance(record, dict):
+            continue
+        if record.get("status") in {"blocked", "failed", "cancelled", "retrying"} or int(record.get("attempts", 0)) > 1:
+            exceptions.append(
+                {
+                    "stage": name,
+                    "status": record.get("status", ""),
+                    "attempts": int(record.get("attempts", 0)),
+                    "message": record.get("message", ""),
+                    "retry_reason": record.get("retry_reason", ""),
+                }
+            )
+    exception_md = paths.status / "异常说明.md"
+    exception_lines = [
+        "# 异常说明（内部）",
+        "",
+        f"- 当前状态：{agent.get('status', 'pending')}",
+        f"- 阻塞原因：{agent.get('blocked_reason') or '无'}",
+        "",
+        "## 阶段异常与重试",
+    ]
+    if exceptions:
+        exception_lines.extend(
+            f"- `{item['stage']}`：{item['status']}，尝试 {item['attempts']} 次；{item['retry_reason'] or item['message']}"
+            for item in exceptions
+        )
+    else:
+        exception_lines.append("- 无")
+    exception_md.write_text("\n".join(exception_lines) + "\n", encoding="utf-8")
+
+    manifest.setdefault("outputs", {}).update(
+        {
+            "internal_cost_report": str(cost_md),
+            "internal_qa_summary": str(qa_md),
+            "internal_exception_report": str(exception_md),
+        }
+    )
+    write_manifest(paths, manifest)
+    return {
+        "cost_md": cost_md,
+        "cost_json": cost_json,
+        "qa_md": qa_md,
+        "qa_json": qa_json,
+        "exception_md": exception_md,
+    }
+
+
 def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) -> Path:
     paths = project_paths(project_dir)
     manifest = detect_project_assets(paths.root)
@@ -1823,6 +1979,8 @@ def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) ->
             manifest.setdefault("qa_warnings", []).append(f"{qa_func.__name__}: {exc}")
     manifest = load_manifest(paths) or manifest
     discover_outputs(paths, manifest)
+    internal_reports = write_internal_agent_reports(paths.root)
+    manifest = load_manifest(paths) or manifest
     report = paths.root / "总交付清单.md"
     story = manifest["story"]
     lines = [
@@ -1877,6 +2035,8 @@ def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) ->
     for key, default_path in product_defaults.items():
         value = manifest.get("outputs", {}).get(key, "")
         required_paths.append(Path(value) if value else default_path)
+    if manifest.get("agent", {}).get("job_id"):
+        required_paths.extend([internal_reports["cost_md"], internal_reports["qa_md"], internal_reports["exception_md"]])
     missing_delivery = [path for path in required_paths if not path.exists()]
     review_failures: list[str] = []
     if manifest.get("agent", {}).get("job_id"):

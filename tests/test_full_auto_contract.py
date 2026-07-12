@@ -168,6 +168,10 @@ class FullAutoContractTests(unittest.TestCase):
             assert complete is not None
             self.assertTrue(complete.get("completed_at"), second_report.read_text(encoding="utf-8"))
             self.assertIn("必备交付物和独立审核均已满足", second_report.read_text(encoding="utf-8"))
+            for name in ("成本报告.md", "QA汇总.md", "异常说明.md"):
+                self.assertTrue((paths.status / name).exists())
+                self.assertFalse((base / name).exists())
+                self.assertFalse((advanced / name).exists())
 
             changed_cover = paths.publish / "main" / "covers" / "cover_3x4.png"
             Image.new("RGB", (900, 1200), (180, 80, 80)).save(changed_cover)

@@ -3316,7 +3316,7 @@ def main() -> None:
     submit.add_argument("--video", required=True, type=Path)
     submit.add_argument("--lut", type=Path, help="可选 .cube 输入 LUT；复制进项目并记录 SHA-256")
     submit.add_argument("--input-mode", choices=["single-greenscreen", "prepared"], default="single-greenscreen")
-    submit.add_argument("--confirmed-text", type=Path, help="prepared 加速入口必填：人工确认的 UTF-8 .txt/.md")
+    submit.add_argument("--confirmed-text", type=Path, help="prepared 加速入口必填：人工确认的 UTF-8 .txt/.md 或 .docx")
     submit.add_argument("--projects-root", default=Path.home() / "Desktop", type=Path)
     submit.add_argument("--story-name", default="")
     submit.add_argument("--slug", default="")

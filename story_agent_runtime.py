@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import time
 import uuid
+import zipfile
+import xml.etree.ElementTree as ET
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -677,6 +679,40 @@ def segment_confirmed_story_text(text: str, *, target_chars: int = 32) -> list[s
     return lines
 
 
+def read_confirmed_story_source(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in {".txt", ".md"}:
+        try:
+            return path.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError("人工确认文本必须是 UTF-8 编码") from exc
+    if suffix != ".docx":
+        raise ValueError("prepared 确认文本只接受 UTF-8 .txt/.md 或 .docx")
+    try:
+        with zipfile.ZipFile(path) as archive:
+            root = ET.fromstring(archive.read("word/document.xml"))
+    except (OSError, KeyError, zipfile.BadZipFile, ET.ParseError) as exc:
+        raise ValueError("prepared .docx 无法读取正文") from exc
+    namespace = "{http://schemas.openxmlformats.org/wordprocessingml/2006/main}"
+    paragraphs: list[str] = []
+    for paragraph in root.iter(namespace + "p"):
+        fragments: list[str] = []
+        for node in paragraph.iter():
+            if node.tag == namespace + "t" and node.text:
+                fragments.append(node.text)
+            elif node.tag == namespace + "tab":
+                fragments.append("\t")
+            elif node.tag in {namespace + "br", namespace + "cr"}:
+                fragments.append("\n")
+        text = "".join(fragments).strip()
+        if text:
+            paragraphs.append(text)
+    body = "\n".join(paragraphs).strip()
+    if not body:
+        raise ValueError("prepared .docx 没有可用正文")
+    return body
+
+
 def prepared_input_contract_errors(project_dir: Path, manifest: dict[str, Any]) -> list[str]:
     agent = manifest.get("agent", {}) if isinstance(manifest.get("agent"), dict) else {}
     contract = agent.get("input_contract") if isinstance(agent.get("input_contract"), dict) else {}
@@ -731,9 +767,9 @@ def prepared_input_contract_errors(project_dir: Path, manifest: dict[str, Any]) 
     confirmed = Path(str(text_record.get("path") or ""))
     if confirmed.is_file():
         try:
-            confirmed_text = confirmed.read_text(encoding="utf-8-sig")
-        except UnicodeDecodeError:
-            errors.append("人工确认文本不再是 UTF-8")
+            confirmed_text = read_confirmed_story_source(confirmed)
+        except ValueError as exc:
+            errors.append(str(exc))
             confirmed_text = ""
         if not confirmed_text.strip():
             errors.append("人工确认文本为空")
@@ -811,12 +847,9 @@ def submit_video_job(
     confirmed_body = ""
     if confirmed_text is not None:
         confirmed_source = confirmed_text.expanduser().resolve()
-        if not confirmed_source.is_file() or confirmed_source.suffix.lower() not in {".txt", ".md"}:
-            raise ValueError("prepared 确认文本首版只接受 UTF-8 .txt/.md 文件")
-        try:
-            confirmed_body = confirmed_source.read_text(encoding="utf-8-sig")
-        except UnicodeDecodeError as exc:
-            raise ValueError("prepared 确认文本必须是 UTF-8 编码") from exc
+        if not confirmed_source.is_file() or confirmed_source.suffix.lower() not in {".txt", ".md", ".docx"}:
+            raise ValueError("prepared 确认文本只接受 UTF-8 .txt/.md 或 .docx 文件")
+        confirmed_body = read_confirmed_story_source(confirmed_source)
         if not confirmed_body.strip():
             raise ValueError("prepared 确认文本不能为空")
         fingerprint = hashlib.sha256(

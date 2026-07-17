@@ -37,7 +37,7 @@ python3 story_agent.py start --job "<job_id>" --scheduler dag --max-parallel 3
 
 ## Use the prepared acceleration entry
 
-Use this only when the user supplies both (a) a complete, already color-restored clean horizontal green-screen video and (b) a UTF-8 `.txt` or `.md` manuscript they manually confirmed. Do not pass a LUT; the Agent must not restore color or automatically remove takes again.
+Use this only when the user supplies both (a) a complete, already color-restored clean horizontal green-screen video and (b) a UTF-8 `.txt`/`.md` or `.docx` manuscript they manually confirmed. Do not pass a LUT; the Agent must not restore color or automatically remove takes again.
 
 ```bash
 python3 story_agent.py submit \

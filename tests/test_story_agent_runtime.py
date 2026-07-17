@@ -10,6 +10,7 @@ import sys
 import tempfile
 import time
 import unittest
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
 from types import SimpleNamespace
@@ -88,6 +89,47 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertTrue(StoryAgent(context)._has_source_edit(manifest))
             Path(manifest["inputs"]["story_text"]).write_text("被篡改", encoding="utf-8")
             self.assertFalse(StoryAgent(context)._has_source_edit(manifest))
+
+    def test_prepared_entry_accepts_reviewed_docx_and_derives_plain_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
+            video = root / "prepared.mp4"
+            shutil.copy2(fixture, video)
+            confirmed = root / "confirmed.docx"
+            document_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
+  <w:body>
+    <w:p><w:r><w:t>小兔子找太阳</w:t></w:r></w:p>
+    <w:p><w:r><w:t>它终于找到了温暖的太阳。</w:t></w:r></w:p>
+  </w:body>
+</w:document>
+"""
+            with zipfile.ZipFile(confirmed, "w") as archive:
+                archive.writestr("word/document.xml", document_xml)
+            _job, project, created = submit_video_job(
+                video,
+                input_mode="prepared",
+                confirmed_text=confirmed,
+                projects_root=root / "projects",
+                story_name="DOCX 加速入口",
+                slug="prepared-docx",
+                registry=JobRegistry(root / "registry.json"),
+            )
+            self.assertTrue(created)
+            manifest = load_manifest(project_paths(project))
+            assert manifest is not None
+            confirmed_record = next(
+                item
+                for item in manifest["agent"]["input_contract"]["user_inputs"]
+                if item["role"] == "confirmed_story_text"
+            )
+            self.assertEqual(Path(confirmed_record["path"]).suffix, ".docx")
+            derived = Path(manifest["inputs"]["story_text"])
+            self.assertEqual(derived.read_text(encoding="utf-8"), "小兔子找太阳它终于找到了温暖的太阳。\n")
+            consumer = Path(manifest["outputs"]["consumer_manuscript"])
+            self.assertEqual(consumer.read_text(encoding="utf-8"), "小兔子找太阳\n它终于找到了温暖的太阳。\n")
+            self.assertEqual(prepared_input_contract_errors(project, manifest), [])
 
     def test_dag_batch_respects_resource_and_write_set_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

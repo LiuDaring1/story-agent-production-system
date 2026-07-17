@@ -2417,6 +2417,12 @@ class StoryAgent:
                     ]
                 elif isinstance(instructions, list):
                     for item in instructions:
+                        if isinstance(item, dict):
+                            scene = item.get("scene")
+                            instruction = str(item.get("instruction") or "").strip()
+                            if scene in indices and instruction:
+                                retry_lines.append(f"- 第{scene}镜：{instruction}")
+                            continue
                         if not isinstance(item, str):
                             continue
                         normalized = item.strip()

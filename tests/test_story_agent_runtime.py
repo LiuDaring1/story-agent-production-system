@@ -614,7 +614,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
                 json.dumps(
                     {
                         "retry_instructions": [
-                            "第3镜：不得出现兔妈妈。",
+                            {"scene": 3, "instruction": "不得出现兔妈妈。"},
                             "第4镜：只保留小兔子。",
                         ]
                     },

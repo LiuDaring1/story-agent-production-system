@@ -5,14 +5,18 @@ import io
 import json
 import os
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import redirect_stdout
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
-from story_agent import AgentContext, StageResult, StoryAgent, classify_command_failure
+from story_agent import AgentContext, StageResult, StoryAgent, WorkerAttempt, classify_command_failure
 from story_agent_runtime import (
     AgentRuntimeError,
     BudgetExceeded,
@@ -28,14 +32,210 @@ from story_agent_runtime import (
     manifest_context_sha256,
     mark_stage,
     job_lock,
+    prepared_input_contract_errors,
     submit_video_job,
     assert_runnable,
+    update_control,
+    load_control,
 )
-from story_project import load_manifest, project_paths, write_manifest
-from story_project import final_delivery, init_project, refresh_project_outputs, write_internal_agent_reports
+from story_project import load_manifest, project_paths, save_json, write_manifest
+from story_project import detect_project_assets, final_delivery, init_project, refresh_project_outputs, write_internal_agent_reports
 
 
 class StoryAgentRuntimeTests(unittest.TestCase):
+    def test_prepared_entry_binds_clean_video_and_confirmed_text_hashes(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
+            video = root / "prepared.mp4"
+            shutil.copy2(fixture, video)
+            confirmed = root / "confirmed.txt"
+            confirmed.write_text("小老虎认真听大家唱歌。\n最后，它学会了公平。\n", encoding="utf-8")
+            _job, project, created = submit_video_job(
+                video,
+                input_mode="prepared",
+                confirmed_text=confirmed,
+                projects_root=root / "projects",
+                story_name="加速入口",
+                slug="prepared-entry",
+                registry=JobRegistry(root / "registry.json"),
+            )
+            self.assertTrue(created)
+            manifest = load_manifest(project_paths(project))
+            assert manifest is not None
+            self.assertEqual(manifest["agent"]["input_contract"]["mode"], "prepared_greenscreen_confirmed_text")
+            self.assertFalse(manifest["agent"]["input_contract"]["counts_toward_default_entry"])
+            self.assertEqual(manifest["inputs"]["greenscreen_video"], manifest["inputs"]["greenscreen_video_original"])
+            self.assertEqual(prepared_input_contract_errors(project, manifest), [])
+            detected = detect_project_assets(project, extract_audio=False)
+            self.assertEqual(detected["inputs"]["story_text"], manifest["inputs"]["story_text"])
+            self.assertEqual(detected["inputs"]["greenscreen_video"], manifest["inputs"]["greenscreen_video"])
+            self.assertEqual(prepared_input_contract_errors(project, detected), [])
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="加速入口",
+                slug="prepared-entry",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            self.assertTrue(StoryAgent(context)._has_source_edit(manifest))
+            Path(manifest["inputs"]["story_text"]).write_text("被篡改", encoding="utf-8")
+            self.assertFalse(StoryAgent(context)._has_source_edit(manifest))
+
+    def test_dag_batch_respects_resource_and_write_set_conflicts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：DAG"
+            init_project(project, story_name="DAG", slug="dag")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="DAG",
+                slug="dag",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+                scheduler="dag",
+                max_parallel=3,
+            )
+            selected = StoryAgent(context)._select_parallel_batch(
+                ["codex_story_images", "music_request", "release_assets"],
+                max_count=3,
+            )
+            self.assertEqual(selected, ["codex_story_images", "music_request"])
+
+    def test_run_stage_worker_writes_envelope_without_touching_canonical_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：worker"
+            manifest = ensure_manifest_v2(init_project(project, story_name="worker", slug="worker"))
+            paths = project_paths(project)
+            write_manifest(paths, manifest)
+            canonical_before = file_sha256(paths.manifest)
+            work = Path(directory) / "attempt"
+            shadow = work / "shadow_manifest.json"
+            result_file = work / "result.json"
+            work.mkdir()
+            shadow.write_text(paths.manifest.read_text(encoding="utf-8"), encoding="utf-8")
+            epoch = int(update_control(project, cancel_requested=False, increment_epoch=True)["run_epoch"])
+            env = os.environ.copy()
+            env.update(
+                {
+                    "STORY_AGENT_MANIFEST_OVERRIDE": str(shadow),
+                    "STORY_AGENT_PROJECT_ROOT": str(project.resolve()),
+                    "STORY_AGENT_WORKER_DIR": str(work),
+                    "STORY_AGENT_RUN_EPOCH": str(epoch),
+                }
+            )
+            process = subprocess.run(
+                [
+                    sys.executable,
+                    str(Path(__file__).resolve().parents[1] / "story_agent.py"),
+                    "run-stage",
+                    "--project-dir",
+                    str(project),
+                    "--story-name",
+                    "worker",
+                    "--slug",
+                    "worker",
+                    "--stage",
+                    "import_inbox",
+                    "--result-file",
+                    str(result_file),
+                    "--run-epoch",
+                    str(epoch),
+                    "--attempt-id",
+                    "attempt-1",
+                ],
+                cwd=str(Path(__file__).resolve().parents[1]),
+                env=env,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
+            self.assertEqual(json.loads(result_file.read_text(encoding="utf-8"))["status"], "done")
+            self.assertEqual(file_sha256(paths.manifest), canonical_before)
+
+    def test_worker_shadow_three_way_merge_preserves_disjoint_updates_and_rejects_collision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：merge"
+            base = ensure_manifest_v2(init_project(project, story_name="merge", slug="merge"))
+            paths = project_paths(project)
+            work = Path(directory) / "attempt"
+            work.mkdir()
+            base_path = work / "base.json"
+            shadow_path = work / "shadow.json"
+            result_path = work / "result.json"
+            log_path = work / "worker.log"
+            save_json(base_path, base)
+            shadow = json.loads(json.dumps(base))
+            shadow["outputs"]["worker_value"] = "A"
+            save_json(shadow_path, shadow)
+            current = json.loads(json.dumps(base))
+            current["inputs"]["coordinator_value"] = "B"
+            write_manifest(paths, current)
+            attempt = WorkerAttempt(
+                "music_request",
+                "attempt-1",
+                1,
+                work,
+                base_path,
+                shadow_path,
+                result_path,
+                log_path,
+                SimpleNamespace(),
+            )
+            agent = StoryAgent(
+                AgentContext(
+                    project_dir=project,
+                    inbox=None,
+                    story_name="merge",
+                    slug="merge",
+                    execute=True,
+                    update_latest_episode=False,
+                    codex_mode="handoff",
+                    codex_model="",
+                    codex_sandbox="workspace-write",
+                    codex_approval="never",
+                    codex_path="codex",
+                    codex_timeout=30,
+                )
+            )
+            self.assertEqual(agent._merge_worker_shadow(attempt), "")
+            merged = load_manifest(paths)
+            assert merged is not None
+            self.assertEqual(merged["outputs"]["worker_value"], "A")
+            self.assertEqual(merged["inputs"]["coordinator_value"], "B")
+
+            save_json(base_path, merged)
+            shadow = json.loads(json.dumps(merged))
+            shadow["story"]["name"] = "worker-name"
+            save_json(shadow_path, shadow)
+            current = json.loads(json.dumps(merged))
+            current["story"]["name"] = "coordinator-name"
+            write_manifest(paths, current)
+            self.assertIn("story.name", agent._merge_worker_shadow(attempt))
+            self.assertEqual(load_manifest(paths)["story"]["name"], "coordinator-name")
+
+    def test_control_epoch_updates_are_serialized(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：control"
+            init_project(project, story_name="control", slug="control")
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                list(pool.map(lambda _index: update_control(project, cancel_requested=False, increment_epoch=True), range(12)))
+            self.assertEqual(load_control(project)["run_epoch"], 12)
+
     def test_external_blockers_are_kept_separate_in_internal_exception_report(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：外部阻塞"

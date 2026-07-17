@@ -10,6 +10,7 @@ from story_agent_runtime import (
     STORY_STAGE_SEQUENCE,
     ensure_manifest_v2,
     file_sha256,
+    prepared_input_contract_errors,
     review_bundle_is_current,
     review_passes,
     write_review_bundle,
@@ -377,6 +378,9 @@ def evaluate_project_for_promotion(project_dir: Path) -> dict[str, Any]:
         return {"project_dir": str(project_dir), "qualified": False, "reasons": ["manifest 缺失或损坏"]}
     agent = manifest.get("agent", {}) if isinstance(manifest.get("agent"), dict) else {}
     story = manifest.get("story", {}) if isinstance(manifest.get("story"), dict) else {}
+    input_contract = agent.get("input_contract", {}) if isinstance(agent.get("input_contract"), dict) else {}
+    input_mode = str(input_contract.get("mode") or "single_greenscreen")
+    default_entry_eligible = input_mode == "single_greenscreen" and bool(input_contract.get("counts_toward_default_entry", True))
     if not manifest.get("completed_at") or agent.get("status") != "completed":
         reasons.append("Agent 未完成全部阶段")
     if not agent.get("unattended_mode") or not agent.get("unattended_started_at"):
@@ -415,7 +419,10 @@ def evaluate_project_for_promotion(project_dir: Path) -> dict[str, Any]:
     source_sha256 = str(source.get("sha256") or "")
     if not source_sha256:
         reasons.append("缺少原始绿幕视频 SHA-256")
-    reasons.extend(f"单绿幕输入证明无效：{item}" for item in _single_greenscreen_contract_errors(project_dir, manifest))
+    if input_mode == "prepared_greenscreen_confirmed_text":
+        reasons.extend(f"prepared 加速输入证明无效：{item}" for item in prepared_input_contract_errors(project_dir, manifest))
+    else:
+        reasons.extend(f"单绿幕输入证明无效：{item}" for item in _single_greenscreen_contract_errors(project_dir, manifest))
 
     outputs = manifest.get("outputs", {}) if isinstance(manifest.get("outputs"), dict) else {}
     for key in ("main_release_video", "library_release_video", "publish_package", "product_base", "product_advanced"):
@@ -425,6 +432,9 @@ def evaluate_project_for_promotion(project_dir: Path) -> dict[str, Any]:
 
     review_status: dict[str, str] = {}
     for name, (review_relative, bundle_relative) in REQUIRED_REVIEW_FILES.items():
+        if input_mode == "prepared_greenscreen_confirmed_text" and name == "source_edit_review":
+            review_status[name] = "not_required_prepared_input"
+            continue
         review_path = paths.status / review_relative
         payload = _load_json(review_path)
         if payload is None:
@@ -480,6 +490,8 @@ def evaluate_project_for_promotion(project_dir: Path) -> dict[str, Any]:
         elif _bundle_predates_start(bundle, start_epoch):
             reasons.append("用户人工终审包含无人值守启动前预置的交付物")
 
+    production_reasons = list(reasons)
+    eligibility_reasons = [] if default_entry_eligible else ["prepared 加速入口可用于生产，但不计入“单原片默认入口”转正样本"]
     return {
         "project_dir": str(project_dir),
         "job_id": str(agent.get("job_id") or ""),
@@ -490,8 +502,12 @@ def evaluate_project_for_promotion(project_dir: Path) -> dict[str, Any]:
         "active_hours": round(active_hours, 3) if math.isfinite(active_hours) else None,
         "human_review_minutes": human_minutes if human_minutes is None or math.isfinite(human_minutes) else None,
         "review_status": review_status,
-        "qualified": not reasons,
-        "reasons": reasons,
+        "input_mode": input_mode,
+        "production_valid": not production_reasons,
+        "production_reasons": production_reasons,
+        "default_entry_eligible": default_entry_eligible,
+        "qualified": not production_reasons and default_entry_eligible,
+        "reasons": production_reasons + eligibility_reasons,
     }
 
 
@@ -515,7 +531,7 @@ def build_promotion_report(projects_root: Path) -> dict[str, Any]:
         seen_sources.add(source_sha256)
         qualified.append(item)
     return {
-        "version": 1,
+        "version": 2,
         "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
         "projects_root": str(projects_root),
         "target_distinct_stories": 3,
@@ -534,8 +550,8 @@ def render_promotion_markdown(report: dict[str, Any], output: Path) -> Path:
         f"- 合格不同故事：{report.get('qualified_distinct_stories', 0)} / {report.get('target_distinct_stories', 3)}",
         f"- 可设为默认入口：{'是' if report.get('ready_for_default_entry') else '否'}",
         "",
-        "| 故事 | 状态 | 成本 | 有效运行 | 人工终审 | 不合格原因 |",
-        "| --- | --- | ---: | ---: | ---: | --- |",
+        "| 故事 | 生产校验 | 默认入口资格 | 成本 | 有效运行 | 人工终审 | 原因 |",
+        "| --- | --- | --- | ---: | ---: | ---: | --- |",
     ]
     for item in report.get("projects", []):
         minutes = item.get("human_review_minutes")
@@ -547,10 +563,11 @@ def render_promotion_markdown(report: dict[str, Any], output: Path) -> Path:
         hours_text = "无效" if hours is None else f"{float(hours):.2f} 小时"
         lines.append(
             f"| {item.get('story_name') or Path(item.get('project_dir', '')).name} | "
+            f"{'通过' if item.get('production_valid', item.get('qualified')) else '不通过'} | "
             f"{'合格' if item.get('qualified') else '不合格'} | {cost_text} | "
             f"{hours_text} | {minute_text} | {reasons} |"
         )
     if not report.get("projects"):
-        lines.append("| 尚无项目 | 不合格 | ¥0.00 | 0.00 小时 | 未记录 | 未发现 manifest |")
+        lines.append("| 尚无项目 | 不通过 | 不合格 | ¥0.00 | 0.00 小时 | 未记录 | 未发现 manifest |")
     output.write_text("\n".join(lines) + "\n", encoding="utf-8")
     return output

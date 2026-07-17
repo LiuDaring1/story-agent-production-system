@@ -12,7 +12,7 @@ from unittest.mock import patch
 
 from story_agent import main as story_agent_main
 from story_agent_runtime import JobRegistry, ensure_manifest_v2, file_sha256, write_review_bundle
-from story_project import init_project, project_paths, save_json, write_manifest
+from story_project import init_project, load_manifest, project_paths, save_json, write_manifest
 from story_qualification import (
     REQUIRED_REVIEW_FILES,
     build_promotion_report,
@@ -179,6 +179,53 @@ class StoryQualificationTests(unittest.TestCase):
             stale = evaluate_project_for_promotion(project)
             self.assertFalse(stale["qualified"])
             self.assertIn("用户人工终审绑定的交付物已变化", stale["reasons"])
+
+    def test_prepared_entry_can_be_production_valid_but_never_counts_for_promotion(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.make_completed_project(Path(directory))
+            paths = project_paths(project)
+            manifest = load_manifest(paths)
+            assert manifest is not None
+            prepared_video = Path(manifest["inputs"]["greenscreen_video"])
+            story_text = Path(manifest["inputs"]["story_text"])
+            confirmed = paths.inputs / "confirmed.txt"
+            confirmed.write_text(story_text.read_text(encoding="utf-8"), encoding="utf-8")
+            manifest["inputs"]["greenscreen_video_original"] = str(prepared_video)
+            manifest["agent"]["input_contract"] = {
+                "version": 1,
+                "mode": "prepared_greenscreen_confirmed_text",
+                "track": "assisted_accelerated",
+                "counts_toward_default_entry": False,
+                "user_inputs": [
+                    {
+                        "role": "prepared_greenscreen_video",
+                        "path": str(prepared_video),
+                        "sha256": file_sha256(prepared_video),
+                        "bytes": prepared_video.stat().st_size,
+                    },
+                    {
+                        "role": "confirmed_story_text",
+                        "path": str(confirmed),
+                        "sha256": file_sha256(confirmed),
+                        "bytes": confirmed.stat().st_size,
+                    },
+                ],
+                "derived_inputs": {
+                    "story_text": {
+                        "path": str(story_text),
+                        "sha256": file_sha256(story_text),
+                        "bytes": story_text.stat().st_size,
+                    }
+                },
+            }
+            write_manifest(paths, manifest)
+            record_human_signoff(project, result="pass", minutes=5)
+            with patch("story_agent_runtime.probe_source_video", return_value={"width": 1920, "height": 1080, "has_audio": True}):
+                result = evaluate_project_for_promotion(project)
+            self.assertTrue(result["production_valid"], result["production_reasons"])
+            self.assertFalse(result["default_entry_eligible"])
+            self.assertFalse(result["qualified"])
+            self.assertTrue(any("不计入" in reason for reason in result["reasons"]))
 
     def test_promotion_rejects_non_unattended_run(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

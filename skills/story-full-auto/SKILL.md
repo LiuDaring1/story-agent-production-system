@@ -23,11 +23,31 @@ python3 story_agent.py submit \
 ```
 
 3. Capture `job_id` and `project_dir` from the JSON response.
-4. Start the durable background supervisor with isolated Codex-native stages:
+4. Start the durable background supervisor. It defaults to the DAG scheduler and may run the visual, music, and release-asset branches concurrently while preserving dependency joins:
 
 ```bash
 python3 story_agent.py start --job "<job_id>"
 ```
+
+Use `--scheduler linear` only for compatibility diagnosis. Limit concurrency explicitly when the machine or external services need it:
+
+```bash
+python3 story_agent.py start --job "<job_id>" --scheduler dag --max-parallel 3
+```
+
+## Use the prepared acceleration entry
+
+Use this only when the user supplies both (a) a complete, already color-restored clean horizontal green-screen video and (b) a UTF-8 `.txt` or `.md` manuscript they manually confirmed. Do not pass a LUT; the Agent must not restore color or automatically remove takes again.
+
+```bash
+python3 story_agent.py submit \
+  --input-mode prepared \
+  --video "/absolute/path/to/restored-clean-greenscreen.mp4" \
+  --confirmed-text "/absolute/path/to/confirmed-story.txt"
+python3 story_agent.py start --job "<job_id>"
+```
+
+The Agent copies both inputs without altering the originals, binds their SHA-256 values, changes only line breaks when deriving the storyboard text, extracts narration, and continues from project setup. Any hash drift blocks the run before paid work. A prepared run can be production-valid but must never count toward the three single-source default-entry promotion samples.
 
 Use the returned job ID for every later operation. Never infer completion from the terminal process alone.
 When running from the desktop sandbox, the supervisor may need scoped approval because child `codex exec` processes write the existing `~/.codex` state database. If the log reports a read-only state database, rerun the same `start` command with that narrow approval; do not broaden the sandbox or use `danger-full-access`.
@@ -41,6 +61,7 @@ python3 story_agent.py status --job "<job_id>"
 ```
 
 Use the returned `remaining_work`, ETA range, `retries_and_failures`, deadline, heartbeat, and `recovery_action`; do not replace these durable fields with guesses from terminal output.
+For DAG jobs, also inspect `ready_stages`, `branches`, `branch_blockers`, and the critical-path ETA. A CAPTCHA or account issue blocks only its branch while independent branches continue; the overall job becomes blocked only when no runnable branch remains.
 
 If a run stops, read `99_项目状态/agent_morning_report.md` and the newest log before acting. Resume only after resolving the named external state:
 

@@ -4,6 +4,7 @@ import hashlib
 import json
 import math
 import os
+import re
 import shutil
 import subprocess
 import time
@@ -92,6 +93,125 @@ STAGE_ESTIMATES_MINUTES = {
     "product_package_review": 10,
     "final_delivery": 5,
     "doctor": 3,
+}
+
+# Keep STORY_STAGE_SEQUENCE as the stable topological/reporting order for old
+# manifests and CLI consumers.  The DAG scheduler uses these explicit edges.
+STORY_STAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
+    "import_inbox": (),
+    "source_edit": ("import_inbox",),
+    "source_text_correction": ("source_edit",),
+    "source_edit_review": ("source_text_correction",),
+    "setup_project": ("source_edit_review",),
+    "codex_story_images": ("setup_project",),
+    "story_images_review": ("codex_story_images",),
+    "prepare_jobs": ("story_images_review",),
+    "timing": ("prepare_jobs",),
+    "video_prompt_review": ("timing",),
+    "generate_videos": ("video_prompt_review",),
+    "video_qa": ("generate_videos",),
+    "video_review": ("video_qa",),
+    "apply_review": ("video_review",),
+    "music_request": ("setup_project",),
+    "suno_generate": ("music_request",),
+    "assemble_music": ("suno_generate",),
+    "music_qa": ("assemble_music",),
+    "assemble_final": ("apply_review", "music_qa"),
+    "release_assets": ("setup_project",),
+    "release_preview": ("assemble_final", "release_assets"),
+    "package_release": ("release_preview",),
+    "release_qa": ("package_release",),
+    "release_video_review": ("release_qa",),
+    "publish_package": ("release_video_review",),
+    "product_preflight": ("release_video_review",),
+    "product_annotation": ("product_preflight",),
+    "product_annotation_review": ("product_annotation",),
+    "product_package": ("product_annotation_review",),
+    "product_package_review": ("product_package",),
+    "publish_package_review": ("publish_package",),
+    "final_delivery": ("product_package_review", "publish_package_review"),
+    "doctor": ("final_delivery",),
+}
+
+STAGE_BRANCHES = {
+    **{name: "source" for name in ("import_inbox", "source_edit", "source_text_correction", "source_edit_review", "setup_project")},
+    **{name: "visual" for name in ("codex_story_images", "story_images_review", "prepare_jobs", "timing", "video_prompt_review", "generate_videos", "video_qa", "video_review", "apply_review")},
+    **{name: "music" for name in ("music_request", "suno_generate", "assemble_music", "music_qa")},
+    "assemble_final": "assembly",
+    "release_assets": "release_assets",
+    **{name: "release" for name in ("release_preview", "package_release", "release_qa", "release_video_review")},
+    **{name: "publish" for name in ("publish_package", "publish_package_review")},
+    **{name: "product" for name in ("product_preflight", "product_annotation", "product_annotation_review", "product_package", "product_package_review")},
+    "final_delivery": "final",
+    "doctor": "final",
+}
+
+# Abstract write sets are checked before launching a parallel batch.  A stage
+# worker writes a shadow manifest, while artifacts remain in these disjoint
+# canonical areas.  Descendant/identical write sets never run together.
+STAGE_WRITE_SETS = {
+    "import_inbox": ("inputs",),
+    "source_edit": ("inputs", "status/source_edit"),
+    "source_text_correction": ("inputs", "status/source_edit"),
+    "source_edit_review": ("status/source_edit",),
+    "setup_project": ("inputs", "release/person_reference"),
+    "codex_story_images": ("images", "status/story_image_progress"),
+    "story_images_review": ("status/reviews/story_images",),
+    "prepare_jobs": ("video_jobs/jobs",),
+    "timing": ("video_jobs/jobs", "assembly/timings"),
+    "video_prompt_review": ("video_jobs/prompt_review", "status/reviews/video_prompt"),
+    "generate_videos": ("video_jobs/videos",),
+    "video_qa": ("status/video_qa",),
+    "video_review": ("status/reviews/video",),
+    "apply_review": ("assembly/clips",),
+    "music_request": ("video_jobs/music",),
+    "suno_generate": ("video_jobs/music",),
+    "assemble_music": ("video_jobs/music",),
+    "music_qa": ("status/music_qa",),
+    "assemble_final": ("assembly/final",),
+    "release_assets": ("release/theme_assets", "release/keying"),
+    "release_preview": ("status/release_preview", "status/reviews/release_preview"),
+    "package_release": ("release/renders",),
+    "release_qa": ("status/release_qa",),
+    "release_video_review": ("status/reviews/release_video",),
+    "publish_package": ("publish",),
+    "publish_package_review": ("status/reviews/publish",),
+    "product_preflight": ("status/product_work",),
+    "product_annotation": ("status/product_work",),
+    "product_annotation_review": ("status/reviews/product_annotation",),
+    "product_package": ("product",),
+    "product_package_review": ("status/reviews/product",),
+    "final_delivery": ("status/final_delivery",),
+    "doctor": ("status/doctor",),
+}
+
+STAGE_RESOURCES = {
+    "codex_story_images": ("codex_exec", "imagegen"),
+    "story_images_review": ("codex_exec",),
+    "video_prompt_review": ("codex_exec",),
+    "generate_videos": ("video_api", "paid_work"),
+    "video_review": ("codex_exec",),
+    "suno_generate": ("codex_exec", "browser_suno"),
+    "assemble_final": ("ffmpeg_heavy",),
+    "release_assets": ("codex_exec", "imagegen"),
+    "release_preview": ("codex_exec",),
+    "package_release": ("ffmpeg_heavy",),
+    "release_video_review": ("codex_exec",),
+    "publish_package": ("codex_exec", "imagegen"),
+    "publish_package_review": ("codex_exec",),
+    "product_annotation": ("codex_exec",),
+    "product_annotation_review": ("codex_exec",),
+    "product_package": ("ffmpeg_heavy",),
+    "product_package_review": ("codex_exec",),
+}
+
+DEFAULT_RESOURCE_CAPACITIES = {
+    "codex_exec": 2,
+    "imagegen": 1,
+    "browser_suno": 1,
+    "video_api": 1,
+    "paid_work": 1,
+    "ffmpeg_heavy": 1,
 }
 
 
@@ -234,6 +354,14 @@ def ensure_manifest_v2(
     agent.setdefault("source", {})
     agent.setdefault("input_contract", {})
     agent.setdefault("external_blockers", [])
+    agent.setdefault("branch_blockers", {})
+    scheduler = agent.setdefault("scheduler", {})
+    scheduler.setdefault("schema_version", 1)
+    scheduler.setdefault("mode", "linear")
+    scheduler.setdefault("max_parallel", 1)
+    scheduler.setdefault("run_epoch", 0)
+    scheduler.setdefault("run_id", "")
+    scheduler.setdefault("running", {})
     stages = agent.setdefault("stages", {})
     for stage in STORY_STAGE_SEQUENCE:
         record = stages.setdefault(stage, {})
@@ -334,11 +462,13 @@ def mark_stage(
         record["review"] = review
     agent = manifest["agent"]
     agent["heartbeat_at"] = now()
+    branch = STAGE_BRANCHES.get(stage, "other")
+    branch_blockers = agent.setdefault("branch_blockers", {})
     if status == "passed":
+        branch_blockers.pop(stage, None)
         current_checkpoint = str(agent.get("last_checkpoint") or "")
         current_index = STORY_STAGE_SEQUENCE.index(current_checkpoint) if current_checkpoint in STORY_STAGE_SEQUENCE else -1
-        stage_index = STORY_STAGE_SEQUENCE.index(stage) if stage in STORY_STAGE_SEQUENCE else current_index
-        if stage_index >= current_index:
+        if STORY_STAGE_SEQUENCE.index(stage) > current_index:
             agent["last_checkpoint"] = stage
         unresolved = any(
             item.get("status") in {"blocked", "failed", "cancelled"}
@@ -349,6 +479,9 @@ def mark_stage(
             agent["blocked_reason"] = ""
     if status == "blocked":
         agent["blocked_reason"] = message
+        branch_blockers[stage] = {"branch": branch, "message": message, "updated_at": now()}
+    elif status in {"failed", "cancelled"}:
+        branch_blockers[stage] = {"branch": branch, "message": message, "updated_at": now()}
     agent["events"] = [
         *agent.get("events", []),
         {"time": now(), "event": "stage", "stage": stage, "status": status, "message": message},
@@ -515,10 +648,141 @@ class JobRegistry:
         return None
 
 
+def segment_confirmed_story_text(text: str, *, target_chars: int = 32) -> list[str]:
+    """Change line breaks only; never rewrite a user-confirmed manuscript."""
+    normalized = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n").strip()
+    paragraphs = [line.strip() for line in normalized.splitlines() if line.strip()]
+    if len(paragraphs) >= 3 and max((len(line) for line in paragraphs), default=0) <= target_chars * 2:
+        return paragraphs
+    units: list[str] = []
+    for paragraph in paragraphs or [normalized]:
+        matches = re.findall(r".*?[。！？!?](?:[”’\"』】])?|.+$", paragraph)
+        units.extend(item.strip() for item in matches if item.strip())
+    lines: list[str] = []
+    current = ""
+    for unit in units:
+        if current and len(current) + len(unit) > target_chars:
+            lines.append(current)
+            current = unit
+        else:
+            current += unit
+    if current:
+        lines.append(current)
+    if not lines:
+        raise ValueError("确认文本无法形成故事分镜行")
+    source_compact = re.sub(r"\s+", "", normalized)
+    output_compact = re.sub(r"\s+", "", "".join(lines))
+    if source_compact != output_compact:
+        raise AgentRuntimeError("确认文本分行改变了正文内容，拒绝创建加速任务")
+    return lines
+
+
+def prepared_input_contract_errors(project_dir: Path, manifest: dict[str, Any]) -> list[str]:
+    agent = manifest.get("agent", {}) if isinstance(manifest.get("agent"), dict) else {}
+    contract = agent.get("input_contract") if isinstance(agent.get("input_contract"), dict) else {}
+    if contract.get("mode") != "prepared_greenscreen_confirmed_text":
+        return ["不是 prepared 加速入口契约"]
+    records = contract.get("user_inputs") if isinstance(contract.get("user_inputs"), list) else []
+    by_role = {
+        str(item.get("role")): item
+        for item in records
+        if isinstance(item, dict) and item.get("role")
+    }
+    errors: list[str] = []
+    expected_roles = {"prepared_greenscreen_video", "confirmed_story_text"}
+    if set(by_role) != expected_roles:
+        errors.append("用户输入必须恰好包含干净绿幕视频和人工确认文本")
+        return errors
+    root = project_dir.expanduser().resolve()
+    inputs_dir = project_paths(root).inputs.resolve()
+    for role in sorted(expected_roles):
+        item = by_role[role]
+        path = Path(str(item.get("path") or "")).expanduser()
+        try:
+            resolved = path.resolve()
+            resolved.relative_to(inputs_dir)
+        except (OSError, ValueError):
+            errors.append(f"{role} 没有指向项目输入目录内的不可变副本")
+            continue
+        if not resolved.is_file():
+            errors.append(f"{role} 项目副本缺失")
+            continue
+        try:
+            recorded_bytes = int(item.get("bytes", -1))
+        except (TypeError, ValueError):
+            recorded_bytes = -1
+        if recorded_bytes != resolved.stat().st_size:
+            errors.append(f"{role} 文件大小已变化")
+        if str(item.get("sha256") or "") != file_sha256(resolved):
+            errors.append(f"{role} SHA-256 已变化")
+    inputs = manifest.get("inputs", {}) if isinstance(manifest.get("inputs"), dict) else {}
+    video_record = by_role["prepared_greenscreen_video"]
+    text_record = by_role["confirmed_story_text"]
+    video = Path(str(video_record.get("path") or ""))
+    original = Path(str(inputs.get("greenscreen_video_original") or ""))
+    clean = Path(str(inputs.get("greenscreen_video") or ""))
+    if not str(original) or not str(clean) or original.expanduser().resolve() != video.expanduser().resolve() or clean.expanduser().resolve() != video.expanduser().resolve():
+        errors.append("manifest 的原始/干净绿幕路径没有绑定 prepared 视频副本")
+    if video.is_file():
+        try:
+            probe_source_video(video)
+        except (OSError, ValueError) as exc:
+            errors.append(f"prepared 视频验证失败：{exc}")
+    confirmed = Path(str(text_record.get("path") or ""))
+    if confirmed.is_file():
+        try:
+            confirmed_text = confirmed.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError:
+            errors.append("人工确认文本不再是 UTF-8")
+            confirmed_text = ""
+        if not confirmed_text.strip():
+            errors.append("人工确认文本为空")
+    story_text = Path(str(inputs.get("story_text") or ""))
+    derived = contract.get("derived_inputs") if isinstance(contract.get("derived_inputs"), dict) else {}
+    derived_story = derived.get("story_text") if isinstance(derived.get("story_text"), dict) else {}
+    if not story_text.is_file():
+        errors.append("prepared 分行故事文本缺失")
+    else:
+        try:
+            recorded_story_bytes = int(derived_story.get("bytes", -1))
+        except (TypeError, ValueError):
+            recorded_story_bytes = -1
+        if (
+            Path(str(derived_story.get("path") or "")).expanduser().resolve() != story_text.expanduser().resolve()
+            or derived_story.get("sha256") != file_sha256(story_text)
+            or recorded_story_bytes != story_text.stat().st_size
+        ):
+            errors.append("prepared 分行故事文本派生哈希失效")
+    return errors
+
+
+def record_contract_derivative(
+    manifest: dict[str, Any],
+    *,
+    role: str,
+    path: Path,
+    source_sha256: str,
+    producer: str,
+) -> None:
+    contract = manifest.get("agent", {}).get("input_contract")
+    if not isinstance(contract, dict) or not path.is_file():
+        return
+    derived = contract.setdefault("derived_inputs", {})
+    derived[role] = {
+        "path": str(path),
+        "sha256": file_sha256(path),
+        "bytes": path.stat().st_size,
+        "producer": producer,
+        "source_sha256": source_sha256,
+    }
+
+
 def submit_video_job(
     video: Path,
     *,
     lut: Path | None = None,
+    input_mode: str = "single-greenscreen",
+    confirmed_text: Path | None = None,
     projects_root: Path,
     story_name: str = "",
     slug: str = "",
@@ -528,12 +792,36 @@ def submit_video_job(
     hard_budget_cny: float = DEFAULT_HARD_BUDGET_CNY,
     deadline_hours: float = DEFAULT_DEADLINE_HOURS,
 ) -> tuple[str, Path, bool]:
+    normalized_mode = input_mode.strip().lower().replace("_", "-")
+    if normalized_mode not in {"single-greenscreen", "prepared"}:
+        raise ValueError(f"未知输入模式：{input_mode}")
+    if normalized_mode == "prepared" and confirmed_text is None:
+        raise ValueError("prepared 加速入口必须提供 --confirmed-text")
+    if normalized_mode == "single-greenscreen" and confirmed_text is not None:
+        raise ValueError("single-greenscreen 模式不能提供 --confirmed-text；请显式选择 --input-mode prepared")
+    if normalized_mode == "prepared" and lut is not None:
+        raise ValueError("prepared 视频应已完成颜色还原，禁止再次传入 LUT 以免重复套色")
     source = video.expanduser().resolve()
     if not source.exists() or not source.is_file():
         raise FileNotFoundError(f"绿幕视频不存在：{source}")
     if source.suffix.lower() not in {".mp4", ".mov", ".mkv", ".m4v"}:
         raise ValueError(f"不支持的视频格式：{source.suffix}")
     fingerprint = media_fingerprint(source)
+    confirmed_source: Path | None = None
+    confirmed_body = ""
+    if confirmed_text is not None:
+        confirmed_source = confirmed_text.expanduser().resolve()
+        if not confirmed_source.is_file() or confirmed_source.suffix.lower() not in {".txt", ".md"}:
+            raise ValueError("prepared 确认文本首版只接受 UTF-8 .txt/.md 文件")
+        try:
+            confirmed_body = confirmed_source.read_text(encoding="utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError("prepared 确认文本必须是 UTF-8 编码") from exc
+        if not confirmed_body.strip():
+            raise ValueError("prepared 确认文本不能为空")
+        fingerprint = hashlib.sha256(
+            f"prepared:{fingerprint}:{file_sha256(confirmed_source)}".encode("utf-8")
+        ).hexdigest()
     color_lut: Path | None = None
     lut_sha256 = ""
     if lut is not None:
@@ -558,8 +846,19 @@ def submit_video_job(
         project_dir = projects_root.expanduser() / f"故事剪辑：{inferred_name}-{job_id[-8:]}"
     manifest = init_project(project_dir, story_name=inferred_name, slug=safe_slug)
     paths = project_paths(project_dir)
-    target = paths.inputs / f"{safe_slug}_greenscreen_source{source.suffix.lower()}"
+    video_stem = "prepared_greenscreen_source" if normalized_mode == "prepared" else "greenscreen_source"
+    target = paths.inputs / f"{safe_slug}_{video_stem}{source.suffix.lower()}"
     copy_verified_input(source, target)
+    confirmed_target: Path | None = None
+    story_text_target: Path | None = None
+    consumer_target: Path | None = None
+    if confirmed_source is not None:
+        confirmed_target = paths.inputs / f"{safe_slug}_confirmed_story{confirmed_source.suffix.lower()}"
+        copy_verified_input(confirmed_source, confirmed_target)
+        story_text_target = paths.inputs / f"{safe_slug}_prepared_story_source.txt"
+        story_text_target.write_text("\n".join(segment_confirmed_story_text(confirmed_body)) + "\n", encoding="utf-8")
+        consumer_target = paths.inputs / f"{safe_slug}_consumer_manuscript.txt"
+        consumer_target.write_text(confirmed_body.lstrip("\ufeff").replace("\r\n", "\n").strip() + "\n", encoding="utf-8")
     lut_target: Path | None = None
     if color_lut is not None:
         lut_target = paths.inputs / f"{safe_slug}_input_lut.cube"
@@ -572,6 +871,11 @@ def submit_video_job(
         deadline_hours=deadline_hours,
     )
     manifest["inputs"]["greenscreen_video"] = str(target)
+    if normalized_mode == "prepared":
+        assert confirmed_target is not None and story_text_target is not None and consumer_target is not None
+        manifest["inputs"]["greenscreen_video_original"] = str(target)
+        manifest["inputs"]["story_text"] = str(story_text_target)
+        manifest["outputs"]["consumer_manuscript"] = str(consumer_target)
     if lut_target is not None:
         manifest["inputs"]["color_lut"] = str(lut_target)
     manifest["agent"]["source"] = {
@@ -583,21 +887,69 @@ def submit_video_job(
         "media": media_info,
         "submitted_at": now(),
     }
-    manifest["agent"]["input_contract"] = {
-        "version": 1,
-        "mode": "single_greenscreen",
-        "created_at": now(),
-        "user_inputs": [
-            {
-                "role": "greenscreen_video",
-                "path": str(target),
-                "sha256": file_sha256(target),
-                "bytes": target.stat().st_size,
-            }
-        ],
-        "processing_assets": [],
-        "derived_inputs": {},
-    }
+    if normalized_mode == "single-greenscreen":
+        manifest["agent"]["input_contract"] = {
+            "version": 1,
+            "mode": "single_greenscreen",
+            "created_at": now(),
+            "user_inputs": [
+                {
+                    "role": "greenscreen_video",
+                    "path": str(target),
+                    "sha256": file_sha256(target),
+                    "bytes": target.stat().st_size,
+                }
+            ],
+            "processing_assets": [],
+            "derived_inputs": {},
+        }
+    else:
+        assert confirmed_target is not None and story_text_target is not None
+        manifest["agent"]["source"]["confirmed_text"] = {
+            "original_path": str(confirmed_source),
+            "project_copy": str(confirmed_target),
+            "sha256": file_sha256(confirmed_target),
+            "bytes": confirmed_target.stat().st_size,
+        }
+        manifest["agent"]["input_contract"] = {
+            "version": 1,
+            "mode": "prepared_greenscreen_confirmed_text",
+            "track": "assisted_accelerated",
+            "counts_toward_default_entry": False,
+            "created_at": now(),
+            "user_declarations": ["already_color_restored", "complete_clean_take", "text_manually_confirmed"],
+            "user_inputs": [
+                {
+                    "role": "prepared_greenscreen_video",
+                    "path": str(target),
+                    "sha256": file_sha256(target),
+                    "bytes": target.stat().st_size,
+                },
+                {
+                    "role": "confirmed_story_text",
+                    "path": str(confirmed_target),
+                    "sha256": file_sha256(confirmed_target),
+                    "bytes": confirmed_target.stat().st_size,
+                },
+            ],
+            "processing_assets": [],
+            "derived_inputs": {
+                "story_text": {
+                    "path": str(story_text_target),
+                    "sha256": file_sha256(story_text_target),
+                    "bytes": story_text_target.stat().st_size,
+                    "producer": "prepared_input_segmentation",
+                    "source_sha256": file_sha256(confirmed_target),
+                },
+                "consumer_manuscript": {
+                    "path": str(consumer_target),
+                    "sha256": file_sha256(consumer_target),
+                    "bytes": consumer_target.stat().st_size,
+                    "producer": "prepared_input_copy",
+                    "source_sha256": file_sha256(confirmed_target),
+                },
+            },
+        }
     if color_lut is not None and lut_target is not None:
         manifest["agent"]["source"]["color_lut"] = {
             "original_path": str(color_lut),
@@ -673,51 +1025,172 @@ def process_is_alive(pid: int) -> bool:
         return False
 
 
+def control_path(project_dir: Path) -> Path:
+    return project_paths(project_dir).status / "story_agent_control.json"
+
+
+@contextmanager
+def control_update_lock(project_dir: Path, *, timeout_seconds: float = 5.0) -> Iterator[Path]:
+    lock = project_paths(project_dir).status / "story_agent_control.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    deadline = time.monotonic() + max(0.1, timeout_seconds)
+    while True:
+        try:
+            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            break
+        except FileExistsError as exc:
+            try:
+                payload = json.loads(lock.read_text(encoding="utf-8"))
+                owner_alive = process_is_alive(int(payload.get("pid", 0)))
+            except (OSError, ValueError, json.JSONDecodeError):
+                try:
+                    owner_alive = time.time() - lock.stat().st_mtime < max(10.0, timeout_seconds)
+                except OSError:
+                    owner_alive = False
+            if not owner_alive:
+                lock.unlink(missing_ok=True)
+                continue
+            if time.monotonic() >= deadline:
+                raise AgentRuntimeError("控制面正在更新，未能在 5 秒内取得锁") from exc
+            time.sleep(0.02)
+    try:
+        os.write(descriptor, json.dumps({"pid": os.getpid(), "token": token, "created_at": now()}).encode("utf-8"))
+        os.close(descriptor)
+        yield lock
+    finally:
+        try:
+            payload = json.loads(lock.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        if payload.get("token") == token:
+            lock.unlink(missing_ok=True)
+
+
+def load_control(project_dir: Path) -> dict[str, Any]:
+    path = control_path(project_dir)
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        payload = {}
+    try:
+        run_epoch = max(0, int(payload.get("run_epoch", 0) or 0))
+    except (TypeError, ValueError):
+        run_epoch = 0
+    return {
+        "version": 1,
+        "run_epoch": run_epoch,
+        "cancel_requested": bool(payload.get("cancel_requested", False)),
+        "updated_at": str(payload.get("updated_at") or ""),
+    }
+
+
+def update_control(project_dir: Path, *, cancel_requested: bool, increment_epoch: bool = True) -> dict[str, Any]:
+    with control_update_lock(project_dir):
+        payload = load_control(project_dir)
+        if increment_epoch:
+            payload["run_epoch"] = int(payload.get("run_epoch", 0)) + 1
+        payload["cancel_requested"] = bool(cancel_requested)
+        payload["updated_at"] = now()
+        save_json(control_path(project_dir), payload)
+    return payload
+
+
 @contextmanager
 def job_lock(project_dir: Path, *, stale_seconds: int = 12 * 3600) -> Iterator[Path]:
     lock = project_paths(project_dir).status / "story_agent.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
     if lock.exists():
-        stale = time.time() - lock.stat().st_mtime > stale_seconds
         alive = False
         try:
             payload = json.loads(lock.read_text(encoding="utf-8"))
             pid = int(payload.get("pid", 0))
             alive = process_is_alive(pid)
-        except (ValueError, json.JSONDecodeError):
-            alive = False
-        if stale or not alive:
+        except (OSError, ValueError, json.JSONDecodeError):
+            try:
+                alive = time.time() - lock.stat().st_mtime <= stale_seconds
+            except OSError:
+                alive = False
+        if not alive:
             lock.unlink(missing_ok=True)
+    token = uuid.uuid4().hex
     try:
         descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
     except FileExistsError as exc:
         raise AgentRuntimeError(f"任务已经在运行：{lock}") from exc
     try:
-        os.write(descriptor, json.dumps({"pid": os.getpid(), "started_at": now()}).encode("utf-8"))
+        os.write(descriptor, json.dumps({"pid": os.getpid(), "token": token, "started_at": now()}).encode("utf-8"))
         os.close(descriptor)
         yield lock
     finally:
-        lock.unlink(missing_ok=True)
+        try:
+            current = json.loads(lock.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            current = {}
+        if current.get("token") == token:
+            lock.unlink(missing_ok=True)
+
+
+@contextmanager
+def supervisor_start_lock(project_dir: Path) -> Iterator[Path]:
+    lock = project_paths(project_dir).status / "story_agent_start.lock"
+    lock.parent.mkdir(parents=True, exist_ok=True)
+    token = uuid.uuid4().hex
+    if lock.exists():
+        try:
+            payload = json.loads(lock.read_text(encoding="utf-8"))
+            owner_alive = process_is_alive(int(payload.get("pid", 0)))
+        except (OSError, ValueError, json.JSONDecodeError):
+            try:
+                owner_alive = time.time() - lock.stat().st_mtime < 10.0
+            except OSError:
+                owner_alive = False
+        if not owner_alive:
+            lock.unlink(missing_ok=True)
+    try:
+        descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError as exc:
+        raise AgentRuntimeError("另一个 start 正在创建 supervisor，请稍后读取 status") from exc
+    try:
+        os.write(descriptor, json.dumps({"pid": os.getpid(), "token": token, "created_at": now()}).encode("utf-8"))
+        os.close(descriptor)
+        yield lock
+    finally:
+        try:
+            payload = json.loads(lock.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            payload = {}
+        if payload.get("token") == token:
+            lock.unlink(missing_ok=True)
 
 
 def request_cancel(project_dir: Path) -> dict[str, Any]:
     paths = project_paths(project_dir)
     manifest = ensure_manifest_v2(load_manifest(paths) or init_project(project_dir))
-    freeze_runtime(manifest["agent"])
+    control = update_control(project_dir, cancel_requested=True, increment_epoch=True)
     manifest["agent"]["cancel_requested"] = True
-    manifest["agent"]["status"] = "cancelled"
-    manifest["agent"]["events"].append({"time": now(), "event": "cancel_requested"})
-    write_manifest(paths, manifest)
+    manifest["agent"]["control_epoch"] = control["run_epoch"]
+    if not (paths.status / "story_agent.lock").exists():
+        freeze_runtime(manifest["agent"])
+        manifest["agent"]["status"] = "cancelled"
+        manifest["agent"]["events"].append({"time": now(), "event": "cancel_requested"})
+        write_manifest(paths, manifest)
     return manifest
 
 
 def resume_job(project_dir: Path) -> dict[str, Any]:
     paths = project_paths(project_dir)
     manifest = ensure_manifest_v2(load_manifest(paths) or init_project(project_dir))
+    control = update_control(project_dir, cancel_requested=False, increment_epoch=True)
     freeze_runtime(manifest["agent"])
     manifest["agent"]["cancel_requested"] = False
+    manifest["agent"]["control_epoch"] = control["run_epoch"]
     manifest["agent"]["status"] = "pending"
     manifest["agent"]["blocked_reason"] = ""
+    manifest["agent"]["branch_blockers"] = {}
+    for record in manifest["agent"].get("stages", {}).values():
+        if isinstance(record, dict) and record.get("status") in {"blocked", "failed", "cancelled", "running"}:
+            record["status"] = "pending"
     manifest["agent"]["events"].append({"time": now(), "event": "resume_requested"})
     write_manifest(paths, manifest)
     return manifest
@@ -725,7 +1198,8 @@ def resume_job(project_dir: Path) -> dict[str, Any]:
 
 def assert_runnable(manifest: dict[str, Any], project_dir: Path | None = None) -> None:
     ensure_manifest_v2(manifest)
-    if manifest["agent"].get("cancel_requested"):
+    control_cancelled = bool(load_control(project_dir).get("cancel_requested")) if project_dir is not None else False
+    if manifest["agent"].get("cancel_requested") or control_cancelled:
         raise JobCancelled("任务已取消；使用 resume 后才能继续。")
     elapsed_hours = runtime_elapsed_seconds(manifest["agent"]) / 3600
     if elapsed_hours > float(manifest["agent"].get("deadline_hours", DEFAULT_DEADLINE_HOURS)):

@@ -180,6 +180,15 @@ def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]
 
 def project_paths(project_dir: Path) -> ProjectPaths:
     root = project_dir.expanduser()
+    manifest_override = os.environ.get("STORY_AGENT_MANIFEST_OVERRIDE", "").strip()
+    worker_root = os.environ.get("STORY_AGENT_PROJECT_ROOT", "").strip()
+    manifest_path = root / PROJECT_DIRS["status"] / MANIFEST_NAME
+    if manifest_override and worker_root:
+        try:
+            if root.resolve() == Path(worker_root).expanduser().resolve():
+                manifest_path = Path(manifest_override).expanduser()
+        except OSError:
+            pass
     return ProjectPaths(
         root=root,
         inputs=root / PROJECT_DIRS["inputs"],
@@ -190,7 +199,7 @@ def project_paths(project_dir: Path) -> ProjectPaths:
         publish=root / PROJECT_DIRS["publish"],
         product=root / PROJECT_DIRS["product"],
         status=root / PROJECT_DIRS["status"],
-        manifest=root / PROJECT_DIRS["status"] / MANIFEST_NAME,
+        manifest=manifest_path,
     )
 
 
@@ -371,14 +380,20 @@ def short_slug(slug: str) -> str:
 def detect_project_assets(project_dir: Path, *, extract_audio: bool = False) -> dict[str, Any]:
     paths = project_paths(project_dir)
     manifest = init_project(paths.root)
+    input_contract = manifest.get("agent", {}).get("input_contract", {}) if isinstance(manifest.get("agent"), dict) else {}
+    prepared_mode = isinstance(input_contract, dict) and input_contract.get("mode") == "prepared_greenscreen_confirmed_text"
     files = [path for path in paths.root.rglob("*") if path.is_file() and STATUS_DIR_NAME not in path.parts]
     input_files = [path for path in files if is_user_input_asset(paths, path)]
-    story_text = choose_first(input_files, TEXT_EXTENSIONS, ("原文", "story", "source", "正文", "故事", "文稿"))
+    bound_story_text = Path(str(manifest.get("inputs", {}).get("story_text") or ""))
+    story_text = bound_story_text if prepared_mode and bound_story_text.is_file() else choose_first(
+        input_files, TEXT_EXTENSIONS, ("原文", "story", "source", "正文", "故事", "文稿")
+    )
     audios = [path for path in input_files if path.suffix.lower() in AUDIO_EXTENSIONS]
     videos = [path for path in input_files if path.suffix.lower() in VIDEO_EXTENSIONS]
     narration = choose_preferred_audio(audios)
     music = choose_preferred_music(audios, narration)
-    greenscreen = choose_preferred_video(videos)
+    bound_greenscreen = Path(str(manifest.get("inputs", {}).get("greenscreen_video") or ""))
+    greenscreen = bound_greenscreen if prepared_mode and bound_greenscreen.is_file() else choose_preferred_video(videos)
     if not story_text:
         existing = manifest["inputs"].get("story_text")
         story_text = Path(existing) if existing else None

@@ -5,10 +5,12 @@ import csv
 import importlib.util
 import json
 import os
+import signal
 import shutil
 import subprocess
 import sys
 import time
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
@@ -30,6 +32,11 @@ from story_agent_runtime import (
     BudgetLedger,
     JobCancelled,
     JobRegistry,
+    DEFAULT_RESOURCE_CAPACITIES,
+    STAGE_BRANCHES,
+    STAGE_RESOURCES,
+    STAGE_WRITE_SETS,
+    STORY_STAGE_DEPENDENCIES,
     STORY_STAGE_SEQUENCE,
     STAGE_ESTIMATES_MINUTES,
     assert_runnable,
@@ -37,11 +44,14 @@ from story_agent_runtime import (
     existing_artifact_hashes,
     file_sha256,
     job_lock,
+    load_control,
     mark_stage,
     manifest_context_sha256,
     process_is_alive,
     render_job_report,
     request_cancel,
+    record_contract_derivative,
+    prepared_input_contract_errors,
     resume_job,
     review_bundle_is_current,
     review_passes,
@@ -49,6 +59,8 @@ from story_agent_runtime import (
     runtime_elapsed_seconds,
     start_runtime,
     submit_video_job,
+    supervisor_start_lock,
+    update_control,
     write_review_bundle,
 )
 from story_project import (
@@ -120,10 +132,25 @@ class AgentContext:
     codex_path: str
     codex_timeout: int
     codex_story_image_batch_size: int = 15
+    scheduler: str = "linear"
+    max_parallel: int = 1
 
     @property
     def paths(self):
         return project_paths(self.project_dir)
+
+
+@dataclass
+class WorkerAttempt:
+    stage: str
+    attempt_id: str
+    run_epoch: int
+    work_dir: Path
+    base_manifest: Path
+    shadow_manifest: Path
+    result_file: Path
+    log_file: Path
+    process: subprocess.Popen[str]
 
 
 def canonical_video_prompt_rows(csv_path: Path) -> list[dict[str, str]]:
@@ -216,11 +243,17 @@ class StoryAgent:
         self.read_only = read_only
         if not read_only:
             ensure_project_dirs(context.paths)
-        self.state_path = context.paths.status / AGENT_STATE_NAME
+        worker_dir = os.environ.get("STORY_AGENT_WORKER_DIR", "").strip()
+        self.state_path = Path(worker_dir) / AGENT_STATE_NAME if worker_dir else context.paths.status / AGENT_STATE_NAME
         self.state: dict[str, Any] = self._load_state()
         self._stage_cost_baselines: dict[str, float] = {}
 
     def run(self, max_steps: int) -> int:
+        if self.context.scheduler == "dag" and self.context.execute:
+            return self._run_dag(max_steps=max_steps)
+        return self._run_linear(max_steps=max_steps)
+
+    def _run_linear(self, max_steps: int) -> int:
         with job_lock(self.context.project_dir):
             manifest = self._manifest()
             ensure_manifest_v2(manifest)
@@ -291,16 +324,385 @@ class StoryAgent:
         render_job_report(self.context.project_dir)
         return 0
 
+    def _run_dag(self, max_steps: int) -> int:
+        with job_lock(self.context.project_dir):
+            manifest = self._manifest()
+            ensure_manifest_v2(manifest)
+            assert_runnable(manifest, self.context.project_dir)
+            control = update_control(self.context.project_dir, cancel_requested=False, increment_epoch=True)
+            run_epoch = int(control["run_epoch"])
+            run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            agent = manifest["agent"]
+            agent["status"] = "running"
+            agent["cancel_requested"] = False
+            agent["control_epoch"] = run_epoch
+            agent["scheduler"].update(
+                {
+                    "schema_version": 1,
+                    "mode": "dag",
+                    "max_parallel": max(1, self.context.max_parallel),
+                    "run_epoch": run_epoch,
+                    "run_id": run_id,
+                    "running": {},
+                }
+            )
+            start_runtime(agent)
+            from story_project import write_manifest
+
+            write_manifest(self.context.paths, manifest)
+            self._record_event("dag_agent_start", {"run_id": run_id, "run_epoch": run_epoch, "max_parallel": self.context.max_parallel})
+            blocked_this_run: set[str] = set()
+            launched_attempts = 0
+            while launched_attempts < max_steps:
+                manifest = self._manifest()
+                assert_runnable(manifest, self.context.project_dir)
+                self._reconcile_all_completed_stage_records(manifest)
+                manifest = load_manifest(self.context.paths) or manifest
+                completed = self._completed_stage_names(manifest)
+                if len(completed) == len(STORY_STAGE_SEQUENCE):
+                    freeze_runtime(manifest["agent"])
+                    manifest["agent"]["status"] = "completed"
+                    manifest["agent"]["blocked_reason"] = ""
+                    manifest["agent"]["branch_blockers"] = {}
+                    manifest["agent"]["finished_at"] = now()
+                    manifest["agent"]["scheduler"]["running"] = {}
+                    write_manifest(self.context.paths, manifest)
+                    render_job_report(self.context.project_dir)
+                    self._record_event("done", {"message": "DAG 故事生产 Agent 已完成全部阶段。"})
+                    print("DONE: DAG 故事生产 Agent 已完成全部阶段。")
+                    return 0
+                ready = self._ready_dag_stages(manifest, completed, blocked_this_run)
+                selected = self._select_parallel_batch(ready, max_count=min(self.context.max_parallel, max_steps - launched_attempts))
+                if not selected:
+                    freeze_runtime(manifest["agent"])
+                    blockers = manifest["agent"].get("branch_blockers", {})
+                    if blocked_this_run or blockers:
+                        manifest["agent"]["status"] = "blocked"
+                        messages = [str(item.get("message", "")) for item in blockers.values() if isinstance(item, dict)]
+                        manifest["agent"]["blocked_reason"] = "；".join(dict.fromkeys(item for item in messages if item)) or "一个或多个并行分支阻塞"
+                        exit_code = 2
+                    else:
+                        manifest["agent"]["status"] = "failed"
+                        manifest["agent"]["blocked_reason"] = "DAG 没有可运行节点且仍有未完成阶段；请检查依赖或产物哈希。"
+                        exit_code = 1
+                    manifest["agent"]["scheduler"]["running"] = {}
+                    write_manifest(self.context.paths, manifest)
+                    render_job_report(self.context.project_dir)
+                    return exit_code
+                print("READY: " + ", ".join(selected))
+                attempts = self._launch_worker_batch(selected, manifest, run_id=run_id, run_epoch=run_epoch)
+                launched_attempts += len(attempts)
+                results = self._wait_worker_batch(attempts, run_epoch=run_epoch)
+                for attempt, result in results:
+                    if result.status == "failed" and self._can_retry_stage(attempt.stage, critical=self._critical_stage(attempt.stage)):
+                        result = StageResult("retrying", f"{result.message}；将在新 attempt 中自动重跑。", result.handoff)
+                    merge_error = self._merge_worker_shadow(attempt)
+                    if merge_error:
+                        result = StageResult("failed", f"worker manifest 合并冲突：{merge_error}", attempt.result_file)
+                    self._record_stage(attempt.stage, result, terminal=False)
+                    current = load_manifest(self.context.paths) or self._manifest()
+                    current["agent"]["scheduler"].setdefault("running", {}).pop(attempt.stage, None)
+                    current["agent"]["status"] = "running"
+                    current["agent"]["blocked_reason"] = ""
+                    start_runtime(current["agent"])
+                    write_manifest(self.context.paths, current)
+                    print(f"{attempt.stage}: {result.status.upper()} {result.message}")
+                    if result.status in {"blocked", "failed", "cancelled"}:
+                        blocked_this_run.add(attempt.stage)
+                if load_control(self.context.project_dir).get("cancel_requested"):
+                    raise JobCancelled("并行任务已按取消请求停止。")
+            manifest = load_manifest(self.context.paths) or self._manifest()
+            freeze_runtime(manifest["agent"])
+            manifest["agent"]["status"] = "pending"
+            manifest["agent"]["scheduler"]["running"] = {}
+            write_manifest(self.context.paths, manifest)
+        print(f"PAUSED: DAG 已启动 {launched_attempts} 个阶段 attempt，达到本轮上限 {max_steps}。")
+        render_job_report(self.context.project_dir)
+        return 0
+
+    def _completed_stage_names(self, manifest: dict[str, Any]) -> set[str]:
+        completed: set[str] = set()
+        for name, done, _action in self._stage_checks():
+            try:
+                if done(manifest):
+                    completed.add(name)
+            except Exception:
+                continue
+        return completed
+
+    def _ready_dag_stages(self, manifest: dict[str, Any], completed: set[str], blocked: set[str]) -> list[str]:
+        stages = manifest.get("agent", {}).get("stages", {})
+        ready: list[str] = []
+        for name in STORY_STAGE_SEQUENCE:
+            if name in completed or name in blocked:
+                continue
+            record = stages.get(name, {}) if isinstance(stages, dict) else {}
+            if isinstance(record, dict) and record.get("status") in {"running", "blocked", "failed", "cancelled"}:
+                continue
+            if all(dependency in completed for dependency in STORY_STAGE_DEPENDENCIES[name]):
+                ready.append(name)
+        return ready
+
+    def _select_parallel_batch(self, ready: list[str], *, max_count: int) -> list[str]:
+        selected: list[str] = []
+        used_resources: dict[str, int] = {}
+        used_writes: list[str] = []
+
+        def overlaps(left: str, right: str) -> bool:
+            return left == right or left.startswith(right + "/") or right.startswith(left + "/")
+
+        for stage in ready:
+            if len(selected) >= max(1, max_count):
+                break
+            writes = STAGE_WRITE_SETS.get(stage, ())
+            if any(overlaps(left, right) for left in writes for right in used_writes):
+                continue
+            resources = STAGE_RESOURCES.get(stage, ())
+            if any(used_resources.get(resource, 0) + 1 > DEFAULT_RESOURCE_CAPACITIES.get(resource, 1) for resource in resources):
+                continue
+            selected.append(stage)
+            used_writes.extend(writes)
+            for resource in resources:
+                used_resources[resource] = used_resources.get(resource, 0) + 1
+        return selected
+
+    def _launch_worker_batch(
+        self,
+        stages: list[str],
+        manifest: dict[str, Any],
+        *,
+        run_id: str,
+        run_epoch: int,
+    ) -> list[WorkerAttempt]:
+        from story_project import write_manifest
+
+        for stage in stages:
+            self._stage_cost_baselines[stage] = float(manifest.get("agent", {}).get("budget", {}).get("spent", 0.0))
+            mark_stage(
+                manifest,
+                stage,
+                "running",
+                message="DAG worker 已启动",
+                input_hashes={"manifest_context": manifest_context_sha256(manifest)},
+                provider=self._provider_for_stage(stage),
+            )
+        write_manifest(self.context.paths, manifest)
+        canonical_snapshot = load_manifest(self.context.paths) or manifest
+        scheduler_root = self.context.paths.status / "scheduler" / "runs" / run_id
+        attempts: list[WorkerAttempt] = []
+        for stage in stages:
+            attempt_id = f"{stage}-{int(time.time() * 1000)}-{uuid.uuid4().hex[:8]}"
+            work_dir = scheduler_root / attempt_id
+            work_dir.mkdir(parents=True, exist_ok=True)
+            base_manifest = work_dir / "base_manifest.json"
+            shadow_manifest = work_dir / "shadow_manifest.json"
+            result_file = work_dir / "result.json"
+            log_file = work_dir / "worker.log"
+            save_json(base_manifest, canonical_snapshot)
+            save_json(shadow_manifest, canonical_snapshot)
+            command = [
+                resolve_agent_runtime_python(),
+                str(Path(__file__).resolve()),
+                "run-stage",
+                "--project-dir",
+                str(self.context.project_dir),
+                "--story-name",
+                self.context.story_name,
+                "--slug",
+                self.context.slug,
+                "--stage",
+                stage,
+                "--result-file",
+                str(result_file),
+                "--run-epoch",
+                str(run_epoch),
+                "--attempt-id",
+                attempt_id,
+                "--codex-mode",
+                self.context.codex_mode,
+                "--codex-sandbox",
+                self.context.codex_sandbox,
+                "--codex-approval",
+                self.context.codex_approval,
+                "--codex-path",
+                self.context.codex_path,
+                "--codex-timeout",
+                str(self.context.codex_timeout),
+                "--codex-story-image-batch-size",
+                str(self.context.codex_story_image_batch_size),
+            ]
+            if self.context.codex_model:
+                command.extend(["--codex-model", self.context.codex_model])
+            env = os.environ.copy()
+            env["STORY_AGENT_MANIFEST_OVERRIDE"] = str(shadow_manifest)
+            env["STORY_AGENT_PROJECT_ROOT"] = str(self.context.project_dir.expanduser().resolve())
+            env["STORY_AGENT_WORKER_DIR"] = str(work_dir)
+            env["STORY_AGENT_RUN_EPOCH"] = str(run_epoch)
+            with log_file.open("w", encoding="utf-8") as worker_log:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(ROOT),
+                    env=env,
+                    text=True,
+                    stdout=worker_log,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                )
+            attempts.append(
+                WorkerAttempt(stage, attempt_id, run_epoch, work_dir, base_manifest, shadow_manifest, result_file, log_file, process)
+            )
+            manifest["agent"]["scheduler"].setdefault("running", {})[stage] = {
+                "attempt_id": attempt_id,
+                "pid": process.pid,
+                "branch": STAGE_BRANCHES.get(stage, "other"),
+                "started_at": now(),
+                "run_epoch": run_epoch,
+            }
+        write_manifest(self.context.paths, manifest)
+        return attempts
+
+    def _wait_worker_batch(self, attempts: list[WorkerAttempt], *, run_epoch: int) -> list[tuple[WorkerAttempt, StageResult]]:
+        pending = {attempt.attempt_id: attempt for attempt in attempts}
+        cancelled = False
+        while pending:
+            control = load_control(self.context.project_dir)
+            if control.get("cancel_requested") or int(control.get("run_epoch", 0)) != run_epoch:
+                cancelled = True
+                for attempt in pending.values():
+                    try:
+                        os.killpg(attempt.process.pid, signal.SIGTERM)
+                    except OSError:
+                        pass
+            for attempt_id, attempt in list(pending.items()):
+                if attempt.process.poll() is not None:
+                    pending.pop(attempt_id)
+            manifest = load_manifest(self.context.paths)
+            if manifest is not None:
+                manifest["agent"]["heartbeat_at"] = now()
+                from story_project import write_manifest
+
+                write_manifest(self.context.paths, manifest)
+            if pending:
+                time.sleep(1)
+        results: list[tuple[WorkerAttempt, StageResult]] = []
+        for attempt in attempts:
+            if cancelled:
+                results.append((attempt, StageResult("cancelled", "worker 已被 run epoch/cancel 控制面终止", attempt.log_file)))
+                continue
+            try:
+                payload = json.loads(attempt.result_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                payload = {}
+            if (
+                attempt.process.returncode != 0
+                or payload.get("attempt_id") != attempt.attempt_id
+                or int(payload.get("run_epoch", -1)) != run_epoch
+            ):
+                results.append((attempt, StageResult("failed", f"stage worker 异常退出或结果信封无效：{attempt.log_file}", attempt.log_file)))
+                continue
+            handoff_text = str(payload.get("handoff") or "")
+            results.append(
+                (
+                    attempt,
+                    StageResult(str(payload.get("status") or "failed"), str(payload.get("message") or "worker 未提供说明"), Path(handoff_text) if handoff_text else None),
+                )
+            )
+        return results
+
+    def _merge_worker_shadow(self, attempt: WorkerAttempt) -> str:
+        try:
+            base = json.loads(attempt.base_manifest.read_text(encoding="utf-8"))
+            shadow = json.loads(attempt.shadow_manifest.read_text(encoding="utf-8"))
+            current = load_manifest(self.context.paths) or {}
+        except (OSError, json.JSONDecodeError) as exc:
+            return str(exc)
+        conflicts: list[str] = []
+
+        def merge(base_value: Any, shadow_value: Any, current_value: Any, path: str) -> Any:
+            if path in {"updated_at", "agent.heartbeat_at"}:
+                return current_value
+            if shadow_value == base_value:
+                return current_value
+            if isinstance(base_value, dict) and isinstance(shadow_value, dict) and isinstance(current_value, dict):
+                result = dict(current_value)
+                for key in set(base_value) | set(shadow_value):
+                    child = f"{path}.{key}" if path else key
+                    if key not in shadow_value:
+                        if key in base_value and current_value.get(key) == base_value.get(key):
+                            result.pop(key, None)
+                        continue
+                    result[key] = merge(base_value.get(key), shadow_value.get(key), current_value.get(key), child)
+                return result
+            if current_value == base_value or current_value == shadow_value:
+                return shadow_value
+            conflicts.append(path or "<root>")
+            return current_value
+
+        merged = merge(base, shadow, current, "")
+        if conflicts:
+            return "、".join(sorted(set(conflicts))[:12])
+        from story_project import write_manifest
+
+        write_manifest(self.context.paths, ensure_manifest_v2(merged))
+        return ""
+
+    def _reconcile_all_completed_stage_records(self, manifest: dict[str, Any]) -> None:
+        changed = False
+        for name, done, _action in self._stage_checks():
+            try:
+                complete = done(manifest)
+            except Exception:
+                complete = False
+            record = manifest.get("agent", {}).get("stages", {}).get(name, {})
+            if complete and record.get("status") != "passed":
+                mark_stage(manifest, name, "passed", message="当前产物与哈希满足 DAG 节点完成条件。")
+                changed = True
+        if changed:
+            from story_project import write_manifest
+
+            write_manifest(self.context.paths, manifest)
+
+    @staticmethod
+    def _critical_stage(stage: str) -> bool:
+        return stage in {
+            "source_edit",
+            "codex_story_images",
+            "generate_videos",
+            "video_review",
+            "suno_generate",
+            "assemble_final",
+            "package_release",
+            "product_package",
+        }
+
     def status(self) -> None:
         manifest = self._manifest()
         stage_name, _ = self._next_stage(manifest)
-        remaining_work: list[dict[str, Any]] = []
-        if stage_name != "done":
-            start_index = STORY_STAGE_SEQUENCE.index(stage_name)
-            for name in STORY_STAGE_SEQUENCE[start_index:]:
-                remaining_work.append({"stage": name, "estimated_minutes": STAGE_ESTIMATES_MINUTES.get(name, 10)})
-        estimate_total = sum(int(item["estimated_minutes"]) for item in remaining_work)
         agent_data = manifest.get("agent", {})
+        scheduler_data = agent_data.get("scheduler", {}) if isinstance(agent_data.get("scheduler"), dict) else {}
+        scheduler_mode = str(scheduler_data.get("mode") or "linear")
+        completed = self._completed_stage_names(manifest) if scheduler_mode == "dag" else {
+            name for name in STORY_STAGE_SEQUENCE[: STORY_STAGE_SEQUENCE.index(stage_name)]
+        } if stage_name != "done" else set(STORY_STAGE_SEQUENCE)
+        remaining_work: list[dict[str, Any]] = []
+        for name in STORY_STAGE_SEQUENCE:
+            if name not in completed:
+                remaining_work.append({"stage": name, "estimated_minutes": STAGE_ESTIMATES_MINUTES.get(name, 10)})
+        estimate_total_work = sum(int(item["estimated_minutes"]) for item in remaining_work)
+        critical_minutes: dict[str, int] = {}
+        for name in STORY_STAGE_SEQUENCE:
+            if name in completed:
+                critical_minutes[name] = 0
+                continue
+            upstream = max((critical_minutes.get(dependency, 0) for dependency in STORY_STAGE_DEPENDENCIES[name]), default=0)
+            critical_minutes[name] = upstream + int(STAGE_ESTIMATES_MINUTES.get(name, 10))
+        estimate_total = max(critical_minutes.values(), default=0) if scheduler_mode == "dag" else estimate_total_work
+        dag_ready = self._ready_dag_stages(manifest, completed, set()) if scheduler_mode == "dag" else ([] if stage_name == "done" else [stage_name])
+        branch_status: dict[str, list[dict[str, str]]] = {}
+        for name in STORY_STAGE_SEQUENCE:
+            branch_status.setdefault(STAGE_BRANCHES.get(name, "other"), []).append(
+                {"stage": name, "status": "passed" if name in completed else str(agent_data.get("stages", {}).get(name, {}).get("status", "pending"))}
+            )
         timing = self._timing_status(agent_data)
         stage_records = agent_data.get("stages", {}) if isinstance(agent_data.get("stages"), dict) else {}
         retries = {
@@ -336,6 +738,10 @@ class StoryAgent:
             "heartbeat_at": agent_data.get("heartbeat_at", ""),
             "blocked_reason": agent_data.get("blocked_reason", ""),
             "external_blockers": agent_data.get("external_blockers", []),
+            "branch_blockers": agent_data.get("branch_blockers", {}),
+            "scheduler": scheduler_data,
+            "ready_stages": dag_ready,
+            "branches": branch_status,
             "recovery_action": self._recovery_action(manifest, stage_name),
             "budget": agent_data.get("budget", {}),
             "timing": timing,
@@ -345,7 +751,8 @@ class StoryAgent:
                 "optimistic": round(estimate_total * 0.65),
                 "nominal": estimate_total,
                 "conservative": round(estimate_total * 1.8),
-                "note": "按阶段经验值估算；外部生成队列、登录阻塞和重试不包含在确定性承诺内。",
+                "total_work_minutes": estimate_total_work,
+                "note": "DAG 模式 nominal 为依赖关系的剩余关键路径；外部排队、登录阻塞和重试不在确定性承诺内。",
             },
             "supervisor": supervisor,
             "state_file": str(self.state_path),
@@ -516,9 +923,39 @@ class StoryAgent:
             self.context.slug,
             "--extract-audio",
         ]
-        return self._workflow(command, "保存故事信息并识别素材")
+        result = self._workflow(command, "保存故事信息并识别素材")
+        contract = manifest.get("agent", {}).get("input_contract", {})
+        if result.status == "done" and contract.get("mode") == "prepared_greenscreen_confirmed_text":
+            current = load_manifest(self.context.paths) or manifest
+            narration = first_existing(
+                current.get("inputs", {}).get("extracted_narration"),
+                current.get("inputs", {}).get("narration"),
+            )
+            user_inputs = contract.get("user_inputs", []) if isinstance(contract.get("user_inputs"), list) else []
+            video_record = next(
+                (item for item in user_inputs if isinstance(item, dict) and item.get("role") == "prepared_greenscreen_video"),
+                {},
+            )
+            if narration is not None:
+                record_contract_derivative(
+                    current,
+                    role="extracted_narration",
+                    path=narration,
+                    source_sha256=str(video_record.get("sha256") or ""),
+                    producer="setup_project_audio_extraction",
+                )
+                from story_project import write_manifest
+
+                write_manifest(self.context.paths, current)
+        return result
 
     def _stage_source_edit(self, manifest: dict[str, Any]) -> StageResult:
+        contract = manifest.get("agent", {}).get("input_contract", {})
+        if contract.get("mode") == "prepared_greenscreen_confirmed_text":
+            errors = prepared_input_contract_errors(self.context.project_dir, manifest)
+            if errors:
+                return StageResult("blocked", "prepared 加速入口契约失效：" + "；".join(errors))
+            return StageResult("done", "prepared 视频与人工确认文本哈希通过，跳过转写、自动剪口和重复还原。")
         inputs = manifest.get("inputs", {})
         video = first_existing(inputs.get("greenscreen_video_original"), inputs.get("greenscreen_video"))
         if video is None:
@@ -2342,6 +2779,9 @@ class StoryAgent:
         return self.context.inbox is None or bool(self.state.get("inbox_imported_at"))
 
     def _has_source_edit(self, manifest: dict[str, Any]) -> bool:
+        contract = manifest.get("agent", {}).get("input_contract", {})
+        if contract.get("mode") == "prepared_greenscreen_confirmed_text":
+            return not prepared_input_contract_errors(self.context.project_dir, manifest)
         inputs = manifest.get("inputs", {})
         story_text = first_existing(inputs.get("story_text"))
         if story_text is None:
@@ -2778,11 +3218,10 @@ class StoryAgent:
     def _save_state(self) -> None:
         if self.read_only:
             return
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         self.state["updated_at"] = now()
-        self.state_path.write_text(json.dumps(self.state, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        save_json(self.state_path, self.state)
 
-    def _record_stage(self, stage: str, result: StageResult) -> None:
+    def _record_stage(self, stage: str, result: StageResult, *, terminal: bool = True) -> None:
         self.state["last_stage"] = stage
         self.state["last_status"] = result.status
         self._record_event(stage, {"status": result.status, "message": result.message, "handoff": str(result.handoff) if result.handoff else ""})
@@ -2815,7 +3254,7 @@ class StoryAgent:
             retry_reason=result.message if runtime_status == "retrying" else "",
             review=review,
         )
-        if runtime_status in {"blocked", "failed", "cancelled"}:
+        if terminal and runtime_status in {"blocked", "failed", "cancelled"}:
             freeze_runtime(manifest["agent"])
             manifest["agent"]["status"] = runtime_status
         from story_project import write_manifest
@@ -2873,9 +3312,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Codex 故事生产 Agent：状态机 + 现有脚本 + Codex 原生动作交接")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    submit = subparsers.add_parser("submit", help="仅投喂一段绿幕视频并创建可续跑任务")
+    submit = subparsers.add_parser("submit", help="投喂单绿幕原片，或已还原干净绿幕+人工确认文本")
     submit.add_argument("--video", required=True, type=Path)
     submit.add_argument("--lut", type=Path, help="可选 .cube 输入 LUT；复制进项目并记录 SHA-256")
+    submit.add_argument("--input-mode", choices=["single-greenscreen", "prepared"], default="single-greenscreen")
+    submit.add_argument("--confirmed-text", type=Path, help="prepared 加速入口必填：人工确认的 UTF-8 .txt/.md")
     submit.add_argument("--projects-root", default=Path.home() / "Desktop", type=Path)
     submit.add_argument("--story-name", default="")
     submit.add_argument("--slug", default="")
@@ -2902,6 +3343,8 @@ def main() -> None:
     run.add_argument("--codex-path", default="codex")
     run.add_argument("--codex-timeout", default=3600, type=int, help="单个 codex exec 子任务超时时间，秒")
     run.add_argument("--codex-story-image-batch-size", default=15, type=int, help="codex_story_images 每个 CLI 子任务批量生成的图片数量；默认 15，通常覆盖一个完整故事")
+    run.add_argument("--scheduler", choices=["linear", "dag"], default="linear", help="linear 保留旧行为；dag 并行调度独立分支")
+    run.add_argument("--max-parallel", default=3, type=int, help="DAG 最多并行 stage worker 数")
 
     start = subparsers.add_parser("start", help="在后台启动无人值守 Agent supervisor")
     start.add_argument("--job", required=True)
@@ -2909,6 +3352,24 @@ def main() -> None:
     start.add_argument("--codex-model", default="")
     start.add_argument("--codex-timeout", default=3600, type=int)
     start.add_argument("--max-steps", default=999, type=int)
+    start.add_argument("--scheduler", choices=["linear", "dag"], default="dag")
+    start.add_argument("--max-parallel", default=3, type=int)
+
+    run_stage = subparsers.add_parser("run-stage", help=argparse.SUPPRESS)
+    run_stage.add_argument("--project-dir", required=True, type=Path)
+    run_stage.add_argument("--story-name", required=True)
+    run_stage.add_argument("--slug", required=True)
+    run_stage.add_argument("--stage", required=True, choices=STORY_STAGE_SEQUENCE)
+    run_stage.add_argument("--result-file", required=True, type=Path)
+    run_stage.add_argument("--run-epoch", required=True, type=int)
+    run_stage.add_argument("--attempt-id", required=True)
+    run_stage.add_argument("--codex-mode", choices=["handoff", "cli"], default="cli")
+    run_stage.add_argument("--codex-model", default="")
+    run_stage.add_argument("--codex-sandbox", choices=["read-only", "workspace-write", "danger-full-access"], default="workspace-write")
+    run_stage.add_argument("--codex-approval", choices=["untrusted", "on-request", "never"], default="never")
+    run_stage.add_argument("--codex-path", default="codex")
+    run_stage.add_argument("--codex-timeout", default=3600, type=int)
+    run_stage.add_argument("--codex-story-image-batch-size", default=15, type=int)
 
     status = subparsers.add_parser("status", help="查看 Agent 下一阶段")
     status.add_argument("--job", default="")
@@ -2965,6 +3426,59 @@ def main() -> None:
     qualification.add_argument("--output", default=ROOT / "FULL_AUTO_PROMOTION_REPORT.md", type=Path)
 
     args = parser.parse_args()
+    if args.command == "run-stage":
+        result = StageResult("failed", "worker 未执行")
+        try:
+            configured_epoch = int(os.environ.get("STORY_AGENT_RUN_EPOCH", "-1"))
+            control = load_control(args.project_dir)
+            if configured_epoch != args.run_epoch or int(control.get("run_epoch", -1)) != args.run_epoch:
+                result = StageResult("cancelled", "worker run epoch 已过期")
+            elif control.get("cancel_requested"):
+                result = StageResult("cancelled", "worker 启动前收到取消请求")
+            else:
+                context = AgentContext(
+                    project_dir=args.project_dir.expanduser(),
+                    inbox=None,
+                    story_name=args.story_name,
+                    slug=args.slug,
+                    execute=True,
+                    update_latest_episode=False,
+                    codex_mode=args.codex_mode,
+                    codex_model=args.codex_model,
+                    codex_sandbox=args.codex_sandbox,
+                    codex_approval=args.codex_approval,
+                    codex_path=args.codex_path,
+                    codex_timeout=max(30, args.codex_timeout),
+                    codex_story_image_batch_size=max(1, args.codex_story_image_batch_size),
+                    scheduler="linear",
+                    max_parallel=1,
+                )
+                worker = StoryAgent(context)
+                manifest = worker._manifest()
+                assert_runnable(manifest, context.project_dir)
+                actions = {name: action for name, _done, action in worker._stage_checks()}
+                result = actions[args.stage](manifest)
+                if result.status not in {"done", "blocked", "failed", "cancelled", "retrying"}:
+                    result = StageResult("failed", f"worker 返回了未知状态：{result.status}", result.handoff)
+        except JobCancelled as exc:
+            result = StageResult("cancelled", str(exc))
+        except Exception as exc:
+            result = StageResult("failed", f"{type(exc).__name__}: {exc}")
+        save_json(
+            args.result_file,
+            {
+                "version": 1,
+                "attempt_id": args.attempt_id,
+                "run_epoch": args.run_epoch,
+                "stage": args.stage,
+                "status": result.status,
+                "message": result.message,
+                "handoff": str(result.handoff) if result.handoff else "",
+                "finished_at": now(),
+            },
+        )
+        print(json.dumps({"stage": args.stage, "status": result.status, "result_file": str(args.result_file)}, ensure_ascii=False))
+        return
     if args.command == "submit":
         if args.soft_budget < 0 or args.hard_budget <= 0 or args.soft_budget > args.hard_budget:
             parser.error("预算必须满足 0 <= soft-budget <= hard-budget")
@@ -2972,6 +3486,8 @@ def main() -> None:
         job_id, project_dir, created = submit_video_job(
             args.video,
             lut=args.lut,
+            input_mode=args.input_mode,
+            confirmed_text=args.confirmed_text,
             projects_root=args.projects_root,
             story_name=args.story_name,
             slug=args.slug,
@@ -2981,7 +3497,7 @@ def main() -> None:
             hard_budget_cny=args.hard_budget,
             deadline_hours=args.deadline_hours,
         )
-        print(json.dumps({"job_id": job_id, "project_dir": str(project_dir), "created": created}, ensure_ascii=False, indent=2))
+        print(json.dumps({"job_id": job_id, "project_dir": str(project_dir), "created": created, "input_mode": args.input_mode}, ensure_ascii=False, indent=2))
         return
     if args.command == "start":
         registry = JobRegistry(args.registry)
@@ -2989,58 +3505,65 @@ def main() -> None:
         status_dir = project_paths(project_dir).status
         status_dir.mkdir(parents=True, exist_ok=True)
         supervisor_path = status_dir / "story_agent_supervisor.json"
-        if supervisor_path.exists():
-            try:
-                existing = json.loads(supervisor_path.read_text(encoding="utf-8"))
-                existing_pid = int(existing.get("pid", 0))
-                if process_is_alive(existing_pid):
-                    record_unattended_launch(project_dir, supervisor_record=supervisor_path)
-                    print(json.dumps({"job_id": args.job, "project_dir": str(project_dir), "pid": existing_pid, "started": False, "message": "supervisor 已在运行"}, ensure_ascii=False, indent=2))
-                    return
-            except (ValueError, json.JSONDecodeError):
-                pass
-        log_path = status_dir / "story_agent_supervisor.log"
-        command = [
-            resolve_agent_runtime_python(),
-            str(Path(__file__).resolve()),
-            "run",
-            "--job",
-            args.job,
-            "--execute",
-            "--codex-mode",
-            "cli",
-            "--max-steps",
-            str(max(1, args.max_steps)),
-            "--codex-timeout",
-            str(max(30, args.codex_timeout)),
-        ]
-        if args.registry:
-            command.extend(["--registry", str(args.registry.expanduser())])
-        if args.codex_model:
-            command.extend(["--codex-model", args.codex_model])
-        launched_at = now()
-        with log_path.open("a", encoding="utf-8") as log_file:
-            process = subprocess.Popen(
-                command,
-                cwd=str(ROOT),
-                stdin=subprocess.DEVNULL,
-                stdout=log_file,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-                close_fds=True,
+        with supervisor_start_lock(project_dir):
+            if supervisor_path.exists():
+                try:
+                    existing = json.loads(supervisor_path.read_text(encoding="utf-8"))
+                    existing_pid = int(existing.get("pid", 0))
+                    if process_is_alive(existing_pid):
+                        record_unattended_launch(project_dir, supervisor_record=supervisor_path)
+                        print(json.dumps({"job_id": args.job, "project_dir": str(project_dir), "pid": existing_pid, "started": False, "message": "supervisor 已在运行"}, ensure_ascii=False, indent=2))
+                        return
+                except (ValueError, json.JSONDecodeError):
+                    pass
+            log_path = status_dir / "story_agent_supervisor.log"
+            command = [
+                resolve_agent_runtime_python(),
+                str(Path(__file__).resolve()),
+                "run",
+                "--job",
+                args.job,
+                "--execute",
+                "--codex-mode",
+                "cli",
+                "--max-steps",
+                str(max(1, args.max_steps)),
+                "--codex-timeout",
+                str(max(30, args.codex_timeout)),
+                "--scheduler",
+                args.scheduler,
+                "--max-parallel",
+                str(max(1, args.max_parallel)),
+            ]
+            if args.registry:
+                command.extend(["--registry", str(args.registry.expanduser())])
+            if args.codex_model:
+                command.extend(["--codex-model", args.codex_model])
+            launched_at = now()
+            with log_path.open("a", encoding="utf-8") as log_file:
+                process = subprocess.Popen(
+                    command,
+                    cwd=str(ROOT),
+                    stdin=subprocess.DEVNULL,
+                    stdout=log_file,
+                    stderr=subprocess.STDOUT,
+                    start_new_session=True,
+                    close_fds=True,
+                )
+            save_json(
+                supervisor_path,
+                {
+                    "kind": "story_agent_start_v1",
+                    "job_id": args.job,
+                    "project_dir": str(project_dir.expanduser().resolve()),
+                    "pid": process.pid,
+                    "started_at": launched_at,
+                    "log": str(log_path.expanduser().resolve()),
+                    "command": command,
+                    "scheduler": args.scheduler,
+                    "max_parallel": max(1, args.max_parallel),
+                },
             )
-        save_json(
-            supervisor_path,
-            {
-                "kind": "story_agent_start_v1",
-                "job_id": args.job,
-                "project_dir": str(project_dir.expanduser().resolve()),
-                "pid": process.pid,
-                "started_at": launched_at,
-                "log": str(log_path.expanduser().resolve()),
-                "command": command,
-            },
-        )
         record_unattended_launch(project_dir, supervisor_record=supervisor_path)
         print(json.dumps({"job_id": args.job, "project_dir": str(project_dir), "pid": process.pid, "started": True, "log": str(log_path)}, ensure_ascii=False, indent=2))
         return
@@ -3088,6 +3611,8 @@ def main() -> None:
             codex_path=args.codex_path,
             codex_timeout=args.codex_timeout,
             codex_story_image_batch_size=max(1, args.codex_story_image_batch_size),
+            scheduler=args.scheduler,
+            max_parallel=max(1, args.max_parallel),
         )
         try:
             exit_code = StoryAgent(context).run(max(1, args.max_steps))

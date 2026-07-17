@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 from pathlib import Path
+from urllib.parse import urlparse
+
+from secret_store import read_secret
 
 from story_video_synthesizer.volcengine_video import (
     DEFAULT_BASE_URL,
@@ -18,6 +22,7 @@ from story_video_synthesizer.volcengine_video import (
     write_jobs_csv,
 )
 from story_video_synthesizer.image_video import write_review_page_from_rows
+from story_video_synthesizer.toapis_video import ToAPIsVideoClient, build_toapis_task_body
 
 
 RETRYABLE_STATUSES = {"failed", "error", "cancelled", "canceled", "expired"}
@@ -28,44 +33,59 @@ def reset_retryable_failed_row(row: dict[str, str], video_path: Path) -> bool:
         return False
     if row.get("status", "").strip() not in RETRYABLE_STATUSES:
         return False
-    if not row.get("task_id", "").strip():
-        return False
-
     scene = row.get("scene", "")
-    print(f"重置失败任务 {scene}：清除旧 task_id 后重新提交。", flush=True)
+    if row.get("task_id", "").strip():
+        print(f"重置失败任务 {scene}：清除旧 task_id 后重新提交。", flush=True)
+    else:
+        print(f"重置提交前失败任务 {scene}：清除错误后重新提交。", flush=True)
     for key in ["task_id", "video_url", "error", "api_response", "query_response"]:
         if key in row:
             row[key] = ""
     row["status"] = "todo"
+    row["provider_attempt"] = str(int(row.get("provider_attempt") or "0") + 1)
     return True
 
 
-def saved_video_base_url() -> str:
+def toapis_extra_body(jobs_csv: Path, row: dict[str, str], extra_body: dict[str, object] | None) -> dict[str, object]:
+    payload = dict(extra_body or {})
+    if "client_business_id" not in payload:
+        identity = "|".join(
+            [
+                str(jobs_csv.expanduser().resolve()),
+                row.get("scene", ""),
+                row.get("image_filename", ""),
+                row.get("prompt", ""),
+                row.get("provider_attempt", "0"),
+            ]
+        )
+        payload["client_business_id"] = "story_" + hashlib.sha256(identity.encode("utf-8")).hexdigest()[:32]
+    return payload
+
+
+def saved_video_adapter_value(key: str, fallback: str) -> str:
     config_path = Path(__file__).resolve().parent / "pipeline_config.json"
     if not config_path.exists():
-        return DEFAULT_BASE_URL
+        return fallback
     try:
         config = json.loads(config_path.read_text(encoding="utf-8"))
     except Exception:
-        return DEFAULT_BASE_URL
+        return fallback
     video_api = config.get("video_api")
     if not isinstance(video_api, dict):
-        return DEFAULT_BASE_URL
-    return str(video_api.get("base_url") or DEFAULT_BASE_URL).strip()
+        return fallback
+    provider = str(video_api.get("provider") or "").strip()
+    adapters = video_api.get("adapters")
+    if isinstance(adapters, dict) and isinstance(adapters.get(provider), dict):
+        return str(adapters[provider].get(key) or fallback).strip()
+    return str(video_api.get(key) or fallback).strip()
+
+
+def saved_video_base_url() -> str:
+    return saved_video_adapter_value("base_url", DEFAULT_BASE_URL)
 
 
 def saved_video_model() -> str:
-    config_path = Path(__file__).resolve().parent / "pipeline_config.json"
-    if not config_path.exists():
-        return DEFAULT_MODEL
-    try:
-        config = json.loads(config_path.read_text(encoding="utf-8"))
-    except Exception:
-        return DEFAULT_MODEL
-    video_api = config.get("video_api")
-    if not isinstance(video_api, dict):
-        return DEFAULT_MODEL
-    return str(video_api.get("model") or DEFAULT_MODEL).strip()
+    return saved_video_adapter_value("model", DEFAULT_MODEL)
 
 
 def parse_scene_filter(value: str) -> set[int]:
@@ -79,20 +99,21 @@ def parse_scene_filter(value: str) -> set[int]:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="用青云聚合 Grok 视频生成 API 批量生成图片转视频片段")
+    parser = argparse.ArgumentParser(description="通过已配置的视频供应商批量生成图片转视频片段")
     parser.add_argument("--jobs-csv", required=True, type=Path, help="prepare_image_video_jobs.py 生成的任务 CSV")
     parser.add_argument("--images-dir", required=True, type=Path, help="稳定命名图片文件夹")
     parser.add_argument("--videos-dir", required=True, type=Path, help="生成视频保存文件夹")
-    parser.add_argument("--api-key", default=os.getenv("QINGYUN_API_KEY", ""), help="青云聚合 API Key；只从 QINGYUN_API_KEY 环境变量或本参数读取")
-    parser.add_argument("--base-url", default=os.getenv("QINGYUN_BASE_URL") or saved_video_base_url(), help="API Base URL")
-    parser.add_argument("--model", default=saved_video_model() or os.getenv("QINGYUN_VIDEO_MODEL", DEFAULT_MODEL), help="视频生成模型")
+    parser.add_argument("--api-key-env", default=saved_video_adapter_value("api_key_env", "QINGYUN_API_KEY"), help="只读取这个环境变量或同名 macOS Keychain 服务中的 API Key；不会写入 CSV 或日志")
+    parser.add_argument("--api-key", default="", help="兼容旧 CLI；优先使用 --api-key-env 指定的环境变量")
+    parser.add_argument("--base-url", default=os.getenv("VIDEO_API_BASE_URL") or saved_video_base_url(), help="API Base URL")
+    parser.add_argument("--model", default=os.getenv("VIDEO_MODEL") or saved_video_model(), help="视频生成模型")
     parser.add_argument("--ratio", default="16:9")
     parser.add_argument("--duration", default=10.0, type=float)
     parser.add_argument("--resolution", default="720p")
-    parser.add_argument("--seconds", default=os.getenv("QINGYUN_VIDEO_SECONDS", DEFAULT_SECONDS), help="青云接口固定生成秒数，Grok video 3 当前按次生成 10 秒")
-    parser.add_argument("--size", default=os.getenv("QINGYUN_VIDEO_SIZE", DEFAULT_SIZE), help="视频清晰度，例如 720P 或 1080P")
+    parser.add_argument("--seconds", default=os.getenv("VIDEO_SECONDS", DEFAULT_SECONDS), help="供应商接口生成秒数；本项目 Grok Video 3 固定使用 10 秒")
+    parser.add_argument("--size", default=os.getenv("VIDEO_SIZE", DEFAULT_SIZE), help="视频清晰度，例如 720P 或 1080P")
     parser.add_argument("--timing-mode", choices=["frames", "duration"], default="frames", help="默认用 frames 支持小数秒")
-    parser.add_argument("--parameter-style", choices=["prompt", "body"], default="prompt", help="兼容旧参数；青云接口会忽略旧的 prompt/body 参数风格")
+    parser.add_argument("--parameter-style", choices=["prompt", "body"], default="prompt", help="旧供应商兼容参数；ToAPIs 路径忽略此项")
     parser.add_argument("--camerafixed", action="store_true", help="固定镜头；默认 false")
     parser.add_argument("--watermark", action="store_true", help="添加水印；默认 false")
     parser.add_argument("--start-scene", default=1, type=int)
@@ -106,7 +127,7 @@ def main() -> None:
     parser.add_argument("--submit-all-first", action="store_true", help="先批量提交待生成任务，再逐个轮询下载；可减少服务端排队导致的串行等待")
     parser.add_argument(
         "--max-submit-first",
-        default=int(os.getenv("QINGYUN_MAX_SUBMIT_FIRST", "20")),
+        default=int(os.getenv("VIDEO_MAX_SUBMIT_FIRST", "20")),
         type=int,
         help="批量提交模式下最多保留多少个已提交未完成任务；0 表示不限制",
     )
@@ -118,7 +139,10 @@ def main() -> None:
 
     rows = read_jobs_csv(args.jobs_csv.expanduser())
     args.videos_dir.expanduser().mkdir(parents=True, exist_ok=True)
-    client = None if args.dry_run else QingyunVideoClient(api_key=args.api_key or "", base_url=args.base_url)
+    api_key = read_secret(args.api_key_env) or args.api_key.strip()
+    is_toapis = urlparse(args.base_url).netloc.lower() in {"toapis.com", "www.toapis.com"}
+    client_type = ToAPIsVideoClient if is_toapis else QingyunVideoClient
+    client = None if args.dry_run else client_type(api_key=api_key, base_url=args.base_url)
     extra_body = json.loads(args.extra_body_json) if args.extra_body_json.strip() else None
     selected_scene_numbers = parse_scene_filter(args.scenes)
     selected_rows = [
@@ -171,6 +195,7 @@ def main() -> None:
             frames = int(row["frames"]) if args.timing_mode == "frames" and row.get("frames", "").strip() else None
             print(f"批量创建任务 {row['scene']}：{row['image_filename']}", flush=True)
             try:
+                request_extra = toapis_extra_body(args.jobs_csv, row, extra_body) if is_toapis else extra_body
                 created = client.create_task(
                     model=args.model,
                     prompt=row["prompt"],
@@ -184,7 +209,7 @@ def main() -> None:
                     parameter_style=args.parameter_style,
                     camera_fixed=args.camerafixed,
                     watermark=args.watermark,
-                    extra_body=extra_body,
+                    extra_body=request_extra,
                 )
             except Exception as exc:
                 if "local_quota_not_enough" in str(exc) or "上游负载已饱和" in str(exc):
@@ -235,35 +260,19 @@ def main() -> None:
             frames = int(row["frames"]) if args.timing_mode == "frames" and row.get("frames", "").strip() else None
             if args.dry_run:
                 image_path = args.images_dir.expanduser() / row["image_filename"]
-                body = build_create_task_body(
-                    model=args.model,
-                    prompt=row["prompt"],
-                    image_path=image_path,
-                    ratio=args.ratio,
-                    duration=duration,
-                    resolution=args.resolution.strip() or None,
-                    frames=frames,
-                    seconds=args.seconds,
-                    size=args.size,
-                    parameter_style=args.parameter_style,
-                    camera_fixed=args.camerafixed,
-                    watermark=args.watermark,
-                    extra_body=extra_body,
-                )
-                redacted = json.loads(json.dumps(body, ensure_ascii=False))
-                if "input_reference" in redacted:
-                    redacted["input_reference"] = str(image_path)
-                print(json.dumps(redacted, ensure_ascii=False, indent=2), flush=True)
-                processed += 1
-                continue
-
-            if not args.poll_existing:
-                task_id = row.get("task_id", "").strip()
-                if not task_id:
-                    image_path = args.images_dir.expanduser() / row["image_filename"]
-                    print(f"创建任务 {row['scene']}：{row['image_filename']}", flush=True)
-                    assert client is not None
-                    created = client.create_task(
+                if is_toapis:
+                    request_extra = toapis_extra_body(args.jobs_csv, row, extra_body)
+                    body = build_toapis_task_body(
+                        model=args.model,
+                        prompt=row["prompt"],
+                        image_url=f"UPLOAD_REQUIRED:{image_path.name}",
+                        ratio=args.ratio,
+                        seconds=args.seconds,
+                        resolution=args.resolution.strip() or args.size,
+                        extra_body=request_extra,
+                    )
+                else:
+                    body = build_create_task_body(
                         model=args.model,
                         prompt=row["prompt"],
                         image_path=image_path,
@@ -277,6 +286,35 @@ def main() -> None:
                         camera_fixed=args.camerafixed,
                         watermark=args.watermark,
                         extra_body=extra_body,
+                    )
+                redacted = json.loads(json.dumps(body, ensure_ascii=False))
+                if "input_reference" in redacted:
+                    redacted["input_reference"] = str(image_path)
+                print(json.dumps(redacted, ensure_ascii=False, indent=2), flush=True)
+                processed += 1
+                continue
+
+            if not args.poll_existing:
+                task_id = row.get("task_id", "").strip()
+                if not task_id:
+                    image_path = args.images_dir.expanduser() / row["image_filename"]
+                    print(f"创建任务 {row['scene']}：{row['image_filename']}", flush=True)
+                    assert client is not None
+                    request_extra = toapis_extra_body(args.jobs_csv, row, extra_body) if is_toapis else extra_body
+                    created = client.create_task(
+                        model=args.model,
+                        prompt=row["prompt"],
+                        image_path=image_path,
+                        ratio=args.ratio,
+                        duration=duration,
+                        resolution=args.resolution.strip() or None,
+                        frames=frames,
+                        seconds=args.seconds,
+                        size=args.size,
+                        parameter_style=args.parameter_style,
+                        camera_fixed=args.camerafixed,
+                        watermark=args.watermark,
+                        extra_body=request_extra,
                     )
                     row["task_id"] = created.task_id
                     row["status"] = "submitted"

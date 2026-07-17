@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -48,12 +49,12 @@ STORY_STAGE_SEQUENCE = (
     "release_qa",
     "release_video_review",
     "publish_package",
-    "publish_package_review",
     "product_preflight",
     "product_annotation",
     "product_annotation_review",
     "product_package",
     "product_package_review",
+    "publish_package_review",
     "final_delivery",
     "doctor",
 )
@@ -108,6 +109,28 @@ class JobCancelled(AgentRuntimeError):
 
 def now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def runtime_elapsed_seconds(agent: dict[str, Any], *, include_current: bool = True) -> float:
+    elapsed = max(0.0, float(agent.get("active_elapsed_seconds", 0.0) or 0.0))
+    started_at = str(agent.get("started_at", ""))
+    if include_current and started_at:
+        try:
+            elapsed += max(0.0, time.time() - time.mktime(time.strptime(started_at, "%Y-%m-%d %H:%M:%S")))
+        except ValueError:
+            pass
+    return elapsed
+
+
+def start_runtime(agent: dict[str, Any]) -> None:
+    agent.setdefault("active_elapsed_seconds", 0.0)
+    if not agent.get("started_at"):
+        agent["started_at"] = now()
+
+
+def freeze_runtime(agent: dict[str, Any]) -> None:
+    agent["active_elapsed_seconds"] = round(runtime_elapsed_seconds(agent), 3)
+    agent["started_at"] = ""
 
 
 def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -199,6 +222,7 @@ def ensure_manifest_v2(
     agent.setdefault("deadline_hours", float(deadline_hours))
     agent.setdefault("min_free_disk_gb", DEFAULT_MIN_FREE_DISK_GB)
     agent.setdefault("started_at", "")
+    agent.setdefault("active_elapsed_seconds", 0.0)
     agent.setdefault("finished_at", "")
     budget = agent.setdefault("budget", {})
     budget.setdefault("currency", "CNY")
@@ -208,6 +232,8 @@ def ensure_manifest_v2(
     budget.setdefault("reserved", 0.0)
     budget.setdefault("entries", [])
     agent.setdefault("source", {})
+    agent.setdefault("input_contract", {})
+    agent.setdefault("external_blockers", [])
     stages = agent.setdefault("stages", {})
     for stage in STORY_STAGE_SEQUENCE:
         record = stages.setdefault(stage, {})
@@ -309,7 +335,18 @@ def mark_stage(
     agent = manifest["agent"]
     agent["heartbeat_at"] = now()
     if status == "passed":
-        agent["last_checkpoint"] = stage
+        current_checkpoint = str(agent.get("last_checkpoint") or "")
+        current_index = STORY_STAGE_SEQUENCE.index(current_checkpoint) if current_checkpoint in STORY_STAGE_SEQUENCE else -1
+        stage_index = STORY_STAGE_SEQUENCE.index(stage) if stage in STORY_STAGE_SEQUENCE else current_index
+        if stage_index >= current_index:
+            agent["last_checkpoint"] = stage
+        unresolved = any(
+            item.get("status") in {"blocked", "failed", "cancelled"}
+            for item in agent.get("stages", {}).values()
+            if isinstance(item, dict)
+        )
+        if not unresolved:
+            agent["blocked_reason"] = ""
     if status == "blocked":
         agent["blocked_reason"] = message
     agent["events"] = [
@@ -344,7 +381,11 @@ def existing_artifact_hashes(artifacts: list[Path | str]) -> dict[str, str]:
 def review_passes(payload: dict[str, Any], *, artifact: Path | None = None, threshold: int = PASS_SCORE) -> bool:
     if not payload.get("approved", False):
         return False
-    if float(payload.get("score", 0)) < threshold:
+    try:
+        score = float(payload.get("score", 0))
+    except (TypeError, ValueError):
+        return False
+    if not math.isfinite(score) or score < threshold:
         return False
     if payload.get("critical_errors"):
         return False
@@ -477,6 +518,7 @@ class JobRegistry:
 def submit_video_job(
     video: Path,
     *,
+    lut: Path | None = None,
     projects_root: Path,
     story_name: str = "",
     slug: str = "",
@@ -492,6 +534,16 @@ def submit_video_job(
     if source.suffix.lower() not in {".mp4", ".mov", ".mkv", ".m4v"}:
         raise ValueError(f"不支持的视频格式：{source.suffix}")
     fingerprint = media_fingerprint(source)
+    color_lut: Path | None = None
+    lut_sha256 = ""
+    if lut is not None:
+        color_lut = lut.expanduser().resolve()
+        if not color_lut.is_file():
+            raise FileNotFoundError(f"LUT 不存在：{color_lut}")
+        if color_lut.suffix.lower() != ".cube":
+            raise ValueError(f"当前只支持 .cube LUT：{color_lut}")
+        lut_sha256 = file_sha256(color_lut)
+        fingerprint = hashlib.sha256(f"{fingerprint}:{lut_sha256}".encode("utf-8")).hexdigest()
     media_info = probe_source_video(source)
     registry = registry or JobRegistry()
     existing = registry.find_by_source(fingerprint)
@@ -507,8 +559,11 @@ def submit_video_job(
     manifest = init_project(project_dir, story_name=inferred_name, slug=safe_slug)
     paths = project_paths(project_dir)
     target = paths.inputs / f"{safe_slug}_greenscreen_source{source.suffix.lower()}"
-    if not target.exists():
-        shutil.copy2(source, target)
+    copy_verified_input(source, target)
+    lut_target: Path | None = None
+    if color_lut is not None:
+        lut_target = paths.inputs / f"{safe_slug}_input_lut.cube"
+        copy_verified_input(color_lut, lut_target)
     ensure_manifest_v2(
         manifest,
         job_id=job_id,
@@ -517,6 +572,8 @@ def submit_video_job(
         deadline_hours=deadline_hours,
     )
     manifest["inputs"]["greenscreen_video"] = str(target)
+    if lut_target is not None:
+        manifest["inputs"]["color_lut"] = str(lut_target)
     manifest["agent"]["source"] = {
         "original_path": str(source),
         "project_copy": str(target),
@@ -526,10 +583,94 @@ def submit_video_job(
         "media": media_info,
         "submitted_at": now(),
     }
+    manifest["agent"]["input_contract"] = {
+        "version": 1,
+        "mode": "single_greenscreen",
+        "created_at": now(),
+        "user_inputs": [
+            {
+                "role": "greenscreen_video",
+                "path": str(target),
+                "sha256": file_sha256(target),
+                "bytes": target.stat().st_size,
+            }
+        ],
+        "processing_assets": [],
+        "derived_inputs": {},
+    }
+    if color_lut is not None and lut_target is not None:
+        manifest["agent"]["source"]["color_lut"] = {
+            "original_path": str(color_lut),
+            "project_copy": str(lut_target),
+            "sha256": lut_sha256,
+            "bytes": color_lut.stat().st_size,
+        }
+        manifest["agent"]["input_contract"]["processing_assets"].append(
+            {
+                "role": "color_lut",
+                "path": str(lut_target),
+                "sha256": lut_sha256,
+                "bytes": lut_target.stat().st_size,
+            }
+        )
     manifest["agent"]["status"] = "pending"
     write_manifest(paths, manifest)
     registry.register(job_id, project_dir, fingerprint)
     return job_id, project_dir, True
+
+
+def record_derived_input(
+    manifest: dict[str, Any],
+    *,
+    role: str,
+    path: Path,
+    source_sha256: str,
+    decisions_sha256: str,
+    producer: str = "source_video_pipeline",
+) -> None:
+    """Record a source-edit derivative without creating a submit contract retroactively."""
+    contract = manifest.get("agent", {}).get("input_contract")
+    if not isinstance(contract, dict) or contract.get("mode") != "single_greenscreen" or not path.is_file():
+        return
+    derived = contract.setdefault("derived_inputs", {})
+    derived[role] = {
+        "path": str(path),
+        "sha256": file_sha256(path),
+        "bytes": path.stat().st_size,
+        "producer": producer,
+        "source_sha256": source_sha256,
+        "decisions_sha256": decisions_sha256,
+    }
+
+
+def copy_verified_input(source: Path, target: Path) -> None:
+    """Copy an immutable task input without accepting an interrupted partial file."""
+    source_size = source.stat().st_size
+    source_sha = file_sha256(source)
+    if target.is_file() and target.stat().st_size == source_size and file_sha256(target) == source_sha:
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.partial-{uuid.uuid4().hex}")
+    try:
+        shutil.copy2(source, temporary)
+        if temporary.stat().st_size != source_size or file_sha256(temporary) != source_sha:
+            raise AgentRuntimeError(f"输入素材复制校验失败：{source} -> {target}")
+        os.replace(temporary, target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def process_is_alive(pid: int) -> bool:
+    """Treat EPERM as alive: sandboxed status readers may not signal the supervisor."""
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+        return True
+    except PermissionError:
+        return True
+    except OSError:
+        return False
 
 
 @contextmanager
@@ -542,10 +683,8 @@ def job_lock(project_dir: Path, *, stale_seconds: int = 12 * 3600) -> Iterator[P
         try:
             payload = json.loads(lock.read_text(encoding="utf-8"))
             pid = int(payload.get("pid", 0))
-            if pid > 0:
-                os.kill(pid, 0)
-                alive = True
-        except (OSError, ValueError, json.JSONDecodeError):
+            alive = process_is_alive(pid)
+        except (ValueError, json.JSONDecodeError):
             alive = False
         if stale or not alive:
             lock.unlink(missing_ok=True)
@@ -564,6 +703,7 @@ def job_lock(project_dir: Path, *, stale_seconds: int = 12 * 3600) -> Iterator[P
 def request_cancel(project_dir: Path) -> dict[str, Any]:
     paths = project_paths(project_dir)
     manifest = ensure_manifest_v2(load_manifest(paths) or init_project(project_dir))
+    freeze_runtime(manifest["agent"])
     manifest["agent"]["cancel_requested"] = True
     manifest["agent"]["status"] = "cancelled"
     manifest["agent"]["events"].append({"time": now(), "event": "cancel_requested"})
@@ -574,10 +714,10 @@ def request_cancel(project_dir: Path) -> dict[str, Any]:
 def resume_job(project_dir: Path) -> dict[str, Any]:
     paths = project_paths(project_dir)
     manifest = ensure_manifest_v2(load_manifest(paths) or init_project(project_dir))
+    freeze_runtime(manifest["agent"])
     manifest["agent"]["cancel_requested"] = False
     manifest["agent"]["status"] = "pending"
     manifest["agent"]["blocked_reason"] = ""
-    manifest["agent"]["started_at"] = ""
     manifest["agent"]["events"].append({"time": now(), "event": "resume_requested"})
     write_manifest(paths, manifest)
     return manifest
@@ -587,15 +727,9 @@ def assert_runnable(manifest: dict[str, Any], project_dir: Path | None = None) -
     ensure_manifest_v2(manifest)
     if manifest["agent"].get("cancel_requested"):
         raise JobCancelled("任务已取消；使用 resume 后才能继续。")
-    started_at = manifest["agent"].get("started_at")
-    if started_at:
-        try:
-            started = time.mktime(time.strptime(started_at, "%Y-%m-%d %H:%M:%S"))
-            elapsed_hours = (time.time() - started) / 3600
-            if elapsed_hours > float(manifest["agent"].get("deadline_hours", DEFAULT_DEADLINE_HOURS)):
-                raise AgentRuntimeError(f"任务已超过运行时限：{elapsed_hours:.1f} 小时")
-        except ValueError:
-            pass
+    elapsed_hours = runtime_elapsed_seconds(manifest["agent"]) / 3600
+    if elapsed_hours > float(manifest["agent"].get("deadline_hours", DEFAULT_DEADLINE_HOURS)):
+        raise AgentRuntimeError(f"任务已超过累计运行时限：{elapsed_hours:.1f} 小时")
     if project_dir is not None:
         usage = shutil.disk_usage(project_dir)
         minimum = float(manifest["agent"].get("min_free_disk_gb", DEFAULT_MIN_FREE_DISK_GB)) * 1024**3
@@ -632,13 +766,7 @@ def render_job_report(project_dir: Path) -> Path:
     manifest = ensure_manifest_v2(load_manifest(paths) or {})
     agent = manifest["agent"]
     budget = agent["budget"]
-    started_text = str(agent.get("started_at", ""))
-    elapsed_hours = 0.0
-    if started_text:
-        try:
-            elapsed_hours = max(0.0, (time.time() - time.mktime(time.strptime(started_text, "%Y-%m-%d %H:%M:%S"))) / 3600)
-        except ValueError:
-            pass
+    elapsed_hours = runtime_elapsed_seconds(agent) / 3600
     deadline_hours = float(agent.get("deadline_hours", DEFAULT_DEADLINE_HOURS))
     stages = agent.get("stages", {}) if isinstance(agent.get("stages"), dict) else {}
     remaining = [name for name in STORY_STAGE_SEQUENCE if stages.get(name, {}).get("status") != "passed"]

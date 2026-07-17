@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -29,8 +30,8 @@ class SynthesisConfig:
     x264_preset: str = "veryfast"
     x264_crf: int = 20
     subtitle_style: str = "clean"
-    sales_skip_head_lines: int = 2
-    sales_skip_tail_lines: int = 1
+    sales_skip_head_lines: int = -1
+    sales_skip_tail_lines: int = -1
     keep_workdir: bool = False
     whisper_model_dir: Path | None = None
     progress_callback: Callable[[str], None] | None = None
@@ -187,11 +188,39 @@ def synthesize_story(config: SynthesisConfig) -> SynthesisResult:
 
 
 def _sales_subtitle_timings(timings: list[LineTiming], config: SynthesisConfig) -> list[LineTiming]:
-    start = max(0, config.sales_skip_head_lines)
-    end = len(timings) - max(0, config.sales_skip_tail_lines)
+    if config.sales_skip_head_lines >= 0:
+        start = min(len(timings), config.sales_skip_head_lines)
+    else:
+        start = 0
+        while start < len(timings) and _is_host_intro_line(timings[start].line):
+            start += 1
+    if config.sales_skip_tail_lines >= 0:
+        end = len(timings) - config.sales_skip_tail_lines
+    else:
+        end = len(timings)
+        for index in range(start, len(timings)):
+            if _is_moral_or_outro_line(timings[index].line):
+                end = index
+                break
     if end < start:
         return []
     return timings[start:end]
+
+
+def _is_host_intro_line(text: str) -> bool:
+    clean = re.sub(r"\s+", "", text)
+    return bool(
+        re.match(r"^(?:大家好|小朋友们好|嗨[,，]?小朋友们|我是绵羊姐姐|今天(?:我要|要|来)?(?:给大家|给小朋友们)?(?:讲|分享|带来))", clean)
+        or re.search(r"故事(?:叫|是|名叫)[《〈].+[》〉]", clean)
+    )
+
+
+def _is_moral_or_outro_line(text: str) -> bool:
+    clean = re.sub(r"\s+", "", text)
+    return bool(
+        re.match(r"^(?:小朋友们[,，]?|这个故事告诉我们|故事告诉我们|我的故事讲完了|今天的故事就到这里)", clean)
+        or "这个故事告诉我们" in clean
+    )
 
 
 def _validate_tools() -> None:

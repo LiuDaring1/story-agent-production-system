@@ -12,6 +12,13 @@ from PIL import Image
 
 from video_provider_adapter import VideoProviderConfigError, resolve_video_provider
 from story_workflow import run_generate_until_complete
+from story_video_synthesizer.toapis_video import (
+    DEFAULT_USER_AGENT,
+    ToAPIsVideoClient,
+    build_toapis_task_body,
+    extract_toapis_video_url,
+)
+from run_image_video_jobs import reset_retryable_failed_row, toapis_extra_body
 
 
 class VideoProviderAdapterTests(unittest.TestCase):
@@ -106,6 +113,103 @@ class VideoProviderAdapterTests(unittest.TestCase):
             self.assertEqual(selected.runner, second)
             self.assertEqual(selected.model, "m2")
             self.assertEqual(selected.estimated_cost_cny_per_clip, 2.5)
+
+    def test_toapis_adapter_passes_only_secret_environment_name(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        config = {
+            "video_api": {
+                "provider": "toapis_grok",
+                "adapters": {
+                    "toapis_grok": {
+                        "runner": "run_image_video_jobs.py",
+                        "base_url": "https://toapis.com/v1",
+                        "model": "grok-video-3",
+                        "api_key_env": "TOAPIS_API_KEY",
+                        "estimated_cost_cny_per_clip": 3.0,
+                    }
+                },
+            }
+        }
+        selected = resolve_video_provider(config, root)
+        self.assertEqual(
+            selected.runner_args(),
+            ["--base-url", "https://toapis.com/v1", "--model", "grok-video-3", "--api-key-env", "TOAPIS_API_KEY"],
+        )
+        self.assertNotIn("sk-", " ".join(selected.runner_args()))
+
+    def test_toapis_request_and_nested_result_contract(self) -> None:
+        body = build_toapis_task_body(
+            model="grok-video-3",
+            prompt="大象缓慢抬起前腿",
+            image_url="https://files.example/scene.png",
+            seconds="10",
+            resolution="720P",
+        )
+        self.assertEqual(body["images"], ["https://files.example/scene.png"])
+        self.assertEqual(body["seconds"], "10")
+        self.assertEqual(body["resolution"], "720p")
+        payload = {"status": "completed", "result": {"data": [{"url": "https://files.example/out.mp4"}]}}
+        self.assertEqual(extract_toapis_video_url(payload), "https://files.example/out.mp4")
+
+    def test_toapis_request_uses_cloudflare_compatible_api_user_agent(self) -> None:
+        class Response:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self):
+                return b'{"ok": true}'
+
+        client = ToAPIsVideoClient("test-secret")
+        with patch("story_video_synthesizer.toapis_video.urlopen", return_value=Response()) as opener:
+            self.assertEqual(client._request("GET", "health", None), {"ok": True})
+        request = opener.call_args.args[0]
+        self.assertEqual(request.get_header("User-agent"), DEFAULT_USER_AGENT)
+
+    def test_toapis_business_id_is_stable_until_controlled_retry(self) -> None:
+        row = {"scene": "1", "image_filename": "01.png", "prompt": "蚂蚁向前走", "provider_attempt": "0"}
+        first = toapis_extra_body(Path("jobs.csv"), row, None)["client_business_id"]
+        second = toapis_extra_body(Path("jobs.csv"), dict(row), None)["client_business_id"]
+        self.assertEqual(first, second)
+        row["provider_attempt"] = "1"
+        retried = toapis_extra_body(Path("jobs.csv"), row, None)["client_business_id"]
+        self.assertNotEqual(first, retried)
+
+    def test_toapis_missing_business_id_proceeds_to_create(self) -> None:
+        client = ToAPIsVideoClient("test-secret")
+        with (
+            patch.object(client, "upload_image", return_value="https://files.example/01.png"),
+            patch.object(client, "get_task", side_effect=RuntimeError('ToAPIs HTTP 400：{"code":"task_not_exist"}')),
+            patch.object(client, "_request", return_value={"id": "created-123"}) as request,
+        ):
+            created = client.create_task(
+                model="grok-video-3",
+                prompt="大象缓慢走动",
+                image_path=Path("01.png"),
+                extra_body={"client_business_id": "story-stable-id"},
+            )
+        self.assertEqual(created.task_id, "created-123")
+        self.assertEqual(request.call_args.args[:2], ("POST", "videos/generations"))
+
+    def test_presubmit_failure_can_be_retried_without_a_task_id(self) -> None:
+        row = {
+            "scene": "1",
+            "status": "error",
+            "task_id": "",
+            "video_url": "",
+            "error": "upload rejected",
+            "api_response": "",
+            "query_response": "",
+            "provider_attempt": "0",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            changed = reset_retryable_failed_row(row, Path(directory) / "01.mp4")
+        self.assertTrue(changed)
+        self.assertEqual(row["status"], "todo")
+        self.assertEqual(row["error"], "")
+        self.assertEqual(row["provider_attempt"], "1")
 
     def test_unknown_provider_fails_before_paid_generation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

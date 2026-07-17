@@ -13,7 +13,8 @@
     "科普故事"
   ],
   "age_range_options": [
-    "3-5岁",
+    "3-6岁",
+    "4-6岁",
     "6-8岁",
     "9-11岁",
     "12-14岁",
@@ -37,42 +38,54 @@
     "b_story_box": "356,180,1209,680",
     "b_windows": "auto",
     "c_windows": "auto",
-    "person_height": 900,
-    "person_x": 755,
-    "person_y": 108,
+    "person_height": 1080,
+    "person_x": 260,
+    "person_y": 0,
     "person_crop": "",
-    "person_grade": "log-soft",
+    "person_grade": "natural",
     "person_beauty": "light",
     "keyer": "colorkey",
     "chroma_color": "0x00FF00",
     "chroma_similarity": 0.095,
     "chroma_blend": 0.04,
-    "watermark_width": 190,
-    "watermark_opacity": 0.78,
-    "watermark_speed": 1.0,
+    "watermark_width": 120,
+    "watermark_opacity": 0.62,
+    "watermark_speed": 0.35,
+    "tail_seconds": 0,
+    "tail_notice_text": "有需要联系客服，好作品有偿分享！",
     "story_logo_width_a": 150,
     "story_logo_width_b": 175,
     "story_logo_x": 42,
     "story_logo_y": 44,
     "output_scale": 2,
-    "crf": 17,
+    "crf": 15,
     "preset": "medium",
-    "subtitle_font_size": 42,
+    "subtitle_font_size": 52,
     "subtitle_margin_v": 72
   },
   "product_defaults": {
     "music_volume": 0.22,
-    "narration_volume": 1.0
+    "narration_volume": 1.0,
+    "include_demo_logo": false
   },
   "external_tools": {
-    "suno_story_score_skill": "~/Downloads/suno-story-score.skill",
-    "story_performance_script_skill": "~/Downloads/story-performance-script.skill"
+    "suno_story_score_skill": "/Users/baiyanglin/.codex/skills/suno-story-score/SKILL.md",
+    "story_performance_script_skill": "skills/story-performance-script/SKILL.md"
   },
   "video_api": {
-    "provider": "qingyun_api",
+    "provider": "toapis_grok",
     "fallback_provider": "browser",
     "browser_provider_name": "Flow",
+    "submit_all_first": true,
+    "max_submit_first": 20,
     "adapters": {
+      "toapis_grok": {
+        "runner": "run_image_video_jobs.py",
+        "base_url": "https://toapis.com/v1",
+        "model": "grok-video-3",
+        "api_key_env": "TOAPIS_API_KEY",
+        "estimated_cost_cny_per_clip": 0.42
+      },
       "qingyun_api": {
         "runner": "run_image_video_jobs.py",
         "base_url": "https://api.qingyuntop.top/v1",
@@ -94,8 +107,12 @@
     "deadline_hours": 10.0,
     "min_free_disk_gb": 10.0,
     "review_pass_score": 85,
+    "max_retries": 2,
+    "max_critical_retries": 3,
     "max_attempts": 2,
     "max_critical_attempts": 3,
-    "whisper_model": "small"
+    "whisper_model": "small",
+    "working_video_max_width": 0,
+    "proxy_video_max_width": 1280
   }
 }

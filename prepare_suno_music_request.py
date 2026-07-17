@@ -308,7 +308,11 @@ def _style_prompt_for_segment(*, title: str, index: int, label: str, text: str) 
 
 
 def _story_world(text: str) -> str:
-    chinese_markers = ["邯郸", "成语", "中国古代", "战国", "燕国", "赵国", "楚国", "齐国", "秦国", "学步"]
+    chinese_markers = [
+        "邯郸", "成语", "寓言", "民间", "神话", "历史", "中国古代", "古时候", "很久以前",
+        "战国", "燕国", "赵国", "楚国", "齐国", "秦国", "皇帝", "将军", "书生", "农夫",
+        "天帝", "龙王", "嫦娥", "后羿", "女娲", "盘古", "学步",
+    ]
     if any(marker in text for marker in chinese_markers):
         return "chinese"
     return "western"
@@ -316,13 +320,13 @@ def _story_world(text: str) -> str:
 
 def _instrument_plan(world: str, text: str) -> tuple[str, str, str]:
     if world == "chinese":
-        anchor = "piano-led children's underscore with soft strings"
+        anchor = "Chinese children's story underscore led by warm guzheng and soft bowed strings"
         if "向往邯郸与出发学习" in text:
-            accent = "subtle pentatonic piano touches"
-            extra = "warm traditional hint, no featured solo instrument"
+            accent = "subtle pentatonic dizi and pipa touches"
+            extra = "warm traditional Chinese color, light and child-friendly"
         elif "认真模仿与逐渐迷失" in text:
-            accent = "light pizzicato strings with sparse woodblock-like taps"
-            extra = "playful motion with subtle unease, no flute lead"
+            accent = "light pipa plucks with sparse woodblock taps"
+            extra = "playful pentatonic motion with subtle unease"
         elif "忘记本领与寓意收束" in text:
             accent = "light guzheng ornament with subtle rhythmic pulse"
             extra = "reflective color with a clearer ending shape"
@@ -336,8 +340,8 @@ def _instrument_plan(world: str, text: str) -> tuple[str, str, str]:
             accent = "light pizzicato strings with sparse woodblock-like taps"
             extra = "playful motion, no flute lead"
         else:
-            accent = "subtle pentatonic piano touches"
-            extra = "warm traditional hint, no featured solo instrument"
+            accent = "subtle dizi and pipa touches"
+            extra = "warm traditional Chinese color, no modern pop drums"
         return anchor, accent, extra
 
     anchor = "piano-led children's underscore with pizzicato strings"

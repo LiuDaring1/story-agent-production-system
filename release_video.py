@@ -72,6 +72,7 @@ class ReleaseConfig:
     chroma_blend: float
     keyer: str
     person_crop: tuple[int, int, int, int] | None
+    detected_person_bbox: tuple[int, int, int, int] | None
     person_grade: str
     person_beauty: str
     library_watermark_text: str
@@ -96,9 +97,9 @@ def main() -> None:
     parser.add_argument("--antipiracy-logo", type=Path, help="宝库号中间视频区域飘动防盗 PNG；不传则使用文字水印")
     parser.add_argument("--plate-image", type=Path, help="AI 生成的 3:4 完整底板图；传入后视频会嵌进 --video-box")
     parser.add_argument("--video-box", default="0,416,1080,608", help="视频嵌入窗口：x,y,w,h，基于 1080x1440")
-    parser.add_argument("--watermark-width", default=190, type=int, help="防盗 PNG 在中间视频里的显示宽度")
-    parser.add_argument("--watermark-opacity", default=0.78, type=float, help="防盗 PNG 不透明度，0-1")
-    parser.add_argument("--watermark-speed", default=1.0, type=float, help="防盗水印移动速度倍率，1 为默认，0.7 更慢")
+    parser.add_argument("--watermark-width", default=120, type=int, help="防盗 PNG 在中间视频里的显示宽度")
+    parser.add_argument("--watermark-opacity", default=0.62, type=float, help="防盗 PNG 不透明度，0-1")
+    parser.add_argument("--watermark-speed", default=0.35, type=float, help="防盗水印移动速度倍率，默认使用缓慢完整移动")
     parser.add_argument("--frame-image", type=Path, help="可选透明 PNG 框模板；不传则使用默认框")
     parser.add_argument("--story-box", default=f"{STORY_BOX_X},{STORY_BOX_Y},{STORY_BOX_W},{STORY_BOX_H}", help="A 画面故事视频窗口：x,y,w,h，基于 1920x1080")
     parser.add_argument("--story-bleed", default=0, type=int, help="故事视频开口遮罩扩展像素；默认由框内开口遮罩控制，不直接铺矩形")
@@ -113,7 +114,7 @@ def main() -> None:
     parser.add_argument("--story-logo-x", default=42, type=int, help="台标固定 X，基于 1920x1080 主画布")
     parser.add_argument("--story-logo-y", default=44, type=int, help="台标固定 Y，基于 1920x1080 主画布")
     parser.add_argument("--subtitle-srt", type=Path, help="独立叠在 16:9 横屏底部的字幕 SRT；故事框内视频应使用无字幕版")
-    parser.add_argument("--subtitle-font-size", default=42, type=int)
+    parser.add_argument("--subtitle-font-size", default=52, type=int)
     parser.add_argument("--subtitle-margin-v", default=72, type=int, help="字幕距 16:9 横屏底部距离")
     parser.add_argument("--mix-bg-audio", action="store_true", help="把 --bg-video 的音频作为配乐，与 --audio-mix 混合")
     parser.add_argument("--voice-volume", default=1.05, type=float, help="--audio-mix 人声音量倍率")
@@ -127,14 +128,14 @@ def main() -> None:
     parser.add_argument("--keyer", choices=["chromakey", "colorkey"], default="chromakey")
     parser.add_argument("--keying-preset-json", type=Path, help="自动抠像生成的 keying_preset.json；传入后覆盖抠像相关参数")
     parser.add_argument("--person-crop", default="", help="可选人像裁剪：x,y,w,h，例如 0,0,1080,1440")
-    parser.add_argument("--person-grade", choices=["none", "log-soft", "log-strong"], default="none")
+    parser.add_argument("--person-grade", choices=["none", "natural", "log-soft", "log-strong"], default="natural")
     parser.add_argument("--person-beauty", choices=["none", "light"], default="light", help="本地可复现轻度磨皮；不依赖剪映")
     parser.add_argument("--library-watermark-text", default="绵羊姐姐原创故事资源")
     parser.add_argument("--tail-seconds", default=0.0, type=float, help="宝库号结尾模糊提示时长；0 表示按总时长自动估算")
     parser.add_argument("--tail-notice-text", default="有需要联系客服，好作品有偿分享！")
-    parser.add_argument("--crf", default=19, type=int)
+    parser.add_argument("--crf", default=15, type=int)
     parser.add_argument("--preset", default="medium")
-    parser.add_argument("--output-scale", default=1, type=int, help="主账号输出倍率：1=1080x1440，2=2160x2880")
+    parser.add_argument("--output-scale", default=2, type=int, help="主账号输出倍率：1=1080x1440，2=2160x2880；宝库号固定 1080x1440")
     parser.add_argument("--preview-dir", type=Path, help="只生成发布合成预览帧 PNG，不编码完整视频")
     parser.add_argument("--preview-times", default="1,2,37,92", help="预览帧时间点，秒，用逗号分隔；默认包含开头动作帧以检查手部裁切")
     parser.add_argument("--preview-person-layouts", default="", help="预览人像布局候选；auto 或 height,x,y;label:height,x,y")
@@ -153,6 +154,9 @@ def main() -> None:
     person_crop_value = args.person_crop
     if not person_crop_value.strip() and keying.get("person_crop") is not None:
         person_crop_value = format_preset_box(keying["person_crop"])
+    detected_person_bbox_value = ""
+    if keying.get("detected_person_bbox") is not None:
+        detected_person_bbox_value = format_preset_box(keying["detected_person_bbox"])
     person_height = args.person_height
     person_x = args.person_x
     person_y = args.person_y
@@ -212,6 +216,7 @@ def main() -> None:
         chroma_blend=float(keying.get("chroma_blend", args.chroma_blend)),
         keyer=keyer,
         person_crop=parse_optional_box(person_crop_value, "--person-crop"),
+        detected_person_bbox=parse_optional_box(detected_person_bbox_value, "detected_person_bbox"),
         person_grade=person_grade,
         person_beauty=person_beauty,
         library_watermark_text=args.library_watermark_text,
@@ -441,7 +446,7 @@ def package_release_videos(config: ReleaseConfig) -> None:
         main_vertical = config.output_dir / "主账号发布视频.mp4"
         render_main_wide(config, assets["frame"], main_wide)
         if config.plate_image is not None:
-            render_plate_package(main_wide, config.plate_image, main_vertical, config)
+            render_plate_package(main_wide, config.plate_image, main_vertical, config, output_scale=config.output_scale)
         else:
             render_vertical_package(
                 source_video=main_wide,
@@ -450,6 +455,7 @@ def package_release_videos(config: ReleaseConfig) -> None:
                 output_path=main_vertical,
                 duration=probe_duration(main_wide),
                 config=config,
+                output_scale=config.output_scale,
             )
         print(f"已生成主账号发布视频：{main_vertical}")
 
@@ -464,7 +470,7 @@ def package_release_videos(config: ReleaseConfig) -> None:
             config=config,
         )
         if config.plate_image is not None:
-            render_plate_package(library_window, config.plate_image, library_output, config)
+            render_plate_package(library_window, config.plate_image, library_output, config, output_scale=1)
         else:
             render_vertical_package(
                 source_video=library_window,
@@ -473,6 +479,7 @@ def package_release_videos(config: ReleaseConfig) -> None:
                 output_path=library_output,
                 duration=probe_duration(library_window),
                 config=config,
+                output_scale=1,
             )
         print(f"已生成宝库号发布视频：{library_output}")
 
@@ -553,12 +560,24 @@ def render_main_preview_frame(
         person_path = work_dir / f"person_{int(round(timestamp)):03d}.png"
         extract_person_frame(config, config.person_greenscreen, person_path, timestamp)
         person = Image.open(person_path).convert("RGBA")
-        person = person.resize(
-            (max(1, round(person.width * config.person_height / max(1, person.height))), config.person_height),
-            Image.Resampling.LANCZOS,
-        )
-        person_x = (WIDE_WIDTH - person.width) // 2 if scene == "c" else config.person_x
-        base.alpha_composite(person, (person_x, config.person_y))
+        if scene == "c":
+            person, person_x, person_y = native_person_preview_layout(
+                person,
+                config.detected_person_bbox if config.person_crop is None else None,
+                WIDE_WIDTH,
+                WIDE_HEIGHT,
+            )
+        else:
+            if config.detected_person_bbox is not None and config.person_crop is None:
+                x, y, width, height = clamp_box(config.detected_person_bbox, person.width, person.height)
+                person = person.crop((x, y, x + width, y + height))
+            person = person.resize(
+                (max(1, round(person.width * config.person_height / max(1, person.height))), config.person_height),
+                Image.Resampling.LANCZOS,
+            )
+            person_x = max(0, min(config.person_x, WIDE_WIDTH - person.width))
+            person_y = max(0, min(config.person_y, WIDE_HEIGHT - person.height))
+        base.alpha_composite(person, (person_x, person_y))
     if config.watermark_logo is not None:
         logo = Image.open(config.watermark_logo).convert("RGBA")
         logo = ImageOps.contain(logo, (190, 190), method=Image.Resampling.LANCZOS)
@@ -674,6 +693,84 @@ def extract_person_frame(config: ReleaseConfig, video: Path, output_path: Path, 
     return output_path
 
 
+def clamp_box(box: tuple[int, int, int, int], canvas_width: int, canvas_height: int) -> tuple[int, int, int, int]:
+    x, y, width, height = box
+    x = max(0, min(canvas_width - 1, x))
+    y = max(0, min(canvas_height - 1, y))
+    width = max(1, min(canvas_width - x, width))
+    height = max(1, min(canvas_height - y, height))
+    return x, y, width, height
+
+
+def native_person_preview_layout(
+    person: Image.Image,
+    detected_bbox: tuple[int, int, int, int] | None,
+    output_width: int,
+    output_height: int,
+) -> tuple[Image.Image, int, int]:
+    """Reconstruct the original source composition without green edge bands."""
+    source_width, source_height = person.size
+    scale = min(output_width / source_width, output_height / source_height)
+    canvas_x = round((output_width - source_width * scale) / 2)
+    canvas_y = round((output_height - source_height * scale) / 2)
+    if detected_bbox is None:
+        resized = person.resize(
+            (max(1, round(source_width * scale)), max(1, round(source_height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+        return resized, canvas_x, canvas_y
+    x, y, width, height = clamp_box(detected_bbox, source_width, source_height)
+    cropped = person.crop((x, y, x + width, y + height))
+    cropped = cropped.resize(
+        (max(1, round(width * scale)), max(1, round(height * scale))),
+        Image.Resampling.LANCZOS,
+    )
+    return cropped, canvas_x + round(x * scale), canvas_y + round(y * scale)
+
+
+def probe_video_size(path: Path) -> tuple[int, int]:
+    process = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=p=0:s=x",
+            str(path),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(f"无法读取人物视频尺寸：{path}: {process.stderr.strip()}")
+    width_text, height_text = process.stdout.strip().split("x", 1)
+    return int(width_text), int(height_text)
+
+
+def native_person_filter_layout(
+    source_path: Path,
+    detected_bbox: tuple[int, int, int, int] | None,
+    output_width: int,
+    output_height: int,
+) -> tuple[str, int, int]:
+    source_width, source_height = probe_video_size(source_path)
+    scale = min(output_width / source_width, output_height / source_height)
+    canvas_x = round((output_width - source_width * scale) / 2)
+    canvas_y = round((output_height - source_height * scale) / 2)
+    if detected_bbox is None:
+        return f"scale={max(1, round(source_width * scale))}:{max(1, round(source_height * scale))}", canvas_x, canvas_y
+    x, y, width, height = clamp_box(detected_bbox, source_width, source_height)
+    return (
+        f"crop={width}:{height}:{x}:{y},scale={max(1, round(width * scale))}:{max(1, round(height * scale))}",
+        canvas_x + round(x * scale),
+        canvas_y + round(y * scale),
+    )
+
+
 def draw_preview_subtitle(
     image: Image.Image,
     config: ReleaseConfig,
@@ -737,6 +834,10 @@ def validate_config(config: ReleaseConfig) -> None:
         crop_x, crop_y, crop_width, crop_height = config.person_crop
         if min(crop_x, crop_y) < 0 or crop_width <= 0 or crop_height <= 0:
             raise ValueError("--person-crop 的 x/y 不能为负，宽高必须大于 0")
+    if config.detected_person_bbox is not None:
+        crop_x, crop_y, crop_width, crop_height = config.detected_person_bbox
+        if min(crop_x, crop_y) < 0 or crop_width <= 0 or crop_height <= 0:
+            raise ValueError("detected_person_bbox 的 x/y 不能为负，宽高必须大于 0")
     if config.person_height <= 0:
         raise ValueError("--person-height 必须大于 0")
     story_x, story_y, story_width, story_height = config.story_box
@@ -935,12 +1036,17 @@ def render_main_wide(config: ReleaseConfig, frame_image: Path, output_path: Path
         filters.append("[person_keyed]split=2[person_keyed_a][person_keyed_c]")
     else:
         filters.append("[person_keyed]null[person_keyed_a]")
+    a_subject_filter = ""
+    if config.detected_person_bbox is not None and config.person_crop is None:
+        source_width, source_height = probe_video_size(config.person_greenscreen)
+        crop_x, crop_y, crop_width, crop_height = clamp_box(config.detected_person_bbox, source_width, source_height)
+        a_subject_filter = f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
     filters.extend(
         [
             f"[{frame_index}:v]scale={wide_width}:{wide_height},setsar=1,format=rgba[frame]",
             "[withstory][frame]overlay=0:0[framed]",
-            f"[person_keyed_a]scale=-1:{config.person_height * scale},setsar=1,format=rgba[person]",
-            f"[framed][person]overlay={config.person_x * scale}:{config.person_y * scale}[withperson]",
+            f"[person_keyed_a]{a_subject_filter}scale=-1:{config.person_height * scale},setsar=1,format=rgba[person]",
+            f"[framed][person]overlay=min({config.person_x * scale}\\,W-w):min({config.person_y * scale}\\,H-h)[withperson]",
         ]
     )
     current = "withperson"
@@ -971,10 +1077,16 @@ def render_main_wide(config: ReleaseConfig, frame_image: Path, output_path: Path
         filters.append(f"[{current}][{b_current}]blend=all_expr='if({b_expr},B,A)'[ab_scene]")
         current = "ab_scene"
     if has_c:
+        c_person_filter, c_person_x, c_person_y = native_person_filter_layout(
+            config.person_greenscreen,
+            config.detected_person_bbox if config.person_crop is None else None,
+            wide_width,
+            wide_height,
+        )
         filters.extend(
             [
-                f"[person_keyed_c]scale=-1:{config.person_height * scale},setsar=1,format=rgba[person_c]",
-                f"[base_c][person_c]overlay=(W-w)/2:{config.person_y * scale}[c_person]",
+                f"[person_keyed_c]{c_person_filter},setsar=1,format=rgba[person_c]",
+                f"[base_c][person_c]overlay={c_person_x}:{c_person_y}[c_person]",
             ]
         )
         c_expr = "+".join(f"between(T\\,{start:.3f}\\,{end:.3f})" for start, end in config.c_windows)
@@ -1020,10 +1132,16 @@ def render_main_wide(config: ReleaseConfig, frame_image: Path, output_path: Path
             str(config.crf),
             "-pix_fmt",
             "yuv420p",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
             "-c:a",
             "aac",
             "-b:a",
-            "192k",
+            "256k",
             "-movflags",
             "+faststart",
             str(output_path),
@@ -1049,6 +1167,8 @@ def person_key_filters(config: ReleaseConfig, source_label: str) -> list[str]:
 
 
 def person_grade_filter(config: ReleaseConfig) -> str:
+    if config.person_grade == "natural":
+        return ",eq=contrast=1.05:saturation=1.07:brightness=0.01:gamma=0.99"
     if config.person_grade == "log-soft":
         return ",eq=contrast=1.18:saturation=1.25:brightness=0.03:gamma=0.96"
     if config.person_grade == "log-strong":
@@ -1163,19 +1283,26 @@ def render_vertical_package(
     output_path: Path,
     duration: float,
     config: ReleaseConfig,
+    tail_notice_png: Path | None = None,
+    output_scale: int | None = None,
 ) -> None:
+    scale = max(1, output_scale if output_scale is not None else config.output_scale)
+    final_width = FINAL_WIDTH * scale
+    final_height = FINAL_HEIGHT * scale
+    top_height = TOP_HEIGHT * scale
+    center_height = CENTER_HEIGHT * scale
+    bottom_height = BOTTOM_HEIGHT * scale
     filters = (
-        f"color=c=0xFFF7DF:s={FINAL_WIDTH}x{FINAL_HEIGHT}:d={duration:.3f}[base];"
-        f"[0:v]scale={FINAL_WIDTH}:{CENTER_HEIGHT}:force_original_aspect_ratio=decrease,"
-        f"pad={FINAL_WIDTH}:{CENTER_HEIGHT}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=rgba[center];"
-        f"[1:v]scale={FINAL_WIDTH}:{TOP_HEIGHT},format=rgba[top];"
-        f"[2:v]scale={FINAL_WIDTH}:{BOTTOM_HEIGHT},format=rgba[bottom];"
+        f"color=c=0xFFF7DF:s={final_width}x{final_height}:d={duration:.3f}[base];"
+        f"[0:v]scale={final_width}:{center_height}:force_original_aspect_ratio=decrease,"
+        f"pad={final_width}:{center_height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=rgba[center];"
+        f"[1:v]scale={final_width}:{top_height},format=rgba[top];"
+        f"[2:v]scale={final_width}:{bottom_height},format=rgba[bottom];"
         "[base][top]overlay=0:0[v1];"
-        f"[v1][center]overlay=0:{TOP_HEIGHT}[v2];"
-        f"[v2][bottom]overlay=0:{TOP_HEIGHT + CENTER_HEIGHT}[v]"
+        f"[v1][center]overlay=0:{top_height}[v2];"
+        f"[v2][bottom]overlay=0:{top_height + center_height}[packaged]"
     )
-    run_command(
-        [
+    command = [
             "ffmpeg",
             "-y",
             "-i",
@@ -1188,6 +1315,18 @@ def render_vertical_package(
             "1",
             "-i",
             str(bottom_panel),
+    ]
+    if tail_notice_png is not None:
+        tail_start = max(0.0, duration - min(3.0, resolved_tail_seconds(duration, config.tail_seconds)))
+        command.extend(["-loop", "1", "-i", str(tail_notice_png)])
+        filters += (
+            f";[3:v]scale={int(final_width * 0.82)}:-1,format=rgba[tail_notice];"
+            f"[packaged][tail_notice]overlay=x=(W-w)/2:y=(H-h)/2:enable='gte(t,{tail_start:.3f})'[v]"
+        )
+    else:
+        filters += ";[packaged]null[v]"
+    command.extend(
+        [
             "-filter_complex",
             filters,
             "-map",
@@ -1204,15 +1343,22 @@ def render_vertical_package(
             str(config.crf),
             "-pix_fmt",
             "yuv420p",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
             "-c:a",
             "aac",
             "-b:a",
-            "192k",
+            "256k",
             "-movflags",
             "+faststart",
             str(output_path),
         ]
     )
+    run_command(command)
 
 
 def render_library_window_video(
@@ -1265,6 +1411,7 @@ def render_library_window_video(
         audio_index = len(args_input_paths(args))
         args.extend(["-i", str(config.audio_mix)])
 
+    wm1_x, wm1_y, wm2_x, wm2_y = safe_watermark_motion_expressions(speed_x, speed_y)
     filters = [
         f"[0:v]scale={video_width}:{video_height}:force_original_aspect_ratio=increase,"
         f"crop={video_width}:{video_height},setsar=1,format=rgba[base]",
@@ -1273,8 +1420,8 @@ def render_library_window_video(
         f"[clean][blurred]overlay=0:0:enable='gte(t,{tail_start:.3f})'[tail]",
         f"[1:v]scale={watermark_width}:-1,format=rgba,colorchannelmixer=aa={opacity:.3f}[wm]",
         "[wm]split=2[wm1][wm2]",
-        f"[tail][wm1]overlay=x='mod(t*{speed_x:.3f}\\,W+w)-w':y='20+mod(t*{speed_y:.3f}\\,max(1\\,H-h-40))'[w1]",
-        f"[w1][wm2]overlay=x='W-mod(t*{speed_x:.3f}\\,W+w)':y='H-h-20-mod(t*{speed_y:.3f}\\,max(1\\,H-h-40))'[w2]",
+        f"[tail][wm1]overlay=x='{wm1_x}':y='{wm1_y}':enable='lt(t,{tail_start:.3f})'[w1]",
+        f"[w1][wm2]overlay=x='{wm2_x}':y='{wm2_y}':enable='lt(t,{tail_start:.3f})'[w2]",
     ]
     current = "w2"
     if subtitle_index is not None:
@@ -1309,10 +1456,16 @@ def render_library_window_video(
             str(config.crf),
             "-pix_fmt",
             "yuv420p",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
             "-c:a",
             "aac",
             "-b:a",
-            "192k",
+            "256k",
             "-movflags",
             "+faststart",
             str(output_path),
@@ -1321,9 +1474,16 @@ def render_library_window_video(
     run_command(args)
 
 
-def render_plate_package(source_video: Path, plate_image: Path, output_path: Path, config: ReleaseConfig) -> None:
+def render_plate_package(
+    source_video: Path,
+    plate_image: Path,
+    output_path: Path,
+    config: ReleaseConfig,
+    tail_notice_png: Path | None = None,
+    output_scale: int | None = None,
+) -> None:
     duration = probe_duration(source_video)
-    scale = config.output_scale
+    scale = max(1, output_scale if output_scale is not None else config.output_scale)
     final_width = FINAL_WIDTH * scale
     final_height = FINAL_HEIGHT * scale
     x, y, width, height = scaled_box(config.video_box, scale)
@@ -1336,10 +1496,9 @@ def render_plate_package(source_video: Path, plate_image: Path, output_path: Pat
         f"[base][window]overlay={x}:{y}[under];"
         f"[1:v]scale={final_width}:{final_height}:force_original_aspect_ratio=increase,"
         f"crop={final_width}:{final_height},setsar=1,format=rgba[plate];"
-        f"[under][plate]overlay=0:0[v]"
+        f"[under][plate]overlay=0:0[packaged]"
     )
-    run_command(
-        [
+    command = [
             "ffmpeg",
             "-y",
             "-i",
@@ -1348,6 +1507,18 @@ def render_plate_package(source_video: Path, plate_image: Path, output_path: Pat
             "1",
             "-i",
             str(plate_overlay),
+    ]
+    if tail_notice_png is not None:
+        tail_start = max(0.0, duration - min(3.0, resolved_tail_seconds(duration, config.tail_seconds)))
+        command.extend(["-loop", "1", "-i", str(tail_notice_png)])
+        filters += (
+            f";[2:v]scale={int(final_width * 0.82)}:-1,format=rgba[tail_notice];"
+            f"[packaged][tail_notice]overlay=x=(W-w)/2:y=(H-h)/2:enable='gte(t,{tail_start:.3f})'[v]"
+        )
+    else:
+        filters += ";[packaged]null[v]"
+    command.extend(
+        [
             "-filter_complex",
             filters,
             "-map",
@@ -1364,15 +1535,22 @@ def render_plate_package(source_video: Path, plate_image: Path, output_path: Pat
             str(config.crf),
             "-pix_fmt",
             "yuv420p",
+            "-colorspace",
+            "bt709",
+            "-color_primaries",
+            "bt709",
+            "-color_trc",
+            "bt709",
             "-c:a",
             "aac",
             "-b:a",
-            "192k",
+            "256k",
             "-movflags",
             "+faststart",
             str(output_path),
         ]
     )
+    run_command(command)
 
 
 def create_plate_overlay_cutout(
@@ -1493,7 +1671,17 @@ def resolved_tail_seconds(duration: float, configured_tail_seconds: float) -> fl
         return min(duration, configured_tail_seconds)
     if duration <= 1:
         return duration
-    return min(duration, max(20.0, min(30.0, duration / 6.0)))
+    return min(duration, max(30.0, min(50.0, duration / 5.0)))
+
+
+def safe_watermark_motion_expressions(speed_x: float, speed_y: float, margin: int = 20) -> tuple[str, str, str, str]:
+    """Return overlay expressions that keep both moving watermarks fully in frame."""
+    span = margin * 2
+    x_forward = f"{margin}+mod(t*{speed_x:.3f}\\,max(1\\,W-w-{span}))"
+    y_forward = f"{margin}+mod(t*{speed_y:.3f}\\,max(1\\,H-h-{span}))"
+    x_reverse = f"W-w-{margin}-mod(t*{speed_x:.3f}\\,max(1\\,W-w-{span}))"
+    y_reverse = f"H-h-{margin}-mod(t*{speed_y:.3f}\\,max(1\\,H-h-{span}))"
+    return x_forward, y_forward, x_reverse, y_reverse
 
 
 def font_candidates() -> list[Path]:

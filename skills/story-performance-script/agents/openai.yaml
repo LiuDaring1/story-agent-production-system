@@ -1,0 +1,4 @@
+interface:
+  display_name: "故事朗读标注"
+  short_description: "儿童故事朗读表演精修：重音、停顿、情绪、表情与动作批注"
+  default_prompt: "使用 $story-performance-script 将这篇儿童故事精修为可直接打包的朗读标注 JSON。"

@@ -44,8 +44,15 @@ def main() -> None:
         prompt = (decision.get("prompt") or "").strip()
         if prompt:
             row["prompt"] = prompt
-        row["review_status"] = review_status
-        row["review_notes"] = notes
+        if decisions:
+            row["review_status"] = review_status
+            row["review_notes"] = notes
+        else:
+            # These fields are derived bookkeeping. Adding them when no manual
+            # decision file is supplied changes the independently reviewed jobs
+            # CSV hash and makes the state machine loop back into video_review.
+            row.pop("review_status", None)
+            row.pop("review_notes", None)
         review_rows.append(
             {
                 "scene": scene,

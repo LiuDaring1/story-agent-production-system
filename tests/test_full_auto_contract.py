@@ -9,12 +9,16 @@ from pathlib import Path
 from PIL import Image
 
 from story_agent import canonical_video_prompt_rows, video_prompt_review_matches_current
-from story_agent_runtime import file_sha256, write_review_bundle
+from story_agent_runtime import STORY_STAGE_SEQUENCE, file_sha256, write_review_bundle
 from story_project import final_delivery, init_project, load_manifest, project_paths, sha256_file, write_manifest
 from tests.test_release_qa import make_vertical_video
 
 
 class FullAutoContractTests(unittest.TestCase):
+    def test_publish_claims_are_reviewed_after_product_package_exists(self) -> None:
+        self.assertLess(STORY_STAGE_SEQUENCE.index("publish_package"), STORY_STAGE_SEQUENCE.index("product_package"))
+        self.assertLess(STORY_STAGE_SEQUENCE.index("product_package_review"), STORY_STAGE_SEQUENCE.index("publish_package_review"))
+
     def test_video_prompt_review_snapshot_survives_status_writeback_but_rejects_content_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -88,12 +92,29 @@ class FullAutoContractTests(unittest.TestCase):
                 (base / name).write_bytes(b"mock")
             for source in base.iterdir():
                 shutil.copy2(source, advanced / source.name)
-            for name in ("背景视频：模拟（含字幕）.mp4", "背景视频：模拟（无字幕）.mp4", "故事PPT：模拟（含字幕）.pptx", "故事PPT：模拟（无字幕）.pptx"):
+            for name in ("背景视频：模拟（含字幕）.mp4", "背景视频：模拟（无字幕）.mp4", "故事PPT：模拟（含字幕）.pptx", "故事PPT：模拟（无字幕）.pptx", "A镜无人物背景视频：模拟.mp4"):
                 (advanced / name).write_bytes(b"mock")
 
             decisions = paths.status / "source_edit" / "edit_decisions.json"
             decisions.parent.mkdir(parents=True, exist_ok=True)
             decisions.write_text("{}", encoding="utf-8")
+            source_qa = paths.status / "qa_source_report.json"
+            source_qa.write_text(
+                json.dumps(
+                    {
+                        "passed": True,
+                        "errors": [],
+                        "artifacts": {
+                            "edit_decisions": {
+                                "path": str(decisions),
+                                "sha256": sha256_file(decisions),
+                                "bytes": decisions.stat().st_size,
+                            }
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
             manifest["outputs"].update(
                 {
                     "main_release_video": str(paths.release / "主账号发布视频.mp4"),
@@ -134,9 +155,19 @@ class FullAutoContractTests(unittest.TestCase):
                 "product_annotation_review": ("product_annotation_bundle.json", [next(base.glob("朗读标注*"))]),
                 "product_package_review": ("product_package_bundle.json", [base, advanced]),
             }
+            review_filenames = {
+                "story_images_review": "story_images_review_review.json",
+                "video_prompt_review": "video_prompt_review.json",
+                "video_review": "video_review_review.json",
+                "release_preview_review": "release_preview_review.json",
+                "release_video_review": "release_video_review_review.json",
+                "publish_package_review": "publish_package_review_review.json",
+                "product_annotation_review": "product_annotation_review_review.json",
+                "product_package_review": "product_package_review_review.json",
+            }
             for review_name, (bundle_name, artifacts) in bundles.items():
                 bundle = write_review_bundle(review_dir / bundle_name, artifacts)
-                (review_dir / f"{review_name}.json").write_text(
+                (review_dir / review_filenames[review_name]).write_text(
                     json.dumps({"approved": True, "score": 92, "critical_errors": [], "artifact_sha256": file_sha256(bundle)}),
                     encoding="utf-8",
                 )
@@ -170,6 +201,12 @@ class FullAutoContractTests(unittest.TestCase):
                 encoding="utf-8",
             )
 
+            bound_qa_files = [
+                Path(value)
+                for value in (load_manifest(paths) or {}).get("qa", {}).values()
+                if value and Path(value).is_file()
+            ]
+            qa_hashes_before_finalization = {path: sha256_file(path) for path in bound_qa_files}
             second_report = final_delivery(project)
             complete = load_manifest(paths)
             assert complete is not None
@@ -180,6 +217,11 @@ class FullAutoContractTests(unittest.TestCase):
                 + (paths.status / "qa_publish_report.json").read_text(encoding="utf-8"),
             )
             self.assertIn("必备交付物和独立审核均已满足", second_report.read_text(encoding="utf-8"))
+            self.assertEqual(
+                qa_hashes_before_finalization,
+                {path: sha256_file(path) for path in bound_qa_files},
+                "Agent 最终交付不得重写已经被独立审核绑定的 QA 报告",
+            )
             for name in ("成本报告.md", "QA汇总.md", "异常说明.md"):
                 self.assertTrue((paths.status / name).exists())
                 self.assertFalse((base / name).exists())

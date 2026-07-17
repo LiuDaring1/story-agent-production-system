@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import importlib.util
 import json
 import os
 import shutil
@@ -38,11 +39,15 @@ from story_agent_runtime import (
     job_lock,
     mark_stage,
     manifest_context_sha256,
+    process_is_alive,
     render_job_report,
     request_cancel,
     resume_job,
     review_bundle_is_current,
     review_passes,
+    freeze_runtime,
+    runtime_elapsed_seconds,
+    start_runtime,
     submit_video_job,
     write_review_bundle,
 )
@@ -61,10 +66,36 @@ from story_project import (
     short_slug,
     slugify,
 )
+from story_qualification import build_promotion_report, record_human_signoff, record_unattended_launch, render_promotion_markdown
 
 
 ROOT = Path(__file__).resolve().parent
 AGENT_STATE_NAME = "story_agent_state.json"
+
+
+def resolve_agent_runtime_python() -> str:
+    """Choose an interpreter that can run the real media pipeline.
+
+    Codex Desktop may launch this entrypoint with Homebrew Python while the
+    workspace's Whisper/torch runtime lives in Miniconda.  The background
+    supervisor must inherit the dependency-complete interpreter, otherwise it
+    can start successfully and then fail every transcription attempt.
+    """
+    if importlib.util.find_spec("whisper") is not None:
+        return sys.executable
+    candidates = [
+        os.environ.get("STORY_AGENT_PYTHON", ""),
+        "/opt/miniconda3/bin/python3",
+        "/opt/miniconda3/bin/python",
+    ]
+    for value in candidates:
+        if not value:
+            continue
+        candidate = Path(value).expanduser()
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        return str(candidate)
+    return sys.executable
 
 
 @dataclass(frozen=True)
@@ -198,7 +229,7 @@ class StoryAgent:
 
             if self.context.execute:
                 manifest["agent"]["status"] = "running"
-                manifest["agent"]["started_at"] = manifest["agent"].get("started_at") or now()
+                start_runtime(manifest["agent"])
                 write_manifest(self.context.paths, manifest)
             self._record_event("agent_start", {"execute": self.context.execute, "codex_mode": self.context.codex_mode})
             for _ in range(max_steps):
@@ -209,7 +240,9 @@ class StoryAgent:
                     self._reconcile_completed_stage_records(manifest, stage_name)
                 if stage_name == "done":
                     if self.context.execute:
+                        freeze_runtime(manifest["agent"])
                         manifest["agent"]["status"] = "completed"
+                        manifest["agent"]["blocked_reason"] = ""
                         manifest["agent"]["finished_at"] = now()
                         write_manifest(self.context.paths, manifest)
                         render_job_report(self.context.project_dir)
@@ -234,6 +267,7 @@ class StoryAgent:
                         "source_edit",
                         "codex_story_images",
                         "generate_videos",
+                        "video_review",
                         "suno_generate",
                         "assemble_final",
                         "package_release",
@@ -248,6 +282,11 @@ class StoryAgent:
                 if result.status in {"blocked", "failed", "cancelled"}:
                     render_job_report(self.context.project_dir)
                     return 2 if result.status == "blocked" else (3 if result.status == "cancelled" else 1)
+            if self.context.execute:
+                manifest = self._manifest()
+                freeze_runtime(manifest["agent"])
+                manifest["agent"]["status"] = "pending"
+                write_manifest(self.context.paths, manifest)
         print(f"PAUSED: 已达到本轮最大步数 {max_steps}，可再次运行继续。")
         render_job_report(self.context.project_dir)
         return 0
@@ -285,9 +324,8 @@ class StoryAgent:
             try:
                 supervisor = json.loads(supervisor_path.read_text(encoding="utf-8"))
                 pid = int(supervisor.get("pid", 0))
-                os.kill(pid, 0)
-                supervisor["running"] = True
-            except (OSError, ValueError, json.JSONDecodeError):
+                supervisor["running"] = process_is_alive(pid)
+            except (ValueError, json.JSONDecodeError):
                 supervisor["running"] = False
         print(json.dumps({
             "job_id": manifest.get("agent", {}).get("job_id", ""),
@@ -297,6 +335,7 @@ class StoryAgent:
             "last_checkpoint": agent_data.get("last_checkpoint", ""),
             "heartbeat_at": agent_data.get("heartbeat_at", ""),
             "blocked_reason": agent_data.get("blocked_reason", ""),
+            "external_blockers": agent_data.get("external_blockers", []),
             "recovery_action": self._recovery_action(manifest, stage_name),
             "budget": agent_data.get("budget", {}),
             "timing": timing,
@@ -329,15 +368,11 @@ class StoryAgent:
     def _timing_status(self, agent_data: dict[str, Any]) -> dict[str, Any]:
         deadline_hours = float(agent_data.get("deadline_hours", 10.0))
         started_text = str(agent_data.get("started_at", ""))
-        elapsed_hours = 0.0
-        if started_text:
-            try:
-                elapsed_hours = max(0.0, (time.time() - time.mktime(time.strptime(started_text, "%Y-%m-%d %H:%M:%S"))) / 3600)
-            except ValueError:
-                pass
+        elapsed_hours = runtime_elapsed_seconds(agent_data) / 3600
         return {
             "started_at": started_text,
             "elapsed_hours": round(elapsed_hours, 3),
+            "active_elapsed_seconds": round(runtime_elapsed_seconds(agent_data), 3),
             "deadline_hours": deadline_hours,
             "remaining_deadline_hours": round(max(0.0, deadline_hours - elapsed_hours), 3),
         }
@@ -350,6 +385,8 @@ class StoryAgent:
         job_id = str(agent_data.get("job_id", "<job_id>"))
         if status == "cancelled" or agent_data.get("cancel_requested"):
             return f"依次运行 `python3 story_agent.py resume --job {job_id}` 和 `python3 story_agent.py start --job {job_id}`。"
+        if next_stage.startswith("codex_") and ("用量" in reason or "usage" in combined or "额度" in reason):
+            return f"等待报告中的 Codex 用量恢复时间，再执行 python3 story_agent.py resume --job {job_id}；已通过检查点不会重做。"
         if "suno" in combined or "browser" in combined or "登录" in reason or "captcha" in combined:
             return "在 Codex 主任务恢复 Suno 登录/浏览器能力，完成 handoff 下载后执行 resume 和 start。"
         if "磁盘" in reason:
@@ -409,12 +446,12 @@ class StoryAgent:
             ("release_qa", self._has_release_qa, self._stage_release_qa),
             ("release_video_review", self._has_release_video_review, self._stage_release_video_review),
             ("publish_package", self._has_publish_package, self._stage_publish_package),
-            ("publish_package_review", self._has_publish_package_review, self._stage_publish_package_review),
             ("product_preflight", self._has_product_preflight, self._stage_product_preflight),
             ("product_annotation", self._has_product_annotation, self._stage_product_annotation),
             ("product_annotation_review", self._has_product_annotation_review, self._stage_product_annotation_review),
             ("product_package", self._has_product_package, self._stage_product_package),
             ("product_package_review", self._has_product_package_review, self._stage_product_package_review),
+            ("publish_package_review", self._has_publish_package_review, self._stage_publish_package_review),
             ("final_delivery", self._has_final_delivery, self._stage_final_delivery),
             ("doctor", self._has_doctor_report, self._stage_doctor),
         ]
@@ -435,8 +472,13 @@ class StoryAgent:
                 complete = checks[name](manifest)
             except Exception:
                 complete = False
-            if record.get("status") == "pending" and complete:
-                mark_stage(manifest, name, "passed", message="由当前输入/已验证产物满足，或按配置安全跳过。")
+            # A stage can be recorded as blocked/failed even after the user or a
+            # recovery path supplies the missing verified artifacts (for example,
+            # native cover generation timing out and being completed by the parent
+            # Agent).  The current completion predicate is the source of truth; do
+            # not leave a completed job with a stale blocked stage record.
+            if record.get("status") != "passed" and complete:
+                mark_stage(manifest, name, "passed", message="由当前输入/已验证产物满足，或在中断后按当前产物重新核验通过。")
                 changed = True
         if changed:
             write_manifest(self.context.paths, manifest)
@@ -483,8 +525,10 @@ class StoryAgent:
             return StageResult("blocked", "缺少绿幕原片，无法生成故事文本和清洁视频。")
         agent_defaults = load_config().get("agent_defaults", {})
         whisper_model = str(agent_defaults.get("whisper_model", "small"))
+        working_max_width = int(agent_defaults.get("working_video_max_width", 0))
+        proxy_max_width = int(agent_defaults.get("proxy_video_max_width", 1280))
         command = [
-            sys.executable,
+            resolve_agent_runtime_python(),
             str(ROOT / "source_video_pipeline.py"),
             "--project-dir",
             str(self.context.project_dir),
@@ -494,10 +538,17 @@ class StoryAgent:
             whisper_model,
             "--language",
             "zh",
+            "--working-max-width",
+            str(max(0, working_max_width)),
+            "--proxy-max-width",
+            str(max(0, proxy_max_width)),
         ]
         model_dir = ROOT / "models" / "whisper"
         if model_dir.exists():
             command.extend(["--whisper-model-dir", str(model_dir)])
+        color_lut = first_existing(inputs.get("color_lut"))
+        if color_lut is not None:
+            command.extend(["--lut", str(color_lut)])
         return self._run_command(command, "绿幕原片转写与可追溯自动剪辑", log_name="source_edit")
 
     def _stage_source_text_correction(self, manifest: dict[str, Any]) -> StageResult:
@@ -510,14 +561,25 @@ class StoryAgent:
             return StageResult("blocked", "缺少原始转写 JSON，无法进行上下文校对。")
         correction = source_dir / "corrected_transcript.json"
         raw_sha = file_sha256(raw_transcript)
+        original_video = first_existing(
+            manifest.get("inputs", {}).get("greenscreen_video_original"),
+            manifest.get("inputs", {}).get("greenscreen_video"),
+        )
+        clean_audio = first_existing(manifest.get("inputs", {}).get("extracted_narration"))
         prompt = "\n".join(
             [
-                "你是中文故事听辨校对生产者。只修正 ASR 文本，不改变 segment 编号、时间范围或保留/删除决定。",
+                "你是中文故事听辨校对生产者。必须以原音为证据修正 ASR，不能只凭上下文把句子改顺。不要改变已有 segment 编号、时间范围或保留/删除决定。",
+                f"必须实际听辨的绿幕原片：`{original_video}`",
+                f"清洁音轨（若存在可优先逐段听）：`{clean_audio}`",
                 f"原始 Whisper 转写：`{raw_transcript}`",
                 f"当前剪辑决定和上下文：`{decisions}`",
-                "结合完整上下文修正同音字、繁简体、他/她/它、的/地/得、专有名词和标点。不要润色、浓缩或改写原意。",
+                "逐段对照原音修正同音字、繁简体、他/她/它、的/地/得、专有名词、歌词和句尾。上下文只帮助定位疑点，不能充当听辨证据。必须逐字忠实，不得润色、浓缩、同义替换或补写连接句。",
+                "对低置信度片段、歌唱、拟声词、重复感叹词、代词和结尾，必须截取对应音频复听；必要时使用另一个 ASR 模型交叉验证。仅因语义更通顺不得修改。",
+                "检查相邻 ASR segment 之间的无字区：若原音中确有被 Whisper 整段漏掉的台词、歌声或拟声词，写入 insertions，给出精确原片 start/end/text 和 audio_evidence；insertions 不得与已有 segment 时间重叠。纯停顿、笑容或无声表演不要写成文字。",
+                "完整保留开场、自我介绍、所有对白、引号、段落、重复感叹词、拟声词（如啊呜/哎哟）和表演性停顿；不确定时维持原转写并在 notes 标疑，禁止猜写。",
+                "本系列固定品牌开场通常是“大家好，我是绵羊姐姐。”；当 Whisper 把低置信度的‘绵羊’听成‘明儿/绵阳’时应据此纠正，但若原音清楚显示不同说法则以原音为准。",
                 f"把 JSON 写入：`{correction}`",
-                "格式必须为 {\"raw_transcript_sha256\":\"...\",\"segments\":[{\"segment\":1,\"corrected_text\":\"...\",\"confidence\":0.0,\"notes\":\"...\"}]}。",
+                "格式必须为 {\"raw_transcript_sha256\":\"...\",\"segments\":[{\"segment\":1,\"corrected_text\":\"...\",\"confidence\":0.0,\"evidence\":\"audio|asr-consensus|unchanged\",\"notes\":\"...\"}],\"insertions\":[{\"start\":1.2,\"end\":2.4,\"text\":\"原音确有但 ASR 漏掉的文字\",\"confidence\":0.0,\"audio_evidence\":\"听辨说明\"}]}。没有整段漏听时 insertions 写空数组。",
                 f"raw_transcript_sha256 必须原样写为：{raw_sha}",
                 "segments 必须覆盖原始转写里的每一个 segment；即使无需修改也要写出 corrected_text。",
             ]
@@ -532,14 +594,35 @@ class StoryAgent:
             return StageResult("blocked", f"上下文校对没有写入有效 JSON：{correction}", raw_transcript)
         expected_count = len(raw_payload.get("segments", []))
         corrected_segments = payload.get("segments", [])
-        if payload.get("raw_transcript_sha256") != raw_sha or not isinstance(corrected_segments, list) or len(corrected_segments) != expected_count:
+        insertions = payload.get("insertions", [])
+        insertions_valid = isinstance(insertions, list)
+        if insertions_valid:
+            for item in insertions:
+                try:
+                    valid_item = (
+                        isinstance(item, dict)
+                        and float(item.get("start", -1)) >= 0
+                        and float(item.get("end", -1)) > float(item.get("start", -1))
+                        and bool(str(item.get("text", "")).strip())
+                        and bool(str(item.get("audio_evidence", "")).strip())
+                    )
+                except (TypeError, ValueError):
+                    valid_item = False
+                if not valid_item:
+                    insertions_valid = False
+                    break
+        if (
+            payload.get("raw_transcript_sha256") != raw_sha
+            or not isinstance(corrected_segments, list)
+            or len(corrected_segments) != expected_count
+            or not insertions_valid
+        ):
             return StageResult("blocked", f"上下文校对未覆盖全部 segment 或源哈希不匹配：{correction}", correction)
         original = first_existing(manifest.get("inputs", {}).get("greenscreen_video_original"))
         if original is None:
             return StageResult("blocked", "缺少绿幕原片，无法应用听辨校对。", correction)
-        self._archive_source_edit_attempt()
-        rerun = self._run_command(
-            [
+        self._archive_source_edit_attempt(preserve_media=True)
+        rerun_command = [
                 sys.executable,
                 str(ROOT / "source_video_pipeline.py"),
                 "--project-dir",
@@ -550,7 +633,13 @@ class StoryAgent:
                 str(raw_transcript),
                 "--text-overrides-json",
                 str(correction),
-            ],
+                "--no-render",
+            ]
+        color_lut = first_existing(manifest.get("inputs", {}).get("color_lut"))
+        if color_lut is not None:
+            rerun_command.extend(["--lut", str(color_lut)])
+        rerun = self._run_command(
+            rerun_command,
             "应用上下文校对并重建清洁文本/字幕/绿幕视频",
             log_name="source_text_correction",
         )
@@ -568,15 +657,37 @@ class StoryAgent:
         story_text = first_existing(manifest.get("inputs", {}).get("story_text"))
         if decisions is None or story_text is None:
             return StageResult("blocked", "缺少自动剪辑决定或清洁文本，无法独立审核。")
+        source_qa_path = self.context.paths.status / "qa_source_report.json"
+        if not self._hashed_qa_report_passes(source_qa_path):
+            return StageResult("blocked", f"源视频机器 QA 缺失、未通过或媒体哈希已变化：{source_qa_path}", source_qa_path)
         review_path = self.context.paths.status / "source_edit" / "source_edit_review.json"
         artifact_sha = file_sha256(decisions)
+        try:
+            decision_payload = json.loads(decisions.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            decision_payload = {}
+        rhythm_guard_passed = bool(decision_payload.get("rhythm_guard", {}).get("passed", False))
+        corrected_transcript = self.context.paths.status / "source_edit" / "corrected_transcript.json"
+        corrected_transcript_line = (
+            f"经上下文校对且已绑定哈希的转写：`{corrected_transcript}`"
+            if corrected_transcript.exists()
+            else "本项目没有上下文校对转写；文本准确性以原始转写为基线。"
+        )
         prompt = "\n".join(
             [
                 "你是独立文本剪辑审核员。不要延续生产者的判断，也不要修改任何生产文件。",
                 f"原始转写：`{self.context.paths.status / 'source_edit' / 'raw_transcript.json'}`",
+                corrected_transcript_line,
                 f"自动剪辑决定：`{decisions}`",
                 f"清洁分镜文本：`{story_text}`",
-                "检查是否误删语义、是否仍保留口误/重复、是否默认保留最后一次完整表达、分镜是否适合约 8–12 秒。",
+                f"源视频/决策/LUT/清洁媒体机器 QA：`{source_qa_path}`",
+                f"必须实际抽听核对的原片：`{first_existing(manifest.get('inputs', {}).get('greenscreen_video_original'))}`",
+                f"可用于逐段复听的清洁音轨：`{first_existing(manifest.get('inputs', {}).get('extracted_narration'))}`",
+                "检查是否误删语义、拟声词、自然呼吸、角色切换停顿或句尾；是否仍保留失败口误/重复；只允许删除可确认的失败重录。",
+                "不能只比 JSON 文本：必须抽听所有低置信度、歌词、拟声词、代词、句尾，以及相邻 ASR segment 之间的无字区。发现原音存在但文字缺失、文字与原音不符或出现无音频依据的顺写/润色，均为关键错误。",
+                "读取 edit_decisions.json 的 rhythm_guard：若 cut_count 超阈值、删除了表演词，或形成密集跳切，approved 必须为 false，并要求恢复最小必要片段。",
+                "审核必须区分‘剪辑删改’与‘ASR 听辨纠错’：若 corrected_transcript.json 存在、其 raw_transcript_sha256 正确，且 edit_decisions.json 的 text_overrides_source_sha256 与它匹配，则 segment 文本应与 corrected_text/insertions 比对；但哈希匹配不代表听辨正确，仍须以原音独立核验。",
+                "原始转写用于核对 segment 数量、时间范围和保留/删除决定；经哈希绑定的校对转写用于核对文字。逐字检查开场、自我介绍、对白引号、重复感叹词和结尾最后一个字；真正的缺句、无依据补写、润色或残句仍是关键错误。",
                 "评分必须为 0–100；总分低于 85 或存在语义误删、故事缺段等关键错误时 approved 必须为 false。",
                 f"把 JSON 写入：`{review_path}`",
                 "JSON 必须包含 approved、score、critical_errors、issues、retry_instructions、artifact_sha256。",
@@ -584,25 +695,43 @@ class StoryAgent:
                 "只做审核，不要读取任何生产者推理或旧审核结论。",
             ]
         )
-        result = self._codex_task(stage="source_edit_review", label="独立文本剪辑审核", handoff=decisions, prompt=prompt)
-        if result.status != "done":
-            return result
+        payload: dict[str, Any] | None = None
         try:
-            payload = json.loads(review_path.read_text(encoding="utf-8"))
+            existing_review = json.loads(review_path.read_text(encoding="utf-8"))
+            if isinstance(existing_review, dict) and existing_review.get("artifact_sha256") == artifact_sha:
+                payload = existing_review
         except (OSError, json.JSONDecodeError):
-            return StageResult("blocked", f"独立审核未写入有效 JSON：{review_path}", decisions)
-        if not review_passes(payload, artifact=decisions):
-            if self._can_retry_stage("source_edit_review", critical=True):
+            pass
+        if payload is None:
+            result = self._codex_task(stage="source_edit_review", label="独立文本剪辑审核", handoff=decisions, prompt=prompt)
+            if result.status != "done":
+                return result
+            try:
+                loaded_review = json.loads(review_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return StageResult("blocked", f"独立审核未写入有效 JSON：{review_path}", decisions)
+            if not isinstance(loaded_review, dict):
+                return StageResult("blocked", f"独立审核 JSON 顶层必须是对象：{review_path}", decisions)
+            payload = loaded_review
+        quality_attempts = self._source_edit_quality_attempts(review_path)
+        if not review_passes(payload, artifact=decisions) or not rhythm_guard_passed:
+            if self._can_retry_stage("source_edit_review", critical=True, attempts_override=quality_attempts):
                 revision_path = self.context.paths.status / "source_edit" / "source_edit_keep_overrides.json"
+                revision_delta_path = self.context.paths.status / "source_edit" / "source_edit_keep_overrides_delta.json"
                 revision_prompt = "\n".join(
                     [
                         "你是文本剪辑修订生产者。根据独立审核意见提出最小 segment 保留/删除修正，不要自行改写故事。",
                         f"原始转写：`{self.context.paths.status / 'source_edit' / 'raw_transcript.json'}`",
                         f"当前剪辑决定：`{decisions}`",
+                        corrected_transcript_line,
                         f"独立审核：`{review_path}`",
-                        f"把 JSON 写入：`{revision_path}`",
-                        "格式：{\"overrides\":[{\"segment\":1,\"keep\":true,\"reason\":\"...\"}]}。",
+                        f"已有累计覆盖（只读参考，可能不存在）：`{revision_path}`",
+                        f"只把本轮新增或替换的覆盖 JSON 写入：`{revision_delta_path}`",
+                        "格式：{\"overrides\":[{\"segment\":1,\"keep\":true,\"trim_start\":1.23,\"trim_end\":4.56,\"text\":\"精确区间对应的清洁文本\",\"reason\":\"...\"}]}。",
+                        "trim_start/trim_end 为可选原片绝对秒数，只能落在该 segment 原始区间内；用于保留半段、删除半段或去掉段首语气词。",
+                        "使用精确区间时必须给出与区间严格对应的 text，不能包含已经裁掉的词。整段保留/删除时可省略 trim_start、trim_end、text。",
                         "只列出必须改变的 segment；不得用改写文本掩盖误删或口误。",
+                        "keep-overrides 只负责剪辑区间和保留/删除，不能撤销或替换 corrected_transcript.json 中的 ASR 纠错；不得把‘小老虎’等已校对文字恢复成 Whisper 的‘小老鼠’等错字。若审核意见只涉及听辨文本而不涉及剪辑区间，不要伪造 segment 剪辑覆盖。",
                     ]
                 )
                 revision = self._codex_task(
@@ -614,18 +743,18 @@ class StoryAgent:
                 if revision.status != "done":
                     return revision
                 try:
-                    revision_payload = json.loads(revision_path.read_text(encoding="utf-8"))
+                    revision_payload = json.loads(revision_delta_path.read_text(encoding="utf-8"))
                 except (OSError, json.JSONDecodeError):
-                    return StageResult("blocked", f"文本修订未写入有效覆盖 JSON：{revision_path}", review_path)
+                    return StageResult("blocked", f"文本修订未写入有效增量覆盖 JSON：{revision_delta_path}", review_path)
                 if not isinstance(revision_payload.get("overrides"), list) or not revision_payload["overrides"]:
-                    return StageResult("blocked", f"审核未通过且修订器没有给出可执行 segment 覆盖：{revision_path}", review_path)
+                    return StageResult("blocked", f"审核未通过且修订器没有给出可执行 segment 覆盖：{revision_delta_path}", review_path)
+                self._merge_source_edit_overrides(revision_path, revision_delta_path)
                 original = first_existing(manifest.get("inputs", {}).get("greenscreen_video_original"))
                 raw_transcript = self.context.paths.status / "source_edit" / "raw_transcript.json"
                 if original is None or not raw_transcript.exists():
                     return StageResult("blocked", "缺少原片或原始转写，无法执行文本剪辑自动修订。", review_path)
                 self._archive_source_edit_attempt()
-                rerun = self._run_command(
-                    [
+                rerun_command = [
                         sys.executable,
                         str(ROOT / "source_video_pipeline.py"),
                         "--project-dir",
@@ -636,8 +765,16 @@ class StoryAgent:
                         str(raw_transcript),
                         "--keep-overrides-json",
                         str(revision_path),
-                    ]
-                    + (["--text-overrides-json", str(self.context.paths.status / "source_edit" / "corrected_transcript.json")] if (self.context.paths.status / "source_edit" / "corrected_transcript.json").exists() else []),
+                        "--working-max-width",
+                        str(max(0, int(load_config().get("agent_defaults", {}).get("working_video_max_width", 0)))),
+                        "--proxy-max-width",
+                        str(max(0, int(load_config().get("agent_defaults", {}).get("proxy_video_max_width", 1280)))),
+                    ] + (["--text-overrides-json", str(self.context.paths.status / "source_edit" / "corrected_transcript.json")] if (self.context.paths.status / "source_edit" / "corrected_transcript.json").exists() else [])
+                color_lut = first_existing(manifest.get("inputs", {}).get("color_lut"))
+                if color_lut is not None:
+                    rerun_command.extend(["--lut", str(color_lut)])
+                rerun = self._run_command(
+                    rerun_command,
                     "按独立审核意见重新剪辑绿幕原片",
                     log_name="source_edit_retry",
                 )
@@ -647,16 +784,64 @@ class StoryAgent:
             return StageResult("blocked", f"文本剪辑审核未通过（{payload.get('score', 0)} 分）：{review_path}", review_path)
         return StageResult("done", f"文本剪辑独立审核通过：{payload.get('score')} 分", review_path)
 
+    def _source_edit_quality_attempts(self, current_review: Path) -> int:
+        """Count distinct reviewed decision hashes, excluding infrastructure-only retries."""
+        candidates = [current_review]
+        rejected_root = self.context.paths.status / "rejected" / "source_edit"
+        if rejected_root.exists():
+            candidates.extend(rejected_root.glob("*/source_edit_review.json"))
+        reviewed_hashes: set[str] = set()
+        for candidate in candidates:
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            artifact_sha = str(payload.get("artifact_sha256", "")) if isinstance(payload, dict) else ""
+            if len(artifact_sha) == 64:
+                reviewed_hashes.add(artifact_sha)
+        return len(reviewed_hashes)
+
+    def _merge_source_edit_overrides(self, cumulative_path: Path, delta_path: Path) -> dict[str, Any]:
+        """Merge incremental review fixes without reviving earlier rejected segments."""
+        cumulative: dict[str, Any] = {"overrides": []}
+        if cumulative_path.exists():
+            try:
+                loaded = json.loads(cumulative_path.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict) and isinstance(loaded.get("overrides"), list):
+                    cumulative = loaded
+            except (OSError, json.JSONDecodeError):
+                pass
+        delta = json.loads(delta_path.read_text(encoding="utf-8"))
+        by_segment: dict[int, dict[str, Any]] = {}
+        for source in (cumulative.get("overrides", []), delta.get("overrides", [])):
+            for item in source:
+                if not isinstance(item, dict):
+                    continue
+                try:
+                    segment = int(item["segment"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                by_segment[segment] = dict(item)
+                by_segment[segment]["segment"] = segment
+        if not by_segment:
+            raise ValueError("增量修订合并后没有有效 segment 覆盖")
+        merged = {"version": 2, "merge_policy": "latest_delta_wins_by_segment", "overrides": [by_segment[key] for key in sorted(by_segment)]}
+        cumulative_path.write_text(json.dumps(merged, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        return merged
+
     def _stage_codex_story_images(self, manifest: dict[str, Any]) -> StageResult:
         staging = self._codex_stage_dir("codex_story_images")
         staging_images = staging / "images"
         staging_storyboard = staging / f"{self.context.slug}_storyboard_lines.txt"
         staging_images.mkdir(parents=True, exist_ok=True)
-        handoff = self._write_story_image_handoff(manifest, staging_images=staging_images, staging_storyboard=staging_storyboard)
         story_lines = self._story_lines(manifest)
         if not story_lines:
-            return StageResult("blocked", "缺少可用故事镜头行，无法生成故事图片。", handoff)
-        self._ensure_storyboard_from_lines(staging_storyboard, story_lines)
+            return StageResult("blocked", "缺少可用故事镜头行，无法生成故事图片。")
+        storyboard_changed = self._ensure_storyboard_from_lines(staging_storyboard, story_lines)
+        if storyboard_changed:
+            self._invalidate_story_image_derivatives(staging_images)
+        authoritative_storyboard_sha = file_sha256(staging_storyboard)
+        handoff = self._write_story_image_handoff(manifest, staging_images=staging_images, staging_storyboard=staging_storyboard)
         self._sync_story_images_from_staging(staging, staging_storyboard, staging_images)
         missing = self._missing_story_image_indices(story_lines)
         if not missing:
@@ -680,6 +865,14 @@ class StoryAgent:
             for index in batch:
                 self._record_story_image_status(index, "failed", result.message)
             return result
+        if not staging_storyboard.exists() or file_sha256(staging_storyboard) != authoritative_storyboard_sha:
+            self._ensure_storyboard_from_lines(staging_storyboard, story_lines)
+            quarantine = self._invalidate_story_image_derivatives(staging_images)
+            return StageResult(
+                "retrying",
+                f"图片生产者改写了只读权威分镜；本批已归档并恢复原 SHA：{quarantine}",
+                handoff,
+            )
         self._sync_story_images_from_staging(staging, staging_storyboard, staging_images)
         completed = []
         for index in batch:
@@ -692,11 +885,19 @@ class StoryAgent:
         if not completed:
             return StageResult("blocked", f"Codex CLI 批量子任务已返回，但本批 {len(batch)} 张图片都没有落盘。", handoff)
 
+        if not self._has_story_visual_control():
+            return StageResult(
+                "retrying",
+                "图片已落盘，但视觉圣经/风格锚点/机器可读分镜计划不完整或未逐行绑定权威分镜，将在下一轮补齐后再放行。",
+                handoff,
+            )
+
         manifest = self._manifest()
         if self._has_story_images(manifest):
             return StageResult("done", f"故事图片已完整生成：{len(story_lines)}/{len(story_lines)} 张。", handoff)
-        current = self._story_image_count(self._image_dir())
-        return StageResult("done", f"已逐张生成 {len(completed)} 张，本阶段进度：{current}/{len(story_lines)}。再次运行 Agent 将继续。", handoff)
+        image_dir = self._image_dir()
+        current = self._expected_named_story_image_count(image_dir, manifest, self._storyboard_path(manifest))
+        return StageResult("retrying", f"已逐张生成 {len(completed)} 张，本阶段进度：{current}/{len(story_lines)}。将在下一批继续。", handoff)
 
     def _stage_prepare_jobs(self, manifest: dict[str, Any]) -> StageResult:
         storyboard = self._storyboard_path(manifest)
@@ -722,22 +923,40 @@ class StoryAgent:
         storyboard = self._storyboard_path(manifest)
         if image_dir is None or storyboard is None:
             return StageResult("blocked", "缺少故事图片或分镜文本，无法独立审核。")
-        contact_sheet = self._make_contact_sheet(
-            sorted(path for path in image_dir.iterdir() if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}),
-            self.context.paths.status / "reviews" / "story_images_contact_sheet.jpg",
-        )
+        story_lines = [line for line in storyboard.read_text(encoding="utf-8-sig", errors="ignore").splitlines() if line.strip()]
+        scene_images = [image_dir / self._story_image_filename(index) for index in range(1, len(story_lines) + 1)]
+        missing = [path.name for path in scene_images if not path.is_file()]
+        if missing:
+            return StageResult("blocked", f"故事图片独立审核缺少目标文件：{', '.join(missing)}")
+        contact_sheets: list[Path] = []
+        for offset in range(0, len(scene_images), 6):
+            group = scene_images[offset : offset + 6]
+            contact_sheets.append(
+                self._make_contact_sheet(
+                    group,
+                    self.context.paths.status / "reviews" / f"story_images_contact_sheet_{offset + 1:02d}_{offset + len(group):02d}.jpg",
+                    columns=3,
+                )
+            )
+        control_files = [
+            self.context.paths.images / f"{self.context.slug}_visual_bible.md",
+            self.context.paths.images / f"{self.context.slug}_storyboard_plan.json",
+        ]
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "story_images_bundle.json",
-            [storyboard, image_dir],
+            [storyboard, *(path for path in control_files if path.exists()), *scene_images],
         )
         result, payload = self._structured_review(
             stage="story_images_review",
             label="故事图片独立审核",
             bundle=bundle,
-            images=[contact_sheet],
+            images=contact_sheets,
             rubric=(
-                "逐镜头检查角色和服装一致性、故事语义、物理错误、文字错误、构图和相邻连续性。"
-                "输出 retry_indices（需要重做的镜头编号整数数组）。角色身份错、肢体崩坏、错误文字、漏镜头属于关键错误。"
+                "逐镜头对照分镜检查角色和服装一致性、故事语义、构图和相邻连续性；逐个数清四足动物的腿，检查五官、嘴和象鼻等解剖位置。"
+                "还要检查物种/颜色身份、该镜头应出现与明确不应出现的角色，以及角色是否提前知道尚未发生的信息。"
+                "逐镜核对 storyboard_plan.json：每个唱歌/关键发言/关键动作/受挫反应角色是否有自己的焦点镜头；连续段是否有建立镜头、表演者中近景和反应镜头，而不是全程同一种双人中景。"
+                "按 appearance_id 逐项比较脸部花纹、服装主色/款式和饰品；虎妈妈等跨镜角色无剧情依据换衣服属于关键连续性错误。"
+                "输出 retry_indices（需要重做的镜头编号整数数组）。角色身份或在场关系错、肢体/五官崩坏、错误文字、漏镜头属于关键错误。"
             ),
         )
         if result.status == "done":
@@ -782,7 +1001,7 @@ class StoryAgent:
         from story_project import write_manifest
 
         write_manifest(self.context.paths, manifest)
-        result = self._workflow([
+        generate_command = [
             "generate",
             "--jobs-csv",
             str(jobs),
@@ -790,7 +1009,11 @@ class StoryAgent:
             str(image_dir),
             "--videos-dir",
             str(self.context.paths.video_jobs / "videos"),
-        ], "调用图生视频 API 生成片段")
+        ]
+        if bool(video_api.get("submit_all_first", False)):
+            generate_command.append("--submit-all-first")
+            generate_command.extend(["--max-submit-first", str(int(video_api.get("max_submit_first", 20)))])
+        result = self._workflow(generate_command, "调用图生视频 API 生成片段")
         manifest = self._manifest()
         ledger = BudgetLedger(manifest)
         after = len(list(videos_dir.glob("*.mp4"))) if videos_dir.exists() else 0
@@ -895,7 +1118,26 @@ class StoryAgent:
         videos_dir = self.context.paths.video_jobs / "videos"
         if jobs is None or qa_report is None or not frame_paths:
             return StageResult("blocked", "缺少视频任务、QA 报告或多帧抽样，无法独立审核。")
-        contact_sheet = self._make_contact_sheet(frame_paths, self.context.paths.status / "reviews" / "video_contact_sheet.jpg")
+        frame_order = {name: index for index, name in enumerate(("start", "q1", "mid", "q3", "end"))}
+        clip_dirs = sorted(path for path in frames_dir.iterdir() if path.is_dir())
+        contact_sheets: list[Path] = []
+        for offset in range(0, len(clip_dirs), 5):
+            group_dirs = clip_dirs[offset : offset + 5]
+            group_frames = sorted(
+                (path for directory in group_dirs for path in directory.glob("*.jpg")),
+                key=lambda path: (path.parent.name, frame_order.get(path.stem, 99)),
+            )
+            if not group_frames:
+                continue
+            first_scene = group_dirs[0].name.split("_")[0]
+            last_scene = group_dirs[-1].name.split("_")[0]
+            contact_sheets.append(
+                self._make_contact_sheet(
+                    group_frames,
+                    self.context.paths.status / "reviews" / f"video_contact_sheet_{first_scene}_{last_scene}.jpg",
+                    columns=5,
+                )
+            )
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "video_bundle.json",
             [jobs, qa_report, videos_dir, frames_dir],
@@ -904,18 +1146,22 @@ class StoryAgent:
             stage="video_review",
             label="图生视频独立审核",
             bundle=bundle,
-            images=[contact_sheet],
+            images=contact_sheets,
             rubric=(
                 "结合分镜任务和首尾/25%/50%/75%抽帧检查动作崩坏、反物理现象、角色漂移、黑帧、文字水印和镜头连续性。"
-                "输出 retry_indices（需要重新调用视频生成的镜头编号整数数组）。人物肢体崩坏、主体变形、关键动作错误属于关键错误。"
+                "逐镜头数清四足动物的腿，检查嘴/五官位置、物种与颜色身份、角色应出现/不应出现状态、信息因果是否正确。"
+                "输出 retry_indices（需要重新调用视频生成的镜头编号整数数组）。肢体或五官崩坏、主体变形、角色错误在场、关键动作错误属于关键错误。"
             ),
         )
         if result.status == "done":
             return result
-        if payload and self._can_retry_stage("video_review", critical=True):
+        rejected_root = self.context.paths.status / "rejected" / "story_videos"
+        quality_attempts = 1 + len([path for path in rejected_root.iterdir() if path.is_dir()]) if rejected_root.exists() else 1
+        if payload and self._can_retry_stage("video_review", critical=True, attempts_override=quality_attempts):
             indices = self._review_retry_indices(payload)
             if indices:
-                moved = self._quarantine_story_videos(indices, jobs)
+                instructions = payload.get("retry_instructions", {})
+                moved = self._quarantine_story_videos(indices, jobs, instructions if isinstance(instructions, dict) else {})
                 if moved:
                     return StageResult("retrying", f"视频审核未通过，已保留失败版本并排队重做镜头：{', '.join(map(str, moved))}", result.handoff)
         return result
@@ -1119,7 +1365,8 @@ class StoryAgent:
             rubric=(
                 "先比较 keying_candidates.jpg 中站立帧与大手势帧的 3×3 参数候选，再检查主账号和宝库号预览中的"
                 "抠像边缘、头发和手部、绿色溢出、透明孔洞、人物比例与位置、故事框覆盖、"
-                "字幕安全区以及 A（人物+故事框）、B（故事框）、C（人物+主题背景）三种构图。抠像截断、人物被框遮挡、框体露缝属于关键错误。"
+                "字幕安全区以及 A（人物+故事框）、B（故事框）、C（人物+主题背景）三种构图。人物必须保留拍摄原构图和原始大小，禁止因自动检测框被缩小或切手。"
+                "同时检查 LUT 是否只应用一次、肤色是否自然、画面是否灰暗或过饱和。抠像截断、人物被框遮挡、框体露缝属于关键错误。"
                 "失败时在 retry_instructions 中明确给出候选 id 或可执行的 keying_preset 参数修订建议。"
             ),
         )
@@ -1174,7 +1421,23 @@ class StoryAgent:
         frames: list[Path] = []
         for video in videos:
             duration = self._probe_duration(video)
-            for index, timestamp in enumerate((0.5, duration * 0.25, duration * 0.5, duration * 0.75, max(0.0, duration - 0.5)), start=1):
+            timestamps = [0.5, duration * 0.25, duration * 0.5, duration * 0.75]
+            if video.name == "宝库号发布视频.mp4":
+                # The library edition must have at least 30 seconds of a blurred,
+                # watermark-free tail.  Sparse quarter-point sampling cannot prove
+                # that duration and previously caused a reviewer to infer a false
+                # start time.  Include boundary evidence on both sides of 30s.
+                timestamps.extend(
+                    [
+                        max(0.0, duration - 36.0),
+                        max(0.0, duration - 31.0),
+                        max(0.0, duration - 30.0),
+                        max(0.0, duration - 29.0),
+                    ]
+                )
+            timestamps.append(max(0.0, duration - 0.5))
+            timestamps = list(dict.fromkeys(round(timestamp, 3) for timestamp in timestamps))
+            for index, timestamp in enumerate(timestamps, start=1):
                 target = frame_dir / video.stem / f"frame_{index:02d}_{timestamp:.1f}s.jpg"
                 target.parent.mkdir(parents=True, exist_ok=True)
                 command = ["ffmpeg", "-y", "-v", "error", "-ss", f"{timestamp:.3f}", "-i", str(video), "-frames:v", "1", "-q:v", "2", str(target)]
@@ -1192,7 +1455,10 @@ class StoryAgent:
             images=[contact_sheet],
             rubric=(
                 "检查主账号和宝库号最终竖版视频抽帧：A/B/C 切换、人物抠像、字幕、标题信息、故事框、Logo、水印、尾部提示、"
-                "黑帧和安全区。任何人物截断、错误标题、画面露缝、黑帧或缺少账号版本都是关键错误。"
+                "黑帧和安全区。主账号必须是 2160×2880 且不得出现销售联系尾卡；宝库号应为 1080×1440，尾部模糊至少 30 秒且模糊阶段不显示移动水印。"
+                "宝库号接近片尾的连续抽帧包含片尾前 36、31、30、29 秒及最后 0.5 秒；请用这些带时间戳的边界帧核验尾部时长，"
+                "不要根据稀疏整十秒采样推测模糊起点。若片尾前 31 秒的帧已经模糊且无移动水印，即满足至少 30 秒。"
+                "人物肤色应自然，不灰、不脏、不过饱和。任何人物截断、错误标题、画面露缝、黑帧或缺少账号版本都是关键错误。"
             ),
         )
         if result.status == "done":
@@ -1266,9 +1532,10 @@ class StoryAgent:
                     return StageResult("retrying", f"发布物料机器 QA 未通过，已保留并排队重做 {len(moved)} 个文件。", qa_json)
             return StageResult("blocked", f"发布物料机器 QA 未通过或已达到重做上限：{qa_json}", qa_json)
         contact_sheet = self._make_contact_sheet(covers, self.context.paths.status / "reviews" / "publish_covers_contact_sheet.jpg", columns=3)
+        lineage = publish / "cover_lineage.json"
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "publish_package_bundle.json",
-            [*covers, *copy_files, qa_report, qa_json],
+            [*covers, *copy_files, qa_report, qa_json, lineage],
         )
         result, payload = self._structured_review(
             stage="publish_package_review",
@@ -1277,7 +1544,10 @@ class StoryAgent:
             images=[contact_sheet],
             rubric=(
                 "检查两个账号文案定位、标题准确性、敏感承诺和话题相关性；检查六张封面标题文字、真人一致性、故事角色、"
-                "比例构图和安全区。每个比例必须是独立合理版式，不能只是机械裁切。失败时输出 retry_files，使用相对发布物料目录的路径。"
+                "比例构图和安全区。结合 cover_lineage.json 检查：主账号 4:3 是唯一主母版，主账号另外两比例由它编辑衍生；"
+                "宝库号 4:3 由主母版移除真人得到，另两比例由宝库号母版衍生。六张必须保持同一故事角色、服装、字体、色彩和装饰语言，不能像六次随机生成，也不能只是机械裁切。"
+                "版式应遵循历史样例的扁平简洁信息层级，标题与时长/年龄集中，底部适用说明克制，不能自创复杂木框、嵌套框或多层装饰。"
+                "失败时输出 retry_files，使用相对发布物料目录的路径。"
             ),
         )
         if result.status == "done":
@@ -1294,7 +1564,7 @@ class StoryAgent:
         return self._workflow(["product-package-preflight-project", "--project-dir", str(self.context.project_dir)], "资料包前置审查")
 
     def _stage_product_annotation(self, manifest: dict[str, Any]) -> StageResult:
-        handoff = self.context.paths.product / "_work" / "第16步资料包_Codex前置审查.md"
+        handoff = self.context.paths.status / "product_package_work" / "第16步资料包_Codex前置审查.md"
         images = self._product_preview_images()
         result = self._codex_task(
             stage="product_annotation",
@@ -1302,8 +1572,8 @@ class StoryAgent:
             handoff=handoff if handoff.exists() else None,
             prompt=build_product_annotation_agent_prompt(
                 handoff,
-                self.context.paths.product / "_work" / "annotation.json",
-                self.context.paths.product / "_work" / "demo_params.json",
+                self.context.paths.status / "product_package_work" / "annotation.json",
+                self.context.paths.status / "product_package_work" / "demo_params.json",
             ),
             images=images,
         )
@@ -1320,7 +1590,7 @@ class StoryAgent:
             command.extend(["--annotation-json", str(annotation)])
         else:
             command.extend(["--annotation-docx", str(annotation)])
-        demo_params = self.context.paths.product / "_work" / "demo_params.json"
+        demo_params = self.context.paths.status / "product_package_work" / "demo_params.json"
         if demo_params.exists():
             try:
                 data = json.loads(demo_params.read_text(encoding="utf-8"))
@@ -1339,7 +1609,7 @@ class StoryAgent:
         annotation = self._product_annotation()
         if annotation is None:
             return StageResult("blocked", "缺少朗读标注，无法独立审核。")
-        work = self.context.paths.product / "_work"
+        work = self.context.paths.status / "product_package_work"
         demo_params = work / "demo_params.json"
         handoff = work / "第16步资料包_Codex前置审查.md"
         artifacts = [annotation]
@@ -1347,6 +1617,9 @@ class StoryAgent:
             artifacts.append(demo_params)
         if handoff.exists():
             artifacts.append(handoff)
+        consumer_manuscript = first_existing(manifest.get("outputs", {}).get("consumer_manuscript"))
+        if consumer_manuscript is not None:
+            artifacts.append(consumer_manuscript)
         bundle = write_review_bundle(self.context.paths.status / "reviews" / "product_annotation_bundle.json", artifacts)
         images = self._product_preview_images()
         result, payload = self._structured_review(
@@ -1355,8 +1628,12 @@ class StoryAgent:
             bundle=bundle,
             images=images,
             rubric=(
-                "检查朗读标注是否逐段覆盖清洁文稿，重音、停连、语气和动作提示是否适合儿童表演，是否混入绵羊姐姐等对外禁用口吻；"
-                "结合预览检查示范视频裁切参数是否会截断手部或身体。漏段、错重音导致语义改变属于关键错误。"
+                "检查朗读标注是否逐段覆盖 consumer_manuscript 的故事正文；消费者文稿已移除主持人开场，因此朗读标注不得补回主持人自我介绍。"
+                "marked_text 必须逐字忠实，不得改代词、对白、形容词或句尾。重音、停连、语气和动作提示应适合儿童表演。结合预览检查示范视频裁切参数是否会截断手部或身体。"
+                "notes 必须像有经验的幼儿园故事老师当面提醒朗读者：温和、自然、短句，先给角色当下的心情或画面，再落到声音/目光/上半身动作；出现‘内容重点、节奏落点、情绪层次、完成收束’等干硬分析术语必须退回。"
+                "长段落的重音必须覆盖动作、情绪、反差和转折，只有一两个重音或只标人物名词必须退回。示范视频应保留原片构图、自然停顿、拟声词和完整句尾。"
+                "示范视频是原主持人的表演参考，允许原声和字幕保留‘我是绵羊姐姐’，但不得叠加额外品牌 Logo；不要把这一点误判为对外文稿泄漏。"
+                "漏掉 consumer_manuscript 中的故事正文、错重音导致语义改变属于关键错误。"
             ),
         )
         if result.status == "done":
@@ -1412,7 +1689,8 @@ class StoryAgent:
             images=[],
             rubric=(
                 "核对基础版必须包含故事文稿、朗读标注、音乐、示范视频、背景图片；进阶版必须包含故事文稿、朗读标注、音乐、"
-                "示范视频、含/无字幕 PPT、含/无字幕背景视频。检查文件名、重复/缺失、对外禁用口吻和 QA 报告。缺少任一必备文件属于关键错误。"
+                "示范视频、背景图片、含/无字幕 PPT、含/无字幕背景视频、A镜无人物背景视频。检查文件名、重复/缺失、对外禁用口吻和 QA 报告。"
+                "06_资料包 对外层只能包含基础版与进阶版两个客户目录，内部过程文件必须位于 99_项目状态。缺少任一必备文件属于关键错误。"
             ),
         )
         if result.status == "done":
@@ -1455,8 +1733,10 @@ class StoryAgent:
                     except subprocess.TimeoutExpired:
                         process.kill()
                         stdout, stderr = process.communicate()
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
                     log_path.write_text((stdout or "") + ("\n[stderr]\n" + stderr if stderr else "") + "\n[cancelled]\n", encoding="utf-8")
                     return StageResult("cancelled", f"{label}已按取消请求停止，日志：{log_path}", log_path)
+        log_path.parent.mkdir(parents=True, exist_ok=True)
         log_path.write_text((stdout or "") + ("\n[stderr]\n" + stderr if stderr else ""), encoding="utf-8")
         if process.returncode != 0:
             status = classify_command_failure((stdout or "") + "\n" + (stderr or ""))
@@ -1546,11 +1826,14 @@ class StoryAgent:
         ]
         if self.context.codex_model:
             command.extend(["--model", self.context.codex_model])
+        # `--image <FILE>...` is variadic in Codex CLI, so the positional prompt
+        # must come before it or the prompt is consumed as another image path.
+        command.append(prompt_text)
         for image in images:
             if image.exists():
                 command.extend(["--image", str(image)])
-        command.append(prompt_text)
-        display_command = [*command[:-1], "<prompt>"]
+        display_command = list(command)
+        display_command[display_command.index(prompt_text)] = "<prompt>"
         process = subprocess.Popen(command, cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
         deadline = time.time() + max(30, self.context.codex_timeout)
         stdout = ""
@@ -1622,12 +1905,54 @@ class StoryAgent:
                 final_images.mkdir(parents=True, exist_ok=True)
                 for path in image_files:
                     shutil.copy2(path, final_images / path.name)
+        for suffix in ("visual_bible.md", "storyboard_plan.json"):
+            source = staging / f"{self.context.slug}_{suffix}"
+            if source.exists():
+                final_storyboard.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, final_storyboard.parent / source.name)
 
-    def _ensure_storyboard_from_lines(self, storyboard: Path, story_lines: list[str]) -> None:
-        if storyboard.exists():
-            return
+    def _ensure_storyboard_from_lines(self, storyboard: Path, story_lines: list[str]) -> bool:
+        expected = "\n".join(story_lines) + "\n"
+        current = storyboard.read_text(encoding="utf-8") if storyboard.exists() else ""
+        if current == expected:
+            return False
         storyboard.parent.mkdir(parents=True, exist_ok=True)
-        storyboard.write_text("\n".join(story_lines) + "\n", encoding="utf-8")
+        storyboard.write_text(expected, encoding="utf-8")
+        return bool(current)
+
+    def _invalidate_story_image_derivatives(self, staging_images: Path) -> Path:
+        """Archive scene-specific outputs when the authoritative storyboard changes."""
+        quarantine = self.context.paths.status / "rejected" / "story_images" / time.strftime("%Y%m%d-%H%M%S")
+        quarantine.mkdir(parents=True, exist_ok=True)
+        final_images = self.context.paths.images / "images"
+        candidates: list[Path] = []
+        for directory in (staging_images, final_images):
+            if directory.exists():
+                candidates.extend(directory.glob(f"{self.context.slug}_scene_*.png"))
+                candidates.extend(directory.glob(f"{self.context.slug}_scene_*.jpg"))
+                candidates.extend(directory.glob(f"{self.context.slug}_scene_*.webp"))
+        candidates.extend(
+            path
+            for pattern in ("*storyboard.md", "*flow_video_prompts.csv", "*flow_video_prompts.md", "*flow_clip_names.csv")
+            for path in staging_images.glob(pattern)
+        )
+        candidates.extend(staging_images.parent.glob(f"{self.context.slug}_storyboard.md"))
+        candidates.extend(staging_images.parent.glob(f"{self.context.slug}_visual_bible.md"))
+        candidates.extend(staging_images.parent.glob(f"{self.context.slug}_storyboard_plan.json"))
+        seen: set[Path] = set()
+        for source in candidates:
+            resolved = source.resolve()
+            if resolved in seen or not source.exists():
+                continue
+            seen.add(resolved)
+            scope = "staging" if staging_images.resolve() in resolved.parents else "final"
+            target = quarantine / f"{scope}_{source.name}"
+            counter = 1
+            while target.exists():
+                target = quarantine / f"{scope}_{counter}_{source.name}"
+                counter += 1
+            shutil.move(str(source), str(target))
+        return quarantine
 
     def _story_image_filename(self, index: int) -> str:
         return f"{self.context.slug}_scene_{index:02d}.png"
@@ -1641,33 +1966,95 @@ class StoryAgent:
         story_lines: list[str],
         indices: list[int],
     ) -> str:
-        return "\n".join(
-            [
+        retry_lines: list[str] = []
+        review_path = self.context.paths.status / "reviews" / "story_images_review_review.json"
+        if review_path.exists():
+            try:
+                review_payload = json.loads(review_path.read_text(encoding="utf-8"))
+                instructions = review_payload.get("retry_instructions", {}) if isinstance(review_payload, dict) else {}
+                if isinstance(instructions, dict):
+                    retry_lines = [
+                        f"- 镜头 {index}：{instructions.get(str(index), instructions.get(index, ''))}"
+                        for index in indices
+                        if instructions.get(str(index), instructions.get(index, ""))
+                    ]
+            except (OSError, json.JSONDecodeError):
+                retry_lines = []
+        lines = [
                 "请执行这份由工作台同源模板生成的儿童故事出图任务：",
                 f"`{handoff}`",
                 "",
-                "这是全自动 Agent 模式，不需要向用户确认分镜；但必须先在任务指定位置写入分镜表、视觉圣经和图生视频提示词文件，再连续生成图片。",
+                "这是全自动 Agent 模式，不需要向用户确认分镜。状态机已经写好并锁定分镜文本；必须只读使用该文件，绝对不得改写、合并、删减或重排任何一行。",
+                "可以创建或更新视觉圣经和图生视频提示词文件，然后连续生成图片；镜头编号必须逐行对应锁定分镜。",
+                f"必须先写入机器可读分镜计划：`{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}`。每镜包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description；story_text 必须逐行等于锁定分镜。",
+                "每个唱歌、关键发言、关键动作或明显受挫的角色都要获得焦点镜头；连续场景要安排建立全景、表演者中近景、反应镜头等景别变化，不能所有角色都和主角挤在同一种双人中景。",
+                "为反复出现的角色固定 appearance_id；生成后续镜头时必须同时引用风格锚点和该角色最近一张已通过图片，禁止只靠文字重新随机生成角色。",
                 "图生视频提示词文件的 CSV 必须包含 `scene,story_text,visual_description,prompt`；`prompt` 要作为后续图生视频 API 和审核页直接使用的最终提示词。图生视频已经有当前图片作为视觉约束，只写具体动作、表情、道具运动、镜头运动和少量禁止项，不要复制文生图视觉圣经、服装细节或画风长描述，也不能用“角色动作自然克制、镜头缓慢推进或轻移”之类通用模板充数。",
                 "",
                 f"本轮应补齐这些镜头编号：{', '.join(str(i) for i in indices)}。",
+                "若目标镜头 PNG 已存在且只是视觉圣经/分镜计划缺失，不要重新生图；读取现有图片补齐控制文件即可。",
                 f"图片暂存目录：`{staging_images}`",
                 f"分镜文本暂存：`{staging_storyboard}`",
+                f"分镜文件当前 SHA-256：`{file_sha256(staging_storyboard)}`；完成返回前必须保持完全不变。",
+        ]
+        if retry_lines:
+            lines.extend(["", "这是独立视觉审核给出的强制重做要求，必须逐条落实：", *retry_lines])
+        lines.extend(
+            [
                 "请使用任务书指定的稳定命名 `{slug}_scene_XX.png`，不要使用旧的 `{slug}_XX.png` 命名。",
                 "如果 imagegen 默认保存到 `$CODEX_HOME/generated_images/...`，生成后把每张最终 PNG 复制到任务书指定的暂存目录。",
                 "完成后只用简短中文说明生成成功的文件路径，以及任何未能完成的镜头编号。",
             ]
         )
+        return "\n".join(lines)
 
     def _missing_story_image_indices(self, story_lines: list[str]) -> list[int]:
         final_images = self.context.paths.images / "images"
-        if not self._has_story_visual_control():
-            return list(range(1, len(story_lines) + 1))
-        return [index for index in range(1, len(story_lines) + 1) if not (final_images / self._story_image_filename(index)).exists()]
+        missing = [index for index in range(1, len(story_lines) + 1) if not (final_images / self._story_image_filename(index)).exists()]
+        if missing:
+            return missing
+        # Use one lightweight Codex turn to repair missing control artifacts;
+        # existing final images are references and must not be regenerated.
+        return [1] if not self._has_story_visual_control() else []
 
     def _has_story_visual_control(self) -> bool:
         safe_project = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.context.slug) or "story"
         staging = ROOT / "output" / "story_agent_cli" / safe_project / "codex_story_images"
-        return (staging / f"{self.context.slug}_visual_bible.md").exists() and (staging / "images" / f"{self.context.slug}_style_anchor.png").exists()
+        plan = staging / f"{self.context.slug}_storyboard_plan.json"
+        storyboard = staging / f"{self.context.slug}_storyboard_lines.txt"
+        return (
+            (staging / f"{self.context.slug}_visual_bible.md").exists()
+            and (staging / "images" / f"{self.context.slug}_style_anchor.png").exists()
+            and self._storyboard_plan_valid(plan, storyboard)
+        )
+
+    def _storyboard_plan_valid(self, plan: Path, storyboard: Path) -> bool:
+        if not plan.exists() or not storyboard.exists():
+            return False
+        try:
+            payload = json.loads(plan.read_text(encoding="utf-8"))
+            rows = payload.get("shots", []) if isinstance(payload, dict) else payload
+            story_lines = [line.strip() for line in storyboard.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+        except (OSError, json.JSONDecodeError):
+            return False
+        if not isinstance(rows, list) or len(rows) != len(story_lines):
+            return False
+        required = {
+            "scene", "story_text", "narrative_function", "shot_size", "focal_character",
+            "visible_characters", "excluded_characters", "continuity_group", "appearance_ids", "visual_description",
+        }
+        for index, (row, text) in enumerate(zip(rows, story_lines), start=1):
+            if not isinstance(row, dict) or not required.issubset(row):
+                return False
+            try:
+                scene = int(row["scene"])
+            except (TypeError, ValueError):
+                return False
+            if scene != index or str(row["story_text"]).strip() != text:
+                return False
+            if not str(row["shot_size"]).strip() or not str(row["focal_character"]).strip():
+                return False
+        return True
 
     def _record_story_image_status(self, index: int, status: str, message: str) -> None:
         progress = self.state.setdefault("codex_story_images", {})
@@ -1711,7 +2098,8 @@ class StoryAgent:
             x = (index % columns) * cell_width + 10
             y = (index // columns) * cell_height + 10
             sheet.paste(image, (x, y))
-            draw.text((x, y + 184), source.name[:45], fill="black")
+            label = f"{source.parent.name}/{source.name}" if source.parent.name else source.name
+            draw.text((x, y + 184), label[:45], fill="black")
         target.parent.mkdir(parents=True, exist_ok=True)
         sheet.save(target, quality=88)
         return target
@@ -1752,13 +2140,21 @@ class StoryAgent:
                 f"artifact_sha256 必须原样写为：{bundle_sha}",
             ]
         )
-        result = self._codex_task(stage=stage, label=label, handoff=bundle, prompt=prompt, images=images)
-        if result.status != "done":
-            return result, None
+        payload: dict[str, Any] | None = None
         try:
-            payload = json.loads(review_path.read_text(encoding="utf-8"))
+            existing = json.loads(review_path.read_text(encoding="utf-8"))
+            if isinstance(existing, dict) and existing.get("artifact_sha256") == bundle_sha:
+                payload = existing
         except (OSError, json.JSONDecodeError):
-            return StageResult("blocked", f"{label}未写入有效 JSON：{review_path}", bundle), None
+            pass
+        if payload is None:
+            result = self._codex_task(stage=stage, label=label, handoff=bundle, prompt=prompt, images=images)
+            if result.status != "done":
+                return result, None
+            try:
+                payload = json.loads(review_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                return StageResult("blocked", f"{label}未写入有效 JSON：{review_path}", bundle), None
         if review_passes(payload, artifact=bundle):
             return StageResult("done", f"{label}通过：{payload.get('score')} 分", review_path), payload
         return StageResult("blocked", f"{label}未通过：{payload.get('score', 0)} 分；{review_path}", review_path), payload
@@ -1793,28 +2189,54 @@ class StoryAgent:
                 result.append(number)
         return result
 
-    def _can_retry_stage(self, stage: str, *, critical: bool = False) -> bool:
+    def _can_retry_stage(
+        self,
+        stage: str,
+        *,
+        critical: bool = False,
+        attempts_override: int | None = None,
+    ) -> bool:
         manifest = self._manifest()
         defaults = load_config().get("agent_defaults", {})
-        limit = int(defaults.get("max_critical_attempts" if critical else "max_attempts", 3 if critical else 2))
-        attempts = int(manifest.get("agent", {}).get("stages", {}).get(stage, {}).get("attempts", 1))
+        retry_key = "max_critical_retries" if critical else "max_retries"
+        if retry_key in defaults:
+            # “重做 N 次”不包含首次生产，因此总质量版本上限为 N + 1。
+            limit = int(defaults[retry_key]) + 1
+        else:
+            # 兼容旧配置：旧字段表示总尝试次数。
+            limit = int(defaults.get("max_critical_attempts" if critical else "max_attempts", 3 if critical else 2))
+        attempts = (
+            int(attempts_override)
+            if attempts_override is not None
+            else int(manifest.get("agent", {}).get("stages", {}).get(stage, {}).get("attempts", 1))
+        )
         return attempts < limit
 
     def _quarantine_story_images(self, indices: list[int]) -> list[int]:
         image_dir = self._image_dir()
-        if image_dir is None:
+        staging_images = self._codex_stage_dir("codex_story_images") / "images"
+        if image_dir is None and not staging_images.exists():
             return []
         quarantine = self.context.paths.status / "rejected" / "story_images" / time.strftime("%Y%m%d-%H%M%S")
         quarantine.mkdir(parents=True, exist_ok=True)
         moved: list[int] = []
         for index in indices:
-            source = image_dir / self._story_image_filename(index)
-            if source.exists():
-                shutil.move(str(source), str(quarantine / source.name))
+            moved_index = False
+            sources = []
+            if image_dir is not None:
+                sources.append(("final", image_dir / self._story_image_filename(index)))
+            sources.append(("staging", staging_images / self._story_image_filename(index)))
+            for scope, source in sources:
+                if not source.exists():
+                    continue
+                target = quarantine / (source.name if scope == "final" else f"staging_{source.name}")
+                shutil.move(str(source), str(target))
+                moved_index = True
+            if moved_index:
                 moved.append(index)
         return moved
 
-    def _archive_source_edit_attempt(self) -> Path:
+    def _archive_source_edit_attempt(self, *, preserve_media: bool = False) -> Path:
         manifest = self._manifest()
         inputs = manifest.get("inputs", {})
         outputs = manifest.get("outputs", {})
@@ -1829,15 +2251,21 @@ class StoryAgent:
             first_existing(self.context.paths.status / "source_edit" / "source_edit_review.json"),
         ]
         original = first_existing(inputs.get("greenscreen_video_original"))
+        clean_video = first_existing(inputs.get("greenscreen_video"))
         for source in candidates:
-            if source is None or source == original or not source.exists():
+            if source is None or source == original or (preserve_media and source == clean_video) or not source.exists():
                 continue
             target = archive / source.name
             if not target.exists():
                 shutil.move(str(source), str(target))
         return archive
 
-    def _quarantine_story_videos(self, indices: list[int], jobs: Path) -> list[int]:
+    def _quarantine_story_videos(
+        self,
+        indices: list[int],
+        jobs: Path,
+        retry_instructions: dict[str, Any] | None = None,
+    ) -> list[int]:
         with jobs.open(encoding="utf-8-sig", newline="") as file:
             reader = csv.DictReader(file)
             rows = list(reader)
@@ -1846,6 +2274,8 @@ class StoryAgent:
         quarantine.mkdir(parents=True, exist_ok=True)
         moved: list[int] = []
         selected = set(indices)
+        if "provider_attempt" not in fieldnames:
+            fieldnames.append("provider_attempt")
         for row in rows:
             try:
                 scene = int(row.get("scene", "0"))
@@ -1856,9 +2286,22 @@ class StoryAgent:
             source = self.context.paths.video_jobs / "videos" / row.get("target_video_filename", "")
             if source.exists():
                 shutil.move(str(source), str(quarantine / source.name))
+            # Preserve the rejected provider identity before clearing it. More
+            # importantly, advance provider_attempt so ToAPIs receives a new
+            # client_business_id even if an independent prompt review later
+            # normalizes the retry prompt back to the previous wording.
+            save_json(quarantine / f"scene_{scene:02d}_rejected_job.json", row)
             for key in ("task_id", "video_url", "error", "api_response", "query_response"):
                 if key in row:
                     row[key] = ""
+            try:
+                provider_attempt = int(row.get("provider_attempt") or "0")
+            except ValueError:
+                provider_attempt = 0
+            row["provider_attempt"] = str(provider_attempt + 1)
+            instruction = str((retry_instructions or {}).get(str(scene)) or "").strip()
+            if instruction and instruction not in row.get("prompt", ""):
+                row["prompt"] = row.get("prompt", "").rstrip() + " 严格重试约束：" + instruction
             row["status"] = "todo"
             moved.append(scene)
         with jobs.open("w", encoding="utf-8-sig", newline="") as file:
@@ -1892,7 +2335,7 @@ class StoryAgent:
         return moved
 
     def _product_preview_images(self) -> list[Path]:
-        preview_dir = self.context.paths.product / "_work" / "demo_preview"
+        preview_dir = self.context.paths.status / "product_package_work" / "demo_preview"
         return sorted(path for path in preview_dir.glob("*.png"))[:8] if preview_dir.exists() else []
 
     def _has_imported_inbox(self, manifest: dict[str, Any]) -> bool:
@@ -1917,11 +2360,34 @@ class StoryAgent:
         review_path = self.context.paths.status / "source_edit" / "source_edit_review.json"
         if not review_path.exists():
             return False
+        if not self._hashed_qa_report_passes(self.context.paths.status / "qa_source_report.json"):
+            return False
         try:
             payload = json.loads(review_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return False
         return review_passes(payload, artifact=decisions)
+
+    def _hashed_qa_report_passes(self, report_path: Path) -> bool:
+        try:
+            payload = json.loads(report_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        artifacts = payload.get("artifacts")
+        if not payload.get("passed") or not isinstance(artifacts, dict) or not artifacts:
+            return False
+        for item in artifacts.values():
+            if not isinstance(item, dict):
+                return False
+            artifact = Path(str(item.get("path", "")))
+            if not artifact.is_file():
+                return False
+            stat = artifact.stat()
+            if item.get("bytes") == stat.st_size and item.get("mtime_ns") == stat.st_mtime_ns:
+                continue
+            if item.get("sha256") != file_sha256(artifact):
+                return False
+        return True
 
     def _has_source_text_correction(self, manifest: dict[str, Any]) -> bool:
         decisions = first_existing(manifest.get("outputs", {}).get("source_edit_decisions"))
@@ -2086,7 +2552,7 @@ class StoryAgent:
         return self._review_stage_current("publish_package_review")
 
     def _has_product_preflight(self, manifest: dict[str, Any]) -> bool:
-        return (self.context.paths.product / "_work" / "第16步资料包_Codex前置审查.md").exists()
+        return (self.context.paths.status / "product_package_work" / "第16步资料包_Codex前置审查.md").exists()
 
     def _has_product_annotation(self, manifest: dict[str, Any]) -> bool:
         return self._product_annotation() is not None
@@ -2122,7 +2588,9 @@ class StoryAgent:
         story_lines = self._story_lines(manifest)
         story_meta = manifest.get("story", {}) if isinstance(manifest.get("story"), dict) else {}
         requirements = [
+            f"权威分镜已由状态机写入 `{staging_storyboard}`；该文件只读，禁止生产者改写、合并、删减、扩写或重排。",
             f"全自动模式下，必须先把视觉圣经保存到：{staging_images.parent / (self.context.slug + '_visual_bible.md')}。",
+            f"必须把逐镜叙事覆盖、焦点角色、景别、在场/不在场角色、连续场景组和 appearance_id 保存到：{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}。",
             f"必须先生成一张非最终交付的风格/角色锚点图，保存到：{staging_images / (self.context.slug + '_style_anchor.png')}。",
             "不要出现绵羊姐姐形象、主持人形象、羊、小羊、人偶或任何与品牌相关的角色形象。",
             "用户提供的原文已经按镜头分行；原则上每一行就是一个独立镜头。",
@@ -2289,7 +2757,7 @@ class StoryAgent:
         return "\n\n".join(text for text in texts if text)
 
     def _product_annotation(self) -> Path | None:
-        work = self.context.paths.product / "_work"
+        work = self.context.paths.status / "product_package_work"
         candidates = [work / "annotation.json", work / "朗读标注.json", work / "朗读标注.docx"]
         if work.exists():
             candidates.extend(sorted(work.glob("*标注*.json")))
@@ -2348,6 +2816,7 @@ class StoryAgent:
             review=review,
         )
         if runtime_status in {"blocked", "failed", "cancelled"}:
+            freeze_runtime(manifest["agent"])
             manifest["agent"]["status"] = runtime_status
         from story_project import write_manifest
 
@@ -2406,6 +2875,7 @@ def main() -> None:
 
     submit = subparsers.add_parser("submit", help="仅投喂一段绿幕视频并创建可续跑任务")
     submit.add_argument("--video", required=True, type=Path)
+    submit.add_argument("--lut", type=Path, help="可选 .cube 输入 LUT；复制进项目并记录 SHA-256")
     submit.add_argument("--projects-root", default=Path.home() / "Desktop", type=Path)
     submit.add_argument("--story-name", default="")
     submit.add_argument("--slug", default="")
@@ -2481,6 +2951,19 @@ def main() -> None:
     probe_suno.add_argument("--codex-path", default="codex")
     probe_suno.add_argument("--codex-timeout", default=300, type=int)
 
+    signoff = subparsers.add_parser("signoff", help="记录用户人工终审，并把结果绑定到当前交付物哈希")
+    signoff.add_argument("--job", default="")
+    signoff.add_argument("--registry", type=Path)
+    signoff.add_argument("--project-dir", type=Path)
+    signoff.add_argument("--result", choices=["pass", "fail"], required=True)
+    signoff.add_argument("--minutes", required=True, type=float)
+    signoff.add_argument("--notes", default="")
+    signoff.add_argument("--reviewer", default="用户人工终审")
+
+    qualification = subparsers.add_parser("qualification", help="核验连续三条不同真实故事是否达到默认入口转正门槛")
+    qualification.add_argument("--projects-root", default=ROOT / "auto-project" / "runs", type=Path)
+    qualification.add_argument("--output", default=ROOT / "FULL_AUTO_PROMOTION_REPORT.md", type=Path)
+
     args = parser.parse_args()
     if args.command == "submit":
         if args.soft_budget < 0 or args.hard_budget <= 0 or args.soft_budget > args.hard_budget:
@@ -2488,6 +2971,7 @@ def main() -> None:
         registry = JobRegistry(args.registry)
         job_id, project_dir, created = submit_video_job(
             args.video,
+            lut=args.lut,
             projects_root=args.projects_root,
             story_name=args.story_name,
             slug=args.slug,
@@ -2509,15 +2993,15 @@ def main() -> None:
             try:
                 existing = json.loads(supervisor_path.read_text(encoding="utf-8"))
                 existing_pid = int(existing.get("pid", 0))
-                if existing_pid > 0:
-                    os.kill(existing_pid, 0)
+                if process_is_alive(existing_pid):
+                    record_unattended_launch(project_dir, supervisor_record=supervisor_path)
                     print(json.dumps({"job_id": args.job, "project_dir": str(project_dir), "pid": existing_pid, "started": False, "message": "supervisor 已在运行"}, ensure_ascii=False, indent=2))
                     return
-            except (OSError, ValueError, json.JSONDecodeError):
+            except (ValueError, json.JSONDecodeError):
                 pass
         log_path = status_dir / "story_agent_supervisor.log"
         command = [
-            sys.executable,
+            resolve_agent_runtime_python(),
             str(Path(__file__).resolve()),
             "run",
             "--job",
@@ -2534,6 +3018,7 @@ def main() -> None:
             command.extend(["--registry", str(args.registry.expanduser())])
         if args.codex_model:
             command.extend(["--codex-model", args.codex_model])
+        launched_at = now()
         with log_path.open("a", encoding="utf-8") as log_file:
             process = subprocess.Popen(
                 command,
@@ -2544,13 +3029,40 @@ def main() -> None:
                 start_new_session=True,
                 close_fds=True,
             )
-        from story_project import save_json
-
         save_json(
             supervisor_path,
-            {"job_id": args.job, "project_dir": str(project_dir), "pid": process.pid, "started_at": now(), "log": str(log_path), "command": command},
+            {
+                "kind": "story_agent_start_v1",
+                "job_id": args.job,
+                "project_dir": str(project_dir.expanduser().resolve()),
+                "pid": process.pid,
+                "started_at": launched_at,
+                "log": str(log_path.expanduser().resolve()),
+                "command": command,
+            },
         )
+        record_unattended_launch(project_dir, supervisor_record=supervisor_path)
         print(json.dumps({"job_id": args.job, "project_dir": str(project_dir), "pid": process.pid, "started": True, "log": str(log_path)}, ensure_ascii=False, indent=2))
+        return
+    if args.command == "signoff":
+        project_dir = JobRegistry(args.registry).resolve(args.job) if args.job else args.project_dir
+        if project_dir is None:
+            parser.error("signoff 需要 --job 或 --project-dir")
+        target = record_human_signoff(
+            project_dir,
+            result=args.result,
+            minutes=args.minutes,
+            notes=args.notes,
+            reviewer=args.reviewer,
+        )
+        print(json.dumps({"project_dir": str(project_dir), "signoff": str(target)}, ensure_ascii=False, indent=2))
+        return
+    if args.command == "qualification":
+        report = build_promotion_report(args.projects_root)
+        output = render_promotion_markdown(report, args.output.expanduser())
+        json_output = output.with_suffix(".json")
+        save_json(json_output, report)
+        print(json.dumps({**report, "markdown": str(output), "json": str(json_output)}, ensure_ascii=False, indent=2))
         return
     if args.command == "run":
         if args.job:

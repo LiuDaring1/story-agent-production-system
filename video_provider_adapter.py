@@ -24,6 +24,8 @@ class VideoProviderAdapter:
             args.extend(["--base-url", self.base_url])
         if self.model:
             args.extend(["--model", self.model])
+        if self.api_key_env:
+            args.extend(["--api-key-env", self.api_key_env])
         return args
 
 

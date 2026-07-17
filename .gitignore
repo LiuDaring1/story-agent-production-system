@@ -23,6 +23,7 @@ dist/
 output/
 tmp/
 backups/
+auto-project/
 story_scoring_v1_render/
 tools/video-subtitle-remover/
 

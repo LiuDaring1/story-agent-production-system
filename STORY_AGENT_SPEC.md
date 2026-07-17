@@ -83,7 +83,7 @@ Agent 必须以“可续跑”为默认：
 `story_agent.py` 已采用“Codex 入口 + 本地持久状态机”结构。工作台不删除，但正常运行不再依赖逐步点击。唯一必需输入是一段横屏绿幕口播原片；系统派生音频、转写、清洁文稿、分镜和字幕。
 
 - 默认软预算 ¥50、硬预算 ¥100、运行时限 10 小时。
-- 图生视频供应商由 `video_api.adapters` 选择；`qingyun_api` 是当前生产适配器，`mock_local` 用于零费用端到端与故障注入，模型不写死在状态机中。
+- 图生视频供应商由 `video_api.adapters` 选择；`toapis_grok` 是当前默认适配器，`qingyun_api` 仅保留旧 CLI 兼容，`mock_local` 用于零费用端到端与故障注入，模型不写死在状态机中。
 - manifest 每阶段记录输入/输出上下文指纹、供应商、实际阶段成本、尝试次数和重试原因。
 - `status` 返回剩余阶段、三档经验 ETA、运行/剩余时限、心跳、预算预留、重试/失败明细和具体恢复动作；ETA 不把外部排队或登录等待伪装成确定承诺。
 - 智能/视觉阶段必须有独立审核 JSON：至少 85 分、无关键错误、产物哈希一致。
@@ -137,8 +137,16 @@ python3 story_agent.py status --job "<job_id>"
 python3 story_agent.py cancel --job "<job_id>"
 python3 story_agent.py resume --job "<job_id>"
 python3 story_agent.py report --job "<job_id>"
+python3 story_agent.py signoff --job "<job_id>" --result pass --minutes 8 --notes "无需修改"
+python3 story_agent.py qualification --projects-root "auto-project/runs"
 ```
 
-`submit` 对原片做 SHA-256 去重并创建 manifest v2；`start` 在后台运行 supervisor；`cancel` 不删除任何素材；`report` 生成早晨交付摘要。项目级入口 Skill 位于 `skills/story-full-auto/`。
+`submit` 对原片做 SHA-256 去重并创建 manifest v2；`start` 只有在后台进程创建成功后才原子保存 supervisor 记录，并把记录 SHA-256、启动时间和日志路径绑定到 manifest；`cancel` 不删除任何素材；`report` 生成早晨交付摘要。项目级入口 Skill 位于 `skills/story-full-auto/`。
+
+`signoff` 只能由用户实际看完最终交付后记录，结果会绑定总清单、两条发布视频、六张封面、两份文案和两套资料包的当前 SHA-256，不能由 Agent 自行臆造。`qualification` 扫描真实项目并执行默认入口转正门槛：必须是三个故事名与原片 SHA 均不同的项目，每条都由 `start` 无人值守启动、九项独立审核当前且通过、成本不高于 ¥50、有效运行不超过 10 小时，并在 10 分钟内完成人工终审。未达到 3/3 时不得把全自动 Agent 宣称为默认生产入口。
+
+`submit` 同时创建 `agent.input_contract`：唯一用户内容输入只能是一段绿幕原片；LUT 只作为处理配置记录。源剪辑生成的故事文本、清洁绿幕和清洁旁白必须分别绑定原片 SHA-256 与当前剪辑决定 SHA-256。转正核验拒绝后来加入的脚本、旁白、音乐、图片等人工输入，也拒绝未全部通过的 Agent 阶段，以及修改时间早于无人值守启动的预置审核产物。
+
+当前真实工程验证与转正计数分别见 `SHADOW_PRODUCTION_REPORT.md` 和 `FULL_AUTO_PROMOTION_REPORT.md`。第一条《大象和蚂蚁》验证了完整交付，但由于运行发生在工程调试过程、没有 `start` 证据和人工终审记录，当前转正计数诚实保持为 0/3。
 
 故障注入回归覆盖死进程锁回收、活锁保护、API 无进展、目标镜头缺失、Codex 子任务失败、Suno 浏览器/登录失效、磁盘不足和取消/续跑。额外 MP4 不得掩盖 jobs CSV 中命名目标的缺失。

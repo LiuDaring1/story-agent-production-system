@@ -6,7 +6,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from story_project import init_project, project_paths, qa_release
+from release_video import safe_watermark_motion_expressions
+from story_project import init_project, project_paths, qa_release, write_manifest
 
 
 def make_vertical_video(path: Path, *, with_audio: bool = True) -> None:
@@ -30,6 +31,17 @@ def make_vertical_video(path: Path, *, with_audio: bool = True) -> None:
 
 
 class ReleaseQaTests(unittest.TestCase):
+    def test_moving_watermarks_stay_inside_safe_margin(self) -> None:
+        expressions = safe_watermark_motion_expressions(70.0, 42.0, margin=20)
+        self.assertEqual(len(expressions), 4)
+        for expression in expressions:
+            self.assertIn("max(1\\,", expression)
+            self.assertNotIn(")-w", expression)
+        self.assertTrue(expressions[0].startswith("20+"))
+        self.assertTrue(expressions[1].startswith("20+"))
+        self.assertTrue(expressions[2].startswith("W-w-20-"))
+        self.assertTrue(expressions[3].startswith("H-h-20-"))
+
     def test_release_qa_requires_vertical_video_with_aligned_audio(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：终片QA"
@@ -53,6 +65,30 @@ class ReleaseQaTests(unittest.TestCase):
             payload = json.loads((paths.status / "qa_release_report.json").read_text(encoding="utf-8"))
             self.assertFalse(payload["passed"])
             self.assertTrue(any("缺少音轨" in issue for issue in payload["issues"]))
+
+    def test_release_qa_never_uses_rejected_video_when_canonical_output_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：拒绝区隔离"
+            manifest = init_project(project, story_name="拒绝区隔离", slug="release-rejected")
+            paths = project_paths(project)
+            current_main = paths.release / "主账号发布视频.mp4"
+            current_library = paths.release / "宝库号发布视频.mp4"
+            make_vertical_video(current_main)
+            make_vertical_video(current_library)
+            rejected = paths.status / "rejected" / "release_videos" / "old"
+            rejected.mkdir(parents=True, exist_ok=True)
+            rejected_main = rejected / "主账号发布视频.mp4"
+            rejected_library = rejected / "宝库号发布视频.mp4"
+            make_vertical_video(rejected_main)
+            make_vertical_video(rejected_library)
+            manifest["outputs"]["main_release_video"] = str(rejected_main)
+            manifest["outputs"]["library_release_video"] = str(rejected_library)
+            write_manifest(paths, manifest)
+
+            qa_release(project)
+            payload = json.loads((paths.status / "qa_release_report.json").read_text(encoding="utf-8"))
+            self.assertEqual(payload["artifacts"]["main_release_video"]["path"], str(current_main))
+            self.assertEqual(payload["artifacts"]["library_release_video"]["path"], str(current_library))
 
 
 if __name__ == "__main__":

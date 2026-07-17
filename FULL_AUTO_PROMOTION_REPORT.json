@@ -1,0 +1,37 @@
+{
+  "version": 1,
+  "checked_at": "2026-07-13 23:59:47",
+  "projects_root": "auto-project/runs",
+  "target_distinct_stories": 3,
+  "qualified_distinct_stories": 0,
+  "ready_for_default_entry": false,
+  "projects": [
+    {
+      "project_dir": "auto-project/runs/故事剪辑：大象和蚂蚁",
+      "job_id": "20260712-114126-elephant-ant-2c0fc9bd",
+      "story_name": "大象和蚂蚁",
+      "source_sha256": "2c0fc9bdc60d22452c8a43934ea9a67d1d0d9624fa98fc00348e7085fa16746a",
+      "completed_at": "2026-07-13 22:59:10",
+      "cost_cny": 8.4,
+      "active_hours": 9.304,
+      "human_review_minutes": null,
+      "review_status": {
+        "source_edit_review": "passed",
+        "story_images_review": "passed",
+        "video_prompt_review": "passed",
+        "video_review": "passed",
+        "release_preview": "passed",
+        "release_video_review": "passed",
+        "product_annotation_review": "passed",
+        "product_package_review": "passed",
+        "publish_package_review": "passed"
+      },
+      "qualified": false,
+      "reasons": [
+        "缺少由 start 后台启动的无人值守运行证据",
+        "单绿幕输入证明无效：缺少 submit 创建的单绿幕输入契约",
+        "缺少用户人工终审记录"
+      ]
+    }
+  ]
+}

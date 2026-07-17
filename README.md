@@ -1,6 +1,6 @@
 # 儿童故事全自动生产 Agent
 
-当前推荐入口是 `story_agent.py`。只投喂一段横版绿幕原片（允许包含重录），Agent 会用本地持久状态机续跑：整理最后一次完整口播、生成故事画面与视频、配乐、合成主账号/宝库号成片、生成两份文案、六张封面，以及基础版/高级版资料包。所有关键阶段都必须经过独立审查，分数不少于 85、无严重问题且审查哈希仍对应当前产物，才会进入下一阶段。
+当前推荐入口是 `story_agent.py`。只投喂一段横版绿幕原片（允许包含重录），Agent 会用本地持久状态机续跑：整理最后一次完整口播、生成故事画面与视频、配乐、合成主账号/宝库号成片、生成两份文案、六张封面，以及基础版/进阶版资料包。所有关键阶段都必须经过独立审查，分数不少于 85、无严重问题且审查哈希仍对应当前产物，才会进入下一阶段。
 
 它不会自动上传或发布。默认费用软上限 50 元、硬上限 100 元，运行期限 10 小时；达到硬上限、磁盘不足、登录/CAPTCHA 或无法自动修复的问题时会安全阻塞并保留全部状态。
 
@@ -18,6 +18,26 @@ python3 story_agent.py start --job JOB_ID
 python3 story_agent.py status --job JOB_ID
 python3 story_agent.py report --job JOB_ID
 ```
+
+早晨实际查看全部交付物后，记录人工终审结果和真实耗时；不要由 Agent 自动代填：
+
+```bash
+python3 story_agent.py signoff \
+  --job JOB_ID \
+  --result pass \
+  --minutes 8.5 \
+  --notes "无需修改"
+```
+
+连续真实故事的转正资格由机器报告判定：
+
+```bash
+python3 story_agent.py qualification \
+  --projects-root "auto-project/runs" \
+  --output "FULL_AUTO_PROMOTION_REPORT.md"
+```
+
+只有保留 `submit` 单绿幕输入契约、通过 `start` 后台无人值守启动、supervisor 启动记录与完成日志可验证、所有 Agent 阶段通过、审核产物不早于无人值守启动、全部审核哈希仍为当前版本、成本不超过 ¥50、有效运行不超过 10 小时、人工终审通过且不超过 10 分钟的不同故事才会计数。达到 3/3 前，工作台仍保留为故障驾驶舱，Agent 不宣称已经转正。
 
 任务可安全取消和续跑：
 
@@ -107,7 +127,7 @@ python3 workbench_app.py
 
 也可以在 Finder 里双击项目里的 `run_workbench.command`。
 
-每个新故事只需要换这几类输入：故事名、`Slug`、短名、故事文本、旁白原声、最终图片或 Codex 出图结果。青云聚合 Grok 视频 API、Whisper、本地合成、Suno 半自动配乐、审核页、销售版字幕规则都已经固定在这个项目里。
+每个新故事只需要换这几类输入：故事名、`Slug`、短名、故事文本、旁白原声、最终图片或 Codex 出图结果。ToAPIs Grok 视频 API、Whisper、本地合成、Suno 网页配乐、审核页、销售版字幕规则都已经固定在这个项目里。
 
 工作台的基本顺序：
 
@@ -116,7 +136,7 @@ python3 workbench_app.py
 3. 在 Codex 对话里按这份任务执行分镜确认和出图。出图完成后，如果图片已经在工作台指定的最终图片目录，可以跳过“1 整理/导入图片”；如果图片在别的文件夹，选择“Codex出图目录”，再点“1 整理/导入图片”。
 4. 确认最终图片目录和分镜文档后，点击“2 准备任务”。
 5. 选择旁白原声，点击“3 写入时长”。
-6. 可先点“4 试跑一条”检查青云 API 请求，再点“5 生成视频”。
+6. 可先点“4 试跑一条”检查当前视频 API 请求，再点“5 生成视频”。
 7. 点“6 打开审核页”，检查视频；坏的标“重做”，不用的标“不使用”，导出审核 CSV。
 8. 回到工作台选择审核 CSV，点击“7 重跑审核问题”；重跑后如果满意，再导出/确认审核 CSV。
 9. 点击“8 应用审核”，整理最终合成用的 `clips/` 和 `script_lines.txt`。
@@ -456,15 +476,15 @@ python3 prepare_image_video_jobs.py \
 
 如果图片数量和分镜文本数量不同，脚本会继续生成任务，但会提示需要人工核对。接入具体视频生成 API 后，可以让 API 读取这份 CSV，逐行上传图片和提示词，生成到 `videos/` 文件夹。
 
-## 调用青云聚合 Grok 视频生成 API
+## 调用 ToAPIs Grok 视频生成 API
 
 当前默认模型：
 
 ```text
-grok-video-3-10s
+grok-video-3
 ```
 
-默认接口是 `https://api.qingyuntop.top/v1/video/create`，横屏 `16x9`，每次生成固定 10 秒。如果要让每个视频片段的时长贴合讲故事原声，先把旁白音频对齐到任务 CSV：
+默认接口是 `https://toapis.com/v1/videos/generations`，横屏 `16:9`、720p，每次生成固定 10 秒。本地参考图会先上传到 `/v1/uploads/images`，再以 URL 提交异步视频任务。如果要让每个视频片段的时长贴合讲故事原声，先把旁白音频对齐到任务 CSV：
 
 ```bash
 python3 apply_narration_durations.py \
@@ -479,7 +499,7 @@ python3 apply_narration_durations.py \
 先把 API Key 放到环境变量，不要写进文件：
 
 ```bash
-export QINGYUN_API_KEY="你的青云聚合 API Key"
+export TOAPIS_API_KEY="只在当前终端设置，不要写进仓库"
 ```
 
 建议先只跑 1 条做验证：
@@ -503,7 +523,7 @@ python3 run_image_video_jobs.py \
   --limit 1
 ```
 
-批量生成时建议一次性先提交全部任务，让青云侧并发排队/生成。半自动工作台的“5 生成视频”默认已经会这样做；如果手动终端跑全量，记得加 `--submit-all-first`：
+批量生成时建议一次性先提交全部任务，让 ToAPIs 异步排队/生成。半自动工作台的“5 生成视频”默认已经会这样做；如果手动终端跑全量，记得加 `--submit-all-first`：
 
 ```bash
 python3 run_image_video_jobs.py \
@@ -513,14 +533,14 @@ python3 run_image_video_jobs.py \
   --submit-all-first
 ```
 
-脚本会按青云聚合的 `video/create` 格式提交请求：
+脚本会按 ToAPIs 的 Grok 视频格式提交请求：
 
 ```text
-model=grok-video-3-10s
+model=grok-video-3
 seconds=10
-size=720P
+resolution=720p
 aspect_ratio=16:9
-images=[data:image/png;base64,...]
+images=[https://files.toapis.com/...]
 ```
 
 确认单条成功后，再去掉 `--limit 1` 批量跑。每完成一个任务，CSV 会写入 `task_id`、`video_url`、`status`，视频保存到 `videos/`，预览页会自动读取对应文件名。

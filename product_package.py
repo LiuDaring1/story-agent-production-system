@@ -57,6 +57,7 @@ class KeyingPreset:
     chroma_similarity: float = 0.10
     chroma_blend: float = 0.0
     person_crop: tuple[int, int, int, int] | None = None
+    detected_person_bbox: tuple[int, int, int, int] | None = None
     person_grade: str = "none"
     person_beauty: str = "light"
     person_height_ratio: float = 0.96
@@ -98,10 +99,10 @@ def main() -> None:
     parser.add_argument("--language", default="zh")
     parser.add_argument("--demo-width", default=1920, type=int)
     parser.add_argument("--demo-height", default=1080, type=int)
-    parser.add_argument("--demo-crf", default=20, type=int)
-    parser.add_argument("--demo-preset", default="veryfast")
+    parser.add_argument("--demo-crf", default=15, type=int)
+    parser.add_argument("--demo-preset", default="medium")
     parser.add_argument("--demo-person-crop-bottom-ratio", default=0.0, type=float, help="示范视频专用：从绿幕人物裁切框底部额外收掉的比例，用于清理发布框原本遮住的地面横条")
-    parser.add_argument("--demo-person-crop-mode", choices=["preset", "full-width"], default="preset", help="示范视频专用：preset 沿用发布裁切；full-width 保留竖屏素材横向全宽，优先防止手部被切")
+    parser.add_argument("--demo-person-crop-mode", choices=["source-native", "preset", "full-width"], default="source-native", help="示范视频默认保留拍摄原构图；只有人工确认后才使用裁切框")
     parser.add_argument("--demo-person-vertical-align", choices=["center", "bottom"], default="center")
     parser.add_argument("--preview-only", action="store_true", help="只生成第 16 步示范视频预览帧和 Codex 交接说明，不渲染完整资料包")
     parser.add_argument("--preview-times", default="0.8,1.5,2.5,37,92", help="示范视频预览抽帧时间点，秒")
@@ -269,6 +270,7 @@ def build_product_package(args: argparse.Namespace) -> None:
         if not annotation_source.exists():
             raise FileNotFoundError(f"朗读标注 JSON 不存在：{annotation_source}")
         blocks = load_annotation_blocks(annotation_source)
+        validate_annotation_coverage(blocks, public_script_lines)
         render_annotation_blocks_docx(story_name, blocks, annotation_docx)
     elif args.allow_draft_annotation:
         print("[warning] 当前使用规则草稿生成朗读标注，仅用于内部预览；正式资料包请传 --annotation-json 或 --annotation-docx。")
@@ -452,6 +454,7 @@ def load_or_build_timings(path: Path | None, script_lines: list[str], narration:
 
 
 def render_story_docx(story_name: str, story_text: str, output_path: Path) -> None:
+    story_text = re.sub(rf"^\s*故事文稿[：:]\s*{re.escape(story_name)}\s*", "", story_text, count=1)
     doc = Document()
     section = doc.sections[0]
     section.top_margin = Inches(0.75)
@@ -592,7 +595,9 @@ def write_annotation_request(story_name: str, lines: list[str], output_path: Pat
 
 硬性要求：
 - 不要套话，不要写“开头要说清楚”“先交代人物情境”这类通用句。
+- 批注像有经验的幼儿园故事老师当面说话：温和、短句、先给角色心情或画面，再给声音和动作；禁止“内容重点、节奏落点、情绪层次”等分析术语。
 - 每段 2-4 句，按场景/角色/情绪转折拆分。
+- marked_text 必须逐字覆盖下方故事台词，除主持人身份脱敏外不得润色、增删、改代词或改句尾。
 - 红字只标真正需要重读的内容词、角色/道具首次出现、关键动作、矛盾转折、道理关键词；不得整句连红。
 - 批注必须基于文本本身，写清楚为什么这样读，如何配合语气、停顿、表情或动作。
 - 输出 JSON 数组，每项字段为 title、marked_text、emotion、notes。
@@ -765,11 +770,12 @@ def render_keyed_preview_frame(source_frame: Path, background_image: Path | None
         x, y, w, h = preset.person_crop
         crop_filter = f"crop={w}:{h}:{x}:{y},"
     key_filter = keying_filter_chain("[1:v]", preset, crop_filter)
+    native_filter, native_x, native_y = source_native_person_layout(source_frame, preset, width, height)
     filters = [
         f"[0:v]scale={width}:{height},setsar=1,format=rgba[bg]",
         key_filter,
-        f"[person_keyed]scale=-1:{int(height * preset.person_height_ratio)},setsar=1,format=rgba[person]",
-        f"[bg][person]overlay=(W-w)/2:H-h-{preset.bottom_margin}[v]",
+        f"[person_keyed]{native_filter},setsar=1,format=rgba[person]",
+        f"[bg][person]overlay={native_x}:{native_y}[v]",
     ]
     run_command(
         [
@@ -822,13 +828,18 @@ def render_demo_video(
 
     crop_filter = demo_crop_filter(person_video, preset, crop_bottom_ratio, crop_mode)
     key_filter = keying_filter_chain("[1:v]", preset, crop_filter)
-    demo_person_height = min(int(height * preset.person_height_ratio), height - 24)
-    person_y = "H-h" if vertical_align == "bottom" else "(H-h)/2"
+    if crop_mode == "source-native":
+        person_filter, person_x, person_y = source_native_person_layout(person_video, preset, width, height)
+    else:
+        demo_person_height = min(int(height * preset.person_height_ratio), height)
+        person_filter = f"scale=-1:{demo_person_height}"
+        person_x = "(W-w)/2"
+        person_y = "H-h" if vertical_align == "bottom" else "(H-h)/2"
     filters = [
         f"[0:v]scale={width}:{height},setsar=1,format=rgba[bg]",
         key_filter,
-        f"[person_keyed]scale=-1:{demo_person_height},setsar=1,format=rgba[person]",
-        f"[bg][person]overlay=(W-w)/2:{person_y}[withperson]",
+        f"[person_keyed]{person_filter},setsar=1,format=rgba[person]",
+        f"[bg][person]overlay={person_x}:{person_y}[withperson]",
         "[2:v]format=rgba[subtitles]",
         "[withperson][subtitles]overlay=0:0[v]",
         f"[3:a]volume={narration_volume:.3f},atrim=0:{duration:.3f},asetpts=PTS-STARTPTS[voice]",
@@ -880,7 +891,7 @@ def render_demo_video(
             "-c:a",
             "aac",
             "-b:a",
-            "192k",
+            "256k",
             "-movflags",
             "+faststart",
             str(output_path),
@@ -956,13 +967,18 @@ def render_demo_preview_frame(
 ) -> None:
     crop_filter = demo_crop_filter(person_video, preset, crop_bottom_ratio, crop_mode)
     key_filter = keying_filter_chain("[1:v]", preset, crop_filter)
-    demo_person_height = min(int(height * preset.person_height_ratio), height - 24)
-    person_y = "H-h" if vertical_align == "bottom" else "(H-h)/2"
+    if crop_mode == "source-native":
+        person_filter, person_x, person_y = source_native_person_layout(person_video, preset, width, height)
+    else:
+        demo_person_height = min(int(height * preset.person_height_ratio), height)
+        person_filter = f"scale=-1:{demo_person_height}"
+        person_x = "(W-w)/2"
+        person_y = "H-h" if vertical_align == "bottom" else "(H-h)/2"
     filters = [
         f"[0:v]scale={width}:{height},setsar=1,format=rgba[bg]",
         key_filter,
-        f"[person_keyed]scale=-1:{demo_person_height},setsar=1,format=rgba[person]",
-        f"[bg][person]overlay=(W-w)/2:{person_y}[withperson]",
+        f"[person_keyed]{person_filter},setsar=1,format=rgba[person]",
+        f"[bg][person]overlay={person_x}:{person_y}[withperson]",
         "[2:v]format=rgba[subtitles]",
         "[withperson][subtitles]overlay=0:0[v]",
     ]
@@ -991,6 +1007,8 @@ def render_demo_preview_frame(
 
 
 def demo_crop_filter(person_video: Path, preset: KeyingPreset, crop_bottom_ratio: float, crop_mode: str) -> str:
+    if crop_mode == "source-native":
+        return ""
     if preset.person_crop is None:
         return ""
     x, y, w, h = preset.person_crop
@@ -1002,6 +1020,34 @@ def demo_crop_filter(person_video: Path, preset: KeyingPreset, crop_bottom_ratio
     if crop_bottom_ratio > 0:
         h = max(1, int(round(h * (1 - crop_bottom_ratio))))
     return f"crop={w}:{h}:{x}:{y},"
+
+
+def source_native_person_layout(
+    person_media: Path,
+    preset: KeyingPreset,
+    output_width: int,
+    output_height: int,
+) -> tuple[str, int, int]:
+    """Preserve source composition while excluding green-screen edge bands."""
+    source_width, source_height = probe_video_size(person_media)
+    scale = min(output_width / source_width, output_height / source_height)
+    canvas_x = round((output_width - source_width * scale) / 2)
+    canvas_y = round((output_height - source_height * scale) / 2)
+    bbox = preset.detected_person_bbox
+    if bbox is None:
+        return f"scale={max(1, round(source_width * scale))}:{max(1, round(source_height * scale))}", canvas_x, canvas_y
+    x, y, width, height = bbox
+    x = max(0, min(source_width - 1, x))
+    y = max(0, min(source_height - 1, y))
+    width = max(1, min(source_width - x, width))
+    height = max(1, min(source_height - y, height))
+    target_width = max(1, round(width * scale))
+    target_height = max(1, round(height * scale))
+    return (
+        f"crop={width}:{height}:{x}:{y},scale={target_width}:{target_height}",
+        canvas_x + round(x * scale),
+        canvas_y + round(y * scale),
+    )
 
 
 def probe_video_size(path: Path) -> tuple[int, int]:
@@ -1122,6 +1168,8 @@ def keying_filter_chain(source: str, preset: KeyingPreset, crop_filter: str = ""
 
 
 def person_grade_filter(value: str) -> str:
+    if value == "natural":
+        return ",eq=contrast=1.05:saturation=1.07:brightness=0.01:gamma=0.99"
     if value == "log-soft":
         return ",eq=contrast=1.18:saturation=1.25:brightness=0.03:gamma=0.96"
     if value == "log-strong":
@@ -1367,6 +1415,15 @@ def load_keying_preset(path: Path) -> KeyingPreset:
         crop = None
     if crop is not None and len(crop) != 4:
         raise ValueError("person_crop 必须是 x,y,w,h")
+    detected_bbox = data.get("detected_person_bbox")
+    if isinstance(detected_bbox, str) and detected_bbox.strip():
+        detected_bbox = tuple(int(float(part.strip())) for part in detected_bbox.replace("，", ",").split(","))
+    elif isinstance(detected_bbox, list):
+        detected_bbox = tuple(int(value) for value in detected_bbox)
+    else:
+        detected_bbox = None
+    if detected_bbox is not None and len(detected_bbox) != 4:
+        raise ValueError("detected_person_bbox 必须是 x,y,w,h")
     keyer = str(data.get("keyer", "colorkey"))
     if keyer not in {"colorkey", "chromakey"}:
         raise ValueError("keyer 只能是 colorkey 或 chromakey")
@@ -1376,6 +1433,7 @@ def load_keying_preset(path: Path) -> KeyingPreset:
         chroma_similarity=float(data.get("chroma_similarity", 0.10)),
         chroma_blend=float(data.get("chroma_blend", 0.0)),
         person_crop=crop,  # type: ignore[arg-type]
+        detected_person_bbox=detected_bbox,  # type: ignore[arg-type]
         person_grade=str(data.get("person_grade", "none")),
         person_beauty=str(data.get("person_beauty", "light")),
         person_height_ratio=float(data.get("person_height_ratio", 0.96)),
@@ -1461,9 +1519,11 @@ def mark_clause(clause: str) -> tuple[str, list[str]]:
     candidates = performance_keyword_candidates(clause)
     selected: list[str] = []
     selected_spans: list[tuple[int, int]] = []
-    red_budget = max(4, min(10, len(re.sub(r"\s+", "", clause)) // 3))
+    clean_length = len(re.sub(r"\s+", "", clause))
+    max_phrases = 2 if clean_length < 12 else (4 if clean_length < 30 else 6)
+    red_budget = max(4, min(18, round(clean_length * 0.32)))
     for candidate in candidates:
-        if len(selected) >= 2:
+        if len(selected) >= max_phrases:
             break
         pos = clause.find(candidate)
         if pos < 0:
@@ -1486,64 +1546,22 @@ def mark_clause(clause: str) -> tuple[str, list[str]]:
 def performance_keyword_candidates(clause: str) -> list[str]:
     clean = re.sub(r"\s+", "", clause)
     candidates: list[str] = []
-    important_terms = (
-        "皇帝的新装",
-        "绵羊姐姐",
-        "皇帝",
-        "新衣服",
-        "两个骗子",
-        "骗子",
-        "好布",
-        "脑子笨",
-        "谁笨谁聪明",
-        "金币",
-        "生丝",
-        "空织机",
-        "最忠诚的大臣",
-        "大臣",
-        "看不见",
-        "美极了",
-        "花纹",
-        "色彩",
-        "另一个大臣",
-        "游行大典",
-        "天真的小孩",
-        "小孩",
-        "没穿",
-        "真话",
-        "裙摆",
-        "自相矛盾",
-        "卖兵器的人",
-        "围观的人",
-        "人群里",
-        "不动脑子",
-        "绕进去",
-        "哭笑不得",
-        "最坚固",
-        "最锋利",
-        "刺不穿",
-        "刺穿",
-        "举起",
-        "放下",
-        "拿起",
-        "夸耀",
-        "吹嘘",
-        "愣住",
-        "说不出",
-        "冷冷地",
-        "得意洋洋",
-        "哈哈大笑",
-        "灰溜溜",
-        "矛",
-        "盾",
+    # 重音应跟随动作、反差、情绪和叙事转折，而不是绑定某几个样例故事。
+    generic_beats = (
+        "凶猛", "横行霸道", "害怕", "勇敢", "聪明", "生气", "得意", "惊讶", "害羞", "紧张", "委屈",
+        "鼓起勇气", "硬着头皮", "毫不畏惧", "主动帮助", "连连点头", "答应", "投降", "再也不",
+        "扬起", "举起", "放下", "拿起", "踩下去", "躲开", "爬上", "爬下", "冲过去", "逃走",
+        "狠狠地", "悄悄地", "飞快地", "灵活地", "突然", "忽然", "一下子", "嗖的一下",
+        "根本", "特别", "非常", "一定", "真正", "最", "没有", "不能", "不会", "却", "竟然",
+        "看不见", "找不到", "记住了", "改掉了", "欺负", "帮助", "好痛", "好痒",
+        "啊呜", "哎哟", "哎呀", "天哪", "哈哈大笑", "哭笑不得", "得意洋洋", "灰溜溜",
     )
-    candidates.extend(term for term in important_terms if term in clean)
+    candidates.extend(term for term in generic_beats if term in clean)
     candidates.extend(re.findall(r"[一二三四五六七八九十百千万两0-9]+[个名只把件句秒年天]?", clean))
-    candidates.extend(re.findall(r"[\u4e00-\u9fff]{1,4}(?:王|先生|大王|小朋友|乐师|队伍|人群|卖兵器的人|南郭先生|齐宣王)", clean))
-    candidates.extend(re.findall(r"(?:根本|特别|非常|最|没有|不能|不会|却|突然|一下子|哈哈大笑)[\u4e00-\u9fff]{0,4}", clean))
-    candidates.extend(re.findall(r"[\u4e00-\u9fff]{1,4}(?:举起|放下|拿起|吹嘘|问道|愣住|逃走|刺穿|刺不穿|合奏|跳舞|考察|混入|收起|围观|大笑)", clean))
-    candidates.extend(re.findall(r"[\u4e00-\u9fff]{2,4}(?:矛盾|成语|故事|名字|竽|矛|盾)", clean))
-    candidates.extend(re.findall(r"[\u4e00-\u9fff]{2,4}(?:热热闹闹|气势十足|摇头晃脑|灰溜溜|得意洋洋|结结巴巴)", clean))
+    candidates.extend(re.findall(r"[\u4e00-\u9fff]{1,4}(?:大象|蚂蚁|狐狸|乌鸦|老虎|狮子|小朋友|先生|大王|将军|孩子|老人)", clean))
+    candidates.extend(re.findall(r"(?:根本|特别|非常|一定|真正|最|没有|不能|不会|却|竟然|突然|忽然)[\u4e00-\u9fff]{0,4}", clean))
+    candidates.extend(re.findall(r"[\u4e00-\u9fff]{0,4}(?:举起|放下|拿起|扬起|踩下|躲开|爬上|爬下|冲去|逃走|愣住|大笑|投降|答应|帮助|欺负)", clean))
+    candidates.extend(re.findall(r"[\u4e00-\u9fff]{2,6}(?:热热闹闹|气势十足|摇头晃脑|结结巴巴)", clean))
     stopwords = {
         "大家好",
         "今天这个",
@@ -1555,7 +1573,7 @@ def performance_keyword_candidates(clause: str) -> list[str]:
         "他说",
         "我是",
     }
-    single_important = {"矛", "盾", "竽"}
+    single_important: set[str] = set()
     filtered = [
         item
         for item in candidates
@@ -1571,11 +1589,13 @@ def performance_keyword_candidates(clause: str) -> list[str]:
 
 def keyword_priority(keyword: str) -> tuple[int, int]:
     priority = 0
-    if any(token in keyword for token in ("王", "先生", "大王", "人", "队伍", "乐师", "矛", "盾", "竽")):
+    if any(token in keyword for token in ("大象", "蚂蚁", "狐狸", "乌鸦", "老虎", "狮子", "先生", "大王", "将军", "孩子")):
         priority += 4
-    if any(token in keyword for token in ("根本", "最", "没有", "不会", "不能", "却")):
+    if any(token in keyword for token in ("根本", "最", "没有", "不会", "不能", "却", "一定", "真正", "再也不")):
         priority += 4
-    if any(token in keyword for token in ("举起", "吹嘘", "愣住", "逃走", "刺", "跳舞", "大笑")):
+    if any(token in keyword for token in ("扬起", "举起", "踩", "躲", "爬", "愣住", "逃走", "大笑", "投降", "帮助", "欺负")):
+        priority += 3
+    if any(token in keyword for token in ("勇敢", "聪明", "害怕", "生气", "惊讶", "得意", "好痛", "好痒", "啊呜", "哎哟")):
         priority += 3
     if re.search(r"[一二三四五六七八九十百千万两0-9]", keyword):
         priority += 2
@@ -1594,17 +1614,37 @@ def unique_preserve_order(items: list[str]) -> list[str]:
 
 
 def validate_annotation_blocks(blocks: list[AnnotationBlock]) -> None:
-    generic_bad = ("开头要说清楚", "先把人物和情境交代稳")
+    generic_bad = (
+        "开头要说清楚",
+        "先把人物和情境交代稳",
+        "内容重点",
+        "节奏落点",
+        "情绪层次",
+        "完成收束",
+    )
     for index, block in enumerate(blocks, start=1):
         plain = re.sub(r"[* /\n]", "", block.marked_text)
         emphasized = "".join(re.findall(r"\*\*(.*?)\*\*", block.marked_text))
         if plain and len(emphasized) / len(plain) > 0.36:
             raise ValueError(f"朗读标注第 {index} 段重音过密，请减少红字。")
-        if any(len(item) > 6 for item in re.findall(r"\*\*(.*?)\*\*", block.marked_text)):
+        groups = re.findall(r"\*\*(.*?)\*\*", block.marked_text)
+        if len(plain) >= 60 and (len(groups) < 5 or len(emphasized) / len(plain) < 0.08):
+            raise ValueError(f"朗读标注第 {index} 段重音不足；请补齐动作、反差、情绪和转折重音。")
+        if any(len(item) > 8 for item in groups):
             raise ValueError(f"朗读标注第 {index} 段存在过长连续重音。")
         notes_text = "\n".join(block.notes)
         if any(bad in notes_text for bad in generic_bad):
             raise ValueError(f"朗读标注第 {index} 段解析出现套话，请改写为基于文本的具体指导。")
+
+
+def validate_annotation_coverage(blocks: list[AnnotationBlock], source_lines: list[str]) -> None:
+    def normalized(value: str) -> str:
+        return re.sub(r"\s+", "", value.replace("**", "").replace("/", ""))
+
+    expected = normalized("".join(source_lines))
+    actual = normalized("".join(block.marked_text for block in blocks))
+    if actual != expected:
+        raise ValueError("朗读标注 marked_text 未逐字覆盖客户正文，存在增删、改写、代词或句尾差异。")
 
 
 def infer_segment_title(line: str, index: int) -> str:
@@ -1745,9 +1785,9 @@ def set_ppt_advance(slide, seconds: float) -> None:
 
 def add_ppt_subtitle(slide, text: str, prs: Presentation) -> None:
     clean, font_size = fit_ppt_subtitle_text(text)
-    height_ratio = 0.15 if "\n" in clean or len(clean) > 32 else 0.09
-    height = int(prs.slide_height * height_ratio)
-    box = slide.shapes.add_textbox(0, prs.slide_height - height, prs.slide_width, height)
+    height_ratio = 0.18 if "\n" in clean else 0.11
+    height = int(prs.slide_height * height_ratio) + 1
+    box = slide.shapes.add_textbox(0, prs.slide_height - height + 1, prs.slide_width, height)
     box.fill.solid()
     box.fill.fore_color.rgb = PptRGBColor(0, 0, 0)
     tf = box.text_frame
@@ -1770,17 +1810,17 @@ def add_ppt_subtitle(slide, text: str, prs: Presentation) -> None:
 
 def fit_ppt_subtitle_text(text: str) -> tuple[str, int]:
     clean = clean_ppt_subtitle_text(text)
-    if len(clean) <= 20:
-        return clean, 26
-    if len(clean) <= 36:
-        return clean, max(18, int(26 * 22 / max(1, len(clean))))
+    if len(clean) <= 22:
+        return clean, 28
+    if len(clean) <= 44:
+        return clean, max(20, int(28 * 28 / max(1, len(clean))))
     midpoint = len(clean) // 2
     split_at = min(
         range(1, len(clean)),
-        key=lambda idx: abs(idx - midpoint) + (0 if clean[idx - 1] == " " else 6),
+        key=lambda idx: abs(idx - midpoint) + (0 if clean[idx - 1] == " " else 4),
     )
     wrapped = clean[:split_at].strip() + "\n" + clean[split_at:].strip()
-    return wrapped, max(16, int(26 * 30 / max(1, len(clean))))
+    return wrapped, max(18, int(28 * 42 / max(1, len(clean))))
 
 
 def clean_ppt_subtitle_text(text: str) -> str:

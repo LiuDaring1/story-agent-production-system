@@ -1,5 +1,7 @@
 # Story Video Composer 工作台交接说明
 
+> 2026-07-13 说明：本文件保留的是旧工作台历史交接，工作台现在仅用于故障诊断，不再是正常生产入口。全自动 Agent 的当前准确信息请优先阅读 `README.md`、`STORY_AGENT_SPEC.md`、`FULL_AUTO_READINESS_AUDIT.md`、`SHADOW_PRODUCTION_REPORT.md` 和 `FULL_AUTO_PROMOTION_REPORT.md`；正常入口是 Codex + `story_agent.py`。
+
 更新时间：2026-05-08
 
 ## 交接对象
@@ -103,7 +105,7 @@
 
 - Codex 对话上下文不会迁移，新账号必须先读本交接文档和 `STORY_PIPELINE.md`。
 - 图片生成能力和 Codex 智能调用消耗当前登录账号额度。
-- 图生视频依赖本地 `QINGYUN_API_KEY` 或工作台里临时填入的青云 Key。
+- 图生视频默认依赖本地 `TOAPIS_API_KEY` 或 macOS 钥匙串 `story-agent.TOAPIS_API_KEY`；旧青云 Key 不再作为默认生产凭据。
 - Suno 仍是人工网页生成和下载。
 - macOS 文件访问审批可能需要新会话重新允许。
 

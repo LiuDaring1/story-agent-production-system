@@ -99,8 +99,12 @@ class StoryWorkbenchApp:
         self.language = StringVar(value="zh")
         self.subtitle_style = StringVar(value="clean")
         video_api = config.get("video_api", {}) if isinstance(config.get("video_api"), dict) else {}
-        self.api_key = StringVar(value=os.getenv("QINGYUN_API_KEY", ""))
-        self.video_base_url = str(video_api.get("base_url") or "").strip()
+        provider_name = str(video_api.get("provider") or "").strip()
+        adapters = video_api.get("adapters", {}) if isinstance(video_api.get("adapters"), dict) else {}
+        provider_config = adapters.get(provider_name, {}) if isinstance(adapters.get(provider_name), dict) else video_api
+        self.api_key_env = str(provider_config.get("api_key_env") or "TOAPIS_API_KEY").strip()
+        self.api_key = StringVar(value=os.getenv(self.api_key_env, ""))
+        self.video_base_url = str(provider_config.get("base_url") or "").strip()
 
         self._build_ui()
         self.story_title.trace_add("write", lambda *_: self._sync_generated_project_fields())
@@ -223,7 +227,7 @@ class StoryWorkbenchApp:
 
         key_row = Frame(settings)
         key_row.pack(fill=X, padx=8, pady=(0, 8))
-        Label(key_row, text="青云 Key", width=9, anchor=W).pack(side=LEFT)
+        Label(key_row, text="视频 API Key", width=12, anchor=W).pack(side=LEFT)
         Entry(key_row, textvariable=self.api_key, show="*", width=44).pack(side=LEFT, fill=X, expand=True)
         Label(key_row, text="可选，不保存；留空则使用环境变量").pack(side=LEFT, padx=(8, 0))
 
@@ -1050,9 +1054,9 @@ class StoryWorkbenchApp:
                 }
             )
             if self.api_key.get().strip():
-                env["QINGYUN_API_KEY"] = self.api_key.get().strip()
+                env[self.api_key_env] = self.api_key.get().strip()
             if self.video_base_url:
-                env["QINGYUN_BASE_URL"] = self.video_base_url
+                env["VIDEO_API_BASE_URL"] = self.video_base_url
             process = subprocess.Popen(
                 command,
                 stdout=subprocess.PIPE,

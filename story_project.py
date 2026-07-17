@@ -44,7 +44,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "default_story_type": "童话故事",
     "default_image_style": "自动",
     "story_type_options": ["寓言故事", "成语故事", "童话故事", "民间故事", "神话故事", "红色故事", "历史故事", "科普故事"],
-    "age_range_options": ["3-5岁", "6-8岁", "9-11岁", "12-14岁", "15岁以上"],
+    "age_range_options": ["3-6岁", "4-6岁", "6-8岁", "9-11岁", "12-14岁", "15岁以上"],
     "default_age_range": "6-8岁",
     "brand_assets": {
         "assets_dir": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材",
@@ -63,40 +63,54 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "b_story_box": "356,180,1209,680",
         "b_windows": "auto",
         "c_windows": "auto",
-        "person_height": 900,
-        "person_x": 755,
-        "person_y": 108,
+        "person_height": 1080,
+        "person_x": 260,
+        "person_y": 0,
         "person_crop": "",
-        "person_grade": "log-soft",
+        "person_grade": "natural",
         "person_beauty": "light",
         "keyer": "colorkey",
         "chroma_color": "0x00FF00",
         "chroma_similarity": 0.095,
         "chroma_blend": 0.04,
-        "watermark_width": 190,
-        "watermark_opacity": 0.78,
-        "watermark_speed": 1.0,
+        "watermark_width": 120,
+        "watermark_opacity": 0.62,
+        "watermark_speed": 0.35,
+        "tail_seconds": 0,
+        "tail_notice_text": "有需要联系客服，好作品有偿分享！",
         "story_logo_width_a": 150,
         "story_logo_width_b": 175,
         "story_logo_x": 42,
         "story_logo_y": 44,
         "output_scale": 2,
-        "crf": 17,
+        "crf": 15,
         "preset": "medium",
+        "subtitle_font_size": 52,
+        "subtitle_margin_v": 72,
     },
     "product_defaults": {
         "music_volume": 0.22,
         "narration_volume": 1.0,
+        "include_demo_logo": False,
     },
     "external_tools": {
         "suno_story_score_skill": str(Path.home() / "Downloads" / "suno-story-score.skill"),
         "story_performance_script_skill": str(Path.home() / "Downloads" / "story-performance-script.skill"),
     },
     "video_api": {
-        "provider": "qingyun_api",
+        "provider": "toapis_grok",
         "fallback_provider": "browser",
         "browser_provider_name": "Flow",
+        "submit_all_first": True,
+        "max_submit_first": 20,
         "adapters": {
+            "toapis_grok": {
+                "runner": "run_image_video_jobs.py",
+                "base_url": "https://toapis.com/v1",
+                "model": "grok-video-3",
+                "api_key_env": "TOAPIS_API_KEY",
+                "estimated_cost_cny_per_clip": 0.42,
+            },
             "qingyun_api": {
                 "runner": "run_image_video_jobs.py",
                 "base_url": "https://api.qingyuntop.top/v1",
@@ -117,9 +131,13 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "hard_budget_cny": 100.0,
         "deadline_hours": 10.0,
         "review_pass_score": 85,
+        "max_retries": 2,
+        "max_critical_retries": 3,
         "max_attempts": 2,
         "max_critical_attempts": 3,
         "whisper_model": "small",
+        "working_video_max_width": 0,
+        "proxy_video_max_width": 1280,
     },
 }
 
@@ -242,6 +260,7 @@ def default_manifest(paths: ProjectPaths, config: dict[str, Any], story_name: st
             "music": "",
             "greenscreen_video": "",
             "greenscreen_video_original": "",
+            "color_lut": "",
             "extracted_narration": "",
         },
         "outputs": {
@@ -278,6 +297,7 @@ def default_manifest(paths: ProjectPaths, config: dict[str, Any], story_name: st
             "deadline_hours": float(agent_defaults.get("deadline_hours", 10.0)),
             "min_free_disk_gb": float(agent_defaults.get("min_free_disk_gb", 10.0)),
             "started_at": "",
+            "active_elapsed_seconds": 0.0,
             "finished_at": "",
             "budget": {
                 "currency": "CNY",
@@ -425,16 +445,36 @@ def choose_preferred_audio(audios: list[Path]) -> Path | None:
 
 
 def choose_preferred_music(audios: list[Path], narration: Path | None = None) -> Path | None:
-    candidates = [path for path in audios if narration is None or path.resolve() != narration.resolve()]
+    candidates = [
+        path
+        for path in audios
+        if (narration is None or path.resolve() != narration.resolve()) and not looks_like_narration_audio(path)
+    ]
     if not candidates:
         return None
     preferred_tokens = ("背景音乐", "配乐", "bgm", "music", "soundtrack", "score")
     preferred = [path for path in candidates if any(token in path.name.lower() for token in preferred_tokens)]
     if preferred:
         return sorted(preferred, key=lambda p: p.name)[0]
-    if len(candidates) == 1:
-        return candidates[0]
     return None
+
+
+def looks_like_narration_audio(path: Path) -> bool:
+    name = path.stem.lower().replace("-", "_")
+    narration_tokens = (
+        "narration",
+        "voice",
+        "voiceover",
+        "source_extracted",
+        "extracted_audio",
+        "clean_audio",
+        "clean_narration",
+        "原声",
+        "旁白",
+        "口播",
+        "人声",
+    )
+    return any(token in name for token in narration_tokens)
 
 
 def choose_preferred_video(videos: list[Path]) -> Path | None:
@@ -495,11 +535,12 @@ def infer_story_type(text: str, default: str) -> str:
 
 
 def infer_age_range(text: str) -> str:
-    if any(token in text for token in ("战争", "牺牲", "历史", "将军", "英雄")):
-        return "12-14岁"
+    serious_history_hits = sum(token in text for token in ("战争", "牺牲", "战役", "革命", "历史", "将军"))
+    if serious_history_hits >= 2:
+        return "9-11岁"
     if len(text) > 1200 or any(token in text for token in ("成语", "道理", "智慧")):
         return "6-8岁"
-    return "3-5岁"
+    return "3-6岁"
 
 
 def update_story_info(
@@ -976,7 +1017,16 @@ def create_theme_asset_request(project_dir: Path) -> dict[str, Path]:
     assets_dir.mkdir(parents=True, exist_ok=True)
     config = load_config()
     theme = infer_theme_text(manifest)
-    duration_text = story.get("duration_text") or "待定"
+    duration_text = str(story.get("duration_text") or "").strip()
+    if not duration_text:
+        narration = first_existing(
+            manifest.get("inputs", {}).get("narration"),
+            manifest.get("inputs", {}).get("extracted_narration"),
+        )
+        if narration is not None:
+            duration_text = format_duration_text(safe_duration(narration))
+            story["duration_text"] = duration_text
+    duration_text = duration_text or "待定"
     request_path = assets_dir / "theme_assets_imagegen_request.md"
     handoff_path = assets_dir / "theme_assets_codex_handoff.txt"
     output_paths = {
@@ -1096,12 +1146,14 @@ def build_theme_asset_imagegen_request(
 ## 总体视觉要求
 
 - 参考“绵羊姐姐讲故事”的高质感儿童节目包装：亲和、明亮、精致、有主题感，不要做成简单 UI 占位图。
+- 把“封面/底板参考”作为固定包装语言参考：沿用其标题层级、上下分区和醒目程度，但不要照搬与本故事无关的角色、文案或装饰。
 - 视觉元素不要套固定模板，也不要每期重复使用同一批装饰。请根据本期故事内容、故事类型、情绪和目标年龄自行判断画面语言，允许自由发挥；但不能杂乱，不能遮挡真实视频区域。
 - 两张 3:4 发布底板必须在 Codex 原生生图结果中直接包含下面“可见内容”列出的文字；不要生成空白牌匾/面板后再用本地代码补字。
 - 所有文字必须尽量准确；如果原生生图文字严重错误，重新生成，不要用 Pillow 或其他本地代码后期修字。
 - 底板整体要清爽、直接、信息优先。主账号尤其要简洁，宝库号可以保留更丰富的商品资料包包装感；两者都不要把装饰、徽章、花纹、角色和道具堆满画面。
 - 中间 16:9 视频安全区必须刚好处在 3:4 竖屏画布正中间：x=0, y=416, w=1080, h=608；上方和下方可视包装区各 416px，高度和面积完全相等。
 - 主账号顶部只放故事类型和故事标题，不放时长、适龄段、品牌字或资料包信息；风格按故事类型轻量适配，例如历史故事可偏典雅，儿童童话可更可爱，但只做简单点缀。
+- 类型适配必须克制且明确：童话/动物故事可圆润可爱；民间、成语、神话和历史故事使用清雅中国绘本气质、传统色与少量纹样，禁止通用塑料 3D 装饰或网游仙侠风。
 - 主账号底部只放完整版时长、适合年龄和固定适用说明，避免商品资料清单式堆叠。
 - 底板不得出现绵羊姐姐、羊头、小羊、卡通羊、人偶或任何人物/动物吉祥物形象；除非故事本身需要，避免无关角色或动物进入发布包装。
 - 底板必须拆成顶部源图和底部源图分别生成，再由程序夹入固定 16:9 视频空挡。不要让 imagegen 直接生成完整 1080x1440 底板，因为它容易把安全区画错。Pillow 只负责拼接、裁切和尺寸整理，不负责生成或修正文案。
@@ -1526,7 +1578,8 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
             "candidates": candidates,
             "recommended_candidate": recommended["id"],
             "candidate_sheet": str(candidate_sheet),
-            "selection_policy": "背景绿幕波动决定初始 similarity；站立与大手势双帧由独立视觉审核最终确认。",
+            "detected_person_bbox": person_crop,
+            "selection_policy": "背景绿幕波动决定初始 similarity；人物框不改变示范/C镜原始大小和位置，只用于清除表演安全区外的暗绿幕残边，并为A镜人物版式提供安全裁切。站立与大手势双帧由独立视觉审核最终确认。",
         },
     )
     # Default for current horizontal 16:9 green-screen shoots: presenter centered
@@ -1536,12 +1589,16 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
         "chroma_color": color,
         "chroma_similarity": recommended["similarity"],
         "chroma_blend": recommended["blend"],
-        "person_crop": person_crop,
-        "person_grade": "log-soft",
+        "person_crop": None,
+        # Union bbox from standing + large-gesture samples.  Native layouts use
+        # it as an alpha boundary without rescaling/repositioning the performer;
+        # A-shot layout may use it as a safe subject crop.
+        "detected_person_bbox": person_crop,
+        "person_grade": "natural",
         "person_beauty": "light",
-        "person_height_ratio": 0.9,
-        "person_x": 755,
-        "person_y": 108,
+        "person_height_ratio": 1.0,
+        "person_x": 260,
+        "person_y": 0,
         "bottom_margin": 0,
         "auto_selected": True,
         "source_video": str(video),
@@ -1949,6 +2006,18 @@ def write_internal_agent_reports(project_dir: Path) -> dict[str, Path]:
         )
     else:
         exception_lines.append("- 无")
+    external_blockers = agent.get("external_blockers", []) if isinstance(agent.get("external_blockers"), list) else []
+    exception_lines.extend(["", "## 外部阻塞"])
+    if external_blockers:
+        for item in external_blockers:
+            if not isinstance(item, dict):
+                continue
+            exception_lines.append(
+                f"- `{item.get('kind', 'external')}`：{item.get('status', 'pending')}；"
+                f"{item.get('message', '')}；恢复动作：{item.get('recovery_action', '')}"
+            )
+    else:
+        exception_lines.append("- 无")
     exception_md.write_text("\n".join(exception_lines) + "\n", encoding="utf-8")
 
     manifest.setdefault("outputs", {}).update(
@@ -1972,7 +2041,21 @@ def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) ->
     paths = project_paths(project_dir)
     manifest = detect_project_assets(paths.root)
     discover_outputs(paths, manifest)
-    for qa_func in (qa_images, qa_videos, qa_release, qa_product, qa_publish):
+    qa_steps = (
+        (qa_images, "images"),
+        (qa_videos, "videos"),
+        (qa_release, "release"),
+        (qa_product, "product"),
+        (qa_publish, "publish"),
+    )
+    agent_job = bool(manifest.get("agent", {}).get("job_id"))
+    for qa_func, qa_key in qa_steps:
+        existing_report = first_existing(manifest.get("qa", {}).get(qa_key))
+        if agent_job and existing_report is not None:
+            # Independent Agent reviews bind the exact QA report bytes. Rewriting an
+            # already-present report here (often only changing checked_at) would
+            # invalidate a valid review bundle during finalization.
+            continue
         try:
             qa_func(paths.root)  # type: ignore[arg-type]
         except Exception as exc:
@@ -2042,14 +2125,14 @@ def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) ->
     if manifest.get("agent", {}).get("job_id"):
         review_paths = {
             "source_edit_review": paths.status / "source_edit" / "source_edit_review.json",
-            "story_images_review": paths.status / "reviews" / "story_images_review.json",
+            "story_images_review": paths.status / "reviews" / "story_images_review_review.json",
             "video_prompt_review": paths.status / "reviews" / "video_prompt_review.json",
-            "video_review": paths.status / "reviews" / "video_review.json",
+            "video_review": paths.status / "reviews" / "video_review_review.json",
             "release_preview": paths.status / "reviews" / "release_preview_review.json",
-            "release_video_review": paths.status / "reviews" / "release_video_review.json",
-            "publish_package_review": paths.status / "reviews" / "publish_package_review.json",
-            "product_annotation_review": paths.status / "reviews" / "product_annotation_review.json",
-            "product_package_review": paths.status / "reviews" / "product_package_review.json",
+            "release_video_review": paths.status / "reviews" / "release_video_review_review.json",
+            "publish_package_review": paths.status / "reviews" / "publish_package_review_review.json",
+            "product_annotation_review": paths.status / "reviews" / "product_annotation_review_review.json",
+            "product_package_review": paths.status / "reviews" / "product_package_review_review.json",
         }
         review_artifacts = {
             "source_edit_review": Path(str(manifest.get("outputs", {}).get("source_edit_decisions", ""))),
@@ -2084,6 +2167,35 @@ def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) ->
             if artifact.name.endswith("_bundle.json") and not review_bundle_current_local(artifact):
                 review_failures.append(f"{name}: bundle 中的产物已经变化")
         music_qa_path = paths.status / "qa_music_report.json"
+        source_decisions = Path(str(manifest.get("outputs", {}).get("source_edit_decisions", "")))
+        if source_decisions.is_file():
+            source_qa_path = paths.status / "qa_source_report.json"
+            try:
+                source_qa = json.loads(source_qa_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                review_failures.append("source_qa: 缺少有效源视频 QA JSON")
+            else:
+                source_artifacts = source_qa.get("artifacts")
+                source_current = isinstance(source_artifacts, dict) and bool(source_artifacts)
+                required_source_artifacts = {"edit_decisions"}
+                source_inputs = manifest.get("inputs", {}) if isinstance(manifest.get("inputs"), dict) else {}
+                if source_inputs.get("greenscreen_video_original"):
+                    required_source_artifacts.update({"source_video", "clean_video", "clean_audio"})
+                if source_inputs.get("color_lut"):
+                    required_source_artifacts.add("color_lut")
+                if source_current and not required_source_artifacts.issubset(source_artifacts):
+                    source_current = False
+                if source_current:
+                    for item in source_artifacts.values():
+                        if not isinstance(item, dict):
+                            source_current = False
+                            break
+                        artifact_path = Path(str(item.get("path", "")))
+                        if not artifact_path.is_file() or item.get("sha256") != sha256_file(artifact_path):
+                            source_current = False
+                            break
+                if not source_qa.get("passed") or not source_current:
+                    review_failures.append("source_qa: 未通过或源视频/剪辑/LUT/清洁媒体哈希已变化")
         try:
             music_qa = json.loads(music_qa_path.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
@@ -2316,10 +2428,12 @@ def qa_product(project_dir: Path) -> Path:
         ("故事配乐",),
         ("朗读标注",),
         ("示范表演",),
+        ("背景图片",),
         ("背景视频", "含字幕"),
         ("背景视频", "无字幕"),
         ("故事PPT", "含字幕"),
         ("故事PPT", "无字幕"),
+        ("A镜无人物背景视频",),
     )
     artifacts: dict[str, dict[str, str]] = {}
     for label, key, required in (
@@ -2445,6 +2559,16 @@ def qa_publish(project_dir: Path) -> Path:
                             if relative not in retry_files:
                                 retry_files.append(relative)
 
+    handoff = publish_dir / "publish_package_codex_handoff.md"
+    lineage_required = handoff.is_file() and "cover_lineage.json" in handoff.read_text(encoding="utf-8-sig", errors="ignore")
+    if lineage_required:
+        lineage_path = publish_dir / "cover_lineage.json"
+        lineage_issues, lineage_retries = validate_cover_lineage(publish_dir, lineage_path)
+        issues.extend(lineage_issues)
+        retry_files.extend(lineage_retries)
+        if lineage_path.is_file():
+            artifacts["cover_lineage"] = {"path": str(lineage_path), "sha256": sha256_file(lineage_path)}
+
     for account_label, account_key in (("主账号", "main"), ("宝库号", "library")):
         copy_path = publish_dir / account_key / "copy.md"
         copy_notes: list[str] = []
@@ -2470,7 +2594,14 @@ def qa_publish(project_dir: Path) -> Path:
             }
         )
     report = paths.status / "qa_publish_report.md"
-    write_qa_report(report, "发布物料机器审查", publish_dir, rows, issues, expected="两账号文案结构完整；六张封面比例/尺寸正确且不是机械缩放同一母版")
+    write_qa_report(
+        report,
+        "发布物料机器审查",
+        publish_dir,
+        rows,
+        issues,
+        expected="两账号文案结构完整；六张封面比例/尺寸正确、不是机械缩放，并具有当前有效的母版编辑血缘",
+    )
     manifest["qa"]["publish"] = str(report)
     report_json = paths.status / "qa_publish_report.json"
     save_json(
@@ -2501,6 +2632,64 @@ def normalized_cover_difference(left: Path, right: Path) -> float:
             total += sum(abs(int(a) - int(b)) for a, b in zip(left_pixel, right_pixel))
             count += 3
     return total / max(1, count)
+
+
+def validate_cover_lineage(publish_dir: Path, lineage_path: Path) -> tuple[list[str], list[str]]:
+    expected_parents: dict[str, str | None] = {
+        "main/covers/cover_4x3.png": None,
+        "main/covers/cover_3x4.png": "main/covers/cover_4x3.png",
+        "main/covers/cover_16x9.png": "main/covers/cover_4x3.png",
+        "library/covers/cover_4x3.png": "main/covers/cover_4x3.png",
+        "library/covers/cover_3x4.png": "library/covers/cover_4x3.png",
+        "library/covers/cover_16x9.png": "library/covers/cover_4x3.png",
+    }
+    issues: list[str] = []
+    retry_files: list[str] = []
+    if not lineage_path.is_file():
+        issues.append("- 六张封面缺少 cover_lineage.json，无法证明参考图编辑血缘")
+        return issues, sorted(expected_parents)
+    try:
+        payload = json.loads(lineage_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        issues.append("- cover_lineage.json 无法解析")
+        return issues, sorted(expected_parents)
+    entries = payload.get("covers", []) if isinstance(payload, dict) else []
+    if not isinstance(entries, list):
+        entries = []
+    by_path = {
+        str(item.get("path", "")).replace("\\", "/"): item
+        for item in entries
+        if isinstance(item, dict) and str(item.get("path", "")).strip()
+    }
+    for relative, expected_parent in expected_parents.items():
+        entry = by_path.get(relative)
+        cover = publish_dir / relative
+        if entry is None:
+            issues.append(f"- 封面血缘缺少记录：{relative}")
+            retry_files.append(relative)
+            continue
+        generation_mode = str(entry.get("generation_mode", ""))
+        expected_mode = "master" if expected_parent is None else "edit-derived"
+        if generation_mode != expected_mode:
+            issues.append(f"- 封面血缘模式错误：{relative} 应为 {expected_mode}")
+            retry_files.append(relative)
+        parent = entry.get("parent") or None
+        if parent != expected_parent:
+            issues.append(f"- 封面母版关系错误：{relative} 的 parent 应为 {expected_parent or 'null'}")
+            retry_files.append(relative)
+        references = entry.get("reference_files")
+        if not isinstance(references, list) or not any(str(item).strip() for item in references):
+            issues.append(f"- 封面缺少生成参考记录：{relative}")
+            retry_files.append(relative)
+        if cover.is_file() and entry.get("sha256") != sha256_file(cover):
+            issues.append(f"- 封面血缘当前哈希失效：{relative}")
+            retry_files.append(relative)
+        if expected_parent is not None:
+            parent_path = publish_dir / expected_parent
+            if not parent_path.is_file() or entry.get("parent_sha256") != sha256_file(parent_path):
+                issues.append(f"- 封面母版哈希失效：{relative}")
+                retry_files.append(relative)
+    return issues, sorted(set(retry_files))
 
 
 def discover_outputs(paths: ProjectPaths, manifest: dict[str, Any]) -> None:
@@ -2537,7 +2726,21 @@ def discover_outputs(paths: ProjectPaths, manifest: dict[str, Any]) -> None:
         "story_frame_a": list(paths.release.rglob("story_frame_a.png")),
         "keying_preset": list(paths.release.rglob("keying_preset.json")),
     }
+    canonical_release_outputs = {
+        "main_release_video": paths.release / "主账号发布视频.mp4",
+        "library_release_video": paths.release / "宝库号发布视频.mp4",
+    }
     for key, values in candidates.items():
+        canonical = canonical_release_outputs.get(key)
+        if canonical is not None and canonical.is_file():
+            manifest["outputs"][key] = str(canonical)
+            continue
+        if key in canonical_release_outputs:
+            values = [
+                path
+                for path in values
+                if paths.status not in path.parents and "_release_work" not in path.parts
+            ]
         if values and should_replace(manifest["outputs"].get(key)):
             manifest["outputs"][key] = str(sorted(values, key=lambda p: len(p.parts))[0])
     base_dirs = [p for p in paths.root.rglob("*基础版*") if p.is_dir() and "_旧版_" not in p.name]

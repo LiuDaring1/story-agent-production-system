@@ -168,7 +168,7 @@ def main() -> None:
     product_preflight.add_argument("--preview-times", default="0.8,1.5,2.5,37,92")
     product_preflight.add_argument("--demo-person-crop-mode", choices=["preset", "full-width"], default="full-width")
     product_preflight.add_argument("--demo-person-vertical-align", choices=["center", "bottom"], default="bottom")
-    product_preflight.add_argument("--demo-person-crop-bottom-ratio", default=0.055, type=float)
+    product_preflight.add_argument("--demo-person-crop-bottom-ratio", default=0.0, type=float)
 
     product_project = subparsers.add_parser("product-package-project", help="从桌面项目自动生成基础版/进阶版资料包")
     product_project.add_argument("--project-dir", required=True, type=Path)
@@ -177,7 +177,7 @@ def main() -> None:
     product_project.add_argument("--allow-draft-annotation", action="store_true", default=False)
     product_project.add_argument("--demo-person-crop-mode", choices=["preset", "full-width"], default="full-width")
     product_project.add_argument("--demo-person-vertical-align", choices=["center", "bottom"], default="bottom")
-    product_project.add_argument("--demo-person-crop-bottom-ratio", default=0.055, type=float)
+    product_project.add_argument("--demo-person-crop-bottom-ratio", default=0.0, type=float)
 
     normalize = subparsers.add_parser("normalize-images", help="文生图输出 -> 标准 images 目录")
     normalize.add_argument("--source-dir", required=True, type=Path)
@@ -993,7 +993,10 @@ def run_script(script_name: str, *args) -> None:
 
 def annotation_skill_path_from_config() -> Path | None:
     value = str(load_config().get("external_tools", {}).get("story_performance_script_skill", "")).strip()
-    return Path(value).expanduser() if value else None
+    if not value:
+        return None
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else ROOT / path
 
 
 def build_abc_scene_windows(duration: float, subtitle_srt: Path | None = None) -> tuple[str, str]:
@@ -1185,6 +1188,10 @@ def run_package_release_project(
             str(release_defaults.get("watermark_opacity", 0.78)),
             "--watermark-speed",
             str(release_defaults.get("watermark_speed", 1.0)),
+            "--tail-seconds",
+            str(release_defaults.get("tail_seconds", 3.0)),
+            "--tail-notice-text",
+            str(release_defaults.get("tail_notice_text", "有需要联系客服，好作品有偿分享！")),
             "--story-logo-width-a",
             str(release_defaults.get("story_logo_width_a", 150)),
             "--story-logo-width-b",
@@ -1712,6 +1719,7 @@ def run_product_package_project(
     inputs = manifest["inputs"]
     outputs = manifest["outputs"]
     story_text = first_existing(inputs.get("story_text"))
+    story_document_text = first_existing(outputs.get("consumer_manuscript"), story_text)
     script_lines = first_existing(inputs.get("story_text"), paths.inputs / "story_source.txt")
     narration = first_existing(inputs.get("narration"), inputs.get("extracted_narration"))
     music = first_existing(paths.video_jobs / "music" / f"{story.get('slug')}_background_music.mp3", inputs.get("music"))
@@ -1728,17 +1736,20 @@ def run_product_package_project(
         product_script, product_timings = build_product_text_sources_from_story_source(
             story_text=story_text,
             subtitles_srt=source_subtitles,
-            output_dir=paths.product / "_work",
+            output_dir=paths.status / "product_package_work",
         )
         script_lines = product_script
         timings = product_timings
     config = load_config()
     brand_assets = config.get("brand_assets", {})
     demo_logo = first_existing(brand_assets.get("story_logo"), brand_assets.get("logo"))
+    product_defaults = config.get("product_defaults", {})
+    if not bool(product_defaults.get("include_demo_logo", False)):
+        demo_logo = None
     release_defaults = config.get("release_defaults", {})
     missing = []
     for label, value in (
-        ("故事正文", story_text),
+        ("故事正文", story_document_text),
         ("逐行台词", script_lines),
         ("旁白", narration),
         ("配乐", music),
@@ -1761,7 +1772,7 @@ def run_product_package_project(
         "--slug",
         story.get("slug", ""),
         "--story-text",
-        story_text,
+        story_document_text,
         "--script-lines",
         script_lines,
         "--narration",
@@ -1787,7 +1798,7 @@ def run_product_package_project(
         "--output-root",
         paths.product,
         "--work-dir",
-        paths.product / "_work",
+        paths.status / "product_package_work",
         "--demo-person-crop-bottom-ratio",
         str(demo_person_crop_bottom_ratio),
         "--demo-person-crop-mode",

@@ -7,6 +7,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 
+from story_agent_runtime import file_sha256
 from story_project import init_project, project_paths, qa_publish
 
 
@@ -56,6 +57,51 @@ class PublishQaTests(unittest.TestCase):
             self.assertIn("比例错误", combined)
             self.assertIn("机械缩放", combined)
             self.assertTrue(payload["retry_files"])
+
+    def test_requires_current_master_edit_lineage_for_new_handoff(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：封面血缘"
+            make_publish_fixture(project)
+            paths = project_paths(project)
+            (paths.publish / "publish_package_codex_handoff.md").write_text("必须写 cover_lineage.json\n", encoding="utf-8")
+            qa_publish(project)
+            missing = json.loads((paths.status / "qa_publish_report.json").read_text(encoding="utf-8"))
+            self.assertFalse(missing["passed"])
+            self.assertIn("缺少 cover_lineage.json", "\n".join(missing["issues"]))
+
+            parents = {
+                "main/covers/cover_4x3.png": None,
+                "main/covers/cover_3x4.png": "main/covers/cover_4x3.png",
+                "main/covers/cover_16x9.png": "main/covers/cover_4x3.png",
+                "library/covers/cover_4x3.png": "main/covers/cover_4x3.png",
+                "library/covers/cover_3x4.png": "library/covers/cover_4x3.png",
+                "library/covers/cover_16x9.png": "library/covers/cover_4x3.png",
+            }
+            covers = []
+            for relative, parent in parents.items():
+                path = paths.publish / relative
+                covers.append(
+                    {
+                        "path": relative,
+                        "parent": parent,
+                        "parent_sha256": file_sha256(paths.publish / parent) if parent else None,
+                        "generation_mode": "edit-derived" if parent else "master",
+                        "reference_files": ["current_story_reference.png"],
+                        "sha256": file_sha256(path),
+                    }
+                )
+            (paths.publish / "cover_lineage.json").write_text(json.dumps({"version": 1, "covers": covers}, ensure_ascii=False), encoding="utf-8")
+            qa_publish(project)
+            passed = json.loads((paths.status / "qa_publish_report.json").read_text(encoding="utf-8"))
+            self.assertTrue(passed["passed"], passed["issues"])
+
+            stale = json.loads((paths.publish / "cover_lineage.json").read_text(encoding="utf-8"))
+            stale["covers"][0]["sha256"] = "0" * 64
+            (paths.publish / "cover_lineage.json").write_text(json.dumps(stale, ensure_ascii=False), encoding="utf-8")
+            qa_publish(project)
+            rejected = json.loads((paths.status / "qa_publish_report.json").read_text(encoding="utf-8"))
+            self.assertFalse(rejected["passed"])
+            self.assertIn("当前哈希失效", "\n".join(rejected["issues"]))
 
 
 if __name__ == "__main__":

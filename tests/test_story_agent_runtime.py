@@ -589,6 +589,55 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertTrue((quarantine / "dual-quarantine_scene_01.png").exists())
             self.assertTrue((quarantine / "staging_dual-quarantine_scene_01.png").exists())
 
+    def test_story_image_retry_prompt_includes_list_form_review_instructions(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：重做指令"
+            init_project(project, story_name="重做指令", slug="retry-list")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="重做指令",
+                slug="retry-list",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context)
+            review = project_paths(project).status / "reviews" / "story_images_review_review.json"
+            review.parent.mkdir(parents=True, exist_ok=True)
+            review.write_text(
+                json.dumps(
+                    {
+                        "retry_instructions": [
+                            "第3镜：不得出现兔妈妈。",
+                            "第4镜：只保留小兔子。",
+                        ]
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            staging = Path(directory) / "staging"
+            images = staging / "images"
+            images.mkdir(parents=True)
+            storyboard = staging / "retry-list_storyboard_lines.txt"
+            storyboard.write_text("第三镜。\n第四镜。\n", encoding="utf-8")
+            prompt = agent._story_images_batch_prompt(
+                handoff=staging / "handoff.md",
+                staging_images=images,
+                staging_storyboard=storyboard,
+                story_lines=["第三镜。", "第四镜。"],
+                indices=[3],
+            )
+            self.assertIn("这是独立视觉审核给出的强制重做要求", prompt)
+            self.assertIn("第3镜：不得出现兔妈妈。", prompt)
+            self.assertNotIn("第4镜：只保留小兔子。", prompt)
+
     def test_text_only_source_archive_preserves_verified_clean_media(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：文字校对归档"

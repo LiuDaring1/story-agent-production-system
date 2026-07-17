@@ -2415,6 +2415,15 @@ class StoryAgent:
                         for index in indices
                         if instructions.get(str(index), instructions.get(index, ""))
                     ]
+                elif isinstance(instructions, list):
+                    for item in instructions:
+                        if not isinstance(item, str):
+                            continue
+                        normalized = item.strip()
+                        for index in indices:
+                            if normalized.startswith((f"第{index}镜", f"镜头{index}", f"镜头 {index}")):
+                                retry_lines.append(f"- {normalized}")
+                                break
             except (OSError, json.JSONDecodeError):
                 retry_lines = []
         lines = [

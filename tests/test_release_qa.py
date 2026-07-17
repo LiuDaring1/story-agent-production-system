@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from release_video import safe_watermark_motion_expressions
+from release_video import probe_video_size, safe_watermark_motion_expressions
 from story_project import init_project, project_paths, qa_release, write_manifest
 
 
@@ -31,6 +31,12 @@ def make_vertical_video(path: Path, *, with_audio: bool = True) -> None:
 
 
 class ReleaseQaTests(unittest.TestCase):
+    def test_probe_video_size_uses_ffprobe(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            video = Path(directory) / "probe.mp4"
+            make_vertical_video(video, with_audio=False)
+            self.assertEqual(probe_video_size(video), (300, 400))
+
     def test_moving_watermarks_stay_inside_safe_margin(self) -> None:
         expressions = safe_watermark_motion_expressions(70.0, 42.0, margin=20)
         self.assertEqual(len(expressions), 4)

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
 

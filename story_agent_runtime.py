@@ -651,33 +651,195 @@ class JobRegistry:
         return None
 
 
-def segment_confirmed_story_text(text: str, *, target_chars: int = 32) -> list[str]:
-    """Change line breaks only; never rewrite a user-confirmed manuscript."""
-    normalized = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n").strip()
-    paragraphs = [line.strip() for line in normalized.splitlines() if line.strip()]
-    if len(paragraphs) >= 3 and max((len(line) for line in paragraphs), default=0) <= target_chars * 2:
-        return paragraphs
+_STORYBOARD_SENTENCE_PUNCT = frozenset("。！？!?；;")
+_STORYBOARD_PAUSE_PUNCT = frozenset("，,、：:")
+_STORYBOARD_OPEN_QUOTES = frozenset("“‘「『《（([{<")
+_STORYBOARD_CLOSE_QUOTES = frozenset("”’」』》）)]}>")
+_STORYBOARD_EVENT_MARKERS = (
+    "突然",
+    "这时",
+    "后来",
+    "然后",
+    "于是",
+    "接着",
+    "不一会儿",
+    "第二天",
+    "第三天",
+    "第四天",
+    "第五天",
+    "过了一会儿",
+    "没想到",
+    "原来",
+    "最后",
+    "只好",
+)
+
+
+def _storyboard_compact_text(text: str) -> str:
+    """Normalize only whitespace for deterministic punctuation segmentation."""
+
+    normalized = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    compact = "".join(character for character in normalized if not character.isspace())
+    if not compact:
+        raise ValueError("确认文本无法形成故事分镜行")
+    return compact
+
+
+def _storyboard_sentence_units(text: str) -> list[str]:
+    """Split at sentence punctuation while retaining closing quote marks."""
+
     units: list[str] = []
-    for paragraph in paragraphs or [normalized]:
-        matches = re.findall(r".*?[。！？!?](?:[”’\"』】])?|.+$", paragraph)
-        units.extend(item.strip() for item in matches if item.strip())
+    current: list[str] = []
+    index = 0
+    while index < len(text):
+        character = text[index]
+        current.append(character)
+        index += 1
+        if character not in _STORYBOARD_SENTENCE_PUNCT:
+            continue
+        # Keep ellipses / repeated punctuation and a directly following
+        # closing quote in the same unit.  This makes a quoted utterance an
+        # indivisible candidate for the later merge pass.
+        while index < len(text) and text[index] in _STORYBOARD_SENTENCE_PUNCT:
+            current.append(text[index])
+            index += 1
+        while index < len(text) and text[index] in _STORYBOARD_CLOSE_QUOTES:
+            current.append(text[index])
+            index += 1
+        units.append("".join(current))
+        current = []
+    if current:
+        units.append("".join(current))
+    return [unit for unit in units if unit]
+
+
+def _storyboard_pause_boundaries(unit: str) -> list[int]:
+    """Return comma/colon boundaries that are outside direct quotations."""
+
+    boundaries: list[int] = []
+    quote_depth = 0
+    for index, character in enumerate(unit):
+        if character in _STORYBOARD_OPEN_QUOTES:
+            quote_depth += 1
+        elif character in _STORYBOARD_CLOSE_QUOTES:
+            quote_depth = max(0, quote_depth - 1)
+        elif character in _STORYBOARD_PAUSE_PUNCT and quote_depth == 0:
+            boundaries.append(index + 1)
+    return boundaries
+
+
+def _split_storyboard_unit(unit: str, *, target_chars: int, hard_max_chars: int) -> list[str]:
+    """Split an overlong sentence at natural pauses, then at a hard bound."""
+
+    if len(unit) <= hard_max_chars:
+        return [unit]
+    boundaries = _storyboard_pause_boundaries(unit)
+    pieces: list[str] = []
+    start = 0
+    while start < len(unit):
+        remaining = len(unit) - start
+        if remaining <= hard_max_chars:
+            pieces.append(unit[start:])
+            break
+        available = [boundary for boundary in boundaries if start < boundary <= start + hard_max_chars]
+        if available:
+            near_target = [boundary for boundary in available if boundary - start <= target_chars + 6]
+            cut = max(near_target or available)
+            # Avoid leaving a tiny tail when the sentence has one final pause.
+            if len(unit) - cut < 12 and cut - start < hard_max_chars:
+                cut = min(available, key=lambda boundary: abs((len(unit) - boundary) - target_chars))
+        else:
+            cut = start + hard_max_chars
+        pieces.append(unit[start:cut])
+        start = cut
+    return [piece for piece in pieces if piece]
+
+
+def _storyboard_starts_event(unit: str) -> bool:
+    return any(unit.startswith(marker) for marker in _STORYBOARD_EVENT_MARKERS)
+
+
+def _storyboard_merge_barrier(previous: str, current: str) -> bool:
+    """Do not merge dialogue boundaries or explicit narrative turns."""
+
+    return (
+        previous.endswith(tuple(_STORYBOARD_CLOSE_QUOTES))
+        or current.startswith(tuple(_STORYBOARD_OPEN_QUOTES))
+        or any(f"：{quote}" in current for quote in _STORYBOARD_OPEN_QUOTES)
+        or _storyboard_starts_event(current)
+    )
+
+
+def segment_storyboard_text(
+    text: str,
+    *,
+    target_chars: int = 32,
+    min_chars: int = 24,
+    max_chars: int = 38,
+    hard_max_chars: int = 60,
+) -> list[str]:
+    """Derive deterministic shot-level lines from semantic story text.
+
+    The input is already selected by the story semantic policy (body plus
+    moral).  This helper only changes line breaks: all non-whitespace source
+    characters must appear exactly once in the result.  Sentence punctuation
+    is preferred, long sentences are cut at top-level commas/colons, and
+    adjacent short clauses are merged unless a quoted dialogue or explicit
+    event transition marks a shot boundary.
+    """
+
+    if target_chars <= 0 or min_chars <= 0 or max_chars < min_chars or hard_max_chars < max_chars:
+        raise ValueError("storyboard 分行参数无效")
+    compact = _storyboard_compact_text(text)
+    sentence_units = _storyboard_sentence_units(compact)
+    units: list[tuple[str, bool]] = []
+    previous = ""
+    for sentence_index, sentence in enumerate(sentence_units):
+        pieces = _split_storyboard_unit(sentence, target_chars=target_chars, hard_max_chars=hard_max_chars)
+        for piece_index, piece in enumerate(pieces):
+            barrier = bool(units) and (
+                _storyboard_merge_barrier(previous, piece)
+                if piece_index == 0
+                else _storyboard_starts_event(piece)
+            )
+            units.append((piece, barrier))
+            previous = piece
+
     lines: list[str] = []
     current = ""
-    for unit in units:
-        if current and len(current) + len(unit) > target_chars:
+    for unit, barrier in units:
+        if not current:
+            current = unit
+            continue
+        combined_length = len(current) + len(unit)
+        # Fill short clauses toward the target.  A line may exceed the soft
+        # 38-character target only when doing so avoids a tiny tail; the
+        # hard bound remains enforced by the sentence splitter.
+        can_merge = not barrier and combined_length <= hard_max_chars and (
+            combined_length <= max_chars or len(current) < min_chars
+        )
+        if can_merge:
+            current += unit
+        else:
             lines.append(current)
             current = unit
-        else:
-            current += unit
     if current:
         lines.append(current)
     if not lines:
         raise ValueError("确认文本无法形成故事分镜行")
-    source_compact = re.sub(r"\s+", "", normalized)
-    output_compact = re.sub(r"\s+", "", "".join(lines))
+    source_compact = re.sub(r"\s+", "", text)
+    output_compact = re.sub(r"\s+", "", "\n".join(lines))
     if source_compact != output_compact:
-        raise AgentRuntimeError("确认文本分行改变了正文内容，拒绝创建加速任务")
+        raise AgentRuntimeError("故事分镜分行改变了正文内容，拒绝创建加速任务")
+    if any(len(line) > hard_max_chars for line in lines):
+        raise AgentRuntimeError("故事分镜行超过硬上限，拒绝创建加速任务")
     return lines
+
+
+def segment_confirmed_story_text(text: str, *, target_chars: int = 32) -> list[str]:
+    """Backward-compatible alias for the prepared-text segmentation helper."""
+
+    return segment_storyboard_text(text, target_chars=target_chars)
 
 
 def read_confirmed_story_source(path: Path) -> str:
@@ -711,6 +873,25 @@ def read_confirmed_story_source(path: Path) -> str:
     body = "\n".join(paragraphs).strip()
     if not body:
         raise ValueError("prepared .docx 没有可用正文")
+    return body
+
+
+def read_confirmed_subtitles_source(path: Path) -> str:
+    """Read an optional user-confirmed subtitle stream without rewriting it.
+
+    Subtitles are deliberately kept separate from the semantic story
+    derivatives.  Spaces and line boundaries are meaningful here because the
+    file is intended for a later timing/demo consumer.
+    """
+
+    if path.suffix.lower() not in {".txt", ".md"}:
+        raise ValueError("prepared 加速入口字幕只接受 UTF-8 .txt/.md")
+    try:
+        body = path.read_text(encoding="utf-8-sig")
+    except UnicodeDecodeError as exc:
+        raise ValueError("prepared 加速入口字幕必须是 UTF-8 编码") from exc
+    if not body.strip():
+        raise ValueError("prepared 加速入口字幕不能为空")
     return body
 
 
@@ -762,6 +943,11 @@ def prepared_input_contract_errors(project_dir: Path, manifest: dict[str, Any]) 
     }
     errors: list[str] = []
     expected_roles = {"prepared_greenscreen_video", "confirmed_story_text"}
+    has_confirmed_subtitles = "confirmed_subtitles" in by_role or bool(
+        (manifest.get("inputs", {}) if isinstance(manifest.get("inputs"), dict) else {}).get("confirmed_subtitles")
+    )
+    if has_confirmed_subtitles:
+        expected_roles.add("confirmed_subtitles")
     if set(by_role) != expected_roles:
         errors.append("用户输入必须恰好包含干净绿幕视频和人工确认文本")
         return errors
@@ -809,6 +995,31 @@ def prepared_input_contract_errors(project_dir: Path, manifest: dict[str, Any]) 
             confirmed_text = ""
         if not confirmed_text.strip():
             errors.append("人工确认文本为空")
+    subtitle_record = by_role.get("confirmed_subtitles")
+    if subtitle_record is not None:
+        subtitles = Path(str(subtitle_record.get("path") or ""))
+        try:
+            subtitle_resolved = subtitles.resolve()
+            subtitle_resolved.relative_to(inputs_dir)
+        except (OSError, ValueError):
+            errors.append("confirmed_subtitles 没有指向项目输入目录内的不可变副本")
+        else:
+            if not subtitle_resolved.is_file():
+                errors.append("confirmed_subtitles 项目副本缺失")
+            else:
+                try:
+                    read_confirmed_subtitles_source(subtitle_resolved)
+                except ValueError as exc:
+                    errors.append(str(exc))
+        configured_subtitles = Path(
+            str(
+                (manifest.get("inputs", {}) if isinstance(manifest.get("inputs"), dict) else {}).get(
+                    "confirmed_subtitles", ""
+                )
+            )
+        )
+        if configured_subtitles.expanduser().resolve() != subtitles.expanduser().resolve():
+            errors.append("manifest inputs.confirmed_subtitles 没有绑定用户确认字幕副本")
     story_text = Path(str(inputs.get("story_text") or ""))
     derived = contract.get("derived_inputs") if isinstance(contract.get("derived_inputs"), dict) else {}
     derived_story = derived.get("story_text") if isinstance(derived.get("story_text"), dict) else {}
@@ -825,6 +1036,47 @@ def prepared_input_contract_errors(project_dir: Path, manifest: dict[str, Any]) 
             or recorded_story_bytes != story_text.stat().st_size
         ):
             errors.append("prepared 分行故事文本派生哈希失效")
+    storyboard_value = inputs.get("storyboard_text")
+    storyboard_derived = derived.get("storyboard_text") if isinstance(derived.get("storyboard_text"), dict) else None
+    # New prepared submissions carry this derived shot-level text.  Older
+    # manifests predate the field and must continue to validate unchanged.
+    if storyboard_value or storyboard_derived is not None:
+        storyboard_path = Path(str(storyboard_value or (storyboard_derived or {}).get("path") or "")).expanduser()
+        try:
+            storyboard_resolved = storyboard_path.resolve()
+            storyboard_resolved.relative_to(inputs_dir)
+        except (OSError, ValueError):
+            errors.append("prepared storyboard_text 没有指向项目输入目录")
+        else:
+            if not storyboard_resolved.is_file():
+                errors.append("prepared storyboard_text 派生文件缺失")
+            elif not story_text.is_file():
+                errors.append("prepared storyboard_text 缺少其 story_text 源文件")
+            else:
+                record = storyboard_derived or {}
+                if storyboard_resolved != Path(str(record.get("path") or "")).expanduser().resolve():
+                    errors.append("prepared storyboard_text 派生记录没有绑定 manifest 输入")
+                if Path(str(inputs.get("storyboard_text") or "")).expanduser().resolve() != storyboard_resolved:
+                    errors.append("manifest inputs.storyboard_text 没有绑定派生文件")
+                try:
+                    recorded_bytes = int(record.get("bytes", -1))
+                except (TypeError, ValueError):
+                    recorded_bytes = -1
+                if record.get("sha256") != file_sha256(storyboard_resolved) or recorded_bytes != storyboard_resolved.stat().st_size:
+                    errors.append("prepared storyboard_text 派生哈希失效")
+                source_sha256 = file_sha256(story_text)
+                if record.get("source_sha256") != source_sha256:
+                    errors.append("prepared storyboard_text 未绑定当前 story_text")
+                try:
+                    expected_storyboard = "\n".join(
+                        segment_storyboard_text(story_text.read_text(encoding="utf-8-sig", errors="strict"))
+                    ) + "\n"
+                    actual_storyboard = storyboard_resolved.read_text(encoding="utf-8-sig", errors="strict")
+                except (OSError, UnicodeError, AgentRuntimeError, ValueError) as exc:
+                    errors.append(f"prepared storyboard_text 无法重算：{exc}")
+                else:
+                    if actual_storyboard != expected_storyboard:
+                        errors.append("prepared storyboard_text 与 story_text 分镜策略不一致")
     if int(contract.get("version", 1) or 1) >= 2 and confirmed.is_file() and confirmed_text.strip():
         try:
             semantic_payload, expected_views = build_prepared_semantic_derivatives(confirmed_text)
@@ -875,6 +1127,29 @@ def prepared_input_contract_errors(project_dir: Path, manifest: dict[str, Any]) 
             consumer_path = Path(str(manifest.get("outputs", {}).get("consumer_manuscript") or ""))
             if consumer_path.expanduser().resolve() != Path(str(derived.get("consumer_manuscript", {}).get("path") or "")).expanduser().resolve():
                 errors.append("manifest 消费者文稿没有绑定语义派生产物")
+            if subtitle_record is not None:
+                subtitle_derived = derived.get("confirmed_subtitles") if isinstance(derived.get("confirmed_subtitles"), dict) else {}
+                subtitle_path = Path(str(subtitle_derived.get("path") or "")).expanduser()
+                if subtitle_path.resolve() != Path(str(subtitle_record.get("path") or "")).expanduser().resolve():
+                    errors.append("prepared confirmed_subtitles 派生记录没有绑定用户输入")
+                if subtitle_derived.get("original_path") != subtitle_record.get("original_path"):
+                    errors.append("prepared confirmed_subtitles 原始路径审计记录不一致")
+                if not subtitle_path.is_file():
+                    errors.append("prepared confirmed_subtitles 派生文件缺失")
+                else:
+                    subtitle_source_path = Path(str(subtitle_record.get("path") or "")).expanduser()
+                    if subtitle_source_path.is_file() and subtitle_derived.get("source_sha256") != file_sha256(subtitle_source_path):
+                        errors.append("prepared confirmed_subtitles 未绑定当前确认字幕")
+                    try:
+                        subtitle_derived_bytes = int(subtitle_derived.get("bytes", -1))
+                    except (TypeError, ValueError):
+                        subtitle_derived_bytes = -1
+                    if subtitle_derived.get("sha256") != file_sha256(subtitle_path) or subtitle_derived_bytes != subtitle_path.stat().st_size:
+                        errors.append("prepared confirmed_subtitles 派生哈希失效")
+                integration = contract.get("integration_points") if isinstance(contract.get("integration_points"), dict) else {}
+                integration_record = integration.get("confirmed_subtitles") if isinstance(integration.get("confirmed_subtitles"), dict) else {}
+                if integration_record.get("manifest_key") != "inputs.confirmed_subtitles":
+                    errors.append("prepared confirmed_subtitles 缺少稳定 manifest 接入点")
     return errors
 
 
@@ -905,6 +1180,7 @@ def submit_video_job(
     lut: Path | None = None,
     input_mode: str = "single-greenscreen",
     confirmed_text: Path | None = None,
+    confirmed_subtitles: Path | None = None,
     projects_root: Path,
     story_name: str = "",
     slug: str = "",
@@ -921,6 +1197,12 @@ def submit_video_job(
         raise ValueError("prepared 加速入口必须提供 --confirmed-text")
     if normalized_mode == "single-greenscreen" and confirmed_text is not None:
         raise ValueError("single-greenscreen 模式不能提供 --confirmed-text；请显式选择 --input-mode prepared")
+    if normalized_mode == "prepared" and confirmed_subtitles is not None:
+        subtitle_suffix = confirmed_subtitles.expanduser().suffix.lower()
+        if subtitle_suffix not in {".txt", ".md"}:
+            raise ValueError("prepared 加速入口字幕只接受 UTF-8 .txt/.md")
+    if normalized_mode == "single-greenscreen" and confirmed_subtitles is not None:
+        raise ValueError("single-greenscreen 模式不能提供 --confirmed-subtitles；请显式选择 --input-mode prepared")
     if normalized_mode == "prepared" and lut is not None:
         raise ValueError("prepared 视频应已完成颜色还原，禁止再次传入 LUT 以免重复套色")
     source = video.expanduser().resolve()
@@ -940,6 +1222,15 @@ def submit_video_job(
             raise ValueError("prepared 确认文本不能为空")
         fingerprint = hashlib.sha256(
             f"prepared:{fingerprint}:{file_sha256(confirmed_source)}".encode("utf-8")
+        ).hexdigest()
+    confirmed_subtitles_source: Path | None = None
+    if confirmed_subtitles is not None:
+        confirmed_subtitles_source = confirmed_subtitles.expanduser().resolve()
+        if not confirmed_subtitles_source.is_file():
+            raise FileNotFoundError(f"确认字幕不存在：{confirmed_subtitles_source}")
+        read_confirmed_subtitles_source(confirmed_subtitles_source)
+        fingerprint = hashlib.sha256(
+            f"{fingerprint}:confirmed_subtitles:{file_sha256(confirmed_subtitles_source)}".encode("utf-8")
         ).hexdigest()
     color_lut: Path | None = None
     lut_sha256 = ""
@@ -974,6 +1265,8 @@ def submit_video_job(
     full_transcript_target: Path | None = None
     sales_subtitle_target: Path | None = None
     semantic_contract_target: Path | None = None
+    storyboard_text_target: Path | None = None
+    confirmed_subtitles_target: Path | None = None
     if confirmed_source is not None:
         confirmed_target = paths.inputs / f"{safe_slug}_confirmed_story{confirmed_source.suffix.lower()}"
         copy_verified_input(confirmed_source, confirmed_target)
@@ -988,6 +1281,12 @@ def submit_video_job(
         sales_subtitle_target.write_text(semantic_views["sales_subtitle_text"], encoding="utf-8")
         semantic_contract_target = paths.inputs / f"{safe_slug}_story_semantics.json"
         save_json(semantic_contract_target, semantic_payload)
+        storyboard_text_target = paths.inputs / f"{safe_slug}_storyboard_text.txt"
+        storyboard_lines = segment_storyboard_text(semantic_views["story_text"])
+        storyboard_text_target.write_text("\n".join(storyboard_lines) + "\n", encoding="utf-8")
+    if confirmed_subtitles_source is not None:
+        confirmed_subtitles_target = paths.inputs / f"{safe_slug}_confirmed_subtitles{confirmed_subtitles_source.suffix.lower()}"
+        copy_verified_input(confirmed_subtitles_source, confirmed_subtitles_target)
     lut_target: Path | None = None
     if color_lut is not None:
         lut_target = paths.inputs / f"{safe_slug}_input_lut.cube"
@@ -1002,13 +1301,21 @@ def submit_video_job(
     manifest["inputs"]["greenscreen_video"] = str(target)
     if normalized_mode == "prepared":
         assert confirmed_target is not None and story_text_target is not None and consumer_target is not None
-        assert full_transcript_target is not None and sales_subtitle_target is not None and semantic_contract_target is not None
+        assert (
+            full_transcript_target is not None
+            and sales_subtitle_target is not None
+            and semantic_contract_target is not None
+            and storyboard_text_target is not None
+        )
         manifest["inputs"]["greenscreen_video_original"] = str(target)
         manifest["inputs"]["story_text"] = str(story_text_target)
         manifest["inputs"]["story_transcript_full"] = str(full_transcript_target)
         manifest["inputs"]["sales_subtitle_text"] = str(sales_subtitle_target)
         manifest["inputs"]["story_semantics"] = str(semantic_contract_target)
+        manifest["inputs"]["storyboard_text"] = str(storyboard_text_target)
         manifest["outputs"]["consumer_manuscript"] = str(consumer_target)
+        if confirmed_subtitles_target is not None:
+            manifest["inputs"]["confirmed_subtitles"] = str(confirmed_subtitles_target)
     if lut_target is not None:
         manifest["inputs"]["color_lut"] = str(lut_target)
     manifest["agent"]["source"] = {
@@ -1044,6 +1351,13 @@ def submit_video_job(
             "sha256": file_sha256(confirmed_target),
             "bytes": confirmed_target.stat().st_size,
         }
+        if confirmed_subtitles_source is not None and confirmed_subtitles_target is not None:
+            manifest["agent"]["source"]["confirmed_subtitles"] = {
+                "original_path": str(confirmed_subtitles_source),
+                "project_copy": str(confirmed_subtitles_target),
+                "sha256": file_sha256(confirmed_subtitles_target),
+                "bytes": confirmed_subtitles_target.stat().st_size,
+            }
         manifest["agent"]["input_contract"] = {
             "version": 2,
             "mode": "prepared_greenscreen_confirmed_text",
@@ -1102,8 +1416,42 @@ def submit_video_job(
                     "producer": "story_semantics:contract",
                     "source_sha256": file_sha256(confirmed_target),
                 },
+                "storyboard_text": {
+                    "path": str(storyboard_text_target),
+                    "sha256": file_sha256(storyboard_text_target),
+                    "bytes": storyboard_text_target.stat().st_size,
+                    "producer": "storyboard:story_text_punctuation_segmentation",
+                    "source_sha256": file_sha256(story_text_target),
+                },
             },
         }
+        if confirmed_subtitles_source is not None and confirmed_subtitles_target is not None:
+            subtitle_sha256 = file_sha256(confirmed_subtitles_target)
+            manifest["agent"]["input_contract"]["user_inputs"].append(
+                {
+                    "role": "confirmed_subtitles",
+                    "path": str(confirmed_subtitles_target),
+                    "original_path": str(confirmed_subtitles_source),
+                    "sha256": subtitle_sha256,
+                    "bytes": confirmed_subtitles_target.stat().st_size,
+                }
+            )
+            manifest["agent"]["input_contract"]["derived_inputs"]["confirmed_subtitles"] = {
+                "path": str(confirmed_subtitles_target),
+                "original_path": str(confirmed_subtitles_source),
+                "sha256": subtitle_sha256,
+                "bytes": confirmed_subtitles_target.stat().st_size,
+                "producer": "user_confirmed_subtitles",
+                "source_sha256": subtitle_sha256,
+            }
+            manifest["agent"]["input_contract"]["integration_points"] = {
+                "confirmed_subtitles": {
+                    "manifest_key": "inputs.confirmed_subtitles",
+                    "consumers": ["assemble_final", "timing", "demo_subtitles"],
+                    "status": "consumed_by_assemble_final",
+                    "notes": "保留用户逐行字幕与空格；assemble_final 通过 --subtitle-script 独立对齐并生成成片字幕，不替换语义派生稿。",
+                }
+            }
     if color_lut is not None and lut_target is not None:
         manifest["agent"]["source"]["color_lut"] = {
             "original_path": str(color_lut),
@@ -1123,6 +1471,103 @@ def submit_video_job(
     write_manifest(paths, manifest)
     registry.register(job_id, project_dir, fingerprint)
     return job_id, project_dir, True
+
+
+def refresh_prepared_inputs(
+    project_dir: Path,
+    *,
+    confirmed_subtitles: Path | None = None,
+) -> dict[str, Any]:
+    """Refresh lightweight prepared derivatives without touching the video.
+
+    This migration path is intentionally limited to files under
+    ``00_输入素材``.  It lets projects submitted before ``storyboard_text`` was
+    introduced gain the new shot-level derivative, and optionally attaches a
+    user-confirmed subtitle stream, without copying or re-rendering the large
+    prepared video again.
+    """
+
+    root = project_dir.expanduser().resolve()
+    paths = project_paths(root)
+    manifest = load_manifest(paths)
+    if not isinstance(manifest, dict):
+        raise FileNotFoundError(f"项目 manifest 不存在：{paths.manifest}")
+    contract = manifest.get("agent", {}).get("input_contract") if isinstance(manifest.get("agent"), dict) else None
+    if not isinstance(contract, dict) or contract.get("mode") != "prepared_greenscreen_confirmed_text":
+        raise ValueError("refresh-prepared-inputs 只适用于 prepared 加速入口项目")
+    story_text_path = Path(str(manifest.get("inputs", {}).get("story_text") or "")).expanduser()
+    if not story_text_path.is_file():
+        raise FileNotFoundError("prepared 项目缺少 story_text 派生稿")
+    try:
+        story_text_body = story_text_path.read_text(encoding="utf-8-sig")
+        storyboard_lines = segment_storyboard_text(story_text_body)
+    except (OSError, UnicodeError, AgentRuntimeError, ValueError) as exc:
+        raise ValueError(f"无法刷新 prepared storyboard_text：{exc}") from exc
+    slug = str(manifest.get("story", {}).get("slug") or slugify(root.name.replace("故事剪辑：", "")))
+    storyboard_target = paths.inputs / f"{slug}_storyboard_text.txt"
+    storyboard_target.write_text("\n".join(storyboard_lines) + "\n", encoding="utf-8")
+    manifest.setdefault("inputs", {})["storyboard_text"] = str(storyboard_target)
+    derived = contract.setdefault("derived_inputs", {})
+    derived["storyboard_text"] = {
+        "path": str(storyboard_target),
+        "sha256": file_sha256(storyboard_target),
+        "bytes": storyboard_target.stat().st_size,
+        "producer": "storyboard:story_text_punctuation_segmentation",
+        "source_sha256": file_sha256(story_text_path),
+    }
+
+    if confirmed_subtitles is not None:
+        subtitle_source = confirmed_subtitles.expanduser().resolve()
+        if not subtitle_source.is_file():
+            raise FileNotFoundError(f"确认字幕不存在：{subtitle_source}")
+        read_confirmed_subtitles_source(subtitle_source)
+        subtitle_target = paths.inputs / f"{slug}_confirmed_subtitles{subtitle_source.suffix.lower()}"
+        copy_verified_input(subtitle_source, subtitle_target)
+        subtitle_sha256 = file_sha256(subtitle_target)
+        manifest["inputs"]["confirmed_subtitles"] = str(subtitle_target)
+        source = manifest.setdefault("agent", {}).setdefault("source", {})
+        source["confirmed_subtitles"] = {
+            "original_path": str(subtitle_source),
+            "project_copy": str(subtitle_target),
+            "sha256": subtitle_sha256,
+            "bytes": subtitle_target.stat().st_size,
+        }
+        user_inputs = contract.setdefault("user_inputs", [])
+        user_record = next(
+            (item for item in user_inputs if isinstance(item, dict) and item.get("role") == "confirmed_subtitles"),
+            None,
+        )
+        if user_record is None:
+            user_record = {"role": "confirmed_subtitles"}
+            user_inputs.append(user_record)
+        user_record.update(
+            {
+                "path": str(subtitle_target),
+                "original_path": str(subtitle_source),
+                "sha256": subtitle_sha256,
+                "bytes": subtitle_target.stat().st_size,
+            }
+        )
+        derived["confirmed_subtitles"] = {
+            "path": str(subtitle_target),
+            "original_path": str(subtitle_source),
+            "sha256": subtitle_sha256,
+            "bytes": subtitle_target.stat().st_size,
+            "producer": "user_confirmed_subtitles",
+            "source_sha256": subtitle_sha256,
+        }
+        contract.setdefault("integration_points", {})["confirmed_subtitles"] = {
+            "manifest_key": "inputs.confirmed_subtitles",
+            "consumers": ["assemble_final", "timing", "demo_subtitles"],
+            "status": "consumed_by_assemble_final",
+            "notes": "保留用户逐行字幕与空格；assemble_final 通过 --subtitle-script 独立对齐并生成成片字幕，不替换语义派生稿。",
+        }
+
+    write_manifest(paths, manifest)
+    errors = prepared_input_contract_errors(root, manifest)
+    if errors:
+        raise AgentRuntimeError("prepared 输入刷新后契约校验失败：" + "；".join(errors))
+    return manifest
 
 
 def record_derived_input(

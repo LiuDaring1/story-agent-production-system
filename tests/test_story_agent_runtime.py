@@ -34,6 +34,8 @@ from story_agent_runtime import (
     mark_stage,
     job_lock,
     prepared_input_contract_errors,
+    refresh_prepared_inputs,
+    segment_storyboard_text,
     submit_video_job,
     assert_runnable,
     update_control,
@@ -90,6 +92,11 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(manifest["agent"]["input_contract"]["version"], 2)
             self.assertFalse(manifest["agent"]["input_contract"]["counts_toward_default_entry"])
             self.assertEqual(manifest["inputs"]["greenscreen_video"], manifest["inputs"]["greenscreen_video_original"])
+            storyboard_text = Path(manifest["inputs"]["storyboard_text"])
+            self.assertTrue(storyboard_text.is_file())
+            derived_storyboard = manifest["agent"]["input_contract"]["derived_inputs"]["storyboard_text"]
+            self.assertEqual(derived_storyboard["path"], str(storyboard_text))
+            self.assertEqual(derived_storyboard["sha256"], file_sha256(storyboard_text))
             self.assertEqual(prepared_input_contract_errors(project, manifest), [])
             detected = detect_project_assets(project, extract_audio=False)
             self.assertEqual(detected["inputs"]["story_text"], manifest["inputs"]["story_text"])
@@ -112,6 +119,143 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertTrue(StoryAgent(context)._has_source_edit(manifest))
             Path(manifest["inputs"]["story_text"]).write_text("被篡改", encoding="utf-8")
             self.assertFalse(StoryAgent(context)._has_source_edit(manifest))
+
+    def test_storyboard_text_splits_long_prepared_story_without_changing_characters(self) -> None:
+        story = (
+            "小壁虎有一条尾巴。一天，小壁虎在墙上爬，突然一条蛇咬住了它的尾巴。"
+            "小壁虎用力一挣，尾巴断了。它来到小河边，对鱼姐姐说：“鱼姐姐，请把尾巴借给我吧。”"
+            "鱼姐姐说：“不行，我要用尾巴拨水呢。”小壁虎又来到大树下，对牛伯伯说：“牛伯伯，请把尾巴借给我吧。”"
+            "牛伯伯说：“不行，我要用尾巴赶蝇子呢。”小壁虎再来到屋檐下，对燕子说：“燕子姐姐，请把尾巴借给我吧。”"
+            "燕子说：“不行，我要用尾巴掌握方向呢。”小壁虎只好继续往前爬。"
+        )
+        lines = segment_storyboard_text(story)
+        compact = lambda value: "".join(value.split())
+        self.assertEqual(compact("".join(lines)), compact(story))
+        self.assertGreater(len(lines), 6)
+        self.assertLessEqual(max(map(len, lines)), 60)
+        self.assertTrue(any("小壁虎有一条尾巴。" in line for line in lines))
+        self.assertTrue(any("突然一条蛇咬住了它的尾巴。" in line for line in lines))
+        self.assertTrue(any("尾巴断了。" in line for line in lines))
+        self.assertFalse(
+            any("蛇咬住了它的尾巴" in line and "尾巴断了" in line for line in lines),
+            "完整尾巴/被咬与断尾转折必须落在不同镜头",
+        )
+        self.assertFalse(
+            any("尾巴断了" in line and "没有尾巴多难看" in line for line in lines),
+            "断尾瞬间与断尾后的情绪反应必须落在不同镜头",
+        )
+        self.assertTrue(any("鱼姐姐说" in line for line in lines))
+        self.assertTrue(any("牛伯伯说" in line for line in lines))
+        self.assertTrue(any("燕子说" in line for line in lines))
+
+    def test_story_agent_story_lines_falls_back_for_legacy_manifest_without_storyboard(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            story_path = root / "legacy_story.txt"
+            story_path.write_text("旧项目第一行。\n旧项目第二行。\n", encoding="utf-8")
+            context = AgentContext(
+                project_dir=root / "故事剪辑：旧项目",
+                inbox=None,
+                story_name="旧项目",
+                slug="legacy-project",
+                execute=False,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context, read_only=True)
+            self.assertEqual(
+                agent._story_lines({"inputs": {"story_text": str(story_path)}}),
+                ["旧项目第一行。", "旧项目第二行。"],
+            )
+
+    def test_visual_continuity_contract_requires_valid_storyboard_state_enum(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "故事剪辑：连续性合同"
+            init_project(project, story_name="连续性合同", slug="continuity-contract")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="连续性合同",
+                slug="continuity-contract",
+                execute=False,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context, read_only=True)
+            contract = project_paths(project).status / "visual_continuity_contract.json"
+            plan = project_paths(project).images / "continuity-contract_storyboard_plan.json"
+            contract.write_text(
+                json.dumps(
+                    {
+                        "version": 1,
+                        "allowed_states": ["intact", "missing"],
+                        "storyboard_requirements": {"required_field": "character_state"},
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            plan.write_text(
+                json.dumps(
+                    [
+                        {"scene": 1, "character_state": "intact"},
+                        {"scene": 2, "character_state": "missing"},
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(agent._visual_continuity_storyboard_errors(contract, plan), [])
+            plan.write_text(
+                json.dumps([{"scene": 1, "character_state": "unknown"}], ensure_ascii=False),
+                encoding="utf-8",
+            )
+            errors = agent._visual_continuity_storyboard_errors(contract, plan)
+            self.assertTrue(any("不属于允许枚举" in error for error in errors))
+
+    def test_assemble_final_passes_confirmed_subtitles_as_independent_subtitle_script(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "故事剪辑：字幕接入"
+            manifest = init_project(project, story_name="字幕接入", slug="subtitle-assembly")
+            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
+            subtitles = project_paths(project).inputs / "subtitle-assembly_confirmed_subtitles.txt"
+            subtitles.write_text("逐行字幕一。\n逐行字幕二。\n", encoding="utf-8")
+            manifest["inputs"]["narration"] = str(fixture)
+            manifest["inputs"]["confirmed_subtitles"] = str(subtitles)
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="字幕接入",
+                slug="subtitle-assembly",
+                execute=False,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context, read_only=True)
+            with patch.object(agent, "_workflow", return_value=StageResult("done", "ok")) as workflow:
+                result = agent._stage_assemble_final(manifest)
+            self.assertEqual(result.status, "done")
+            command = workflow.call_args.args[0]
+            self.assertEqual(command[0], "assemble")
+            subtitle_index = command.index("--subtitle-script")
+            self.assertEqual(Path(command[subtitle_index + 1]), subtitles)
 
     def test_prepared_entry_accepts_reviewed_docx_and_derives_plain_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -155,6 +299,85 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             full = Path(manifest["inputs"]["story_transcript_full"])
             self.assertEqual(full.read_text(encoding="utf-8"), "小兔子找太阳\n它终于找到了温暖的太阳。\n")
             self.assertEqual(prepared_input_contract_errors(project, manifest), [])
+
+    def test_prepared_entry_accepts_optional_confirmed_subtitles_as_audited_input(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
+            video = root / "prepared.mp4"
+            shutil.copy2(fixture, video)
+            confirmed = root / "confirmed.txt"
+            confirmed.write_text(
+                "小壁虎借尾巴\n大家好，我是绵羊姐姐。\n小壁虎爬呀爬，爬到小河边。\n",
+                encoding="utf-8",
+            )
+            subtitles = root / "confirmed-subtitles.txt"
+            subtitle_text = "大家好，我是绵羊姐姐。\n小壁虎 爬呀爬，爬到小河边。\n"
+            subtitles.write_text(subtitle_text, encoding="utf-8")
+            _job, project, created = submit_video_job(
+                video,
+                input_mode="prepared",
+                confirmed_text=confirmed,
+                confirmed_subtitles=subtitles,
+                projects_root=root / "projects",
+                story_name="字幕审计",
+                slug="subtitle-audit",
+                registry=JobRegistry(root / "registry.json"),
+            )
+            self.assertTrue(created)
+            manifest = load_manifest(project_paths(project))
+            assert manifest is not None
+            subtitle_copy = Path(manifest["inputs"]["confirmed_subtitles"])
+            self.assertTrue(subtitle_copy.is_file())
+            self.assertEqual(subtitle_copy.read_text(encoding="utf-8"), subtitle_text)
+            self.assertEqual(subtitle_copy.parent.resolve(), project_paths(project).inputs.resolve())
+            source_record = manifest["agent"]["source"]["confirmed_subtitles"]
+            self.assertEqual(source_record["original_path"], str(subtitles.resolve()))
+            self.assertEqual(source_record["project_copy"], str(subtitle_copy))
+            self.assertEqual(source_record["sha256"], file_sha256(subtitle_copy))
+            self.assertEqual(source_record["bytes"], subtitle_copy.stat().st_size)
+            contract = manifest["agent"]["input_contract"]
+            subtitle_record = next(item for item in contract["user_inputs"] if item["role"] == "confirmed_subtitles")
+            self.assertEqual(subtitle_record["original_path"], str(subtitles.resolve()))
+            self.assertEqual(subtitle_record["sha256"], file_sha256(subtitle_copy))
+            self.assertEqual(subtitle_record["bytes"], subtitle_copy.stat().st_size)
+            derived_record = contract["derived_inputs"]["confirmed_subtitles"]
+            self.assertEqual(derived_record["path"], str(subtitle_copy))
+            self.assertEqual(derived_record["source_sha256"], file_sha256(subtitle_copy))
+            self.assertEqual(derived_record["producer"], "user_confirmed_subtitles")
+            self.assertEqual(contract["integration_points"]["confirmed_subtitles"]["manifest_key"], "inputs.confirmed_subtitles")
+            self.assertEqual(prepared_input_contract_errors(project, manifest), [])
+            # The optional subtitle stream is an independent future timing/demo
+            # input; it must not replace semantic story derivatives.
+            self.assertNotEqual(Path(manifest["inputs"]["story_text"]).read_text(encoding="utf-8"), subtitle_text)
+            self.assertNotIn("大家好，我是绵羊姐姐。", Path(manifest["inputs"]["sales_subtitle_text"]).read_text(encoding="utf-8"))
+
+    def test_confirmed_subtitles_are_prepared_only_and_must_be_utf8_text(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
+            video = root / "prepared.mp4"
+            shutil.copy2(fixture, video)
+            confirmed = root / "confirmed.txt"
+            confirmed.write_text("小故事\n故事正文。\n", encoding="utf-8")
+            subtitles = root / "subtitles.srt"
+            subtitles.write_text("1\n00:00:00,000 --> 00:00:01,000\n故事正文。\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "prepared 加速入口字幕只接受 UTF-8 .txt/.md"):
+                submit_video_job(
+                    video,
+                    input_mode="prepared",
+                    confirmed_text=confirmed,
+                    confirmed_subtitles=subtitles,
+                    projects_root=root / "projects",
+                    registry=JobRegistry(root / "registry.json"),
+                )
+            with self.assertRaisesRegex(ValueError, "single-greenscreen 模式不能提供 --confirmed-subtitles"):
+                submit_video_job(
+                    video,
+                    confirmed_subtitles=root / "subtitles.txt",
+                    projects_root=root / "projects",
+                    registry=JobRegistry(root / "registry-single.json"),
+                )
 
     def test_prepared_semantic_contract_separates_customer_and_full_transcript_views(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

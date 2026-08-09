@@ -15,7 +15,15 @@ from story_video_synthesizer.volcengine_video import CreateTaskResult, QueryTask
 
 
 DEFAULT_BASE_URL = "https://toapis.com/v1"
-DEFAULT_MODEL = "grok-video-3"
+DEFAULT_MODEL = "grok-video-1.5"
+DEFAULT_SECONDS = "8"
+MIN_SECONDS = 1
+MAX_SECONDS = 15
+DEFAULT_RESOLUTION = "720p"
+DEFAULT_RATIO = "16:9"
+# Keep the historical default for callers that still explicitly request an
+# older Grok Video model.  The new provider default is eight seconds.
+LEGACY_DEFAULT_SECONDS = "10"
 DEFAULT_USER_AGENT = "curl/8.7.1"
 
 
@@ -24,22 +32,61 @@ def build_toapis_task_body(
     model: str,
     prompt: str,
     image_url: str,
-    ratio: str = "16:9",
-    seconds: str = "10",
-    resolution: str = "720p",
+    ratio: str = DEFAULT_RATIO,
+    seconds: str | int | float | None = None,
+    resolution: str = DEFAULT_RESOLUTION,
     extra_body: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
+    model_name = str(model).strip()
+    requested_seconds = _default_seconds_for_model(model_name) if seconds is None else seconds
     body: dict[str, Any] = {
-        "model": model,
+        "model": model_name,
         "prompt": prompt.strip(),
         "images": [image_url],
-        "seconds": str(seconds),
-        "resolution": resolution.lower(),
-        "aspect_ratio": ratio,
+        "seconds": _normalize_seconds(model_name, requested_seconds),
+        "resolution": _normalize_resolution(resolution),
+        "aspect_ratio": str(ratio or DEFAULT_RATIO).strip(),
     }
     if extra_body:
         body.update(extra_body)
+    # Validate the final body as well so an explicit extra_body cannot bypass
+    # the provider's documented 1–15 second contract.
+    body["seconds"] = _normalize_seconds(model_name, body.get("seconds"))
+    body["resolution"] = _normalize_resolution(body.get("resolution", DEFAULT_RESOLUTION))
     return body
+
+
+def _default_seconds_for_model(model: str) -> str:
+    return DEFAULT_SECONDS if model.strip().lower() == DEFAULT_MODEL else LEGACY_DEFAULT_SECONDS
+
+
+def _normalize_seconds(model: str, value: Any) -> str:
+    if value is None or str(value).strip() == "":
+        value = _default_seconds_for_model(model)
+    # Preserve the historical ToAPIs body contract for older models.  The
+    # strict one-to-fifteen integer validation is specific to grok-video-1.5;
+    # legacy callers may still pass provider-specific string values.
+    if model.strip().lower() != DEFAULT_MODEL:
+        return str(value)
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"ToAPIs seconds 必须是整数（{MIN_SECONDS}–{MAX_SECONDS}）") from exc
+    if not numeric.is_integer():
+        raise ValueError(f"ToAPIs seconds 必须是整数（{MIN_SECONDS}–{MAX_SECONDS}）")
+    seconds = int(numeric)
+    if model.strip().lower() == DEFAULT_MODEL and not MIN_SECONDS <= seconds <= MAX_SECONDS:
+        raise ValueError(f"grok-video-1.5 的 seconds 必须在 {MIN_SECONDS}–{MAX_SECONDS} 秒之间")
+    return str(seconds)
+
+
+def _normalize_resolution(value: Any) -> str:
+    normalized = str(value or DEFAULT_RESOLUTION).strip().lower().replace(" ", "")
+    if normalized in {"720", "720p"}:
+        return "720p"
+    if normalized in {"1080", "1080p"}:
+        return "1080p"
+    return normalized
 
 
 def extract_toapis_video_url(payload: dict[str, Any]) -> str | None:
@@ -109,13 +156,13 @@ class ToAPIsVideoClient:
         prompt: str,
         image_path: Path | None = None,
         image_url: str | None = None,
-        ratio: str = "16:9",
+        ratio: str = DEFAULT_RATIO,
         duration: float = 10.0,
         resolution: str | None = None,
         frames: int | None = None,
         role: str = "first_frame",
         parameter_style: str = "prompt",
-        seconds: str = "10",
+        seconds: str | int | float | None = None,
         size: str = "720P",
         camera_fixed: bool = False,
         watermark: bool = False,

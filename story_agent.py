@@ -52,6 +52,7 @@ from story_agent_runtime import (
     request_cancel,
     record_contract_derivative,
     prepared_input_contract_errors,
+    refresh_prepared_inputs,
     resume_job,
     review_bundle_is_current,
     review_passes,
@@ -1420,6 +1421,13 @@ class StoryAgent:
         semantic_contract = first_existing(manifest.get("inputs", {}).get("story_semantics"))
         if semantic_contract is not None:
             control_files.append(semantic_contract)
+        continuity_contract = self._visual_continuity_contract_path()
+        if continuity_contract is not None:
+            control_files.append(continuity_contract)
+        storyboard_plan = control_files[1]
+        continuity_errors = self._visual_continuity_storyboard_errors(continuity_contract, storyboard_plan)
+        if continuity_errors:
+            return StageResult("blocked", "视觉连续性合同校验失败（关键错误）：" + "；".join(continuity_errors), continuity_contract)
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "story_images_bundle.json",
             [storyboard, *(path for path in control_files if path.exists()), *scene_images],
@@ -1435,6 +1443,8 @@ class StoryAgent:
                 "逐镜核对 storyboard_plan.json：每个唱歌/关键发言/关键动作/受挫反应角色是否有自己的焦点镜头；连续段是否有建立镜头、表演者中近景和反应镜头，而不是全程同一种双人中景。"
                 "按 appearance_id 逐项比较脸部花纹、服装主色/款式和饰品；虎妈妈等跨镜角色无剧情依据换衣服属于关键连续性错误。"
                 "若 bundle 包含 story_semantics.json，必须按其语义分段检查：主持人开场/故事预告不得被生成为第二个片名镜头，片名只能出现一次。"
+                "若 bundle 包含 visual_continuity_contract.json，必须将其作为逐镜硬约束：按 allowed_states、transitions、story_boundaries 和 state_rules 核对每镜当前状态、事件转折与在场证据；状态越界或违反 required/forbidden 均为 critical_errors，不能用整体印象放行。"
+                "若合同的 storyboard_requirements 指定 required_field，机器可读 storyboard_plan 必须逐镜提供该字段且值必须属于合同 allowed_states；缺失或枚举无效是关键错误。"
                 "审核 JSON 的 evidence_matrix 必须逐镜写明：角色数量、身份/服装、关键物体数量、角色应在场/不应在场及画面证据；不得用“整体正常”代替逐项核对。"
                 "输出 retry_indices（需要重做的镜头编号整数数组）。角色身份或在场关系错、肢体/五官崩坏、错误文字、漏镜头属于关键错误。"
             ),
@@ -1621,7 +1631,13 @@ class StoryAgent:
             )
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "video_bundle.json",
-            [jobs, qa_report, videos_dir, frames_dir],
+            [
+                jobs,
+                qa_report,
+                videos_dir,
+                frames_dir,
+                *(item for item in [self._visual_continuity_contract_path()] if item is not None),
+            ],
         )
         result, payload = self._structured_review(
             stage="video_review",
@@ -1632,6 +1648,7 @@ class StoryAgent:
                 "结合分镜任务和首尾/25%/50%/75%抽帧检查动作崩坏、反物理现象、角色漂移、黑帧、文字水印和镜头连续性。"
                 "逐镜头数清四足动物的腿，检查嘴/五官位置、物种与颜色身份、角色应出现/不应出现状态、信息因果是否正确。"
                 "必须把每个镜头的 start/q1/mid/q3/end 与起始分镜图逐一比较，evidence_matrix 中记录五个时点的角色数量、关键物体数量、形状拓扑（如实心/空心）和依据文件名。"
+                "若 bundle 包含 visual_continuity_contract.json，必须按合同逐镜核对状态、story_boundaries、transitions、required/forbidden 规则；状态越界或转折不成立必须列入 critical_errors 并重做，不能只写“角色一致”。"
                 "如果证据与结论冲突，以画面为准并必须判定不通过；不得在没有逐时点证据时声称“全程一致”。"
                 "输出 retry_indices（需要重新调用视频生成的镜头编号整数数组）。肢体或五官崩坏、主体变形、角色错误在场、关键动作错误属于关键错误。"
             ),
@@ -1807,6 +1824,12 @@ class StoryAgent:
         model_dir = ROOT / "models" / "whisper"
         if model_dir.exists():
             command.extend(["--whisper-model-dir", str(model_dir)])
+        confirmed_subtitles = first_existing(manifest.get("inputs", {}).get("confirmed_subtitles"))
+        if confirmed_subtitles is not None:
+            # Keep semantic story_text/storyboard_text as the video timing
+            # script.  The optional user-confirmed stream is only the subtitle
+            # script, aligned independently by the existing synthesizer.
+            command.extend(["--subtitle-script", str(confirmed_subtitles)])
         return self._workflow(command, "合成背景成片")
 
     def _stage_release_assets(self, manifest: dict[str, Any]) -> StageResult:
@@ -2581,6 +2604,56 @@ class StoryAgent:
                 return False
         return True
 
+    def _visual_continuity_contract_path(self) -> Path | None:
+        candidate = self.context.paths.status / "visual_continuity_contract.json"
+        return candidate if candidate.is_file() else None
+
+    def _visual_continuity_storyboard_errors(self, contract_path: Path | None, storyboard_plan: Path) -> list[str]:
+        """Validate contract-declared storyboard state fields before review.
+
+        The contract is optional for legacy projects.  When present, a
+        ``required_field`` is a machine-readable per-shot enum requirement;
+        missing/invalid values are surfaced as critical blockers rather than
+        relying on a reviewer prompt alone.
+        """
+
+        if contract_path is None:
+            return []
+        try:
+            contract = json.loads(contract_path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            return [f"合同不可读：{exc}"]
+        if not isinstance(contract, dict):
+            return ["合同必须是 JSON 对象"]
+        requirements = contract.get("storyboard_requirements")
+        if not isinstance(requirements, dict):
+            return []
+        required_field = str(requirements.get("required_field") or "").strip()
+        if not required_field:
+            return []
+        if not storyboard_plan.is_file():
+            return [f"storyboard_plan 缺失，无法提供合同要求字段 {required_field}"]
+        try:
+            payload = json.loads(storyboard_plan.read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+            return [f"storyboard_plan 不可读：{exc}"]
+        rows = payload.get("shots", []) if isinstance(payload, dict) else payload
+        if not isinstance(rows, list) or not rows:
+            return ["storyboard_plan 没有可校验的逐镜列表"]
+        allowed = contract.get("allowed_states")
+        allowed_states = {str(item).strip() for item in allowed if str(item).strip()} if isinstance(allowed, list) else set()
+        errors: list[str] = []
+        for index, row in enumerate(rows, start=1):
+            if not isinstance(row, dict):
+                errors.append(f"第 {index} 镜不是对象")
+                continue
+            value = row.get(required_field)
+            if not isinstance(value, str) or not value.strip():
+                errors.append(f"第 {index} 镜缺少 {required_field}")
+            elif allowed_states and value.strip() not in allowed_states:
+                errors.append(f"第 {index} 镜 {required_field}={value!r} 不属于允许枚举")
+        return errors
+
     def _record_story_image_status(self, index: int, status: str, message: str) -> None:
         progress = self.state.setdefault("codex_story_images", {})
         images = progress.setdefault("images", {})
@@ -3128,6 +3201,14 @@ class StoryAgent:
             "除明确的本集标题和结尾道理文本外，其他镜头不要生成中文文字、字幕、水印。",
             "原文里的“绵羊姐姐”“小朋友们”“我的故事讲完了”只是旁白口吻，绝对不能变成画面人物或角色。",
         ]
+        continuity_contract = self._visual_continuity_contract_path()
+        if continuity_contract is not None:
+            requirements.extend(
+                [
+                    f"必须先读取并遵守视觉连续性合同：{continuity_contract}；它是本项目逐镜状态、转折、required/forbidden 约束的唯一机器可读来源。",
+                    "storyboard_plan.json 每镜必须写入合同 storyboard_requirements.required_field 指定的字段，并使用合同 allowed_states 中的有效枚举；缺失、越界或没有按 transitions/story_boundaries 拆镜都必须先修正再出图。",
+                ]
+            )
         skill_path = ROOT / "skills" / "children-storyboard-images" / "SKILL.md"
         final_request.write_text(
             build_children_story_image_request(
@@ -3215,7 +3296,10 @@ class StoryAgent:
         return None
 
     def _story_lines(self, manifest: dict[str, Any]) -> list[str]:
-        story_text = first_existing(manifest.get("inputs", {}).get("story_text"))
+        story_text = first_existing(
+            manifest.get("inputs", {}).get("storyboard_text"),
+            manifest.get("inputs", {}).get("story_text"),
+        )
         if story_text is None:
             return []
         try:
@@ -3406,6 +3490,11 @@ def main() -> None:
     submit.add_argument("--lut", type=Path, help="可选 .cube 输入 LUT；复制进项目并记录 SHA-256")
     submit.add_argument("--input-mode", choices=["single-greenscreen", "prepared"], default="single-greenscreen")
     submit.add_argument("--confirmed-text", type=Path, help="prepared 加速入口必填：人工确认的 UTF-8 .txt/.md 或 .docx")
+    submit.add_argument(
+        "--confirmed-subtitles",
+        type=Path,
+        help="prepared 加速入口可选：人工确认的逐行 UTF-8 .txt/.md 字幕；仅登记供后续 timing/示范字幕使用",
+    )
     submit.add_argument("--projects-root", default=Path.home() / "Desktop", type=Path)
     submit.add_argument("--story-name", default="")
     submit.add_argument("--slug", default="")
@@ -3414,6 +3503,17 @@ def main() -> None:
     submit.add_argument("--hard-budget", default=100.0, type=float)
     submit.add_argument("--deadline-hours", default=10.0, type=float)
     submit.add_argument("--force", action="store_true", help="即使同一原片已投喂也创建新任务")
+
+    refresh_prepared = subparsers.add_parser(
+        "refresh-prepared-inputs",
+        help="为旧 prepared 项目刷新镜头级 storyboard_text；可选登记人工确认字幕，不复制/重渲染视频",
+    )
+    refresh_prepared.add_argument("--project-dir", required=True, type=Path)
+    refresh_prepared.add_argument(
+        "--confirmed-subtitles",
+        type=Path,
+        help="可选：追加人工确认的 UTF-8 .txt/.md 字幕副本",
+    )
 
     run = subparsers.add_parser("run", help="推进 Agent loop")
     run.add_argument("--job", default="", help="submit 返回的任务 ID")
@@ -3589,6 +3689,7 @@ def main() -> None:
             lut=args.lut,
             input_mode=args.input_mode,
             confirmed_text=args.confirmed_text,
+            confirmed_subtitles=args.confirmed_subtitles,
             projects_root=args.projects_root,
             story_name=args.story_name,
             slug=args.slug,
@@ -3599,6 +3700,23 @@ def main() -> None:
             deadline_hours=args.deadline_hours,
         )
         print(json.dumps({"job_id": job_id, "project_dir": str(project_dir), "created": created, "input_mode": args.input_mode}, ensure_ascii=False, indent=2))
+        return
+    if args.command == "refresh-prepared-inputs":
+        manifest = refresh_prepared_inputs(
+            args.project_dir,
+            confirmed_subtitles=args.confirmed_subtitles,
+        )
+        print(
+            json.dumps(
+                {
+                    "project_dir": str(args.project_dir.expanduser().resolve()),
+                    "storyboard_text": manifest.get("inputs", {}).get("storyboard_text", ""),
+                    "confirmed_subtitles": manifest.get("inputs", {}).get("confirmed_subtitles", ""),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
         return
     if args.command == "start":
         registry = JobRegistry(args.registry)

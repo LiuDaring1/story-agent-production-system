@@ -22,7 +22,15 @@ from story_video_synthesizer.volcengine_video import (
     write_jobs_csv,
 )
 from story_video_synthesizer.image_video import write_review_page_from_rows
-from story_video_synthesizer.toapis_video import ToAPIsVideoClient, build_toapis_task_body
+from story_video_synthesizer.toapis_video import (
+    DEFAULT_MODEL as TOAPIS_DEFAULT_MODEL,
+    DEFAULT_RATIO as TOAPIS_DEFAULT_RATIO,
+    DEFAULT_SECONDS as TOAPIS_DEFAULT_SECONDS,
+    DEFAULT_RESOLUTION as TOAPIS_DEFAULT_RESOLUTION,
+    LEGACY_DEFAULT_SECONDS as TOAPIS_LEGACY_DEFAULT_SECONDS,
+    ToAPIsVideoClient,
+    build_toapis_task_body,
+)
 
 
 RETRYABLE_STATUSES = {"failed", "error", "cancelled", "canceled", "expired"}
@@ -107,11 +115,15 @@ def main() -> None:
     parser.add_argument("--api-key", default="", help="兼容旧 CLI；优先使用 --api-key-env 指定的环境变量")
     parser.add_argument("--base-url", default=os.getenv("VIDEO_API_BASE_URL") or saved_video_base_url(), help="API Base URL")
     parser.add_argument("--model", default=os.getenv("VIDEO_MODEL") or saved_video_model(), help="视频生成模型")
-    parser.add_argument("--ratio", default="16:9")
+    parser.add_argument("--ratio", default="")
     parser.add_argument("--duration", default=10.0, type=float)
-    parser.add_argument("--resolution", default="720p")
-    parser.add_argument("--seconds", default=os.getenv("VIDEO_SECONDS", DEFAULT_SECONDS), help="供应商接口生成秒数；本项目 Grok Video 3 固定使用 10 秒")
-    parser.add_argument("--size", default=os.getenv("VIDEO_SIZE", DEFAULT_SIZE), help="视频清晰度，例如 720P 或 1080P")
+    parser.add_argument("--resolution", default="")
+    parser.add_argument(
+        "--seconds",
+        default=os.getenv("VIDEO_SECONDS", ""),
+        help="供应商接口生成秒数；ToAPIs grok-video-1.5 支持 1–15 秒，默认 8 秒",
+    )
+    parser.add_argument("--size", default=os.getenv("VIDEO_SIZE", ""), help="视频清晰度，例如 720P 或 1080P")
     parser.add_argument("--timing-mode", choices=["frames", "duration"], default="frames", help="默认用 frames 支持小数秒")
     parser.add_argument("--parameter-style", choices=["prompt", "body"], default="prompt", help="旧供应商兼容参数；ToAPIs 路径忽略此项")
     parser.add_argument("--camerafixed", action="store_true", help="固定镜头；默认 false")
@@ -137,10 +149,32 @@ def main() -> None:
     parser.add_argument("--extra-body-json", default="", help="额外请求体 JSON，例如 '{\"watermark\": false}'")
     args = parser.parse_args()
 
+    is_toapis = urlparse(args.base_url).netloc.lower() in {"toapis.com", "www.toapis.com"}
+    configured_model = saved_video_model()
+    same_configured_toapis_model = is_toapis and args.model.strip() == configured_model
+    if not args.seconds.strip():
+        configured_seconds = saved_video_adapter_value("default_seconds", "") if same_configured_toapis_model else ""
+        if is_toapis:
+            fallback_seconds = (
+                TOAPIS_DEFAULT_SECONDS
+                if args.model.strip().lower() == TOAPIS_DEFAULT_MODEL
+                else TOAPIS_LEGACY_DEFAULT_SECONDS
+            )
+        else:
+            fallback_seconds = DEFAULT_SECONDS
+        args.seconds = configured_seconds or fallback_seconds
+    if not args.ratio.strip():
+        configured_ratio = saved_video_adapter_value("default_ratio", "") if same_configured_toapis_model else ""
+        args.ratio = configured_ratio or (TOAPIS_DEFAULT_RATIO if is_toapis else "16:9")
+    if not args.resolution.strip():
+        configured_resolution = saved_video_adapter_value("default_resolution", "") if same_configured_toapis_model else ""
+        args.resolution = configured_resolution or (TOAPIS_DEFAULT_RESOLUTION if is_toapis else "720p")
+    if not args.size.strip():
+        args.size = os.getenv("VIDEO_SIZE") or DEFAULT_SIZE
+
     rows = read_jobs_csv(args.jobs_csv.expanduser())
     args.videos_dir.expanduser().mkdir(parents=True, exist_ok=True)
     api_key = read_secret(args.api_key_env) or args.api_key.strip()
-    is_toapis = urlparse(args.base_url).netloc.lower() in {"toapis.com", "www.toapis.com"}
     client_type = ToAPIsVideoClient if is_toapis else QingyunVideoClient
     client = None if args.dry_run else client_type(api_key=api_key, base_url=args.base_url)
     extra_body = json.loads(args.extra_body_json) if args.extra_body_json.strip() else None

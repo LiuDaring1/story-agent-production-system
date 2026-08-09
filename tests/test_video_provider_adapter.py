@@ -13,6 +13,10 @@ from PIL import Image
 from video_provider_adapter import VideoProviderConfigError, resolve_video_provider
 from story_workflow import run_generate_until_complete
 from story_video_synthesizer.toapis_video import (
+    DEFAULT_MODEL as TOAPIS_DEFAULT_MODEL,
+    DEFAULT_SECONDS as TOAPIS_DEFAULT_SECONDS,
+    MAX_SECONDS as TOAPIS_MAX_SECONDS,
+    MIN_SECONDS as TOAPIS_MIN_SECONDS,
     DEFAULT_USER_AGENT,
     ToAPIsVideoClient,
     build_toapis_task_body,
@@ -113,6 +117,71 @@ class VideoProviderAdapterTests(unittest.TestCase):
             self.assertEqual(selected.runner, second)
             self.assertEqual(selected.model, "m2")
             self.assertEqual(selected.estimated_cost_cny_per_clip, 2.5)
+
+    def test_adapter_supports_per_second_cost_and_generation_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            runner = root / "runner.py"
+            runner.write_text("pass\n", encoding="utf-8")
+            config = {
+                "video_api": {
+                    "provider": "toapis_grok",
+                    "adapters": {
+                        "toapis_grok": {
+                            "runner": "runner.py",
+                            "model": "grok-video-1.5",
+                            "estimated_cost_cny_per_clip": 0.08,
+                            "estimated_cost_cny_per_second": 0.01,
+                            "default_seconds": 8,
+                            "min_seconds": 1,
+                            "max_seconds": 15,
+                            "default_resolution": "720p",
+                            "default_ratio": "16:9",
+                        }
+                    },
+                }
+            }
+            selected = resolve_video_provider(config, root)
+            self.assertEqual(selected.default_seconds, 8.0)
+            self.assertEqual(selected.min_seconds, 1.0)
+            self.assertEqual(selected.max_seconds, 15.0)
+            self.assertEqual(selected.default_resolution, "720p")
+            self.assertEqual(selected.default_ratio, "16:9")
+            self.assertEqual(selected.estimate_cost(), 0.08)
+            self.assertEqual(selected.estimate_cost(12), 0.12)
+
+    def test_toapis_grok_video_15_defaults_to_eight_seconds_720p_and_16_9(self) -> None:
+        body = build_toapis_task_body(
+            model=TOAPIS_DEFAULT_MODEL,
+            prompt="小动物轻轻眨眼",
+            image_url="https://files.example/scene.png",
+        )
+        self.assertEqual(TOAPIS_DEFAULT_MODEL, "grok-video-1.5")
+        self.assertEqual(TOAPIS_DEFAULT_SECONDS, "8")
+        self.assertEqual(body["seconds"], "8")
+        self.assertEqual(body["resolution"], "720p")
+        self.assertEqual(body["aspect_ratio"], "16:9")
+
+    def test_toapis_grok_video_15_rejects_seconds_outside_one_to_fifteen(self) -> None:
+        self.assertEqual(TOAPIS_MIN_SECONDS, 1)
+        self.assertEqual(TOAPIS_MAX_SECONDS, 15)
+        for seconds in ("0", "16", "-1", "not-a-number"):
+            with self.assertRaises(ValueError):
+                build_toapis_task_body(
+                    model=TOAPIS_DEFAULT_MODEL,
+                    prompt="测试",
+                    image_url="https://files.example/scene.png",
+                    seconds=seconds,
+                )
+
+    def test_legacy_toapis_model_keeps_opaque_seconds_values_compatible(self) -> None:
+        body = build_toapis_task_body(
+            model="grok-video-3",
+            prompt="测试",
+            image_url="https://files.example/scene.png",
+            seconds="provider-default",
+        )
+        self.assertEqual(body["seconds"], "provider-default")
 
     def test_toapis_adapter_passes_only_secret_environment_name(self) -> None:
         root = Path(__file__).resolve().parents[1]

@@ -107,9 +107,15 @@ DEFAULT_CONFIG: dict[str, Any] = {
             "toapis_grok": {
                 "runner": "run_image_video_jobs.py",
                 "base_url": "https://toapis.com/v1",
-                "model": "grok-video-3",
+                "model": "grok-video-1.5",
                 "api_key_env": "TOAPIS_API_KEY",
-                "estimated_cost_cny_per_clip": 0.42,
+                "estimated_cost_cny_per_clip": 0.08,
+                "estimated_cost_cny_per_second": 0.01,
+                "default_seconds": 8,
+                "min_seconds": 1,
+                "max_seconds": 15,
+                "default_resolution": "720p",
+                "default_ratio": "16:9",
             },
             "qingyun_api": {
                 "runner": "run_image_video_jobs.py",

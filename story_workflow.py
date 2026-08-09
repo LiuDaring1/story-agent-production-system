@@ -185,7 +185,7 @@ def main() -> None:
     normalize.add_argument("--slug", required=True)
     normalize.add_argument("--count", default=0, type=int)
 
-    pacing = subparsers.add_parser("analyze-pacing", help="分析手动换行分镜是否适合 Grok 10 秒图生视频")
+    pacing = subparsers.add_parser("analyze-pacing", help="分析手动换行分镜是否适合 Grok Video 1.5（1-15 秒，默认 8 秒）图生视频")
     pacing.add_argument("--story-file", required=True, type=Path)
     pacing.add_argument("--output-dir", required=True, type=Path)
     pacing.add_argument("--slug", default="story")
@@ -207,7 +207,7 @@ def main() -> None:
     timing.add_argument("--whisper-model", default="base")
     timing.add_argument("--language", default="zh")
     timing.add_argument("--whisper-model-dir", default=None, type=Path)
-    timing.add_argument("--max-duration", default=10.0, type=float)
+    timing.add_argument("--max-duration", default=8.0, type=float, help="单镜头推荐默认 8 秒；Grok Video 1.5 支持 1-15 秒")
 
     generate = subparsers.add_parser("generate", help="调用视频 API 生成片段")
     generate.add_argument("--jobs-csv", required=True, type=Path)

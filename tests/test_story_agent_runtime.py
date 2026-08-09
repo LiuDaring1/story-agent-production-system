@@ -1227,6 +1227,72 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertLess(command.index("视觉审核提示"), command.index("--image"))
             self.assertEqual(command[command.index("--image") + 1], str(image_path))
 
+    def test_visual_review_uses_native_multimodal_without_user_vision_bridge(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：原生视觉审核"
+            init_project(project, story_name="原生视觉审核", slug="native-vision-review")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="原生视觉审核",
+                slug="native-vision-review",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="cli",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context)
+            prompt_path = Path(directory) / "prompt.md"
+            image_path = Path(directory) / "sheet.jpg"
+            prompt_path.write_text("原生多模态审核提示", encoding="utf-8")
+            image_path.write_bytes(b"image")
+            with patch("story_agent.subprocess.Popen") as popen:
+                process = popen.return_value
+                process.communicate.return_value = ("", "")
+                process.returncode = 0
+                result = agent._run_codex_exec("story_images_review", prompt_path, [image_path])
+            command = popen.call_args.args[0]
+            self.assertEqual(result.status, "done")
+            self.assertIn("--ignore-user-config", command)
+            self.assertLess(command.index("exec"), command.index("--ignore-user-config"))
+            self.assertEqual(command[command.index("--image") + 1], str(image_path))
+
+    def test_visual_producer_with_images_keeps_user_config_compatibility(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：视觉生产兼容"
+            init_project(project, story_name="视觉生产兼容", slug="visual-producer-compat")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="视觉生产兼容",
+                slug="visual-producer-compat",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="cli",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context)
+            prompt_path = Path(directory) / "prompt.md"
+            image_path = Path(directory) / "sheet.jpg"
+            prompt_path.write_text("视觉生产提示", encoding="utf-8")
+            image_path.write_bytes(b"image")
+            with patch("story_agent.subprocess.Popen") as popen:
+                process = popen.return_value
+                process.communicate.return_value = ("", "")
+                process.returncode = 0
+                result = agent._run_codex_exec("product_annotation", prompt_path, [image_path])
+            command = popen.call_args.args[0]
+            self.assertEqual(result.status, "done")
+            self.assertNotIn("--ignore-user-config", command)
+
     def test_dead_process_lock_is_reclaimed_but_live_lock_is_preserved(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：锁恢复"

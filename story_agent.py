@@ -86,6 +86,22 @@ from story_qualification import build_promotion_report, record_human_signoff, re
 ROOT = Path(__file__).resolve().parent
 AGENT_STATE_NAME = "story_agent_state.json"
 
+# Review-only stages that attach visual evidence to the Codex prompt.  These
+# stages use GPT's native multimodal input; bypassing user config prevents a
+# user-level Claude/GLM vision bridge from being injected into the review
+# process.  Keep production/imagegen/browser/Suno stages out of this set.
+NATIVE_VISION_REVIEW_STAGES = frozenset(
+    {
+        "story_images_review",
+        "video_prompt_review",
+        "video_review",
+        "release_preview",
+        "release_video_review",
+        "publish_package_review",
+        "product_annotation_review",
+    }
+)
+
 
 def resolve_agent_runtime_python() -> str:
     """Choose an interpreter that can run the real media pipeline.
@@ -2354,6 +2370,11 @@ class StoryAgent:
             "--output-last-message",
             str(output_path),
         ]
+        if stage in NATIVE_VISION_REVIEW_STAGES and images:
+            # `--ignore-user-config` is an exec subcommand option.  It keeps
+            # this isolated to visual review calls while preserving user
+            # config for imagegen, Suno, browser and production workers.
+            command.insert(4, "--ignore-user-config")
         _role, selected_model, selected_reasoning = self.context.codex_route(stage)
         if selected_model:
             command.extend(["--model", selected_model])

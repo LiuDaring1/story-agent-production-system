@@ -6,7 +6,16 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from release_video import probe_video_size, safe_watermark_motion_expressions
+from PIL import Image, ImageDraw
+
+from release_video import (
+    build_tail_frame_probe_commands,
+    person_tail_pad_seconds,
+    probe_video_size,
+    release_plate_integrity_issues,
+    safe_watermark_motion_expressions,
+    story_frame_integrity_issues,
+)
 from story_project import init_project, project_paths, qa_release, write_manifest
 
 
@@ -47,6 +56,52 @@ class ReleaseQaTests(unittest.TestCase):
         self.assertTrue(expressions[1].startswith("20+"))
         self.assertTrue(expressions[2].startswith("W-w-20-"))
         self.assertTrue(expressions[3].startswith("H-h-20-"))
+
+    def test_person_tail_padding_is_deterministic_and_clones_last_frame(self) -> None:
+        self.assertEqual(person_tail_pad_seconds(12.03, 12.0), 0.0)
+        # A stream that is a few frames short receives a small deterministic
+        # clone window instead of allowing ffmpeg to synthesize an EOF frame.
+        self.assertAlmostEqual(person_tail_pad_seconds(11.96, 12.0), 0.08, places=6)
+        self.assertAlmostEqual(person_tail_pad_seconds(11.96, 12.0, frame_duration=1 / 25), 0.08, places=6)
+
+    def test_tail_probe_samples_the_whole_last_two_seconds_and_final_frame(self) -> None:
+        commands = build_tail_frame_probe_commands(Path("release.mp4"), Path("frames"), 10.0, fps=8)
+        self.assertEqual(len(commands), 2)
+        tail_command, final_command = commands
+        self.assertIn("-t", tail_command)
+        self.assertIn("2.000", tail_command)
+        self.assertIn("fps=8", tail_command)
+        self.assertIn("9.875", final_command)
+        self.assertNotIn("9.500", tail_command)
+
+    def test_release_plate_integrity_rejects_black_partition_and_large_black_rectangle(self) -> None:
+        image = Image.new("RGB", (1080, 1440), (245, 240, 220))
+        draw = ImageDraw.Draw(image)
+        draw.rectangle((0, 416, 1079, 425), fill=(0, 0, 0))
+        draw.rectangle((160, 1040, 920, 1310), fill=(0, 0, 0))
+        issues = release_plate_integrity_issues(image, (0, 416, 1080, 608))
+        self.assertTrue(any("black_seam" in issue for issue in issues))
+        self.assertTrue(any("black_rectangle" in issue for issue in issues))
+
+    def test_story_frame_integrity_rejects_missing_corner(self) -> None:
+        image = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        window = (170, 250, 990, 557)
+        x, y, width, height = window
+        draw.rectangle((x - 40, y - 40, x + width + 40, y + height + 40), outline=(255, 180, 80, 255), width=18)
+        draw.rectangle((x - 50, y - 50, x + 15, y + 15), fill=(0, 0, 0, 0))
+        issues = story_frame_integrity_issues(image, window)
+        self.assertTrue(any("corner_missing" in issue for issue in issues))
+
+    def test_story_frame_integrity_rejects_open_side_gap(self) -> None:
+        image = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        window = (170, 250, 990, 557)
+        x, y, width, height = window
+        draw.rectangle((x, y, x + width, y + height), outline=(255, 180, 80, 255), width=18)
+        draw.rectangle((x + width // 2 - 60, y - 30, x + width // 2 + 60, y + 30), fill=(0, 0, 0, 0))
+        issues = story_frame_integrity_issues(image, window)
+        self.assertTrue(any("contour_gap" in issue for issue in issues))
 
     def test_release_qa_requires_vertical_video_with_aligned_audio(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

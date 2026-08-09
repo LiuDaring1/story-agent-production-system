@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from story_project import init_project, load_manifest, project_paths, save_json, slugify, write_internal_agent_reports, write_manifest
+from story_semantics import StoryOutput, classify_story, lines_for_output
 
 
 MANIFEST_VERSION = 2
@@ -713,6 +714,41 @@ def read_confirmed_story_source(path: Path) -> str:
     return body
 
 
+def build_prepared_semantic_derivatives(text: str) -> tuple[dict[str, Any], dict[str, str]]:
+    """Build every text view from one immutable, line-preserving semantic contract."""
+    normalized = text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n").strip()
+    source_lines = [line.strip() for line in normalized.splitlines() if line.strip()]
+    # Human-confirmed paragraph boundaries are semantic evidence.  Only invent
+    # line breaks when the submitted document is genuinely one long paragraph.
+    segmented_text = "\n".join(source_lines if len(source_lines) > 1 else segment_confirmed_story_text(normalized))
+    semantics = classify_story(segmented_text)
+
+    def selected(output: StoryOutput) -> str:
+        lines = [line.text for line in lines_for_output(semantics, output)]
+        return "\n".join(lines).strip() + ("\n" if lines else "")
+
+    views = {
+        "full_transcript": selected(StoryOutput.NARRATION_FULL),
+        "story_text": selected(StoryOutput.STORY_TEXT),
+        "consumer_manuscript": selected(StoryOutput.READING_ANNOTATION),
+        "sales_subtitle_text": selected(StoryOutput.SALES_SUBTITLES),
+    }
+    if not views["story_text"].strip():
+        raise ValueError("确认文本没有可用的故事正文/道理，请检查开场与正文分段")
+    contract = {
+        "version": 1,
+        "source_text_sha256": hashlib.sha256(
+            text.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n").strip().encode("utf-8")
+        ).hexdigest(),
+        **semantics.to_dict(),
+        "outputs": {
+            output.value: [line.line_number for line in lines_for_output(semantics, output)]
+            for output in StoryOutput
+        },
+    }
+    return contract, views
+
+
 def prepared_input_contract_errors(project_dir: Path, manifest: dict[str, Any]) -> list[str]:
     agent = manifest.get("agent", {}) if isinstance(manifest.get("agent"), dict) else {}
     contract = agent.get("input_contract") if isinstance(agent.get("input_contract"), dict) else {}
@@ -789,6 +825,56 @@ def prepared_input_contract_errors(project_dir: Path, manifest: dict[str, Any]) 
             or recorded_story_bytes != story_text.stat().st_size
         ):
             errors.append("prepared 分行故事文本派生哈希失效")
+    if int(contract.get("version", 1) or 1) >= 2 and confirmed.is_file() and confirmed_text.strip():
+        try:
+            semantic_payload, expected_views = build_prepared_semantic_derivatives(confirmed_text)
+        except (AgentRuntimeError, ValueError) as exc:
+            errors.append(f"prepared 语义合同无法重建：{exc}")
+        else:
+            expected_roles_v2 = {
+                "full_transcript",
+                "story_text",
+                "consumer_manuscript",
+                "sales_subtitle_text",
+                "semantic_contract",
+            }
+            if not expected_roles_v2.issubset(derived):
+                errors.append("prepared v2 缺少完整的语义派生产物")
+            source_sha = file_sha256(confirmed)
+            for role in sorted(expected_roles_v2):
+                record = derived.get(role) if isinstance(derived.get(role), dict) else {}
+                path = Path(str(record.get("path") or "")).expanduser()
+                try:
+                    resolved = path.resolve()
+                    resolved.relative_to(inputs_dir)
+                except (OSError, ValueError):
+                    errors.append(f"prepared {role} 没有指向项目输入目录")
+                    continue
+                if not resolved.is_file():
+                    errors.append(f"prepared {role} 派生文件缺失")
+                    continue
+                try:
+                    recorded_bytes = int(record.get("bytes", -1))
+                except (TypeError, ValueError):
+                    recorded_bytes = -1
+                if record.get("source_sha256") != source_sha:
+                    errors.append(f"prepared {role} 未绑定当前确认文本")
+                if record.get("sha256") != file_sha256(resolved) or recorded_bytes != resolved.stat().st_size:
+                    errors.append(f"prepared {role} 派生哈希失效")
+                    continue
+                if role == "semantic_contract":
+                    try:
+                        actual_semantics = json.loads(resolved.read_text(encoding="utf-8"))
+                    except (OSError, json.JSONDecodeError):
+                        errors.append("prepared 语义合同不是有效 JSON")
+                    else:
+                        if actual_semantics != semantic_payload:
+                            errors.append("prepared 语义合同与确认文本不一致")
+                elif resolved.read_text(encoding="utf-8") != expected_views[role]:
+                    errors.append(f"prepared {role} 内容与语义策略不一致")
+            consumer_path = Path(str(manifest.get("outputs", {}).get("consumer_manuscript") or ""))
+            if consumer_path.expanduser().resolve() != Path(str(derived.get("consumer_manuscript", {}).get("path") or "")).expanduser().resolve():
+                errors.append("manifest 消费者文稿没有绑定语义派生产物")
     return errors
 
 
@@ -885,13 +971,23 @@ def submit_video_job(
     confirmed_target: Path | None = None
     story_text_target: Path | None = None
     consumer_target: Path | None = None
+    full_transcript_target: Path | None = None
+    sales_subtitle_target: Path | None = None
+    semantic_contract_target: Path | None = None
     if confirmed_source is not None:
         confirmed_target = paths.inputs / f"{safe_slug}_confirmed_story{confirmed_source.suffix.lower()}"
         copy_verified_input(confirmed_source, confirmed_target)
+        semantic_payload, semantic_views = build_prepared_semantic_derivatives(confirmed_body)
         story_text_target = paths.inputs / f"{safe_slug}_prepared_story_source.txt"
-        story_text_target.write_text("\n".join(segment_confirmed_story_text(confirmed_body)) + "\n", encoding="utf-8")
+        story_text_target.write_text(semantic_views["story_text"], encoding="utf-8")
         consumer_target = paths.inputs / f"{safe_slug}_consumer_manuscript.txt"
-        consumer_target.write_text(confirmed_body.lstrip("\ufeff").replace("\r\n", "\n").strip() + "\n", encoding="utf-8")
+        consumer_target.write_text(semantic_views["consumer_manuscript"], encoding="utf-8")
+        full_transcript_target = paths.inputs / f"{safe_slug}_full_transcript.txt"
+        full_transcript_target.write_text(semantic_views["full_transcript"], encoding="utf-8")
+        sales_subtitle_target = paths.inputs / f"{safe_slug}_sales_subtitle_text.txt"
+        sales_subtitle_target.write_text(semantic_views["sales_subtitle_text"], encoding="utf-8")
+        semantic_contract_target = paths.inputs / f"{safe_slug}_story_semantics.json"
+        save_json(semantic_contract_target, semantic_payload)
     lut_target: Path | None = None
     if color_lut is not None:
         lut_target = paths.inputs / f"{safe_slug}_input_lut.cube"
@@ -906,8 +1002,12 @@ def submit_video_job(
     manifest["inputs"]["greenscreen_video"] = str(target)
     if normalized_mode == "prepared":
         assert confirmed_target is not None and story_text_target is not None and consumer_target is not None
+        assert full_transcript_target is not None and sales_subtitle_target is not None and semantic_contract_target is not None
         manifest["inputs"]["greenscreen_video_original"] = str(target)
         manifest["inputs"]["story_text"] = str(story_text_target)
+        manifest["inputs"]["story_transcript_full"] = str(full_transcript_target)
+        manifest["inputs"]["sales_subtitle_text"] = str(sales_subtitle_target)
+        manifest["inputs"]["story_semantics"] = str(semantic_contract_target)
         manifest["outputs"]["consumer_manuscript"] = str(consumer_target)
     if lut_target is not None:
         manifest["inputs"]["color_lut"] = str(lut_target)
@@ -945,7 +1045,7 @@ def submit_video_job(
             "bytes": confirmed_target.stat().st_size,
         }
         manifest["agent"]["input_contract"] = {
-            "version": 1,
+            "version": 2,
             "mode": "prepared_greenscreen_confirmed_text",
             "track": "assisted_accelerated",
             "counts_toward_default_entry": False,
@@ -967,18 +1067,39 @@ def submit_video_job(
             ],
             "processing_assets": [],
             "derived_inputs": {
+                "full_transcript": {
+                    "path": str(full_transcript_target),
+                    "sha256": file_sha256(full_transcript_target),
+                    "bytes": full_transcript_target.stat().st_size,
+                    "producer": "story_semantics:narration_full",
+                    "source_sha256": file_sha256(confirmed_target),
+                },
                 "story_text": {
                     "path": str(story_text_target),
                     "sha256": file_sha256(story_text_target),
                     "bytes": story_text_target.stat().st_size,
-                    "producer": "prepared_input_segmentation",
+                    "producer": "story_semantics:story_text",
                     "source_sha256": file_sha256(confirmed_target),
                 },
                 "consumer_manuscript": {
                     "path": str(consumer_target),
                     "sha256": file_sha256(consumer_target),
                     "bytes": consumer_target.stat().st_size,
-                    "producer": "prepared_input_copy",
+                    "producer": "story_semantics:reading_annotation",
+                    "source_sha256": file_sha256(confirmed_target),
+                },
+                "sales_subtitle_text": {
+                    "path": str(sales_subtitle_target),
+                    "sha256": file_sha256(sales_subtitle_target),
+                    "bytes": sales_subtitle_target.stat().st_size,
+                    "producer": "story_semantics:sales_subtitles",
+                    "source_sha256": file_sha256(confirmed_target),
+                },
+                "semantic_contract": {
+                    "path": str(semantic_contract_target),
+                    "sha256": file_sha256(semantic_contract_target),
+                    "bytes": semantic_contract_target.stat().st_size,
+                    "producer": "story_semantics:contract",
                     "source_sha256": file_sha256(confirmed_target),
                 },
             },

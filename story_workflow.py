@@ -1045,6 +1045,20 @@ def run_package_release_project(
         reset_release_preview_dir(preview_dir)
     manifest = detect_project_assets(paths.root, extract_audio=True)
     manifest = refresh_project_outputs(paths.root)
+    if not is_preview:
+        # Full renders are expensive and irreversible enough that a reviewed
+        # preview, bound to the exact preset/search/evidence hashes, is a hard
+        # prerequisite even when this legacy CLI is invoked directly.
+        from story_agent_runtime import review_bundle_is_current, review_passes
+
+        preview_bundle = paths.status / "reviews" / "release_preview_bundle.json"
+        preview_review = paths.status / "reviews" / "release_preview_review.json"
+        try:
+            review_payload = json.loads(preview_review.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError("全片渲染前必须完成独立发布预览审核") from exc
+        if not review_bundle_is_current(preview_bundle) or not review_passes(review_payload, artifact=preview_bundle):
+            raise RuntimeError("发布预览审核未通过，或审核后的択像/布局产物已变更，拒绝渲染全片")
     config = load_config()
     story = manifest["story"]
     outputs = manifest["outputs"]

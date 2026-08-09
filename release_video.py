@@ -244,6 +244,24 @@ def load_keying_preset(path: Path) -> dict:
     data = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(data, dict):
         raise ValueError("keying_preset.json 必须是 JSON 对象")
+    selected = str(data.get("keying_candidate") or "").strip()
+    if selected:
+        search_ref = str(data.get("keying_search") or "").strip()
+        search_path = Path(search_ref).expanduser() if search_ref else path.with_name("keying_search.json")
+        if not search_path.is_absolute():
+            search_path = (path.parent / search_path).resolve()
+        try:
+            search = json.loads(search_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"択像预设缺少可验证的 keying_search 证据：{search_path}") from exc
+        candidates = search.get("candidates") if isinstance(search, dict) else None
+        candidate_ids = {
+            str(item.get("id") or item.get("candidate_id") or "").strip()
+            for item in (candidates or [])
+            if isinstance(item, dict)
+        }
+        if selected not in candidate_ids:
+            raise ValueError(f"keying_candidate={selected!r} 未出现在 keying_search.candidates 中")
     return data
 
 
@@ -752,6 +770,96 @@ def probe_video_size(path: Path) -> tuple[int, int]:
     return int(width_text), int(height_text)
 
 
+def probe_video_stream_duration(path: Path) -> float | None:
+    """Read the duration of the first video stream, excluding any audio tail.
+
+    ``format=duration`` is intentionally not used here: a muxed greenscreen
+    file can carry an audio stream that outlives the actual image stream.  A
+    missing/invalid duration is returned as ``None`` so callers can retain the
+    normal ffmpeg EOF boundary instead of guessing.
+    """
+    process = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            str(path),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if process.returncode != 0:
+        return None
+    try:
+        value = float(process.stdout.strip())
+    except (TypeError, ValueError):
+        return None
+    return value if value > 0 else None
+
+
+def probe_video_frame_duration(path: Path) -> float:
+    """Return one frame's duration for a video, with a deterministic fallback."""
+    process = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-show_entries",
+            "stream=avg_frame_rate,r_frame_rate",
+            "-of",
+            "default=noprint_wrappers=1:nokey=0",
+            str(path),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if process.returncode == 0:
+        rates: list[float] = []
+        for line in process.stdout.splitlines():
+            if "=" not in line:
+                continue
+            _, raw_rate = line.split("=", 1)
+            try:
+                if "/" in raw_rate:
+                    numerator, denominator = raw_rate.split("/", 1)
+                    rate = float(numerator) / float(denominator)
+                else:
+                    rate = float(raw_rate)
+            except (TypeError, ValueError, ZeroDivisionError):
+                continue
+            if rate > 0:
+                rates.append(rate)
+        if rates:
+            return 1.0 / max(rates)
+    return 1.0 / 25.0
+
+
+def person_tail_pad_seconds(
+    person_duration: float | None,
+    target_duration: float,
+    frame_duration: float = 1.0 / 25.0,
+) -> float:
+    """How long to clone the last valid person frame before the output ends.
+
+    One extra frame is included by default so a stream that ends exactly on a
+    frame boundary cannot expose an EOF-generated black frame.  A source that
+    is already long enough receives no pad.  The function is pure and is kept
+    separate from ffprobe so it can be tested without media files.
+    """
+    if person_duration is None or target_duration <= 0 or person_duration >= target_duration:
+        return 0.0
+    safety_frame = max(0.0, float(frame_duration))
+    return max(0.0, target_duration - max(0.0, person_duration)) + safety_frame
+
+
 def native_person_filter_layout(
     source_path: Path,
     detected_bbox: tuple[int, int, int, int] | None,
@@ -852,10 +960,348 @@ def validate_config(config: ReleaseConfig) -> None:
     if b_x < 0 or b_y < 0 or b_x + b_width > WIDE_WIDTH or b_y + b_height > WIDE_HEIGHT:
         raise ValueError("--b-story-box 必须落在 1920x1080 主画布内")
     # B 景默认复用 A 景统一故事框；只在需要完全不同框图时传 --frame-image-b。
+    validate_release_assets(config)
+
+
+def _load_rgba_image(source: Image.Image | Path) -> Image.Image:
+    """Load an image source without leaking an open file handle."""
+    if isinstance(source, Image.Image):
+        return source.convert("RGBA").copy()
+    with Image.open(source) as image:
+        return image.convert("RGBA").copy()
+
+
+def _visible_alpha_mask(image: Image.Image, threshold: int = 24) -> Image.Image:
+    return image.convert("RGBA").getchannel("A").point(lambda value: 255 if value > threshold else 0, mode="L")
+
+
+def _composite_rgb_for_integrity(image: Image.Image, sample_limit: int = 256) -> Image.Image:
+    """Flatten transparent pixels to white before dark-pixel analysis."""
+    rgba = image.convert("RGBA")
+    if max(rgba.size) > sample_limit:
+        scale = sample_limit / max(rgba.size)
+        rgba = rgba.resize(
+            (max(1, round(rgba.width * scale)), max(1, round(rgba.height * scale))),
+            Image.Resampling.BOX,
+        )
+    background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+    background.alpha_composite(rgba)
+    return background.convert("RGB")
+
+
+def _rgb_pixel_values(image: Image.Image):
+    getter = getattr(image, "get_flattened_data", None)
+    return getter() if getter is not None else image.getdata()
+
+
+def _black_pixel_mask(image: Image.Image, threshold: int = 18) -> Image.Image:
+    rgb = _composite_rgb_for_integrity(image)
+    return Image.frombytes(
+        "L",
+        rgb.size,
+        bytes(255 if max(pixel) <= threshold else 0 for pixel in _rgb_pixel_values(rgb)),
+    )
+
+
+def _black_components(mask: Image.Image) -> list[tuple[int, int, int, int, int]]:
+    """Return connected black components as (area, x, y, width, height)."""
+    width, height = mask.size
+    pixels = mask.load()
+    visited = bytearray(width * height)
+    components: list[tuple[int, int, int, int, int]] = []
+    for y in range(height):
+        for x in range(width):
+            index = y * width + x
+            if visited[index] or pixels[x, y] == 0:
+                continue
+            visited[index] = 1
+            queue = [(x, y)]
+            area = 0
+            min_x = max_x = x
+            min_y = max_y = y
+            while queue:
+                current_x, current_y = queue.pop()
+                area += 1
+                min_x = min(min_x, current_x)
+                max_x = max(max_x, current_x)
+                min_y = min(min_y, current_y)
+                max_y = max(max_y, current_y)
+                for next_x, next_y in (
+                    (current_x - 1, current_y),
+                    (current_x + 1, current_y),
+                    (current_x, current_y - 1),
+                    (current_x, current_y + 1),
+                ):
+                    if not (0 <= next_x < width and 0 <= next_y < height):
+                        continue
+                    next_index = next_y * width + next_x
+                    if not visited[next_index] and pixels[next_x, next_y] != 0:
+                        visited[next_index] = 1
+                        queue.append((next_x, next_y))
+            components.append((area, min_x, min_y, max_x - min_x + 1, max_y - min_y + 1))
+    return components
+
+
+def release_plate_integrity_issues(
+    source: Image.Image | Path,
+    video_box: tuple[int, int, int, int] = DEFAULT_VIDEO_BOX,
+    *,
+    dark_threshold: int = 18,
+    seam_fraction: float = 0.82,
+    rectangle_area_fraction: float = 0.05,
+) -> list[str]:
+    """Detect black seams and large black rectangles in a release plate.
+
+    The check intentionally operates on a downsampled copy, making it a fast
+    deterministic gate before any full-video render. Transparent source pixels
+    are flattened to white so alpha does not masquerade as a black seam.
+    """
+    image = _load_rgba_image(source)
+    width, height = image.size
+    issues: list[str] = []
+    x, y, box_width, box_height = video_box
+    if box_width <= 0 or box_height <= 0 or x < 0 or y < 0 or x + box_width > width or y + box_height > height:
+        issues.append("plate_video_box_invalid: 视频窗口超出底板范围")
+
+    rgb = _composite_rgb_for_integrity(image)
+    mask = Image.frombytes(
+        "L",
+        rgb.size,
+        bytes(255 if max(pixel) <= dark_threshold else 0 for pixel in _rgb_pixel_values(rgb)),
+    )
+    mask_pixels = mask.load()
+    sample_width, sample_height = mask.size
+    row_fraction = [
+        sum(1 for px in range(sample_width) if mask_pixels[px, py]) / max(1, sample_width)
+        for py in range(sample_height)
+    ]
+    column_fraction = [
+        sum(1 for py in range(sample_height) if mask_pixels[px, py]) / max(1, sample_height)
+        for px in range(sample_width)
+    ]
+    edge_rows = max(1, round(sample_height * 0.012))
+    edge_columns = max(1, round(sample_width * 0.012))
+    if any(value >= seam_fraction for value in row_fraction[:edge_rows] + row_fraction[-edge_rows:]):
+        issues.append("plate_edge_black_seam: 底板外边缘存在连续黑接缝")
+    if any(value >= seam_fraction for value in column_fraction[:edge_columns] + column_fraction[-edge_columns:]):
+        issues.append("plate_edge_black_seam: 底板外边缘存在连续黑接缝")
+
+    # Interior rows/columns are partition boundaries.  Downsampling can turn
+    # a real 8-12px seam into one sampled pixel, so preserve a one-pixel run as
+    # a deterministic failure signal rather than hiding it as anti-aliasing.
+    interior_row_run = max(1, round(sample_height * 0.002))
+    interior_col_run = max(1, round(sample_width * 0.002))
+    if _has_fraction_run(row_fraction, seam_fraction, interior_row_run, edge_rows, sample_height - edge_rows):
+        issues.append("plate_partition_black_seam: 底板分区之间存在连续黑接缝")
+    if _has_fraction_run(column_fraction, seam_fraction, interior_col_run, edge_columns, sample_width - edge_columns):
+        issues.append("plate_partition_black_seam: 底板分区之间存在连续黑接缝")
+
+    for area, component_x, component_y, component_width, component_height in _black_components(_black_pixel_mask(image, dark_threshold)):
+        component_area_fraction = area / max(1, sample_width * sample_height)
+        bounding_area = component_width * component_height
+        rectangularity = area / max(1, bounding_area)
+        if (
+            component_area_fraction >= rectangle_area_fraction
+            and component_width >= sample_width * 0.15
+            and component_height >= sample_height * 0.06
+            and rectangularity >= 0.62
+        ):
+            issues.append(
+                "plate_large_black_rectangle: "
+                f"黑色区域约占底板 {component_area_fraction:.1%} "
+                f"（x={component_x}, y={component_y}, w={component_width}, h={component_height}）"
+            )
+            break
+    return issues
+
+
+def plate_integrity_issues(
+    source: Image.Image | Path,
+    video_box: tuple[int, int, int, int] = DEFAULT_VIDEO_BOX,
+    **kwargs,
+) -> list[str]:
+    """Backward/short-name wrapper for :func:`release_plate_integrity_issues`."""
+    return release_plate_integrity_issues(source, video_box, **kwargs)
+
+
+def _has_fraction_run(values: list[float], threshold: float, run: int, start: int, end: int) -> bool:
+    count = 0
+    for index, value in enumerate(values):
+        if index < start or index >= end:
+            continue
+        if value >= threshold:
+            count += 1
+            if count >= run:
+                return True
+        else:
+            count = 0
+    return False
+
+
+def story_frame_integrity_issues(
+    source: Image.Image | Path,
+    window: tuple[int, int, int, int],
+    *,
+    alpha_threshold: int = 24,
+) -> list[str]:
+    """Check that an A-scene frame has four visible corners and a closed outline."""
+    original_mode = source.mode if isinstance(source, Image.Image) else None
+    if original_mode is None:
+        try:
+            with Image.open(source) as source_image:
+                original_mode = source_image.mode
+        except OSError:
+            return ["frame_unreadable: 无法读取故事框图片"]
+    image = _load_rgba_image(source)
+    issues: list[str] = []
+    if original_mode != "RGBA":
+        issues.append("frame_not_rgba: 故事框必须是RGBA透明图")
+        return issues
+    width, height = image.size
+    x, y, box_width, box_height = window
+    if box_width <= 0 or box_height <= 0 or x < 0 or y < 0 or x + box_width > width or y + box_height > height:
+        return ["frame_window_invalid: 故事视频窗口超出画布范围"]
+    alpha = _visible_alpha_mask(image, alpha_threshold)
+    if alpha.getbbox() is None:
+        return ["frame_empty: 故事框没有可见轮廓"]
+    pixels = alpha.load()
+    outer = max(24, min(120, round(min(box_width, box_height) * 0.18)))
+    corners = {
+        # Include the boundary pixel so a frame drawn exactly on the story
+        # window (rather than outside it) is still treated as a valid corner.
+        "top_left": (max(0, x - outer), max(0, y - outer), min(width, x + 1), min(height, y + 1)),
+        "top_right": (max(0, x + box_width - 1), max(0, y - outer), min(width, x + box_width + outer), min(height, y + 1)),
+        "bottom_left": (max(0, x - outer), max(0, y + box_height - 1), min(width, x + 1), min(height, y + box_height + outer)),
+        "bottom_right": (max(0, x + box_width - 1), max(0, y + box_height - 1), min(width, x + box_width + outer), min(height, y + box_height + outer)),
+    }
+    missing_corners: list[str] = []
+    corner_probe_radius = max(8, round(outer * 0.12))
+    for label, (x1, y1, x2, y2) in corners.items():
+        patch_width = max(1, x2 - x1)
+        patch_height = max(1, y2 - y1)
+        visible_points = [(px, py) for py in range(y1, y2) for px in range(x1, x2) if pixels[px, py]]
+        visible = len(visible_points)
+        ratio = visible / max(1, patch_width * patch_height)
+        if label.endswith("left"):
+            corner_x = x
+        else:
+            corner_x = x + box_width
+        if label.startswith("top"):
+            corner_y = y
+        else:
+            corner_y = y + box_height
+        nearest_distance = min(
+            (max(abs(px - corner_x), abs(py - corner_y)) for px, py in visible_points),
+            default=outer + 1,
+        )
+        if ratio < 0.012 and nearest_distance > corner_probe_radius:
+            missing_corners.append(label)
+            issues.append(f"frame_corner_missing:{label}: A镜框{label}角缺失")
+    if missing_corners:
+        issues.append("frame_contour_open: A镜框四角未形成闭合轮廓")
+
+    side_bands = {
+        "top": (max(0, x - outer), max(0, y - outer), min(width, x + box_width + outer), min(height, y + max(1, outer // 2))),
+        "bottom": (max(0, x - outer), max(0, y + box_height - max(1, outer // 2)), min(width, x + box_width + outer), min(height, y + box_height + outer)),
+        "left": (max(0, x - outer), max(0, y - outer), min(width, x + max(1, outer // 2)), min(height, y + box_height + outer)),
+        "right": (max(0, x + box_width - max(1, outer // 2)), max(0, y - outer), min(width, x + box_width + outer), min(height, y + box_height + outer)),
+    }
+    missing_sides: list[str] = []
+    for label, (x1, y1, x2, y2) in side_bands.items():
+        band_width = max(1, x2 - x1)
+        band_height = max(1, y2 - y1)
+        visible = sum(1 for py in range(y1, y2) for px in range(x1, x2) if pixels[px, py])
+        if visible / max(1, band_width * band_height) < 0.004:
+            missing_sides.append(label)
+            issues.append(f"frame_side_missing:{label}: A镜框{label}边缺失")
+            continue
+        # A side can have enough decoration overall while still containing a
+        # conspicuous gap.  Check interior segments separately to enforce a
+        # genuinely closed contour rather than just four corner ornaments.
+        segment_count = 10
+        for segment_index in range(segment_count):
+            if label in {"top", "bottom"}:
+                segment_x1 = x + (box_width * segment_index) // segment_count
+                segment_x2 = x + (box_width * (segment_index + 1)) // segment_count
+                segment_box = (segment_x1, y1, max(segment_x1 + 1, segment_x2), y2)
+            else:
+                segment_y1 = y + (box_height * segment_index) // segment_count
+                segment_y2 = y + (box_height * (segment_index + 1)) // segment_count
+                segment_box = (x1, segment_y1, x2, max(segment_y1 + 1, segment_y2))
+            sx1, sy1, sx2, sy2 = segment_box
+            segment_width = max(1, sx2 - sx1)
+            segment_height = max(1, sy2 - sy1)
+            segment_visible = sum(1 for py in range(sy1, sy2) for px in range(sx1, sx2) if pixels[px, py])
+            coordinate_distances: list[int] = []
+            if label in {"top", "bottom"}:
+                coordinate_range = range(sx1, sx2)
+                for coordinate in coordinate_range:
+                    distances = [
+                        abs(py - (y if label == "top" else y + box_height))
+                        for py in range(sy1, sy2)
+                        if pixels[coordinate, py]
+                    ]
+                    coordinate_distances.append(min(distances, default=outer + 1))
+            else:
+                coordinate_range = range(sy1, sy2)
+                for coordinate in coordinate_range:
+                    distances = [
+                        abs(px - (x if label == "left" else x + box_width))
+                        for px in range(sx1, sx2)
+                        if pixels[px, coordinate]
+                    ]
+                    coordinate_distances.append(min(distances, default=outer + 1))
+            finite_distances = sorted(value for value in coordinate_distances if value <= outer)
+            baseline_distance = finite_distances[len(finite_distances) // 2] if finite_distances else outer
+            gap_limit = max(corner_probe_radius * 2, baseline_distance + corner_probe_radius)
+            gap_run = 0
+            has_gap = False
+            for distance in coordinate_distances:
+                if distance > gap_limit:
+                    gap_run += 1
+                    if gap_run >= max(4, len(coordinate_distances) // 20):
+                        has_gap = True
+                        break
+                else:
+                    gap_run = 0
+            if segment_visible / max(1, segment_width * segment_height) < 0.001 or has_gap:
+                issues.append(f"frame_contour_gap:{label}:{segment_index}: A镜框闭合轮廓存在缺口")
+                if not any(item.startswith("frame_contour_open:") for item in issues):
+                    issues.append("frame_contour_open: A镜框边缘未闭合")
+                break
+    if missing_sides and not any(item.startswith("frame_contour_open:") for item in issues):
+        issues.append("frame_contour_open: A镜框边缘未闭合")
+    return issues
+
+
+def frame_integrity_issues(
+    source: Image.Image | Path,
+    window: tuple[int, int, int, int],
+    **kwargs,
+) -> list[str]:
+    """Short-name wrapper for A-scene frame integrity checks."""
+    return story_frame_integrity_issues(source, window, **kwargs)
+
+
+def validate_release_assets(config: ReleaseConfig, *, frame_image: Path | None = None) -> None:
+    """Fail before rendering when a plate or story frame is structurally bad."""
+    issues: list[str] = []
+    if config.plate_image is not None:
+        issues.extend(release_plate_integrity_issues(config.plate_image, config.video_box))
+    candidate_frame = frame_image or config.frame_image
+    if candidate_frame is not None:
+        issues.extend(story_frame_integrity_issues(candidate_frame, config.story_box))
+    if config.frame_image_b is not None and config.b_windows:
+        issues.extend(story_frame_integrity_issues(config.frame_image_b, config.b_story_box))
+    if issues:
+        raise ValueError("发布素材未通过机器完整性检查，已阻止全片渲染：\n" + "\n".join(f"- {issue}" for issue in issues))
 
 
 def render_static_assets(config: ReleaseConfig, work_dir: Path) -> dict[str, Path]:
     frame = config.frame_image or render_default_frame(work_dir / "default_frame.png")
+    # Validate the generated default frame too.  This keeps the same preflight
+    # gate for hand-supplied and built-in A-scene frames.
+    validate_release_assets(config, frame_image=frame)
     main_top = render_top_panel(
         work_dir / "main_top.png",
         "故事表演",
@@ -912,6 +1358,14 @@ def render_main_wide(config: ReleaseConfig, frame_image: Path, output_path: Path
     assert config.person_greenscreen is not None
     assert config.audio_mix is not None
     duration = probe_duration(config.audio_mix)
+    # A greenscreen source can be a few frames shorter than the narration.  A
+    # raw EOF frame is not safe to composite: ffmpeg may materialize it as an
+    # opaque black rectangle before chroma-keying.  Pad the source with a clone
+    # of its last *valid* frame and make the person overlay non-repeating as a
+    # second defensive boundary.
+    person_duration = probe_video_stream_duration(config.person_greenscreen)
+    person_frame_duration = probe_video_frame_duration(config.person_greenscreen)
+    person_tail_pad = person_tail_pad_seconds(person_duration, duration, person_frame_duration)
     scale = config.output_scale
     wide_width = WIDE_WIDTH * scale
     wide_height = WIDE_HEIGHT * scale
@@ -993,12 +1447,25 @@ def render_main_wide(config: ReleaseConfig, frame_image: Path, output_path: Path
     person_source = "[2:v]"
     if config.person_crop is not None:
         crop_x, crop_y, crop_width, crop_height = config.person_crop
-        filters_prefix = [
-            f"[2:v]crop={crop_width}:{crop_height}:{crop_x}:{crop_y},setsar=1[person_in]"
-        ]
+        filters_prefix = []
+        if person_tail_pad > 0:
+            filters_prefix.append(
+                f"[2:v]tpad=stop_mode=clone:stop_duration={person_tail_pad:.6f},"
+                f"setpts=PTS-STARTPTS[person_padded]"
+            )
+            person_source = "[person_padded]"
+        filters_prefix.append(
+            f"{person_source}crop={crop_width}:{crop_height}:{crop_x}:{crop_y},setsar=1[person_in]"
+        )
         person_source = "[person_in]"
     else:
         filters_prefix = []
+        if person_tail_pad > 0:
+            filters_prefix.append(
+                f"[2:v]tpad=stop_mode=clone:stop_duration={person_tail_pad:.6f},"
+                f"setpts=PTS-STARTPTS[person_padded]"
+            )
+            person_source = "[person_padded]"
 
     has_b = bool(config.b_windows)
     has_c = bool(config.c_windows)
@@ -1047,7 +1514,8 @@ def render_main_wide(config: ReleaseConfig, frame_image: Path, output_path: Path
             f"[{frame_index}:v]scale={wide_width}:{wide_height},setsar=1,format=rgba[frame]",
             "[withstory][frame]overlay=0:0[framed]",
             f"[person_keyed_a]{a_subject_filter}scale=-1:{config.person_height * scale},setsar=1,format=rgba[person]",
-            f"[framed][person]overlay=min({config.person_x * scale}\\,W-w):min({config.person_y * scale}\\,H-h)[withperson]",
+            f"[framed][person]overlay=min({config.person_x * scale}\\,W-w):min({config.person_y * scale}\\,H-h):"
+            "eof_action=pass:repeatlast=0[withperson]",
         ]
     )
     current = "withperson"
@@ -1673,6 +2141,136 @@ def resolved_tail_seconds(duration: float, configured_tail_seconds: float) -> fl
     if duration <= 1:
         return duration
     return min(duration, max(30.0, min(50.0, duration / 5.0)))
+
+
+def tail_probe_timestamps(duration: float, fps: int = 12, window_seconds: float = 2.0) -> tuple[float, ...]:
+    """Return dense timestamps covering the final window plus a safe final frame."""
+    duration = max(0.0, float(duration))
+    fps = max(1, int(fps))
+    window = max(0.0, min(float(window_seconds), duration))
+    if duration <= 0:
+        return (0.0,)
+    start = max(0.0, duration - window)
+    step = 1.0 / fps
+    values: list[float] = []
+    current = start
+    # Keep the last timestamp strictly before EOF.  The final frame command
+    # below probes the same safe point explicitly, even when fps rounding would
+    # otherwise skip it.
+    while current < duration - 1e-9:
+        values.append(round(current, 6))
+        current += step
+    # Leave one frame period before EOF; codecs commonly place their last
+    # decodable frame there even when the container duration rounds up.
+    final = max(0.0, duration - max(step, 0.001))
+    if not values or abs(values[-1] - final) > 1e-6:
+        values.append(round(final, 6))
+    return tuple(values)
+
+
+def build_tail_frame_probe_commands(
+    video: Path,
+    output_dir: Path,
+    duration: float,
+    *,
+    fps: int = 12,
+    window_seconds: float = 2.0,
+) -> tuple[list[str], list[str]]:
+    """Build ffmpeg commands for dense tail sampling and a safe terminal frame.
+
+    The first command samples the complete final two seconds at ``fps``.  The
+    second command seeks to a timestamp just before EOF and writes one frame,
+    so a QA caller can detect a terminal black block instead of checking only
+    ``duration - 0.5``.
+    """
+    duration = max(0.0, float(duration))
+    fps = max(1, int(fps))
+    window = max(0.0, min(float(window_seconds), duration))
+    start = max(0.0, duration - window)
+    safe_final = max(0.0, duration - max(1.0 / fps, 0.001))
+    tail_pattern = str(output_dir / "tail_%04d.jpg")
+    final_path = str(output_dir / "tail_final.jpg")
+    tail_command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{start:.3f}",
+        "-i",
+        str(video),
+        "-t",
+        f"{window:.3f}",
+        "-vf",
+        f"fps={fps}",
+        "-an",
+        "-q:v",
+        "2",
+        tail_pattern,
+    ]
+    final_command = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{safe_final:.3f}",
+        "-i",
+        str(video),
+        "-frames:v",
+        "1",
+        "-an",
+        "-q:v",
+        "2",
+        final_path,
+    ]
+    return tail_command, final_command
+
+
+def build_tail_probe_commands(
+    video: Path,
+    output_dir: Path,
+    duration: float,
+    **kwargs,
+) -> tuple[list[str], list[str]]:
+    """Short-name wrapper for :func:`build_tail_frame_probe_commands`."""
+    return build_tail_frame_probe_commands(video, output_dir, duration, **kwargs)
+
+
+def inspect_tail_image_black_rectangles(
+    source: Image.Image | Path,
+    *,
+    dark_threshold: int = 18,
+    rectangle_area_fraction: float = 0.05,
+) -> list[str]:
+    """Inspect one tail frame for a large contiguous black rectangle."""
+    image = _load_rgba_image(source)
+    mask = _black_pixel_mask(image, dark_threshold)
+    width, height = mask.size
+    for area, x, y, component_width, component_height in _black_components(mask):
+        area_fraction = area / max(1, width * height)
+        rectangularity = area / max(1, component_width * component_height)
+        if (
+            area_fraction >= rectangle_area_fraction
+            and component_width >= width * 0.15
+            and component_height >= height * 0.06
+            and rectangularity >= 0.62
+        ):
+            return [
+                "tail_black_rectangle: "
+                f"黑色区域约占画面 {area_fraction:.1%}（x={x}, y={y}, w={component_width}, h={component_height}）"
+            ]
+    return []
+
+
+def tail_frame_integrity_issues(
+    source: Image.Image | Path,
+    **kwargs,
+) -> list[str]:
+    """Short-name wrapper for terminal black-rectangle inspection."""
+    return inspect_tail_image_black_rectangles(source, **kwargs)
 
 
 def safe_watermark_motion_expressions(speed_x: float, speed_y: float, margin: int = 20) -> tuple[str, str, str, str]:

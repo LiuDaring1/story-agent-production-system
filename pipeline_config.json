@@ -22,13 +22,13 @@
   ],
   "default_age_range": "6-8岁",
   "brand_assets": {
-    "assets_dir": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材",
-    "logo": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材/标题初级版本.png",
-    "watermark_logo": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材/标题初级版本.png",
-    "story_logo": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材/标题初级版本.png",
-    "antipiracy_logo": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材/标题初级版本.png",
-    "frame_reference": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材/矩形边框 3.png",
-    "cover_reference": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材/封面参考图/狐狸分奶酪_202603301924 (1).jpeg"
+    "assets_dir": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材",
+    "logo": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材/标题初级版本.png",
+    "watermark_logo": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材/标题初级版本.png",
+    "story_logo": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材/标题初级版本.png",
+    "antipiracy_logo": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材/标题初级版本.png",
+    "frame_reference": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材/矩形边框 3.png",
+    "cover_reference": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材/封面参考图/狐狸分奶酪_202603301924 (1).jpeg"
   },
   "release_defaults": {
     "video_box": "0,416,1080,608",
@@ -113,6 +113,10 @@
     "max_critical_attempts": 3,
     "whisper_model": "small",
     "working_video_max_width": 0,
-    "proxy_video_max_width": 1280
+    "proxy_video_max_width": 1280,
+    "commander_model": "gpt-5.6-sol",
+    "commander_reasoning_effort": "xhigh",
+    "worker_model": "gpt-5.6-luna",
+    "worker_reasoning_effort": "max"
   }
 }

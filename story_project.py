@@ -47,7 +47,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "age_range_options": ["3-6岁", "4-6岁", "6-8岁", "9-11岁", "12-14岁", "15岁以上"],
     "default_age_range": "6-8岁",
     "brand_assets": {
-        "assets_dir": "/Users/baiyanglin/Desktop/（常用）剪辑所使用的素材",
+        "assets_dir": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材",
         "logo": "",
         "watermark_logo": "",
         "story_logo": "",
@@ -1268,6 +1268,8 @@ def infer_theme_text(manifest: dict[str, Any]) -> str:
 
 
 def qa_theme_assets(paths: ProjectPaths, assets: list[Path] | None = None, *, strict: bool = False) -> Path:
+    from release_video import release_plate_integrity_issues, story_frame_integrity_issues
+
     config = load_config()
     release_defaults = config.get("release_defaults", {})
     video_box = parse_box(str(release_defaults.get("video_box", "0,416,1080,608")))
@@ -1313,8 +1315,10 @@ def qa_theme_assets(paths: ProjectPaths, assets: list[Path] | None = None, *, st
                     notes.append(f"尺寸应为{expected_size[0]}x{expected_size[1]}")
                 if path.name in {"main_release_plate.png", "library_release_plate.png", "release_plate_placeholder.png"}:
                     notes.extend(qa_release_plate_image(image, video_box))
+                    notes.extend(release_plate_integrity_issues(image, video_box))
                 if path.name in expected_windows:
                     notes.extend(qa_story_frame_image(image, expected_windows[path.name]))
+                    notes.extend(story_frame_integrity_issues(image, expected_windows[path.name]))
                 if path.name == "main_background_16x9.png":
                     notes.extend(qa_main_background_image(image))
                 rows.append({"index": str(index), "file": str(path), "status": "warning" if notes else "ok", "notes": f"{width}x{height} {'；'.join(notes)}"})
@@ -1561,6 +1565,10 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
     person_crop = detect_person_crop(frames, color)
     standing_frame, gesture_frame = select_keying_representative_frames(frames, color)
     base_similarity = 0.075 if green_variation < 10 else (0.095 if green_variation < 24 else 0.115)
+    # Search a bounded conservative neighbourhood around the measured centre.
+    # The centre is the default recommendation; any stricter/aggressive value
+    # remains available for independent visual review instead of being silently
+    # hard-coded into the generated preset.
     candidates = [
         {
             "id": f"s{similarity:.3f}_b{blend:.3f}",
@@ -1570,7 +1578,13 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
         for similarity in (max(0.04, base_similarity - 0.02), base_similarity, min(0.16, base_similarity + 0.02))
         for blend in (0.02, 0.04, 0.06)
     ]
-    recommended = min(candidates, key=lambda item: abs(item["similarity"] - base_similarity) + abs(item["blend"] - 0.04))
+    recommended = min(
+        candidates,
+        key=lambda item: abs(item["similarity"] - base_similarity) + abs(item["blend"] - 0.04),
+    )
+    candidate_ids = {str(item["id"]) for item in candidates}
+    if str(recommended["id"]) not in candidate_ids:
+        raise RuntimeError("自动抠像推荐候选未出现在 keying_search candidates 中")
     candidate_sheet = output_dir / "keying_candidates.jpg"
     render_keying_candidate_sheet(
         standing_frame,
@@ -1579,6 +1593,10 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
         candidates,
         candidate_sheet,
     )
+    candidate_detail_sheet = output_dir / "keying_candidates_detail.jpg"
+    # Keep a separately named evidence artefact for downstream QA/review.  The
+    # candidate renderer itself includes full-resolution and local-zoom panels.
+    shutil.copy2(candidate_sheet, candidate_detail_sheet)
     search_path = output_dir / "keying_search.json"
     save_json(
         search_path,
@@ -1593,8 +1611,11 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
             "candidates": candidates,
             "recommended_candidate": recommended["id"],
             "candidate_sheet": str(candidate_sheet),
+            "candidate_detail_sheet": str(candidate_detail_sheet),
             "detected_person_bbox": person_crop,
-            "selection_policy": "背景绿幕波动决定初始 similarity；人物框不改变示范/C镜原始大小和位置，只用于清除表演安全区外的暗绿幕残边，并为A镜人物版式提供安全裁切。站立与大手势双帧由独立视觉审核最终确认。",
+            "selection_policy": "背景绿幕波动决定候选中心 similarity；默认保守中心候选（blend=0.04），其余候选只供独立视觉审核比较。人物框不改变示范/C镜原始大小和位置，只用于清除表演安全区外的暗绿幕残边，并为A镜人物版式提供安全裁切。站立与大手势双帧由独立视觉审核最终确认。",
+            "visual_review_required": True,
+            "visual_review_status": "pending",
         },
     )
     # Default for current horizontal 16:9 green-screen shoots: presenter centered
@@ -1619,6 +1640,8 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
         "source_video": str(video),
         "keying_search": str(search_path),
         "keying_candidate": recommended["id"],
+        "visual_review_required": True,
+        "visual_review_status": "pending",
     }
     preset_path = output_dir / "keying_preset.json"
     save_json(preset_path, preset)
@@ -1627,6 +1650,7 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
     manifest["outputs"]["keying_preset"] = str(preset_path)
     manifest["qa"]["keying_samples"] = str(sheet)
     manifest["qa"]["keying_candidates"] = str(candidate_sheet)
+    manifest["qa"]["keying_candidate_detail"] = str(candidate_detail_sheet)
     manifest["qa"]["keying_search"] = str(search_path)
     write_manifest(paths, manifest)
     return preset_path
@@ -1717,38 +1741,82 @@ def render_keying_candidate_sheet(
         green = tuple(int(chroma_color[index : index + 2], 16) for index in (2, 4, 6))
     except Exception:
         green = (0, 255, 0)
+    # The old evidence sheet downscaled both frames to 300x180, which made
+    # hair strands and hand silhouettes impossible to judge.  Each candidate
+    # now includes a high-resolution full-frame preview plus a padded local
+    # foreground zoom for both standing and wide-gesture samples.
+    tile_width, tile_height = 960, 470
+    full_size = (500, 282)
+    zoom_size = (420, 282)
     tiles: list[Image.Image] = []
+
+    def foreground_zoom(source: Image.Image, similarity: float, blend: float) -> Image.Image:
+        width, height = source.size
+        sample = source.resize((min(320, width), min(240, height)), Image.Resampling.BILINEAR)
+        points = [
+            (x, y)
+            for y in range(sample.height)
+            for x in range(sample.width)
+            if is_presenter_pixel(sample.getpixel((x, y)), green)
+        ]
+        if points:
+            sx, sy = width / sample.width, height / sample.height
+            x1 = max(0, int(min(x for x, _ in points) * sx - width * 0.08))
+            y1 = max(0, int(min(y for _, y in points) * sy - height * 0.10))
+            x2 = min(width, int((max(x for x, _ in points) + 1) * sx + width * 0.08))
+            y2 = min(height, int((max(y for _, y in points) + 1) * sy + height * 0.10))
+            if x2 - x1 >= 8 and y2 - y1 >= 8:
+                source = source.crop((x1, y1, x2, y2))
+        source = source.copy()
+        source.thumbnail(zoom_size, Image.Resampling.LANCZOS)
+        source = preview_chromakey(source, green, similarity, blend)
+        panel = Image.new("RGB", zoom_size, (48, 45, 56))
+        panel.paste(source, ((zoom_size[0] - source.width) // 2, (zoom_size[1] - source.height) // 2))
+        return panel
+
     for candidate in candidates:
-        panels = []
-        for frame in (standing_frame, gesture_frame):
-            with Image.open(frame).convert("RGB") as image:
-                image.thumbnail((300, 180), Image.Resampling.LANCZOS)
-                panels.append(
-                    preview_chromakey(
-                        image,
-                        green,
-                        float(candidate["similarity"]),
-                        float(candidate["blend"]),
-                    )
-                )
-        tile = Image.new("RGB", (620, 218), (34, 32, 42))
-        tile.paste(panels[0], (8, 30))
-        tile.paste(panels[1], (312, 30))
+        tile = Image.new("RGB", (tile_width, tile_height), (34, 32, 42))
         draw = ImageDraw.Draw(tile)
         draw.text(
-            (12, 5),
+            (12, 7),
             f"{candidate['id']}  similarity={candidate['similarity']:.3f}  blend={candidate['blend']:.3f}",
             fill=(245, 245, 245),
-            font=load_font(18),
+            font=load_font(20),
         )
+        for row, frame in enumerate((standing_frame, gesture_frame)):
+            with Image.open(frame).convert("RGB") as image:
+                full_source = image.copy()
+                full_source.thumbnail(full_size, Image.Resampling.LANCZOS)
+                full = preview_chromakey(
+                    full_source,
+                    green,
+                    float(candidate["similarity"]),
+                    float(candidate["blend"]),
+                )
+                zoom_source = image.copy()
+                zoom = foreground_zoom(
+                    zoom_source,
+                    float(candidate["similarity"]),
+                    float(candidate["blend"]),
+                )
+            y = 42 + row * 210
+            tile.paste(full, (8, y))
+            tile.paste(zoom, (520, y))
+            label = "站立帧" if row == 0 else "大手势帧"
+            draw.text((516, y - 21), f"{label} 局部放大（发丝/手边缘）", fill=(230, 220, 150), font=load_font(16))
         tiles.append(tile)
     columns = 3
     rows = math.ceil(len(tiles) / columns)
-    sheet = Image.new("RGB", (columns * 620, 54 + rows * 218), (238, 236, 232))
+    sheet = Image.new("RGB", (columns * tile_width, 54 + rows * tile_height), (238, 236, 232))
     draw = ImageDraw.Draw(sheet)
-    draw.text((18, 12), "抠像参数搜索：左=站立帧，右=大手势帧（候选预览仅供选参）", fill=(25, 25, 25), font=load_font(24))
+    draw.text(
+        (18, 12),
+        "抠像参数搜索：左=高分辨率整帧，右=发丝/手部边缘局部放大（独立视觉审核前仅供选参）",
+        fill=(25, 25, 25),
+        font=load_font(24),
+    )
     for index, tile in enumerate(tiles):
-        sheet.paste(tile, ((index % columns) * 620, 54 + (index // columns) * 218))
+        sheet.paste(tile, ((index % columns) * tile_width, 54 + (index // columns) * tile_height))
     output.parent.mkdir(parents=True, exist_ok=True)
     sheet.save(output, quality=92)
 
@@ -2325,6 +2393,8 @@ def review_bundle_current_local(bundle: Path) -> bool:
 
 
 def qa_release(project_dir: Path) -> Path:
+    from release_video import build_tail_frame_probe_commands, inspect_tail_image_black_rectangles, release_plate_integrity_issues
+
     paths = project_paths(project_dir)
     manifest = init_project(paths.root)
     discover_outputs(paths, manifest)
@@ -2349,8 +2419,74 @@ def qa_release(project_dir: Path) -> Path:
         height = int(alignment.get("height") or 0)
         if width <= 0 or height <= 0 or abs(width / height - 3 / 4) > 0.01:
             notes.append(f"画幅不是 3:4：{width}x{height}")
+        tail_dir = paths.status / "release_tail_probe" / path.stem
+        if tail_dir.exists():
+            shutil.rmtree(tail_dir)
+        tail_dir.mkdir(parents=True, exist_ok=True)
+        probe_commands = build_tail_frame_probe_commands(path, tail_dir, duration, fps=12, window_seconds=2.0)
+        for command in probe_commands:
+            process = subprocess.run(command, text=True, capture_output=True)
+            if process.returncode != 0:
+                notes.append("片尾高频抽帧失败")
+                break
+        tail_frames = sorted(tail_dir.glob("tail_*.jpg"))
+        if len(tail_frames) < 2:
+            notes.append("片尾高频证据不足")
+        else:
+            for tail_frame in tail_frames:
+                tail_issues = inspect_tail_image_black_rectangles(tail_frame)
+                if tail_issues:
+                    notes.extend(f"{tail_frame.name}: {issue}" for issue in tail_issues)
+                    break
+        general_frames: list[Path] = []
+        for sample_index, timestamp in enumerate((0.5, duration * 0.25, duration * 0.5, duration * 0.75), start=1):
+            frame_path = tail_dir / f"general_{sample_index:02d}_{max(0.0, timestamp):.3f}.jpg"
+            process = subprocess.run(
+                [
+                    "ffmpeg",
+                    "-hide_banner",
+                    "-loglevel",
+                    "error",
+                    "-y",
+                    "-ss",
+                    f"{max(0.0, timestamp):.3f}",
+                    "-i",
+                    str(path),
+                    "-frames:v",
+                    "1",
+                    "-q:v",
+                    "2",
+                    str(frame_path),
+                ],
+                text=True,
+                capture_output=True,
+            )
+            if process.returncode == 0 and frame_path.is_file():
+                general_frames.append(frame_path)
+        scaled_video_box = (
+            0,
+            round(height * 416 / 1440),
+            width,
+            round(height * 608 / 1440),
+        )
+        for general_frame in general_frames:
+            general_issues = release_plate_integrity_issues(general_frame, scaled_video_box)
+            if general_issues:
+                notes.extend(f"{general_frame.name}: {issue}" for issue in general_issues)
+                break
         rows.append({"index": str(len(rows) + 1), "file": str(path), "status": "warning" if notes else "ok", "notes": f"{duration:.2f}s {'；'.join(notes)}"})
-        structured_results.append({"label": label, "path": str(path), "duration_sec": duration, **alignment, "issues": notes})
+        structured_results.append(
+            {
+                "label": label,
+                "path": str(path),
+                "duration_sec": duration,
+                **alignment,
+                "tail_probe_dir": str(tail_dir),
+                "tail_probe_frame_count": len(tail_frames),
+                "general_probe_frame_count": len(general_frames),
+                "issues": notes,
+            }
+        )
         artifacts[key] = {"path": str(path), "sha256": sha256_file(path)}
         if notes:
             issues.append(f"- {label}：{'；'.join(notes)}")
@@ -2633,6 +2769,100 @@ def qa_publish(project_dir: Path) -> Path:
     manifest["qa"]["publish_json"] = str(report_json)
     write_manifest(paths, manifest)
     return report
+
+
+def apply_fixed_cover_branding(project_dir: Path) -> Path:
+    """Overlay the exact configured brand PNG on all covers and hash the operation."""
+    paths = project_paths(project_dir)
+    config = load_config()
+    brand = config.get("brand_assets", {}) if isinstance(config.get("brand_assets"), dict) else {}
+    logo = first_existing(brand.get("cover_logo"), brand.get("logo"))
+    if logo is None:
+        raise FileNotFoundError("封面定版缺少可读的固定品牌 Logo；禁止让生图模型伪造图标")
+    covers = [
+        paths.publish / account / "covers" / f"cover_{ratio}.png"
+        for account in ("main", "library")
+        for ratio in ("3x4", "4x3", "16x9")
+    ]
+    missing = [path for path in covers if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("封面定版缺少文件：" + "、".join(path.name for path in missing))
+    receipt = paths.status / "publish_cover_branding.json"
+    logo_sha = sha256_file(logo)
+    try:
+        old_receipt = json.loads(receipt.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        old_receipt = {}
+    old_outputs = old_receipt.get("covers") if isinstance(old_receipt.get("covers"), dict) else {}
+    if old_receipt.get("logo_sha256") == logo_sha and all(
+        isinstance(old_outputs.get(str(path)), dict)
+        and old_outputs[str(path)].get("output_sha256") == sha256_file(path)
+        for path in covers
+    ):
+        return receipt
+
+    with Image.open(logo) as logo_source:
+        logo_rgba = logo_source.convert("RGBA")
+        logo_bbox = logo_rgba.getbbox()
+        if logo_bbox is None:
+            raise ValueError("配置的品牌 Logo 全透明")
+        logo_rgba = logo_rgba.crop(logo_bbox)
+    cover_records: dict[str, dict[str, Any]] = {}
+    for cover in covers:
+        input_sha = sha256_file(cover)
+        with Image.open(cover) as source:
+            canvas = source.convert("RGBA")
+        max_width = round(canvas.width * 0.27)
+        max_height = round(canvas.height * 0.105)
+        scale = min(max_width / logo_rgba.width, max_height / logo_rgba.height)
+        logo_resized = logo_rgba.resize(
+            (max(1, round(logo_rgba.width * scale)), max(1, round(logo_rgba.height * scale))),
+            Image.Resampling.LANCZOS,
+        )
+        x = (canvas.width - logo_resized.width) // 2
+        y = round(canvas.height * 0.025)
+        canvas.alpha_composite(logo_resized, (x, y))
+        temporary = cover.with_name(f".{cover.stem}.branding-{uuid.uuid4().hex}.png")
+        canvas.convert("RGB").save(temporary, format="PNG", optimize=True)
+        os.replace(temporary, cover)
+        cover_records[str(cover)] = {
+            "input_sha256": input_sha,
+            "output_sha256": sha256_file(cover),
+            "logo_box": [x, y, logo_resized.width, logo_resized.height],
+        }
+
+    lineage_path = paths.publish / "cover_lineage.json"
+    if lineage_path.is_file():
+        try:
+            lineage = json.loads(lineage_path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            lineage = None
+        if isinstance(lineage, dict) and isinstance(lineage.get("covers"), list):
+            for item in lineage["covers"]:
+                if not isinstance(item, dict):
+                    continue
+                relative = str(item.get("path") or "")
+                target = paths.publish / relative
+                if target.is_file():
+                    item["sha256"] = sha256_file(target)
+                    item["brand_asset_sha256"] = logo_sha
+                    item["brand_mode"] = "deterministic_exact_overlay"
+                parent = item.get("parent")
+                parent_path = paths.publish / str(parent) if parent else None
+                if parent_path is not None and parent_path.is_file():
+                    item["parent_sha256"] = sha256_file(parent_path)
+            save_json(lineage_path, lineage)
+    save_json(
+        receipt,
+        {
+            "version": 1,
+            "logo_path": str(logo),
+            "logo_sha256": logo_sha,
+            "mode": "deterministic_exact_overlay",
+            "covers": cover_records,
+        },
+    )
+    return receipt
 
 
 def normalized_cover_difference(left: Path, right: Path) -> float:

@@ -313,6 +313,7 @@ def build_publish_package_agent_prompt(handoff: Path, project_dir: Path) -> str:
 - 两个账号最终仍分别交付 `cover_3x4.png`、`cover_4x3.png`、`cover_16x9.png`，共六张。衍生是重新组织版式，不是机械裁切、拉伸或补边。
 - 把生成血缘写入两个账号 covers 目录共同上级的 `cover_lineage.json`：记录每张图的 parent、parent_sha256、generation_mode（master/edit-derived）、reference_files 和当前 sha256；所有 edit-derived 的 parent 哈希必须与实际文件一致。
 - 六张封面必须使用 Codex 原生生图能力生成或衍生；禁止用 Pillow/HTML/CSS/截图拼接/模板叠字作为最终封面。
+- 品牌 Logo 不得由生图模型临摹或改造。六张图的上方中间预留干净安全区，不要自行生成花朵/图标/品牌字样；生产任务返回后主 Agent 会把配置中的原始 Logo PNG 原样叠加并记录哈希。这是唯一允许的确定性后期。
 - 如果还没有参考帧，主账号优先使用第 13 步确认的发布预览帧；宝库号查看候选帧索引并选择故事动作/冲突帧，然后运行：
   `python3 story_workflow.py publish-package-project --project-dir "{project_dir}" --generate-covers --library-frame <编号>`
   之后继续执行新生成的 handoff 和封面任务。

@@ -71,6 +71,23 @@ class KeyingSearchTests(unittest.TestCase):
             payload = json.loads(search.read_text(encoding="utf-8"))
             self.assertEqual(len(payload["candidates"]), 9)
             self.assertEqual(preset["keying_candidate"], payload["recommended_candidate"])
+            candidate_ids = {item["id"] for item in payload["candidates"]}
+            self.assertIn(preset["keying_candidate"], candidate_ids)
+            self.assertIn("candidate_detail_sheet", payload)
+            self.assertTrue(Path(payload["candidate_detail_sheet"]).exists())
+            # With a stable green screen the conservative centre candidate is
+            # selected; the recommendation must be evidence-backed by the
+            # searched candidates rather than a hard-coded aggressive value.
+            similarities = sorted({item["similarity"] for item in payload["candidates"]})
+            centre_similarity = similarities[len(similarities) // 2]
+            self.assertEqual(preset["chroma_similarity"], centre_similarity)
+            self.assertEqual(preset["chroma_blend"], 0.04)
+
+            with Image.open(payload["candidate_detail_sheet"]) as detail:
+                # Detail evidence is intentionally larger than the old 300px
+                # thumbnails so hair and hand edges can be inspected.
+                self.assertGreaterEqual(detail.width, 1800)
+                self.assertGreaterEqual(detail.height, 600)
 
     def test_selects_standing_and_wide_gesture_frames_and_renders_grid(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

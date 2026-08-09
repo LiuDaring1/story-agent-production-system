@@ -9,6 +9,7 @@ from typing import Callable
 from .align import LineTiming, align_script_to_narration, read_script_lines, save_timings
 from .media import ensure_dir, probe_duration, run_command, sorted_video_files
 from .subtitles import SubtitleCue, build_subtitle_cues, write_srt
+from story_semantics import SemanticKind, classify_story, select_line_numbers
 
 
 @dataclass(frozen=True)
@@ -188,39 +189,51 @@ def synthesize_story(config: SynthesisConfig) -> SynthesisResult:
 
 
 def _sales_subtitle_timings(timings: list[LineTiming], config: SynthesisConfig) -> list[LineTiming]:
+    """Return customer subtitle timings under the shared semantic contract.
+
+    ``sales_skip_head_lines``/``sales_skip_tail_lines`` remain an explicit
+    compatibility escape hatch for old CLI callers.  When either value is
+    omitted, only that side is inferred semantically; this preserves the
+    historical ability to override one side without disabling the other.
+    """
+
+    if not timings:
+        return []
+
+    semantics = classify_story([timing.line for timing in timings])
+    body_numbers = select_line_numbers(semantics, "sales_subtitles")
+    if body_numbers:
+        semantic_start = min(body_numbers) - 1
+        semantic_end = max(body_numbers)
+    else:
+        semantic_start = len(timings)
+        semantic_end = len(timings)
+
     if config.sales_skip_head_lines >= 0:
         start = min(len(timings), config.sales_skip_head_lines)
     else:
-        start = 0
-        while start < len(timings) and _is_host_intro_line(timings[start].line):
-            start += 1
+        start = semantic_start
     if config.sales_skip_tail_lines >= 0:
-        end = len(timings) - config.sales_skip_tail_lines
+        end = max(0, len(timings) - config.sales_skip_tail_lines)
     else:
-        end = len(timings)
-        for index in range(start, len(timings)):
-            if _is_moral_or_outro_line(timings[index].line):
-                end = index
-                break
+        end = semantic_end
     if end < start:
         return []
     return timings[start:end]
 
 
 def _is_host_intro_line(text: str) -> bool:
-    clean = re.sub(r"\s+", "", text)
-    return bool(
-        re.match(r"^(?:大家好|小朋友们好|嗨[,，]?小朋友们|我是绵羊姐姐|今天(?:我要|要|来)?(?:给大家|给小朋友们)?(?:讲|分享|带来))", clean)
-        or re.search(r"故事(?:叫|是|名叫)[《〈].+[》〉]", clean)
-    )
+    kind = classify_story([text]).kind_at(1)
+    return kind in {SemanticKind.HOST_INTRO, SemanticKind.STORY_ANNOUNCEMENT}
+
+
+def _looks_like_standalone_title(text: str) -> bool:
+    return classify_story([text]).kind_at(1) is SemanticKind.TITLE
 
 
 def _is_moral_or_outro_line(text: str) -> bool:
-    clean = re.sub(r"\s+", "", text)
-    return bool(
-        re.match(r"^(?:小朋友们[,，]?|这个故事告诉我们|故事告诉我们|我的故事讲完了|今天的故事就到这里)", clean)
-        or "这个故事告诉我们" in clean
-    )
+    kind = classify_story([text]).kind_at(1)
+    return kind in {SemanticKind.MORAL, SemanticKind.OUTRO}
 
 
 def _validate_tools() -> None:

@@ -44,6 +44,28 @@ from story_project import detect_project_assets, final_delivery, init_project, r
 
 
 class StoryAgentRuntimeTests(unittest.TestCase):
+    def test_two_role_model_routing_uses_commander_for_judgment_and_worker_for_execution(self) -> None:
+        context = AgentContext(
+            project_dir=Path("/private/tmp/two-role-routing"),
+            inbox=None,
+            story_name="双档路由",
+            slug="two-role-routing",
+            execute=False,
+            update_latest_episode=False,
+            codex_mode="cli",
+            codex_model="gpt-5.6-sol",
+            codex_sandbox="workspace-write",
+            codex_approval="never",
+            codex_path="codex",
+            codex_timeout=30,
+            codex_worker_model="gpt-5.6-luna",
+            codex_reasoning_effort="xhigh",
+            codex_worker_reasoning_effort="max",
+        )
+        self.assertEqual(context.codex_route("video_review"), ("commander", "gpt-5.6-sol", "xhigh"))
+        self.assertEqual(context.codex_route("codex_story_images"), ("worker", "gpt-5.6-luna", "max"))
+        self.assertEqual(context.codex_route("generate_videos"), ("worker", "gpt-5.6-luna", "max"))
+
     def test_prepared_entry_binds_clean_video_and_confirmed_text_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -65,6 +87,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             manifest = load_manifest(project_paths(project))
             assert manifest is not None
             self.assertEqual(manifest["agent"]["input_contract"]["mode"], "prepared_greenscreen_confirmed_text")
+            self.assertEqual(manifest["agent"]["input_contract"]["version"], 2)
             self.assertFalse(manifest["agent"]["input_contract"]["counts_toward_default_entry"])
             self.assertEqual(manifest["inputs"]["greenscreen_video"], manifest["inputs"]["greenscreen_video_original"])
             self.assertEqual(prepared_input_contract_errors(project, manifest), [])
@@ -126,10 +149,45 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(Path(confirmed_record["path"]).suffix, ".docx")
             derived = Path(manifest["inputs"]["story_text"])
-            self.assertEqual(derived.read_text(encoding="utf-8"), "小兔子找太阳它终于找到了温暖的太阳。\n")
+            self.assertEqual(derived.read_text(encoding="utf-8"), "它终于找到了温暖的太阳。\n")
             consumer = Path(manifest["outputs"]["consumer_manuscript"])
-            self.assertEqual(consumer.read_text(encoding="utf-8"), "小兔子找太阳\n它终于找到了温暖的太阳。\n")
+            self.assertEqual(consumer.read_text(encoding="utf-8"), "它终于找到了温暖的太阳。\n")
+            full = Path(manifest["inputs"]["story_transcript_full"])
+            self.assertEqual(full.read_text(encoding="utf-8"), "小兔子找太阳\n它终于找到了温暖的太阳。\n")
             self.assertEqual(prepared_input_contract_errors(project, manifest), [])
+
+    def test_prepared_semantic_contract_separates_customer_and_full_transcript_views(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
+            video = root / "prepared.mp4"
+            shutil.copy2(fixture, video)
+            confirmed = root / "confirmed.txt"
+            confirmed.write_text(
+                "大家好\n我是故事老师\n今天给大家讲的故事是《小兔子找太阳》。\n"
+                "小兔子出门找太阳。\n我们要学会仔细观察。\n故事讲完了，再见。\n",
+                encoding="utf-8",
+            )
+            _job, project, _created = submit_video_job(
+                video,
+                input_mode="prepared",
+                confirmed_text=confirmed,
+                projects_root=root / "projects",
+                story_name="语义合同",
+                slug="semantic-contract",
+                registry=JobRegistry(root / "registry.json"),
+            )
+            manifest = load_manifest(project_paths(project))
+            assert manifest is not None
+            self.assertEqual(
+                Path(manifest["outputs"]["consumer_manuscript"]).read_text(encoding="utf-8"),
+                "小兔子出门找太阳。\n我们要学会仔细观察。\n",
+            )
+            self.assertIn("我是故事老师", Path(manifest["inputs"]["story_transcript_full"]).read_text(encoding="utf-8"))
+            self.assertEqual(Path(manifest["inputs"]["sales_subtitle_text"]).read_text(encoding="utf-8"), "小兔子出门找太阳。\n")
+            self.assertEqual(prepared_input_contract_errors(project, manifest), [])
+            Path(manifest["inputs"]["story_semantics"]).write_text("{}", encoding="utf-8")
+            self.assertTrue(prepared_input_contract_errors(project, manifest))
 
     def test_dag_batch_respects_resource_and_write_set_conflicts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

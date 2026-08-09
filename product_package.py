@@ -48,6 +48,9 @@ PPT_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 PPT_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PPT_P14_NS = "http://schemas.microsoft.com/office/powerpoint/2010/main"
 PPT_P14_EXT_URI = "{DAA4B4D4-6D71-4841-9C94-3DE7FCFB9230}"
+DELIVERY_CJK_FONT = "Arial Unicode MS"
+PPT_SUBTITLE_MAX_LINES = 2
+PPT_SUBTITLE_MAX_HEIGHT_RATIO = 0.16
 
 
 @dataclass(frozen=True)
@@ -104,6 +107,12 @@ def main() -> None:
     parser.add_argument("--demo-person-crop-bottom-ratio", default=0.0, type=float, help="示范视频专用：从绿幕人物裁切框底部额外收掉的比例，用于清理发布框原本遮住的地面横条")
     parser.add_argument("--demo-person-crop-mode", choices=["source-native", "preset", "full-width"], default="source-native", help="示范视频默认保留拍摄原构图；只有人工确认后才使用裁切框")
     parser.add_argument("--demo-person-vertical-align", choices=["center", "bottom"], default="center")
+    parser.add_argument(
+        "--demo-background-brightness",
+        default=1.0,
+        type=float,
+        help="示范视频背景亮度；默认 1.0（只模糊，不压暗），仅在人工确认需要时调整",
+    )
     parser.add_argument("--preview-only", action="store_true", help="只生成第 16 步示范视频预览帧和 Codex 交接说明，不渲染完整资料包")
     parser.add_argument("--preview-times", default="0.8,1.5,2.5,37,92", help="示范视频预览抽帧时间点，秒")
     parser.add_argument("--music-volume", default=0.22, type=float)
@@ -134,6 +143,7 @@ def build_product_package(args: argparse.Namespace) -> None:
         if args.work_dir
         else Path("output") / "product_package_work" / (args.slug or sanitize_filename(story_name))
     )
+    background_brightness = max(0.0, float(getattr(args, "demo_background_brightness", 1.0)))
 
     for label, path in (
         ("故事正文", story_text_path),
@@ -201,6 +211,7 @@ def build_product_package(args: argparse.Namespace) -> None:
             output_dir=preview_dir,
             width=args.demo_width,
             height=args.demo_height,
+            background_brightness=background_brightness,
         )
         if demo_background is None:
             render_background_candidate_sheet(images, work_dir / "demo_background_candidates.jpg")
@@ -237,6 +248,7 @@ def build_product_package(args: argparse.Namespace) -> None:
             logo_width=max(1, args.demo_logo_width),
             logo_x=max(0, args.demo_logo_x),
             logo_y=max(0, args.demo_logo_y),
+            background_brightness=background_brightness,
         )
         request_path = work_dir / "朗读标注_需精修.md"
         write_annotation_request(story_name, public_script_lines, request_path, annotation_skill_path)
@@ -325,6 +337,7 @@ def build_product_package(args: argparse.Namespace) -> None:
         logo_width=max(1, args.demo_logo_width),
         logo_x=max(0, args.demo_logo_x),
         logo_y=max(0, args.demo_logo_y),
+        background_brightness=background_brightness,
     )
     if story_frame_a is not None:
         render_a_only_background_video(
@@ -455,6 +468,7 @@ def load_or_build_timings(path: Path | None, script_lines: list[str], narration:
 
 def render_story_docx(story_name: str, story_text: str, output_path: Path) -> None:
     story_text = re.sub(rf"^\s*故事文稿[：:]\s*{re.escape(story_name)}\s*", "", story_text, count=1)
+    story_text = re.sub(rf"^\s*{re.escape(story_name)}\s*(?:\r?\n)+", "", story_text, count=1)
     doc = Document()
     section = doc.sections[0]
     section.top_margin = Inches(0.75)
@@ -464,16 +478,13 @@ def render_story_docx(story_name: str, story_text: str, output_path: Path) -> No
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = title.add_run(f"《{story_name}》")
-    run.bold = True
-    run.font.name = "微软雅黑"
-    run._element.rPr.rFonts.set(docx_qn("w:eastAsia"), "微软雅黑")
-    run.font.size = Pt(22)
+    set_run_font(run, DELIVERY_CJK_FONT, 22, "1A1A1A", bold=True)
     for paragraph_text in split_story_paragraphs(story_text):
         paragraph = doc.add_paragraph()
         paragraph.paragraph_format.first_line_indent = Pt(22)
-        paragraph.paragraph_format.line_spacing = 1.45
+        paragraph.paragraph_format.line_spacing = 1.25
         run = paragraph.add_run(paragraph_text)
-        set_run_font(run, "微软雅黑", 12, "1A1A1A")
+        set_run_font(run, "微软雅黑", 11, "1A1A1A")
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(output_path)
 
@@ -597,7 +608,7 @@ def write_annotation_request(story_name: str, lines: list[str], output_path: Pat
 - 不要套话，不要写“开头要说清楚”“先交代人物情境”这类通用句。
 - 批注像有经验的幼儿园故事老师当面说话：温和、短句、先给角色心情或画面，再给声音和动作；禁止“内容重点、节奏落点、情绪层次”等分析术语。
 - 每段 2-4 句，按场景/角色/情绪转折拆分。
-- marked_text 必须逐字覆盖下方故事台词，除主持人身份脱敏外不得润色、增删、改代词或改句尾。
+- marked_text 必须逐字覆盖下方已经清洁的故事台词；主持人自我介绍整句删除，除此之外不得润色、增删、改代词或改句尾。
 - 红字只标真正需要重读的内容词、角色/道具首次出现、关键动作、矛盾转折、道理关键词；不得整句连红。
 - 批注必须基于文本本身，写清楚为什么这样读，如何配合语气、停顿、表情或动作。
 - 输出 JSON 数组，每项字段为 title、marked_text、emotion、notes。
@@ -667,7 +678,14 @@ def ppt_slide_durations(timings: list[LineTiming], total_duration: float | None 
     return durations
 
 
-def generate_keying_preview(person_video: Path, background_image: Path | None, output_dir: Path, width: int, height: int) -> None:
+def generate_keying_preview(
+    person_video: Path,
+    background_image: Path | None,
+    output_dir: Path,
+    width: int,
+    height: int,
+    background_brightness: float = 1.0,
+) -> None:
     ensure_dir(output_dir)
     duration = probe_duration(person_video)
     timestamps = [min(duration * ratio, max(0.0, duration - 0.1)) for ratio in (0.12, 0.50, 0.82)]
@@ -704,7 +722,15 @@ def generate_keying_preview(person_video: Path, background_image: Path | None, o
     keyed_frames: list[Path] = []
     for idx, frame in enumerate(raw_frames, start=1):
         out = output_dir / f"keyed_preview_{idx:02d}.png"
-        render_keyed_preview_frame(frame, background_image, out, suggested, width, height)
+        render_keyed_preview_frame(
+            frame,
+            background_image,
+            out,
+            suggested,
+            width,
+            height,
+            background_brightness=background_brightness,
+        )
         keyed_frames.append(out)
     render_preview_sheet(raw_frames, keyed_frames, output_dir / "示范表演_抠像预览.jpg")
 
@@ -759,12 +785,20 @@ def sample_green_color(image: Image.Image) -> str:
     return f"0x{r:02X}{g:02X}{b:02X}"
 
 
-def render_keyed_preview_frame(source_frame: Path, background_image: Path | None, output_path: Path, preset: KeyingPreset, width: int, height: int) -> None:
+def render_keyed_preview_frame(
+    source_frame: Path,
+    background_image: Path | None,
+    output_path: Path,
+    preset: KeyingPreset,
+    width: int,
+    height: int,
+    background_brightness: float = 1.0,
+) -> None:
     background = output_path.parent / "preview_background.png"
     if background_image is None:
         make_neutral_background(background, width, height)
     else:
-        make_blurred_background(background_image, background, width, height)
+        make_blurred_background(background_image, background, width, height, brightness=background_brightness)
     crop_filter = ""
     if preset.person_crop is not None:
         x, y, w, h = preset.person_crop
@@ -817,18 +851,19 @@ def render_demo_video(
     logo_width: int = 150,
     logo_x: int = 24,
     logo_y: int = 20,
+    background_brightness: float = 1.0,
 ) -> None:
     duration = probe_duration(narration)
     work_dir = output_path.parent / "_demo_work"
     ensure_dir(work_dir)
     background = work_dir / "demo_background.png"
-    make_blurred_background(background_image, background, width, height)
+    make_blurred_background(background_image, background, width, height, brightness=background_brightness)
     subtitle_overlay = work_dir / "demo_subtitle_overlay.mov"
     render_subtitle_overlay(subtitles, subtitle_overlay, duration, width, height)
 
     crop_filter = demo_crop_filter(person_video, preset, crop_bottom_ratio, crop_mode)
     key_filter = keying_filter_chain("[1:v]", preset, crop_filter)
-    if crop_mode == "source-native":
+    if preserve_native_composition(preset, crop_mode):
         person_filter, person_x, person_y = source_native_person_layout(person_video, preset, width, height)
     else:
         demo_person_height = min(int(height * preset.person_height_ratio), height)
@@ -916,11 +951,12 @@ def render_demo_preview_frames(
     logo_width: int,
     logo_x: int,
     logo_y: int,
+    background_brightness: float = 1.0,
 ) -> list[Path]:
     ensure_dir(output_dir)
     duration = probe_duration(person_video)
     background = output_dir / "demo_background.png"
-    make_blurred_background(background_image, background, width, height)
+    make_blurred_background(background_image, background, width, height, brightness=background_brightness)
     subtitle_overlay = output_dir / "demo_subtitle_overlay.mov"
     render_subtitle_overlay(subtitles, subtitle_overlay, duration, width, height)
     output_paths: list[Path] = []
@@ -964,10 +1000,11 @@ def render_demo_preview_frame(
     logo_width: int,
     logo_x: int,
     logo_y: int,
+    background_brightness: float = 1.0,
 ) -> None:
     crop_filter = demo_crop_filter(person_video, preset, crop_bottom_ratio, crop_mode)
     key_filter = keying_filter_chain("[1:v]", preset, crop_filter)
-    if crop_mode == "source-native":
+    if preserve_native_composition(preset, crop_mode):
         person_filter, person_x, person_y = source_native_person_layout(person_video, preset, width, height)
     else:
         demo_person_height = min(int(height * preset.person_height_ratio), height)
@@ -1022,21 +1059,45 @@ def demo_crop_filter(person_video: Path, preset: KeyingPreset, crop_bottom_ratio
     return f"crop={w}:{h}:{x}:{y},"
 
 
-def source_native_person_layout(
-    person_media: Path,
-    preset: KeyingPreset,
-    output_width: int,
-    output_height: int,
+def preserve_native_composition(preset: KeyingPreset, crop_mode: str) -> bool:
+    """Whether demo rendering should keep the source frame scale and placement.
+
+    A crop mode without an actual human-confirmed crop is equivalent to the
+    default native mode.  This guard prevents ``full-width`` (or legacy
+    ``preset``) plus a null crop from falling through to a second, arbitrary
+    person-height scale such as the historical 0.84 multiplier.
+    """
+    return crop_mode == "source-native" or preset.person_crop is None
+
+
+def compute_source_native_layout(
+    source_size: tuple[int, int],
+    output_size: tuple[int, int],
+    detected_person_bbox: tuple[int, int, int, int] | None = None,
 ) -> tuple[str, int, int]:
-    """Preserve source composition while excluding green-screen edge bands."""
-    source_width, source_height = probe_video_size(person_media)
+    """Return the ffmpeg transform and overlay position for native composition.
+
+    The calculation is deliberately pure: callers can probe media dimensions
+    outside this function and tests can verify that a 16:9 source rendered to a
+    16:9 canvas stays at 1.0 scale.  ``detected_person_bbox`` only trims the
+    transparent green-screen perimeter; it does *not* resize the performer
+    relative to the original frame.
+    """
+    source_width, source_height = (int(source_size[0]), int(source_size[1]))
+    output_width, output_height = (int(output_size[0]), int(output_size[1]))
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError("source_size 必须是正数宽高")
+    if output_width <= 0 or output_height <= 0:
+        raise ValueError("output_size 必须是正数宽高")
     scale = min(output_width / source_width, output_height / source_height)
-    canvas_x = round((output_width - source_width * scale) / 2)
-    canvas_y = round((output_height - source_height * scale) / 2)
-    bbox = preset.detected_person_bbox
-    if bbox is None:
-        return f"scale={max(1, round(source_width * scale))}:{max(1, round(source_height * scale))}", canvas_x, canvas_y
-    x, y, width, height = bbox
+    rendered_width = max(1, round(source_width * scale))
+    rendered_height = max(1, round(source_height * scale))
+    canvas_x = round((output_width - rendered_width) / 2)
+    canvas_y = round((output_height - rendered_height) / 2)
+    if detected_person_bbox is None:
+        return f"scale={rendered_width}:{rendered_height}", canvas_x, canvas_y
+
+    x, y, width, height = (int(value) for value in detected_person_bbox)
     x = max(0, min(source_width - 1, x))
     y = max(0, min(source_height - 1, y))
     width = max(1, min(source_width - x, width))
@@ -1047,6 +1108,21 @@ def source_native_person_layout(
         f"crop={width}:{height}:{x}:{y},scale={target_width}:{target_height}",
         canvas_x + round(x * scale),
         canvas_y + round(y * scale),
+    )
+
+
+def source_native_person_layout(
+    person_media: Path,
+    preset: KeyingPreset,
+    output_width: int,
+    output_height: int,
+) -> tuple[str, int, int]:
+    """Preserve source composition while excluding green-screen edge bands."""
+    source_size = probe_video_size(person_media)
+    return compute_source_native_layout(
+        source_size,
+        (output_width, output_height),
+        preset.detected_person_bbox,
     )
 
 
@@ -1199,12 +1275,28 @@ def render_subtitle_overlay(srt_path: Path, output_path: Path, duration: float, 
     )
 
 
-def make_blurred_background(source: Path, output: Path, width: int, height: int) -> None:
+def make_blurred_background(
+    source: Path,
+    output: Path,
+    width: int,
+    height: int,
+    *,
+    brightness: float = 1.0,
+    contrast: float = 1.0,
+) -> None:
+    """Prepare a blurred background without silently changing its exposure.
+
+    ``brightness`` and ``contrast`` remain explicit knobs for a deliberate
+    visual decision, but both default to 1.0 so blur alone does not darken a
+    customer's selected background plate.
+    """
     image = Image.open(source).convert("RGB")
     image = crop_image_to_ratio(image, width / height).resize((width, height), Image.Resampling.LANCZOS)
     image = image.filter(ImageFilter.GaussianBlur(radius=12))
-    image = ImageEnhance.Brightness(image).enhance(0.72)
-    image = ImageEnhance.Contrast(image).enhance(0.96)
+    if brightness != 1.0:
+        image = ImageEnhance.Brightness(image).enhance(max(0.0, float(brightness)))
+    if contrast != 1.0:
+        image = ImageEnhance.Contrast(image).enhance(max(0.0, float(contrast)))
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output)
 
@@ -1406,6 +1498,7 @@ def create_package_dirs(
 
 def load_keying_preset(path: Path) -> KeyingPreset:
     data = json.loads(path.read_text(encoding="utf-8"))
+    validate_keying_preset_selection(path, data)
     crop = data.get("person_crop")
     if isinstance(crop, str) and crop.strip():
         crop = tuple(int(float(part.strip())) for part in crop.replace("，", ",").split(","))
@@ -1443,6 +1536,41 @@ def load_keying_preset(path: Path) -> KeyingPreset:
     )
 
 
+def validate_keying_preset_selection(preset_path: Path, data: dict[str, Any]) -> None:
+    """Require a declared keying candidate to be present in its search record."""
+    selected = data.get("keying_candidate")
+    if not selected:
+        return
+    search_ref = data.get("keying_search")
+    if not search_ref:
+        raise ValueError(
+            f"抠像预设声明了 keying_candidate={selected!r}，但缺少 keying_search 证据路径：{preset_path}"
+        )
+    search_path = Path(str(search_ref)).expanduser()
+    if not search_path.is_absolute():
+        relative_to_preset = (preset_path.parent / search_path).resolve()
+        relative_to_cwd = search_path.resolve()
+        search_path = relative_to_preset if relative_to_preset.exists() else relative_to_cwd
+    if not search_path.exists():
+        raise ValueError(f"抠像搜索证据不存在：{search_path}")
+    try:
+        payload = json.loads(search_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"抠像搜索证据无法读取：{search_path}") from exc
+    if not isinstance(payload, dict):
+        raise ValueError(f"抠像搜索证据必须是 JSON 对象：{search_path}")
+    candidate_ids = {
+        str(item.get("id"))
+        for item in payload.get("candidates", [])
+        if isinstance(item, dict) and item.get("id")
+    }
+    if str(selected) not in candidate_ids:
+        raise ValueError(
+            f"keying_preset 选择了未出现在 keying_search candidates 中的候选：{selected!r}；"
+            f"证据文件：{search_path}"
+        )
+
+
 def split_story_paragraphs(text: str) -> list[str]:
     paragraphs = [part.strip() for part in re.split(r"\n\s*\n|\n", text) if part.strip()]
     if paragraphs:
@@ -1451,10 +1579,16 @@ def split_story_paragraphs(text: str) -> list[str]:
 
 
 def clean_public_story_text(text: str) -> str:
-    text = re.sub(r"我是\s*绵羊姐姐姐姐", "我是____", text)
-    text = re.sub(r"我是\s*绵羊姐姐", "我是____", text)
+    # 对外文稿和朗读标注都不保留主持人自我介绍。过去这里只把姓名
+    # 替换成下划线，导致独立审核要求“整句删除”而打包器仍要求逐字
+    # 覆盖占位句，形成无法通过的互斥门槛。
+    text = re.sub(
+        r"(?:大家好\s*[，,。！？!?]?\s*)?我是\s*绵羊姐姐(?:姐姐)?\s*[。！？!?]?\s*",
+        "",
+        text,
+    )
     text = text.replace("绵羊姐姐", "____")
-    return text
+    return text.strip()
 
 
 def build_annotation_blocks(lines: list[str]) -> list[AnnotationBlock]:
@@ -1723,8 +1857,13 @@ def add_markup_runs(paragraph, text: str) -> None:
 
 
 def set_run_font(run, font_name: str, size: int, color: str, bold: bool = False) -> None:
-    run.font.name = font_name
-    run._element.rPr.rFonts.set(docx_qn("w:eastAsia"), font_name)
+    # The delivery machine does not reliably resolve Microsoft YaHei/FangSong
+    # through headless LibreOffice. Use a font that is actually installed and
+    # declare it for every OOXML script slot so Chinese text cannot disappear.
+    resolved_font = DELIVERY_CJK_FONT if font_name in {"微软雅黑", "仿宋"} else font_name
+    run.font.name = resolved_font
+    for slot in ("ascii", "hAnsi", "eastAsia", "cs"):
+        run._element.rPr.rFonts.set(docx_qn(f"w:{slot}"), resolved_font)
     run.font.size = Pt(size)
     run.font.color.rgb = RGBColor.from_string(color)
     run.bold = bold
@@ -1766,7 +1905,7 @@ def overlay_title(slide, story_name: str, prs: Presentation) -> None:
     p.alignment = PP_ALIGN.CENTER
     run = p.add_run()
     run.text = story_name
-    run.font.name = "微软雅黑"
+    run.font.name = DELIVERY_CJK_FONT
     run.font.size = PptPt(58)
     run.font.bold = True
     run.font.color.rgb = PptRGBColor(255, 224, 86)
@@ -1785,9 +1924,11 @@ def set_ppt_advance(slide, seconds: float) -> None:
 
 def add_ppt_subtitle(slide, text: str, prs: Presentation) -> None:
     clean, font_size = fit_ppt_subtitle_text(text)
-    height_ratio = 0.18 if "\n" in clean else 0.11
-    height = int(prs.slide_height * height_ratio) + 1
-    box = slide.shapes.add_textbox(0, prs.slide_height - height + 1, prs.slide_width, height)
+    line_count = min(PPT_SUBTITLE_MAX_LINES, clean.count("\n") + 1)
+    height_ratio = 0.09 if line_count == 1 else 0.14
+    height = min(int(prs.slide_height * PPT_SUBTITLE_MAX_HEIGHT_RATIO), int(prs.slide_height * height_ratio))
+    height = max(1, height)
+    box = slide.shapes.add_textbox(0, prs.slide_height - height, prs.slide_width, height)
     box.fill.solid()
     box.fill.fore_color.rgb = PptRGBColor(0, 0, 0)
     tf = box.text_frame
@@ -1802,7 +1943,7 @@ def add_ppt_subtitle(slide, text: str, prs: Presentation) -> None:
     p.alignment = PP_ALIGN.CENTER
     run = p.add_run()
     run.text = clean
-    run.font.name = "微软雅黑"
+    run.font.name = DELIVERY_CJK_FONT
     run.font.size = PptPt(font_size)
     run.font.bold = True
     run.font.color.rgb = PptRGBColor(255, 255, 255)
@@ -1810,17 +1951,28 @@ def add_ppt_subtitle(slide, text: str, prs: Presentation) -> None:
 
 def fit_ppt_subtitle_text(text: str) -> tuple[str, int]:
     clean = clean_ppt_subtitle_text(text)
+    if not clean:
+        return "", 28
     if len(clean) <= 22:
         return clean, 28
-    if len(clean) <= 44:
-        return clean, max(20, int(28 * 28 / max(1, len(clean))))
+
+    # Keep the subtitle to two balanced lines.  Chinese text has no reliable
+    # whitespace boundaries, so prefer punctuation/spaces near the midpoint,
+    # then fall back to a character split.  A very long sentence still stays
+    # within the bounded two-line box and gets a verifiably smaller font.
     midpoint = len(clean) // 2
     split_at = min(
         range(1, len(clean)),
-        key=lambda idx: abs(idx - midpoint) + (0 if clean[idx - 1] == " " else 4),
+        key=lambda idx: abs(idx - midpoint)
+        + (0 if clean[idx - 1] in " ，,；;：:、 " or clean[idx] in " ，,；;：:、 " else 4),
     )
-    wrapped = clean[:split_at].strip() + "\n" + clean[split_at:].strip()
-    return wrapped, max(18, int(28 * 42 / max(1, len(clean))))
+    first = clean[:split_at].strip()
+    second = clean[split_at:].strip()
+    if not first or not second:
+        first, second = clean[:midpoint], clean[midpoint:]
+    longest_line = max(len(first), len(second))
+    font_size = max(16, min(28, int(round(28 * 22 / max(22, longest_line)))))
+    return f"{first}\n{second}", font_size
 
 
 def clean_ppt_subtitle_text(text: str) -> str:

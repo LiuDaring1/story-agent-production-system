@@ -68,6 +68,7 @@ from story_project import (
     TEXT_EXTENSIONS,
     VIDEO_EXTENSIONS,
     ensure_project_dirs,
+    apply_fixed_cover_branding,
     first_existing,
     init_project,
     load_config,
@@ -131,6 +132,9 @@ class AgentContext:
     codex_approval: str
     codex_path: str
     codex_timeout: int
+    codex_worker_model: str = ""
+    codex_reasoning_effort: str = ""
+    codex_worker_reasoning_effort: str = ""
     codex_story_image_batch_size: int = 15
     scheduler: str = "linear"
     max_parallel: int = 1
@@ -138,6 +142,23 @@ class AgentContext:
     @property
     def paths(self):
         return project_paths(self.project_dir)
+
+    def codex_route(self, stage: str) -> tuple[str, str, str]:
+        """Return the fixed two-role route: commander for judgment, worker otherwise."""
+        commander_stages = {
+            "source_edit_review",
+            "story_images_review",
+            "video_prompt_review",
+            "video_review",
+            "release_preview",
+            "release_video_review",
+            "product_annotation_review",
+            "product_package_review",
+            "publish_package_review",
+        }
+        if stage in commander_stages or not self.codex_worker_model:
+            return "commander", self.codex_model, self.codex_reasoning_effort
+        return "worker", self.codex_worker_model, self.codex_worker_reasoning_effort
 
 
 @dataclass
@@ -533,6 +554,12 @@ class StoryAgent:
             ]
             if self.context.codex_model:
                 command.extend(["--codex-model", self.context.codex_model])
+            if self.context.codex_worker_model:
+                command.extend(["--codex-worker-model", self.context.codex_worker_model])
+            if self.context.codex_reasoning_effort:
+                command.extend(["--codex-reasoning-effort", self.context.codex_reasoning_effort])
+            if self.context.codex_worker_reasoning_effort:
+                command.extend(["--codex-worker-reasoning-effort", self.context.codex_worker_reasoning_effort])
             env = os.environ.copy()
             env["STORY_AGENT_MANIFEST_OVERRIDE"] = str(shadow_manifest)
             env["STORY_AGENT_PROJECT_ROOT"] = str(self.context.project_dir.expanduser().resolve())
@@ -757,6 +784,17 @@ class StoryAgent:
             "supervisor": supervisor,
             "state_file": str(self.state_path),
             "codex_mode": self.context.codex_mode,
+            "model_routing": {
+                "roles": 2,
+                "commander": {
+                    "model": self.context.codex_model,
+                    "reasoning_effort": self.context.codex_reasoning_effort,
+                },
+                "worker": {
+                    "model": self.context.codex_worker_model,
+                    "reasoning_effort": self.context.codex_worker_reasoning_effort,
+                },
+            },
             "story_images": {
                 "actual": self._story_image_count(image_dir),
                 "expected_named_actual": self._expected_named_story_image_count(image_dir, manifest, storyboard),
@@ -1379,6 +1417,9 @@ class StoryAgent:
             self.context.paths.images / f"{self.context.slug}_visual_bible.md",
             self.context.paths.images / f"{self.context.slug}_storyboard_plan.json",
         ]
+        semantic_contract = first_existing(manifest.get("inputs", {}).get("story_semantics"))
+        if semantic_contract is not None:
+            control_files.append(semantic_contract)
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "story_images_bundle.json",
             [storyboard, *(path for path in control_files if path.exists()), *scene_images],
@@ -1393,6 +1434,8 @@ class StoryAgent:
                 "还要检查物种/颜色身份、该镜头应出现与明确不应出现的角色，以及角色是否提前知道尚未发生的信息。"
                 "逐镜核对 storyboard_plan.json：每个唱歌/关键发言/关键动作/受挫反应角色是否有自己的焦点镜头；连续段是否有建立镜头、表演者中近景和反应镜头，而不是全程同一种双人中景。"
                 "按 appearance_id 逐项比较脸部花纹、服装主色/款式和饰品；虎妈妈等跨镜角色无剧情依据换衣服属于关键连续性错误。"
+                "若 bundle 包含 story_semantics.json，必须按其语义分段检查：主持人开场/故事预告不得被生成为第二个片名镜头，片名只能出现一次。"
+                "审核 JSON 的 evidence_matrix 必须逐镜写明：角色数量、身份/服装、关键物体数量、角色应在场/不应在场及画面证据；不得用“整体正常”代替逐项核对。"
                 "输出 retry_indices（需要重做的镜头编号整数数组）。角色身份或在场关系错、肢体/五官崩坏、错误文字、漏镜头属于关键错误。"
             ),
         )
@@ -1519,6 +1562,7 @@ class StoryAgent:
                 f"当前任务及图片哈希清单：`{bundle}`",
                 f"读取任务 CSV：`{jobs}`",
                 "逐镜头检查动作是否具体、是否符合当前图片和故事、是否过度文学化、是否可能触发眼睛发光/肢体畸变/新增角色。",
+                "每个镜头的 prompt 必须显式锁定起始图的角色数量、物体数量和核心外观，禁止凭空新增/删除/融合物体，禁止改变太阳、月亮等核心物体的实心/空心拓扑。",
                 f"把最终确认 CSV 写入：`{decisions_csv}`",
                 "CSV 必须包含 scene,image_filename,story_text,review_status,prompt,notes；每个镜头一行，review_status 必须是 approved，必要时直接在 prompt 列给出修正后的最终动作提示。",
                 f"把结构化审核 JSON 写入：`{review_path}`",
@@ -1587,6 +1631,8 @@ class StoryAgent:
             rubric=(
                 "结合分镜任务和首尾/25%/50%/75%抽帧检查动作崩坏、反物理现象、角色漂移、黑帧、文字水印和镜头连续性。"
                 "逐镜头数清四足动物的腿，检查嘴/五官位置、物种与颜色身份、角色应出现/不应出现状态、信息因果是否正确。"
+                "必须把每个镜头的 start/q1/mid/q3/end 与起始分镜图逐一比较，evidence_matrix 中记录五个时点的角色数量、关键物体数量、形状拓扑（如实心/空心）和依据文件名。"
+                "如果证据与结论冲突，以画面为准并必须判定不通过；不得在没有逐时点证据时声称“全程一致”。"
                 "输出 retry_indices（需要重新调用视频生成的镜头编号整数数组）。肢体或五官崩坏、主体变形、角色错误在场、关键动作错误属于关键错误。"
             ),
         )
@@ -1851,11 +1897,16 @@ class StoryAgent:
         return StageResult("done", "发布终片编码与音画同步 QA 通过。", report)
 
     def _stage_release_video_review(self, manifest: dict[str, Any]) -> StageResult:
+        from release_video import tail_probe_timestamps
+
         videos = [self.context.paths.release / "主账号发布视频.mp4", self.context.paths.release / "宝库号发布视频.mp4"]
         if not all(path.exists() for path in videos):
             return StageResult("blocked", "主账号或宝库号发布视频缺失，无法终片独立审核。")
         frame_dir = self.context.paths.status / "release_video_review_frames"
+        if frame_dir.exists():
+            shutil.rmtree(frame_dir)
         frames: list[Path] = []
+        tail_sheets: list[Path] = []
         for video in videos:
             duration = self._probe_duration(video)
             timestamps = [0.5, duration * 0.25, duration * 0.5, duration * 0.75]
@@ -1873,6 +1924,7 @@ class StoryAgent:
                     ]
                 )
             timestamps.append(max(0.0, duration - 0.5))
+            timestamps.extend(tail_probe_timestamps(duration, fps=6, window_seconds=2.0))
             timestamps = list(dict.fromkeys(round(timestamp, 3) for timestamp in timestamps))
             for index, timestamp in enumerate(timestamps, start=1):
                 target = frame_dir / video.stem / f"frame_{index:02d}_{timestamp:.1f}s.jpg"
@@ -1881,6 +1933,15 @@ class StoryAgent:
                 process = subprocess.run(command, text=True, capture_output=True)
                 if process.returncode == 0 and target.exists():
                     frames.append(target)
+            video_tail_frames = sorted((frame_dir / video.stem).glob("*.jpg"))[-14:]
+            if video_tail_frames:
+                tail_sheets.append(
+                    self._make_contact_sheet(
+                        video_tail_frames,
+                        self.context.paths.status / "reviews" / f"{video.stem}_tail_2s_contact_sheet.jpg",
+                        columns=7,
+                    )
+                )
         if not frames:
             return StageResult("blocked", "发布终片无法抽帧，拒绝仅凭文件存在放行。")
         contact_sheet = self._make_contact_sheet(frames, self.context.paths.status / "reviews" / "release_videos_contact_sheet.jpg", columns=5)
@@ -1889,13 +1950,15 @@ class StoryAgent:
             stage="release_video_review",
             label="发布终片独立审核",
             bundle=bundle,
-            images=[contact_sheet],
+            images=[contact_sheet, *tail_sheets],
             rubric=(
                 "检查主账号和宝库号最终竖版视频抽帧：A/B/C 切换、人物抠像、字幕、标题信息、故事框、Logo、水印、尾部提示、"
                 "黑帧和安全区。主账号必须是 2160×2880 且不得出现销售联系尾卡；宝库号应为 1080×1440，尾部模糊至少 30 秒且模糊阶段不显示移动水印。"
                 "宝库号接近片尾的连续抽帧包含片尾前 36、31、30、29 秒及最后 0.5 秒；请用这些带时间戳的边界帧核验尾部时长，"
                 "不要根据稀疏整十秒采样推测模糊起点。若片尾前 31 秒的帧已经模糊且无移动水印，即满足至少 30 秒。"
                 "人物肤色应自然，不灰、不脏、不过饱和。任何人物截断、错误标题、画面露缝、黑帧或缺少账号版本都是关键错误。"
+                "另外必须逐张检查两个版本最后 2 秒 6fps 高频证据和安全终帧，审核 JSON 的 evidence_matrix 要写明时间戳、文件名、是否有大黑矩形/透明人形变黑块/边缘断裂；"
+                "只看片尾前 0.5 秒或仅凭音画时长数字不能判定通过。"
             ),
         )
         if result.status == "done":
@@ -1903,7 +1966,7 @@ class StoryAgent:
         preset = self.context.paths.release / "keying" / "keying_preset.json"
         if payload and preset.exists() and self._can_retry_stage("release_video_review", critical=True):
             previous_sha = file_sha256(preset)
-            review_path = self.context.paths.status / "reviews" / "release_video_review.json"
+            review_path = self.context.paths.status / "reviews" / "release_video_review_review.json"
             revision = self._codex_task(
                 stage=f"release_video_revision_{int(self._manifest().get('agent', {}).get('stages', {}).get('release_video_review', {}).get('attempts', 1))}",
                 label="发布终片参数自动修订",
@@ -1939,6 +2002,12 @@ class StoryAgent:
             )
             if result.status == "done" and not self._has_publish_package(self._manifest()):
                 return StageResult("blocked", "Codex CLI 子任务已返回，但主账号/宝库号 4:3 封面没有完整落盘。", handoff)
+            if result.status == "done":
+                try:
+                    receipt = apply_fixed_cover_branding(self.context.project_dir)
+                except (OSError, ValueError) as exc:
+                    return StageResult("blocked", f"封面固定品牌 Logo 定版失败：{exc}", handoff)
+                return StageResult("done", "已生成六张封面并原样叠加固定品牌 Logo。", receipt)
             return result
         return result
 
@@ -1972,7 +2041,7 @@ class StoryAgent:
         lineage = publish / "cover_lineage.json"
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "publish_package_bundle.json",
-            [*covers, *copy_files, qa_report, qa_json, lineage],
+            [*covers, *copy_files, qa_report, qa_json, lineage, self.context.paths.status / "publish_cover_branding.json"],
         )
         result, payload = self._structured_review(
             stage="publish_package_review",
@@ -1984,6 +2053,7 @@ class StoryAgent:
                 "比例构图和安全区。结合 cover_lineage.json 检查：主账号 4:3 是唯一主母版，主账号另外两比例由它编辑衍生；"
                 "宝库号 4:3 由主母版移除真人得到，另两比例由宝库号母版衍生。六张必须保持同一故事角色、服装、字体、色彩和装饰语言，不能像六次随机生成，也不能只是机械裁切。"
                 "版式应遵循历史样例的扁平简洁信息层级，标题与时长/年龄集中，底部适用说明克制，不能自创复杂木框、嵌套框或多层装饰。"
+                "必须对照 publish_cover_branding.json 确认六张封面使用同一个原始 Logo SHA-256 的确定性叠加；生成的花朵/仿写字样不得冒充品牌 Logo。"
                 "失败时输出 retry_files，使用相对发布物料目录的路径。"
             ),
         )
@@ -2261,8 +2331,11 @@ class StoryAgent:
             "--output-last-message",
             str(output_path),
         ]
-        if self.context.codex_model:
-            command.extend(["--model", self.context.codex_model])
+        _role, selected_model, selected_reasoning = self.context.codex_route(stage)
+        if selected_model:
+            command.extend(["--model", selected_model])
+        if selected_reasoning:
+            command.extend(["--config", f'model_reasoning_effort="{selected_reasoning}"'])
         # `--image <FILE>...` is variadic in Codex CLI, so the positional prompt
         # must come before it or the prompt is consumed as another image path.
         command.append(prompt_text)
@@ -2589,6 +2662,7 @@ class StoryAgent:
                 "评分 0–100；低于 85 或存在关键错误时 approved 必须为 false。",
                 f"把审核 JSON 写入：`{review_path}`",
                 "JSON 必须包含 approved、score、critical_errors、issues、retry_indices、retry_files、retry_instructions、artifact_sha256。",
+                "对视觉/连续性审核，JSON 还必须包含 evidence_matrix；每条结论要引用实际文件名或时间戳，禁止无证据自述通过。",
                 f"artifact_sha256 必须原样写为：{bundle_sha}",
             ]
         )
@@ -3352,7 +3426,10 @@ def main() -> None:
     run.add_argument("--max-steps", default=999, type=int, help="本轮最多推进阶段数；默认 999，面向一键跑完整链路")
     run.add_argument("--update-latest-episode", action="store_true")
     run.add_argument("--codex-mode", choices=["handoff", "cli"], default="handoff", help="智能节点处理方式：handoff=生成交接文件后暂停；cli=自动调用 codex exec")
-    run.add_argument("--codex-model", default="", help="传给 codex exec 的模型；留空使用 CLI 默认模型")
+    run.add_argument("--codex-model", default="", help="指挥官模型；留空使用 pipeline_config.json 的 commander_model")
+    run.add_argument("--codex-worker-model", default="", help="执行工人模型；留空使用 pipeline_config.json 的 worker_model")
+    run.add_argument("--codex-reasoning-effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default="", help="指挥官推理强度")
+    run.add_argument("--codex-worker-reasoning-effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default="", help="执行工人推理强度")
     run.add_argument("--codex-sandbox", choices=["read-only", "workspace-write", "danger-full-access"], default="workspace-write")
     run.add_argument("--codex-approval", choices=["untrusted", "on-request", "never"], default="never")
     run.add_argument("--codex-path", default="codex")
@@ -3365,6 +3442,9 @@ def main() -> None:
     start.add_argument("--job", required=True)
     start.add_argument("--registry", type=Path)
     start.add_argument("--codex-model", default="")
+    start.add_argument("--codex-worker-model", default="")
+    start.add_argument("--codex-reasoning-effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default="")
+    start.add_argument("--codex-worker-reasoning-effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default="")
     start.add_argument("--codex-timeout", default=3600, type=int)
     start.add_argument("--max-steps", default=999, type=int)
     start.add_argument("--scheduler", choices=["linear", "dag"], default="dag")
@@ -3380,6 +3460,9 @@ def main() -> None:
     run_stage.add_argument("--attempt-id", required=True)
     run_stage.add_argument("--codex-mode", choices=["handoff", "cli"], default="cli")
     run_stage.add_argument("--codex-model", default="")
+    run_stage.add_argument("--codex-worker-model", default="")
+    run_stage.add_argument("--codex-reasoning-effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default="")
+    run_stage.add_argument("--codex-worker-reasoning-effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default="")
     run_stage.add_argument("--codex-sandbox", choices=["read-only", "workspace-write", "danger-full-access"], default="workspace-write")
     run_stage.add_argument("--codex-approval", choices=["untrusted", "on-request", "never"], default="never")
     run_stage.add_argument("--codex-path", default="codex")
@@ -3464,6 +3547,9 @@ def main() -> None:
                     codex_approval=args.codex_approval,
                     codex_path=args.codex_path,
                     codex_timeout=max(30, args.codex_timeout),
+                    codex_worker_model=args.codex_worker_model,
+                    codex_reasoning_effort=args.codex_reasoning_effort,
+                    codex_worker_reasoning_effort=args.codex_worker_reasoning_effort,
                     codex_story_image_batch_size=max(1, args.codex_story_image_batch_size),
                     scheduler="linear",
                     max_parallel=1,
@@ -3554,6 +3640,12 @@ def main() -> None:
                 command.extend(["--registry", str(args.registry.expanduser())])
             if args.codex_model:
                 command.extend(["--codex-model", args.codex_model])
+            if args.codex_worker_model:
+                command.extend(["--codex-worker-model", args.codex_worker_model])
+            if args.codex_reasoning_effort:
+                command.extend(["--codex-reasoning-effort", args.codex_reasoning_effort])
+            if args.codex_worker_reasoning_effort:
+                command.extend(["--codex-worker-reasoning-effort", args.codex_worker_reasoning_effort])
             launched_at = now()
             with log_path.open("a", encoding="utf-8") as log_file:
                 process = subprocess.Popen(
@@ -3612,6 +3704,11 @@ def main() -> None:
         story_name = infer_story_name(args.inbox, args.story_name, args.project_dir)
         slug = args.slug.strip() or slugify(story_name)
         project_dir = args.project_dir.expanduser() if args.project_dir else Path.home() / "Desktop" / f"故事剪辑：{story_name}"
+        agent_defaults = load_config().get("agent_defaults", {})
+        commander_model = args.codex_model or str(agent_defaults.get("commander_model", ""))
+        worker_model = args.codex_worker_model or str(agent_defaults.get("worker_model", ""))
+        commander_effort = args.codex_reasoning_effort or str(agent_defaults.get("commander_reasoning_effort", ""))
+        worker_effort = args.codex_worker_reasoning_effort or str(agent_defaults.get("worker_reasoning_effort", ""))
         context = AgentContext(
             project_dir=project_dir,
             inbox=args.inbox.expanduser() if args.inbox else None,
@@ -3620,11 +3717,14 @@ def main() -> None:
             execute=args.execute,
             update_latest_episode=args.update_latest_episode,
             codex_mode=args.codex_mode,
-            codex_model=args.codex_model,
+            codex_model=commander_model,
             codex_sandbox=args.codex_sandbox,
             codex_approval=args.codex_approval,
             codex_path=args.codex_path,
             codex_timeout=args.codex_timeout,
+            codex_worker_model=worker_model,
+            codex_reasoning_effort=commander_effort,
+            codex_worker_reasoning_effort=worker_effort,
             codex_story_image_batch_size=max(1, args.codex_story_image_batch_size),
             scheduler=args.scheduler,
             max_parallel=max(1, args.max_parallel),
@@ -3663,6 +3763,7 @@ def main() -> None:
             parser.error("status 需要 --job 或 --project-dir")
         story_name = infer_story_name(None, args.story_name, args.project_dir)
         slug = args.slug.strip() or slugify(story_name)
+        agent_defaults = load_config().get("agent_defaults", {})
         context = AgentContext(
             project_dir=args.project_dir.expanduser(),
             inbox=None,
@@ -3671,11 +3772,14 @@ def main() -> None:
             execute=False,
             update_latest_episode=False,
             codex_mode="handoff",
-            codex_model="",
+            codex_model=str(agent_defaults.get("commander_model", "")),
             codex_sandbox="workspace-write",
             codex_approval="never",
             codex_path="codex",
             codex_timeout=900,
+            codex_worker_model=str(agent_defaults.get("worker_model", "")),
+            codex_reasoning_effort=str(agent_defaults.get("commander_reasoning_effort", "")),
+            codex_worker_reasoning_effort=str(agent_defaults.get("worker_reasoning_effort", "")),
         )
         StoryAgent(context, read_only=True).status()
         return

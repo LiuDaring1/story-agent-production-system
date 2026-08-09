@@ -4,11 +4,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
 from story_agent_runtime import file_sha256
-from story_project import init_project, project_paths, qa_publish
+from story_project import apply_fixed_cover_branding, init_project, project_paths, qa_publish
 
 
 def make_publish_fixture(project: Path, *, mechanical: bool = False) -> None:
@@ -35,6 +36,22 @@ def make_publish_fixture(project: Path, *, mechanical: bool = False) -> None:
 
 
 class PublishQaTests(unittest.TestCase):
+    def test_fixed_branding_overlays_exact_logo_once_and_writes_hash_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "故事剪辑：品牌定版"
+            make_publish_fixture(project)
+            logo = root / "logo.png"
+            Image.new("RGBA", (240, 80), (255, 0, 0, 220)).save(logo)
+            with patch("story_project.load_config", return_value={"brand_assets": {"logo": str(logo)}}):
+                receipt = apply_fixed_cover_branding(project)
+                first = json.loads(receipt.read_text(encoding="utf-8"))
+                hashes = {path: item["output_sha256"] for path, item in first["covers"].items()}
+                apply_fixed_cover_branding(project)
+                second = json.loads(receipt.read_text(encoding="utf-8"))
+            self.assertEqual(first["logo_sha256"], file_sha256(logo))
+            self.assertEqual(hashes, {path: item["output_sha256"] for path, item in second["covers"].items()})
+
     def test_passes_six_distinct_correct_ratio_covers_and_two_copies(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：发布QA"

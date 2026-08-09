@@ -40,6 +40,17 @@ class SalesSubtitlePolicyTests(unittest.TestCase):
         result = _sales_subtitle_timings(timings, self.config(head=1, tail=1))
         self.assertEqual([item.index for item in result], [2, 3])
 
+    def test_standalone_title_does_not_preserve_following_host_intro(self) -> None:
+        timings = [
+            timing(1, "小兔子找太阳"),
+            timing(2, "大家好"),
+            timing(3, "我是绵羊姐姐"),
+            timing(4, "今天要给大家讲的故事是小兔子找太阳"),
+            timing(5, "有一只可爱的小兔子"),
+        ]
+        result = _sales_subtitle_timings(timings, self.config())
+        self.assertEqual([item.index for item in result], [5])
+
 
 if __name__ == "__main__":
     unittest.main()

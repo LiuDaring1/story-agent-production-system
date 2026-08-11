@@ -23,6 +23,7 @@ dist/
 output/
 tmp/
 backups/
+version_backups/
 auto-project/
 story_scoring_v1_render/
 tools/video-subtitle-remover/
@@ -53,6 +54,10 @@ models/
 .env.*
 secrets.*
 pipeline_config.local.json
+
+# Raw conversation exports may contain credentials, local paths, account data,
+# or personal information. Only curated and redacted summaries are versioned.
+docs/conversations/raw/
 
 # Historical one-off analysis/output artifacts unrelated to the story Agent
 杨霞求职分析_*/

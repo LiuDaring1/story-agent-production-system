@@ -14,6 +14,8 @@ from story_workflow import reset_redo_scenes
 from story_video_synthesizer.image_video import (
     VisualContinuityContractError,
     build_jobs,
+    continuity_context_from_row,
+    inject_visual_continuity_prompt,
     write_job_outputs,
 )
 
@@ -198,6 +200,24 @@ class ImageVideoContinuityTests(unittest.TestCase):
             self.assertIn("重新生成且保留连续性", row["prompt"])
             self.assertIn('"current_state":"state_a"', row["prompt"])
             self.assertTrue(row["prompt"].endswith("禁止状态。"))
+
+    def test_long_continuity_prompt_is_idempotent(self) -> None:
+        row = {
+            "scene": "08",
+            "continuity_state": "tail_missing",
+            "continuity_required": json.dumps(["无尾，或仅保留短小圆钝的断尾根"], ensure_ascii=False),
+            "continuity_forbidden": json.dumps(["完整尾巴", "细长尾巴"], ensure_ascii=False),
+        }
+        base = (
+            "参考当前图片，小壁虎沿老槐树树干向上爬两步后停住俯看，身体末端保持短小圆钝断尾根；"
+            "雄性牛伯伯低头咀嚼青草，四条牛腿稳稳站住，再把从臀部连接的长牛尾向侧后方甩动。"
+            "镜头从树干上方俯摇到牛和牛尾。保持牛尾连接牛身，小壁虎不出现完整尾巴、乳房或乳头。"
+            "保持角色、服装、道具、场景和画风不变；不要新增字幕、文字、logo或水印。"
+            " [审核备注] 视频生成时错误长出完整尾巴；必须保持短圆断尾根，禁止可见完整尾巴。"
+        )
+        first = inject_visual_continuity_prompt(base, continuity_context_from_row(row))
+        second = inject_visual_continuity_prompt(first, continuity_context_from_row(row))
+        self.assertEqual(first, second)
 
 
 if __name__ == "__main__":

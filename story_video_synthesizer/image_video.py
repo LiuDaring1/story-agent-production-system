@@ -303,10 +303,11 @@ def inject_visual_continuity_prompt(
         return str(prompt or "").strip()
     required_values = tuple(str(item).strip() for item in required if str(item).strip())
     forbidden_values = tuple(str(item).strip() for item in forbidden if str(item).strip())
-    base = normalize_image_to_video_prompt(prompt)
     marker = "视觉连续性硬约束（机器可读）："
+    base = str(prompt or "").strip()
     if marker in base:
         base = base.split(marker, 1)[0].rstrip(" ；;。")
+    base = normalize_image_to_video_prompt(base)
     machine = json.dumps(
         {"current_state": state, "required": list(required_values), "forbidden": list(forbidden_values)},
         ensure_ascii=False,

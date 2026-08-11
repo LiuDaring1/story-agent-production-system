@@ -10,6 +10,7 @@ from PIL import Image
 
 from story_agent import AgentContext, StoryAgent
 from story_project import init_project, project_paths
+from story_workflow import reset_redo_scenes
 from story_video_synthesizer.image_video import (
     VisualContinuityContractError,
     build_jobs,
@@ -172,6 +173,31 @@ class ImageVideoContinuityTests(unittest.TestCase):
             agent._sync_story_images_from_staging(staging, staging_storyboard, staging_images)
             for name in ("sync-test_flow_video_prompts.csv", "sync-test_flow_video_prompts.md", "sync-test_flow_clip_names.csv"):
                 self.assertTrue((project_paths(project).images / name).is_file())
+
+    def test_redo_reset_keeps_continuity_clause_at_end_of_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_dir, storyboard, contract, plan = self._fixture(root)
+            output_dir = root / "jobs"
+            jobs, _warnings = build_jobs(image_dir, storyboard, output_dir, "demo", "demo", contract, plan)
+            outputs = write_job_outputs(jobs, output_dir, "demo")
+            videos_dir = output_dir / "videos"
+            videos_dir.mkdir(exist_ok=True)
+            (videos_dir / "demo.mp4").write_bytes(b"old")
+            decisions = root / "decisions.csv"
+            decisions.write_text(
+                "scene,review_status,notes\n"
+                "01,redo,重新生成且保留连续性\n",
+                encoding="utf-8-sig",
+            )
+
+            self.assertEqual(reset_redo_scenes(outputs["manifest_csv"], videos_dir, decisions), [1])
+            with outputs["manifest_csv"].open(encoding="utf-8-sig", newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["status"], "todo")
+            self.assertIn("重新生成且保留连续性", row["prompt"])
+            self.assertIn('"current_state":"state_a"', row["prompt"])
+            self.assertTrue(row["prompt"].endswith("禁止状态。"))
 
 
 if __name__ == "__main__":

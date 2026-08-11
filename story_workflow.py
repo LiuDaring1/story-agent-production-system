@@ -2023,7 +2023,11 @@ def reset_redo_scenes(jobs_csv: Path, videos_dir: Path, decisions_csv: Path) -> 
         row["status"] = "todo"
         decision = decisions.get(f"{scene:02d}", {})
         row["notes"] = decision.get("notes", row.get("notes", ""))
-        row["prompt"] = _apply_review_notes_to_prompt(_review_prompt(row, decision), row["notes"])
+        reviewed_prompt = _review_prompt(row, decision)
+        if row.get("continuity_state") or row.get("visual_continuity_state"):
+            reviewed_prompt = reviewed_prompt.split("视觉连续性硬约束（机器可读）：", 1)[0].rstrip(" ；;。")
+        reviewed_prompt = _apply_review_notes_to_prompt(reviewed_prompt, row["notes"])
+        row["prompt"] = enforce_prompt_continuity_contract(reviewed_prompt, row)
         row["review_status"] = "redo"
         row["review_notes"] = row["notes"]
 

@@ -19,6 +19,7 @@ from story_video_synthesizer.image_video import (
     validate_image_video_jobs,
 )
 from video_provider_adapter import resolve_video_provider
+from story_semantics import SemanticKind, classify_story
 
 from story_project import (
     auto_keying,
@@ -1797,9 +1798,18 @@ def run_product_package_project(
     story_frame_a = first_existing(outputs.get("story_frame_a"), paths.release / "theme_assets" / "story_frame_a.png")
     timings = first_existing(outputs.get("timings_json"), paths.assembly / "timings.json")
     source_subtitles = first_existing(paths.assembly / "story_subtitles.srt")
-    if story_text is not None and source_subtitles is not None:
+    # The customer manuscript keeps natural reading paragraphs, while PPTs
+    # must stay one-to-one with the generated storyboard images.  Prepared
+    # projects therefore use the audited storyboard text for presentation
+    # captions/timings without changing the document or annotation source.
+    storyboard_text = first_existing(
+        inputs.get("storyboard_text"),
+        paths.inputs / f"{story.get('slug')}_storyboard_text.txt",
+        story_text,
+    )
+    if storyboard_text is not None and source_subtitles is not None:
         product_script, product_timings = build_product_text_sources_from_story_source(
-            story_text=story_text,
+            story_text=storyboard_text,
             subtitles_srt=source_subtitles,
             output_dir=paths.status / "product_package_work",
         )
@@ -1910,37 +1920,39 @@ def build_product_text_sources_from_story_source(story_text: Path, subtitles_srt
     cues = parse_simple_srt(subtitles_srt)
     output_dir.mkdir(parents=True, exist_ok=True)
     patched_timings: list[dict] = []
-    cue_index = 0
+    subtitle_start = _find_story_subtitle_start(cues, story_lines)
+    subtitle_stream, stream_segments = _build_story_subtitle_stream(cues, subtitle_start)
+    stream_offset = 0
     for index, line in enumerate(story_lines, start=1):
         line_key = normalize_story_text_for_alignment(line)
-        start: float | None = None
-        end: float | None = None
-        consumed = ""
-        line_cue_start = cue_index
-        while cue_index < len(cues) and len(consumed) < len(line_key):
-            cue_start, cue_end, cue_text = cues[cue_index]
-            if start is None:
-                start = cue_start
-            end = cue_end
-            consumed += normalize_story_text_for_alignment(cue_text)
-            cue_index += 1
-            if line_key and line_key in consumed:
-                break
         if not line_key:
             start = end = 0.0
-        elif line_key not in consumed:
-            matched = consumed[:48]
-            raise ValueError(
-                f"故事原文第 {index} 行无法与 story_subtitles.srt 顺序对齐：{line}\n"
-                f"已匹配到：{matched}\n"
-                "请先修正原文或字幕，资料包不再回退使用画面描述文本。"
-            )
-        if start is None or end is None:
-            if patched_timings:
-                start = patched_timings[-1]["source_end"]
-                end = start
-            else:
-                start = end = 0.0
+            source_cue_start = subtitle_start + 1
+            source_cue_end = subtitle_start
+        else:
+            if not subtitle_stream.startswith(line_key, stream_offset):
+                matched = subtitle_stream[stream_offset : stream_offset + 48]
+                raise ValueError(
+                    f"故事原文第 {index} 行无法与 story_subtitles.srt 顺序对齐：{line}\n"
+                    f"已匹配到：{matched}\n"
+                    "请先修正原文或字幕，资料包不再回退使用画面描述文本。"
+                )
+            line_start_offset = stream_offset
+            line_end_offset = stream_offset + len(line_key) - 1
+            start_segment = _stream_segment_at_offset(stream_segments, line_start_offset)
+            end_segment = _stream_segment_at_offset(stream_segments, line_end_offset)
+            if start_segment is None or end_segment is None:
+                matched = subtitle_stream[stream_offset : stream_offset + 48]
+                raise ValueError(
+                    f"故事原文第 {index} 行无法与 story_subtitles.srt 顺序对齐：{line}\n"
+                    f"已匹配到：{matched}\n"
+                    "请先修正原文或字幕，资料包不再回退使用画面描述文本。"
+                )
+            start = start_segment[3]
+            end = end_segment[4]
+            source_cue_start = start_segment[2] + 1
+            source_cue_end = end_segment[2] + 1
+            stream_offset += len(line_key)
         duration = max(0.0, end - start)
         patched_timings.append(
             {
@@ -1951,8 +1963,8 @@ def build_product_text_sources_from_story_source(story_text: Path, subtitles_srt
                 "duration": round(duration, 3),
                 "timeline_start": round(start, 3),
                 "timeline_end": round(end, 3),
-                "source_cue_start": line_cue_start + 1,
-                "source_cue_end": cue_index,
+                "source_cue_start": source_cue_start,
+                "source_cue_end": source_cue_end,
             }
         )
     script_path = output_dir / "product_script_lines_from_story_source.txt"
@@ -1960,6 +1972,78 @@ def build_product_text_sources_from_story_source(story_text: Path, subtitles_srt
     script_path.write_text("\n".join(story_lines) + "\n", encoding="utf-8")
     timings_path.write_text(json.dumps(patched_timings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return script_path, timings_path
+
+
+def _find_story_subtitle_start(
+    cues: list[tuple[float, float, str]], story_lines: list[str]
+) -> int:
+    """Find the first subtitle cue that can contain the supplied story text.
+
+    ``story_text`` is normally the semantic body/moral view while
+    ``story_subtitles.srt`` can still contain the spoken title and presenter
+    framing.  The shared semantic classifier is used only to bound the
+    skippable prefix; after that boundary alignment is a strict contiguous
+    match.  Trying every prefix boundary also preserves legacy callers whose
+    story source already includes a title or opening line.
+    """
+
+    if not cues:
+        return 0
+    story_stream = "".join(normalize_story_text_for_alignment(line) for line in story_lines)
+    semantics = classify_story([cue[2] for cue in cues])
+    opening_kinds = {
+        SemanticKind.TITLE,
+        SemanticKind.HOST_INTRO,
+        SemanticKind.STORY_ANNOUNCEMENT,
+    }
+    semantic_prefix_end = 0
+    for cue_index in range(len(cues)):
+        if semantics.kind_at(cue_index + 1) not in opening_kinds:
+            break
+        semantic_prefix_end = cue_index + 1
+
+    matching_boundaries = []
+    for boundary in range(semantic_prefix_end + 1):
+        candidate_stream = "".join(
+            normalize_story_text_for_alignment(cue[2]) for cue in cues[boundary:]
+        )
+        if candidate_stream.startswith(story_stream):
+            matching_boundaries.append(boundary)
+    if matching_boundaries:
+        # Prefer the furthest semantic opening boundary.  This avoids treating
+        # a spoken title that happens to equal the first body line as part of
+        # the body, while boundary 0 still preserves direct/legacy alignment.
+        return max(matching_boundaries)
+    return semantic_prefix_end
+
+
+def _build_story_subtitle_stream(
+    cues: list[tuple[float, float, str]], start: int
+) -> tuple[str, list[tuple[int, int, int, float, float]]]:
+    """Return normalized subtitle text and cue spans for timing projection."""
+
+    stream_parts: list[str] = []
+    segments: list[tuple[int, int, int, float, float]] = []
+    offset = 0
+    for cue_index in range(start, len(cues)):
+        cue_start, cue_end, cue_text = cues[cue_index]
+        normalized = normalize_story_text_for_alignment(cue_text)
+        if not normalized:
+            continue
+        stream_parts.append(normalized)
+        next_offset = offset + len(normalized)
+        segments.append((offset, next_offset, cue_index, cue_start, cue_end))
+        offset = next_offset
+    return "".join(stream_parts), segments
+
+
+def _stream_segment_at_offset(
+    segments: list[tuple[int, int, int, float, float]], offset: int
+) -> tuple[int, int, int, float, float] | None:
+    for segment in segments:
+        if segment[0] <= offset < segment[1]:
+            return segment
+    return None
 
 
 def normalize_story_text_for_alignment(text: str) -> str:

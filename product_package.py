@@ -33,6 +33,7 @@ from story_video_synthesizer.align import LineTiming, align_evenly, read_script_
 from story_video_synthesizer.image_video import sorted_image_files
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
 from story_video_synthesizer.subtitles import write_srt
+from story_semantics import SemanticKind, classify_story, lines_for_output
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -395,16 +396,57 @@ def reject_full_subtitle_background(path: Path) -> None:
         srt_candidates.append(path.with_name("story_sales_subtitles.srt"))
     elif path.stem == "story_subs_bgm":
         srt_candidates.append(path.with_name("story_subtitles.srt"))
-    banned_patterns = ("我是绵羊姐姐", "我是____", "大家好", "小朋友们", "告诉我们", "这个故事告诉")
     for srt in srt_candidates:
         if not srt.exists():
             continue
-        text = srt.read_text(encoding="utf-8-sig", errors="ignore")
-        if any(pattern in text for pattern in banned_patterns):
+        subtitle_lines = _read_srt_cue_texts(srt)
+        if not subtitle_lines:
+            continue
+        semantics = classify_story(subtitle_lines)
+        # Keep the shared output policy as the source of truth for which
+        # semantic kinds are customer-facing.  Moral lines are intentionally
+        # retained here because consumer_manuscript includes the closing
+        # teaching interaction, even when the sales policy trims it.
+        selected_kinds = {
+            kind
+            for line in lines_for_output(semantics, "background_subtitles")
+            if (kind := semantics.kind_at(line.line_number)) is not None
+        }
+        allowed_kinds = selected_kinds | {SemanticKind.MORAL}
+        blocked_kinds = {
+            SemanticKind.TITLE,
+            SemanticKind.HOST_INTRO,
+            SemanticKind.STORY_ANNOUNCEMENT,
+            SemanticKind.OUTRO,
+        } | (set(SemanticKind) - allowed_kinds)
+        for line in semantics.lines:
+            kind = semantics.kind_at(line.line_number)
+            redacted_host_intro = bool(
+                re.match(r"^(?:大家好\s*[，,、]?\s*)?我是_{2,}\s*[。！？!?]?$", line.text.strip())
+            )
+            if kind not in blocked_kinds and not redacted_host_intro:
+                continue
+            semantic_label = kind.value if kind is not None else SemanticKind.HOST_INTRO.value
             raise ValueError(
                 f"含字幕背景视频对应字幕文件含开头/结尾通用性风险文本：{srt}。"
+                f"检测到语义区间 {semantic_label}（第 {line.line_number} 行：{line.text}）。"
                 "请改用正文字幕版背景视频，或确认后加 --allow-full-subtitle-bg。"
             )
+
+
+def _read_srt_cue_texts(path: Path) -> list[str]:
+    """Read cue text in source order for semantic background validation."""
+
+    text = path.read_text(encoding="utf-8-sig", errors="ignore")
+    lines: list[str] = []
+    for block in re.split(r"\n\s*\n", text.strip()):
+        cue_lines = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(cue_lines) < 3 or "-->" not in cue_lines[1]:
+            continue
+        cue_text = "，".join(cue_lines[2:]).strip()
+        if cue_text:
+            lines.append(cue_text)
+    return lines
 
 
 def validate_person_video_choice(path: Path, allow_test: bool) -> None:
@@ -521,6 +563,7 @@ def render_annotation_blocks_docx(story_name: str, blocks: list[AnnotationBlock]
     set_run_font(sub_run, "微软雅黑", 10, "888888")
 
     legend = doc.add_table(rows=1, cols=1)
+    prevent_table_row_split(legend.rows[0])
     legend_cell = legend.cell(0, 0)
     set_cell_shading(legend_cell, "D4E6F1")
     set_cell_border(legend_cell, "000000", 8)
@@ -533,6 +576,8 @@ def render_annotation_blocks_docx(story_name: str, blocks: list[AnnotationBlock]
         doc.add_paragraph("")
         table = doc.add_table(rows=3, cols=1)
         table.autofit = True
+        for row in table.rows:
+            prevent_table_row_split(row)
         title_cell, text_cell, note_cell = table.cell(0, 0), table.cell(1, 0), table.cell(2, 0)
         for cell in (title_cell, text_cell, note_cell):
             cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
@@ -563,6 +608,14 @@ def render_annotation_blocks_docx(story_name: str, blocks: list[AnnotationBlock]
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(output_path)
+
+
+def prevent_table_row_split(row: Any) -> None:
+    """Keep a single annotation row together when Word paginates the table."""
+
+    tr_properties = row._tr.get_or_add_trPr()
+    if tr_properties.find(docx_qn("w:cantSplit")) is None:
+        tr_properties.append(OxmlElement("w:cantSplit"))
 
 
 def load_annotation_blocks(path: Path) -> list[AnnotationBlock]:
@@ -1003,7 +1056,11 @@ def render_demo_preview_frame(
     background_brightness: float = 1.0,
 ) -> None:
     crop_filter = demo_crop_filter(person_video, preset, crop_bottom_ratio, crop_mode)
-    key_filter = keying_filter_chain("[1:v]", preset, crop_filter)
+    # Input-level seeking keeps source timestamps on some QuickTime files.  The
+    # single-frame background starts at PTS 0, so framesync can otherwise emit
+    # only the background while silently dropping the sought person frame.
+    # Normalise both sought video inputs before keying/overlaying them.
+    key_filter = keying_filter_chain("[person_source]", preset, crop_filter)
     if preserve_native_composition(preset, crop_mode):
         person_filter, person_x, person_y = source_native_person_layout(person_video, preset, width, height)
     else:
@@ -1013,10 +1070,11 @@ def render_demo_preview_frame(
         person_y = "H-h" if vertical_align == "bottom" else "(H-h)/2"
     filters = [
         f"[0:v]scale={width}:{height},setsar=1,format=rgba[bg]",
+        "[1:v]setpts=PTS-STARTPTS[person_source]",
         key_filter,
         f"[person_keyed]{person_filter},setsar=1,format=rgba[person]",
         f"[bg][person]overlay={person_x}:{person_y}[withperson]",
-        "[2:v]format=rgba[subtitles]",
+        "[2:v]setpts=PTS-STARTPTS,format=rgba[subtitles]",
         "[withperson][subtitles]overlay=0:0[v]",
     ]
     command = [

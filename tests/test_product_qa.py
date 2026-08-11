@@ -5,6 +5,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from unittest.mock import patch
 
 from product_package import (
     AnnotationBlock,
@@ -17,6 +18,7 @@ from product_package import (
     load_keying_preset,
     make_blurred_background,
     preserve_native_composition,
+    render_demo_preview_frame,
     render_annotation_blocks_docx,
     render_story_docx,
     validate_annotation_blocks,
@@ -146,6 +148,39 @@ class ProductQaTests(unittest.TestCase):
             with zipfile.ZipFile(story_docx) as archive:
                 story_xml = archive.read("word/document.xml").decode("utf-8")
             self.assertEqual(story_xml.count("字体检查"), 1)
+            with zipfile.ZipFile(annotation_docx) as archive:
+                annotation_xml = archive.read("word/document.xml").decode("utf-8")
+            self.assertGreaterEqual(annotation_xml.count("w:cantSplit"), 4)
+
+    def test_demo_preview_normalizes_sought_video_timestamps(self) -> None:
+        preset = KeyingPreset()
+        with patch("product_package.demo_crop_filter", return_value=""), patch(
+            "product_package.keying_filter_chain", return_value="[person_source]format=rgba[person_keyed]"
+        ), patch(
+            "product_package.preserve_native_composition", return_value=False
+        ), patch("product_package.run_command") as run:
+            render_demo_preview_frame(
+                Path("person.mov"),
+                Path("background.png"),
+                Path("subtitles.mov"),
+                Path("preview.png"),
+                preset,
+                1920,
+                1080,
+                0.0,
+                "full-width",
+                "bottom",
+                37.0,
+                None,
+                200,
+                20,
+                20,
+            )
+
+        command = run.call_args.args[0]
+        filters = command[command.index("-filter_complex") + 1]
+        self.assertIn("[1:v]setpts=PTS-STARTPTS[person_source]", filters)
+        self.assertIn("[2:v]setpts=PTS-STARTPTS,format=rgba[subtitles]", filters)
 
     def test_public_story_removes_host_self_introduction_entirely(self) -> None:
         self.assertEqual(clean_public_story_text("大家好，我是绵羊姐姐。"), "")

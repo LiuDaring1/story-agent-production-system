@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from PIL import Image, ImageDraw
 from video_provider_adapter import resolve_row_generation_seconds, resolve_video_provider
+from story_video_synthesizer.image_video import validate_image_video_jobs
 
 from story_codex_tasks import (
     build_children_story_handoff,
@@ -193,7 +194,13 @@ class WorkerAttempt:
 
 def canonical_video_prompt_rows(csv_path: Path) -> list[dict[str, str]]:
     with csv_path.open(encoding="utf-8-sig", newline="") as file:
-        rows = list(csv.DictReader(file))
+        reader = csv.DictReader(file)
+        rows = list(reader)
+        has_continuity = bool(
+            set(reader.fieldnames or []).intersection(
+                {"continuity_state", "continuity_required", "continuity_forbidden", "visual_continuity_state"}
+            )
+        )
     result: list[dict[str, str]] = []
     for row in rows:
         raw_scene = (row.get("scene") or "").strip()
@@ -201,14 +208,21 @@ def canonical_video_prompt_rows(csv_path: Path) -> list[dict[str, str]]:
             scene = str(int(raw_scene)).zfill(2)
         except ValueError:
             scene = raw_scene
-        result.append(
-            {
-                "scene": scene,
-                "image_filename": (row.get("image_filename") or "").strip(),
-                "story_text": (row.get("story_text") or "").strip(),
-                "prompt": (row.get("prompt") or "").strip(),
-            }
-        )
+        item = {
+            "scene": scene,
+            "image_filename": (row.get("image_filename") or "").strip(),
+            "story_text": (row.get("story_text") or "").strip(),
+            "prompt": (row.get("prompt") or "").strip(),
+        }
+        if has_continuity:
+            item.update(
+                {
+                    "continuity_state": (row.get("continuity_state") or row.get("visual_continuity_state") or "").strip(),
+                    "continuity_required": (row.get("continuity_required") or row.get("visual_continuity_required") or "").strip(),
+                    "continuity_forbidden": (row.get("continuity_forbidden") or row.get("visual_continuity_forbidden") or "").strip(),
+                }
+            )
+        result.append(item)
     return sorted(result, key=lambda item: item["scene"])
 
 
@@ -236,14 +250,16 @@ def video_prompt_review_matches_current(jobs: Path, snapshot: Path, decisions: P
         source = original_by_scene.get(scene)
         if source is None or (row.get("review_status") or "").strip() != "approved":
             return False
-        approved.append(
-            {
-                "scene": scene,
-                "image_filename": (row.get("image_filename") or source.get("image_filename") or "").strip(),
-                "story_text": (row.get("story_text") or source.get("story_text") or "").strip(),
-                "prompt": (row.get("prompt") or source.get("prompt") or "").strip(),
-            }
-        )
+        item = {
+            "scene": scene,
+            "image_filename": (row.get("image_filename") or source.get("image_filename") or "").strip(),
+            "story_text": (row.get("story_text") or source.get("story_text") or "").strip(),
+            "prompt": (row.get("prompt") or source.get("prompt") or "").strip(),
+        }
+        for key in ("continuity_state", "continuity_required", "continuity_forbidden"):
+            if key in source:
+                item[key] = (row.get(key) or source.get(key) or "").strip()
+        approved.append(item)
     approved.sort(key=lambda item: item["scene"])
     return len(approved) == len(original) and current == approved
 
@@ -1396,7 +1412,17 @@ class StoryAgent:
         image_dir = self._image_dir()
         if storyboard is None or image_dir is None:
             return StageResult("blocked", "缺少分镜文本或图片目录，无法准备图生视频任务。")
-        return self._workflow([
+        continuity_contract = self._visual_continuity_contract_path()
+        storyboard_plan = self.context.paths.images / f"{self.context.slug}_storyboard_plan.json"
+        if continuity_contract is not None:
+            continuity_errors = self._visual_continuity_storyboard_errors(continuity_contract, storyboard_plan)
+            if continuity_errors:
+                return StageResult(
+                    "blocked",
+                    "视觉连续性合同校验失败，未准备/付费：" + "；".join(continuity_errors),
+                    continuity_contract,
+                )
+        command = [
             "prepare",
             "--image-dir",
             str(image_dir),
@@ -1408,7 +1434,12 @@ class StoryAgent:
             self.context.slug,
             "--short-slug",
             short_slug(self.context.slug),
-        ], "准备图生视频任务")
+        ]
+        if continuity_contract is not None:
+            command.extend(["--continuity-contract", str(continuity_contract)])
+        if storyboard_plan.is_file():
+            command.extend(["--storyboard-plan", str(storyboard_plan)])
+        return self._workflow(command, "准备图生视频任务")
 
     def _stage_story_images_review(self, manifest: dict[str, Any]) -> StageResult:
         image_dir = self._image_dir()
@@ -1514,6 +1545,13 @@ class StoryAgent:
         image_dir = self._image_dir()
         if jobs is None or image_dir is None:
             return StageResult("blocked", "缺少 jobs CSV 或图片目录，无法生成视频片段。")
+        continuity_errors = validate_image_video_jobs(jobs)
+        if continuity_errors:
+            return StageResult(
+                "blocked",
+                "视觉连续性合同/任务校验失败，未发起付费调用：" + "；".join(continuity_errors),
+                jobs,
+            )
         videos_dir = self.context.paths.video_jobs / "videos"
         actual = len(list(videos_dir.glob("*.mp4"))) if videos_dir.exists() else 0
         pending = max(0, self._job_count(jobs) - actual)
@@ -1649,7 +1687,14 @@ class StoryAgent:
         review_dir = self.context.paths.status / "reviews"
         snapshot = review_dir / "video_prompt_inputs.json"
         save_json(snapshot, {"version": 1, "rows": canonical_video_prompt_rows(jobs)})
-        bundle = write_review_bundle(review_dir / "video_prompt_bundle.json", [snapshot, image_dir])
+        control_files = [
+            self.context.paths.images / f"{self.context.slug}_storyboard_plan.json",
+            self._visual_continuity_contract_path(),
+        ]
+        bundle = write_review_bundle(
+            review_dir / "video_prompt_bundle.json",
+            [snapshot, image_dir, *(path for path in control_files if path is not None and path.exists())],
+        )
         decisions_csv = self.context.paths.video_jobs / "prompt_review_decisions.csv"
         review_path = review_dir / "video_prompt_review.json"
         bundle_sha = file_sha256(bundle)
@@ -1662,10 +1707,11 @@ class StoryAgent:
                 "你是独立图生视频动作提示词审核员。不要读取生产者推理，也不要修改 jobs CSV。",
                 f"当前任务及图片哈希清单：`{bundle}`",
                 f"读取任务 CSV：`{jobs}`",
+                "如果任务 CSV 含 continuity_state/continuity_required/continuity_forbidden，必须逐字段保留并审核；这些字段和最终提示词中的视觉连续性硬约束不可删改，不能以审核 CSV 覆盖。",
                 "逐镜头检查动作是否具体、是否符合当前图片和故事、是否过度文学化、是否可能触发眼睛发光/肢体畸变/新增角色。",
                 "每个镜头的 prompt 必须显式锁定起始图的角色数量、物体数量和核心外观，禁止凭空新增/删除/融合物体，禁止改变太阳、月亮等核心物体的实心/空心拓扑。",
                 f"把最终确认 CSV 写入：`{decisions_csv}`",
-                "CSV 必须包含 scene,image_filename,story_text,review_status,prompt,notes；每个镜头一行，review_status 必须是 approved，必要时直接在 prompt 列给出修正后的最终动作提示。",
+                "CSV 必须包含 scene,image_filename,story_text,review_status,prompt,notes；如果任务 CSV 含 continuity_* 字段，也原样写回每镜的机器字段；每个镜头一行，review_status 必须是 approved，必要时直接在 prompt 列给出修正后的最终动作提示。",
                 f"把结构化审核 JSON 写入：`{review_path}`",
                 "JSON 必须包含 approved、score、critical_errors、issues、retry_indices、retry_files、retry_instructions、artifact_sha256。",
                 f"artifact_sha256 必须原样写为：{bundle_sha}",
@@ -2539,6 +2585,28 @@ class StoryAgent:
             if source.exists():
                 final_storyboard.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, final_storyboard.parent / source.name)
+        # The storyboard-image skill writes hand-authored motion prompts and
+        # clip naming tables next to the staged stills.  Keep these control
+        # artifacts with the final images so prepare never falls back to a
+        # generic action prompt after a successful image batch.
+        control_patterns = (
+            "*_flow_video_prompts.csv",
+            "*_flow_video_prompts.md",
+            "*_flow_clip_names.csv",
+        )
+        control_sources = [
+            source
+            for root in (staging_images, staging)
+            if root.exists()
+            for pattern in control_patterns
+            for source in root.glob(pattern)
+            if source.is_file()
+        ]
+        for source in control_sources:
+            final_storyboard.parent.mkdir(parents=True, exist_ok=True)
+            target = final_storyboard.parent / source.name
+            if source.resolve() != target.resolve():
+                shutil.copy2(source, target)
 
     def _ensure_storyboard_from_lines(self, storyboard: Path, story_lines: list[str]) -> bool:
         expected = "\n".join(story_lines) + "\n"
@@ -2560,10 +2628,17 @@ class StoryAgent:
                 candidates.extend(directory.glob(f"{self.context.slug}_scene_*.png"))
                 candidates.extend(directory.glob(f"{self.context.slug}_scene_*.jpg"))
                 candidates.extend(directory.glob(f"{self.context.slug}_scene_*.webp"))
+        control_roots = (staging_images, staging_images.parent, self.context.paths.images)
         candidates.extend(
             path
-            for pattern in ("*storyboard.md", "*flow_video_prompts.csv", "*flow_video_prompts.md", "*flow_clip_names.csv")
-            for path in staging_images.glob(pattern)
+            for root in control_roots
+            if root.exists()
+            for pattern in (
+                f"{self.context.slug}_flow_video_prompts.csv",
+                f"{self.context.slug}_flow_video_prompts.md",
+                f"{self.context.slug}_flow_clip_names.csv",
+            )
+            for path in root.glob(pattern)
         )
         candidates.extend(staging_images.parent.glob(f"{self.context.slug}_storyboard.md"))
         candidates.extend(staging_images.parent.glob(f"{self.context.slug}_visual_bible.md"))
@@ -3194,6 +3269,8 @@ class StoryAgent:
         decisions = self.context.paths.video_jobs / "prompt_review_decisions.csv"
         jobs = self._jobs_csv(manifest)
         if jobs is None or not bundle.exists() or not review.exists() or not snapshot.exists() or not decisions.exists() or not review_bundle_is_current(bundle):
+            return False
+        if validate_image_video_jobs(jobs):
             return False
         try:
             payload = json.loads(review.read_text(encoding="utf-8"))

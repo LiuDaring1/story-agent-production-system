@@ -3,7 +3,12 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from story_video_synthesizer.image_video import build_jobs, write_job_outputs
+from story_video_synthesizer.image_video import (
+    VisualContinuityContractError,
+    build_jobs,
+    discover_visual_continuity_paths,
+    write_job_outputs,
+)
 
 
 def main() -> None:
@@ -13,15 +18,41 @@ def main() -> None:
     parser.add_argument("--output-dir", required=True, type=Path, help="输出任务文件夹")
     parser.add_argument("--slug", default="story", help="故事 slug，用于文件命名")
     parser.add_argument("--short-slug", default="hlbyg", help="视频片段短名，例如 01_hlbyg.mp4")
+    parser.add_argument(
+        "--continuity-contract",
+        type=Path,
+        default=None,
+        help="可选视觉连续性合同 JSON；存在时逐镜状态硬约束会注入最终提示词",
+    )
+    parser.add_argument(
+        "--storyboard-plan",
+        type=Path,
+        default=None,
+        help="可选机器可读 storyboard_plan.json；合同存在时必填",
+    )
     args = parser.parse_args()
 
-    jobs, warnings = build_jobs(
-        image_dir=args.image_dir.expanduser(),
-        storyboard_path=args.storyboard.expanduser(),
-        output_dir=args.output_dir.expanduser(),
-        slug=args.slug,
-        short_slug=args.short_slug,
+    discovered_contract, discovered_plan = discover_visual_continuity_paths(
+        args.image_dir.expanduser(),
+        args.storyboard.expanduser(),
+        args.output_dir.expanduser(),
+        args.slug,
     )
+    continuity_contract = args.continuity_contract.expanduser() if args.continuity_contract else discovered_contract
+    storyboard_plan = args.storyboard_plan.expanduser() if args.storyboard_plan else discovered_plan
+
+    try:
+        jobs, warnings = build_jobs(
+            image_dir=args.image_dir.expanduser(),
+            storyboard_path=args.storyboard.expanduser(),
+            output_dir=args.output_dir.expanduser(),
+            slug=args.slug,
+            short_slug=args.short_slug,
+            continuity_contract_path=continuity_contract,
+            storyboard_plan_path=storyboard_plan,
+        )
+    except VisualContinuityContractError as exc:
+        raise SystemExit(f"视觉连续性合同校验失败，未生成/付费：{exc}") from exc
     outputs = write_job_outputs(jobs, args.output_dir.expanduser(), args.slug)
 
     print(f"已生成 {len(jobs)} 个图片转视频任务。")

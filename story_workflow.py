@@ -14,6 +14,10 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from analyze_storyboard_pacing import analyze_storyboard_pacing
 from story_video_synthesizer.media import probe_duration
+from story_video_synthesizer.image_video import (
+    enforce_prompt_continuity_contract,
+    validate_image_video_jobs,
+)
 from video_provider_adapter import resolve_video_provider
 
 from story_project import (
@@ -200,6 +204,8 @@ def main() -> None:
     prepare.add_argument("--output-dir", required=True, type=Path)
     prepare.add_argument("--slug", required=True)
     prepare.add_argument("--short-slug", required=True)
+    prepare.add_argument("--continuity-contract", type=Path, default=None, help="视觉连续性合同 JSON")
+    prepare.add_argument("--storyboard-plan", type=Path, default=None, help="机器可读 storyboard_plan.json")
 
     timing = subparsers.add_parser("timing", help="根据旁白写入 frames、目标时长，以及可选的自适应整数秒请求")
     timing.add_argument("--jobs-csv", required=True, type=Path)
@@ -582,8 +588,7 @@ def main() -> None:
         print(f"已生成建议换行草稿：{analysis.draft_path}")
         print(analysis.summary)
     elif args.command == "prepare":
-        run_script(
-            "prepare_image_video_jobs.py",
+        command = [
             "--image-dir",
             args.image_dir,
             "--storyboard",
@@ -594,7 +599,12 @@ def main() -> None:
             args.slug,
             "--short-slug",
             args.short_slug,
-        )
+        ]
+        if args.continuity_contract is not None:
+            command.extend(["--continuity-contract", args.continuity_contract])
+        if args.storyboard_plan is not None:
+            command.extend(["--storyboard-plan", args.storyboard_plan])
+        run_script("prepare_image_video_jobs.py", *command)
     elif args.command == "timing":
         command = [
             "--jobs-csv",
@@ -625,6 +635,11 @@ def main() -> None:
             )
         run_script("apply_narration_durations.py", *command)
     elif args.command == "generate":
+        continuity_errors = validate_image_video_jobs(args.jobs_csv)
+        if continuity_errors:
+            raise ValueError(
+                "视觉连续性合同/任务校验失败，已在付费调用前阻断：" + "；".join(continuity_errors)
+            )
         provider = resolve_video_provider(load_config(), ROOT, args.provider)
         images_dir = resolve_generate_images_dir(args.jobs_csv, args.images_dir)
         if not args.skip_prompt_review and not args.dry_run:
@@ -2140,6 +2155,11 @@ def apply_prompt_review_confirmation(
     """
     jobs_csv = jobs_csv.expanduser()
     decisions_csv = decisions_csv.expanduser()
+    continuity_errors = validate_image_video_jobs(jobs_csv)
+    if continuity_errors:
+        raise ValueError(
+            "视觉连续性合同/任务校验失败，已停止调用视频 API。" + "；".join(continuity_errors)
+        )
     if not decisions_csv.exists():
         raise FileNotFoundError(
             "缺少图生视频提示词确认 CSV，已停止调用视频 API。\n"
@@ -2198,7 +2218,9 @@ def apply_prompt_review_confirmation(
             continue
         prompt = (decision.get("prompt") or "").strip()
         if prompt:
-            row["prompt"] = prompt
+            row["prompt"] = enforce_prompt_continuity_contract(prompt, row)
+        else:
+            row["prompt"] = enforce_prompt_continuity_contract(row.get("prompt", ""), row)
         row["prompt_review_status"] = "approved"
         row["prompt_review_notes"] = (decision.get("notes") or "").strip()
 

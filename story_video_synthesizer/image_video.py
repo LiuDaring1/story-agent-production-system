@@ -8,10 +8,36 @@ import shutil
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any, Mapping
 from xml.etree import ElementTree
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+
+
+class VisualContinuityContractError(ValueError):
+    """Raised when a visual-continuity contract cannot bind to every shot."""
+
+
+@dataclass(frozen=True)
+class VisualContinuityShot:
+    """The immutable, machine-readable continuity constraints for one shot."""
+
+    scene: int
+    state: str
+    required: tuple[str, ...] = ()
+    forbidden: tuple[str, ...] = ()
+
+    @property
+    def current_state(self) -> str:
+        return self.state
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "current_state": self.state,
+            "required": list(self.required),
+            "forbidden": list(self.forbidden),
+        }
 
 
 @dataclass(frozen=True)
@@ -32,6 +58,353 @@ class ImageVideoJob:
     target_video_filename: str
     status: str = "todo"
     notes: str = ""
+    continuity_state: str = ""
+    continuity_required: tuple[str, ...] = ()
+    continuity_forbidden: tuple[str, ...] = ()
+    continuity_contract_path: str = ""
+    storyboard_plan_path: str = ""
+
+
+def discover_visual_continuity_paths(
+    image_dir: Path,
+    storyboard_path: Path | None = None,
+    output_dir: Path | None = None,
+    slug: str = "",
+) -> tuple[Path | None, Path | None]:
+    """Find the optional project continuity contract and machine storyboard.
+
+    The contract is deliberately optional: projects created before continuity
+    contracts existed continue to use their historical prompt path.  Once a
+    contract is present, however, the machine storyboard is mandatory and is
+    resolved from the same project layout rather than from a story-specific
+    filename.
+    """
+
+    image_dir = image_dir.expanduser()
+    storyboard_path = storyboard_path.expanduser() if storyboard_path else None
+    output_dir = output_dir.expanduser() if output_dir else None
+    image_parent = image_dir.parent
+    roots: list[Path] = [image_dir, image_parent]
+    if output_dir is not None:
+        roots.extend([output_dir, output_dir.parent])
+    if storyboard_path is not None:
+        roots.extend([storyboard_path.parent, storyboard_path.parent.parent])
+
+    contract_candidates: list[Path] = []
+    plan_candidates: list[Path] = []
+    if slug:
+        plan_candidates.extend(
+            [
+                image_parent / f"{slug}_storyboard_plan.json",
+                image_dir / f"{slug}_storyboard_plan.json",
+            ]
+        )
+    contract_name = "visual_continuity_contract.json"
+    for root in roots:
+        contract_candidates.extend(
+            [
+                root / contract_name,
+                root / "99_项目状态" / contract_name,
+                root.parent / "99_项目状态" / contract_name,
+            ]
+        )
+        if slug:
+            plan_candidates.extend(
+                [
+                    root / f"{slug}_storyboard_plan.json",
+                    root / "01_分镜与图片" / f"{slug}_storyboard_plan.json",
+                    root / "images" / f"{slug}_storyboard_plan.json",
+                ]
+            )
+    contract = _first_existing_path(contract_candidates)
+    plan = _first_existing_path(plan_candidates)
+    return contract, plan
+
+
+def _first_existing_path(candidates: list[Path]) -> Path | None:
+    seen: set[Path] = set()
+    for candidate in candidates:
+        candidate = candidate.expanduser()
+        if candidate in seen:
+            continue
+        seen.add(candidate)
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+def load_visual_continuity_contract(
+    contract_path: Path | None,
+    storyboard_plan_path: Path | None = None,
+    *,
+    expected_scenes: int | set[int] | None = None,
+) -> dict[int, VisualContinuityShot]:
+    """Load and validate a continuity contract + per-shot machine storyboard.
+
+    ``None`` means no contract is configured and returns an empty mapping for
+    legacy projects.  A present contract is strict: missing/invalid states,
+    malformed state rules, duplicate/non-contiguous shot numbers, and a plan
+    that does not cover the requested scenes all fail before any API call.
+    """
+
+    if contract_path is None:
+        return {}
+    contract_path = contract_path.expanduser()
+    if not contract_path.is_file():
+        raise VisualContinuityContractError(f"视觉连续性合同不存在：{contract_path}")
+    try:
+        contract = json.loads(contract_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise VisualContinuityContractError(f"视觉连续性合同不可读：{exc}") from exc
+    if not isinstance(contract, dict):
+        raise VisualContinuityContractError("视觉连续性合同必须是 JSON 对象")
+
+    requirements = contract.get("storyboard_requirements")
+    if not isinstance(requirements, dict):
+        raise VisualContinuityContractError("视觉连续性合同缺少 storyboard_requirements")
+    required_field = str(requirements.get("required_field") or "").strip()
+    if not required_field:
+        raise VisualContinuityContractError("视觉连续性合同缺少 storyboard_requirements.required_field")
+
+    allowed_raw = contract.get("allowed_states")
+    if not isinstance(allowed_raw, list) or not allowed_raw:
+        raise VisualContinuityContractError("视觉连续性合同缺少非空 allowed_states 枚举")
+    allowed_states = {str(item).strip() for item in allowed_raw if isinstance(item, str) and item.strip()}
+    if len(allowed_states) != len(allowed_raw):
+        raise VisualContinuityContractError("视觉连续性合同 allowed_states 必须是非空字符串枚举")
+
+    state_rules = contract.get("state_rules")
+    if not isinstance(state_rules, dict):
+        raise VisualContinuityContractError("视觉连续性合同缺少 state_rules 对象")
+
+    if storyboard_plan_path is None:
+        raise VisualContinuityContractError("存在视觉连续性合同但未提供 storyboard_plan.json")
+    storyboard_plan_path = storyboard_plan_path.expanduser()
+    if not storyboard_plan_path.is_file():
+        raise VisualContinuityContractError(f"存在视觉连续性合同但 storyboard_plan 不存在：{storyboard_plan_path}")
+    try:
+        plan_payload = json.loads(storyboard_plan_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise VisualContinuityContractError(f"storyboard_plan 不可读：{exc}") from exc
+    shots = plan_payload.get("shots") if isinstance(plan_payload, dict) else plan_payload
+    if not isinstance(shots, list) or not shots:
+        raise VisualContinuityContractError("storyboard_plan 没有可校验的逐镜列表")
+
+    if expected_scenes is None:
+        expected = None
+    elif isinstance(expected_scenes, int):
+        expected = set(range(1, expected_scenes + 1))
+    else:
+        expected = {int(scene) for scene in expected_scenes}
+
+    errors: list[str] = []
+    result: dict[int, VisualContinuityShot] = {}
+    for index, row in enumerate(shots, start=1):
+        if not isinstance(row, dict):
+            errors.append(f"第 {index} 镜不是对象")
+            continue
+        raw_scene = row.get("scene")
+        try:
+            scene = int(raw_scene)
+        except (TypeError, ValueError):
+            errors.append(f"第 {index} 镜 scene 非法：{raw_scene!r}")
+            continue
+        if scene <= 0:
+            errors.append(f"第 {index} 镜 scene 必须为正整数")
+            continue
+        if scene in result:
+            errors.append(f"镜头 {scene:02d} 重复")
+            continue
+        if scene != index:
+            errors.append(f"第 {index} 镜 scene={scene}，镜头编号不连续")
+        raw_state = row.get(required_field)
+        state = raw_state.strip() if isinstance(raw_state, str) else ""
+        if not state:
+            errors.append(f"第 {scene:02d} 镜缺少 {required_field}")
+            continue
+        if state not in allowed_states:
+            errors.append(f"第 {scene:02d} 镜 {required_field}={state!r} 不属于允许枚举")
+            continue
+        rule = state_rules.get(state)
+        if not isinstance(rule, dict):
+            errors.append(f"状态 {state!r} 缺少 state_rules 规则")
+            continue
+        required = _normalize_constraint_list(rule.get("required"), f"状态 {state!r} required", errors)
+        forbidden = _normalize_constraint_list(rule.get("forbidden"), f"状态 {state!r} forbidden", errors)
+        result[scene] = VisualContinuityShot(scene=scene, state=state, required=required, forbidden=forbidden)
+
+    if expected is not None:
+        actual = set(result)
+        missing = sorted(expected - actual)
+        extra = sorted(actual - expected)
+        if missing:
+            errors.append("storyboard_plan 缺少镜头：" + ",".join(f"{scene:02d}" for scene in missing))
+        if extra:
+            errors.append("storyboard_plan 多出镜头：" + ",".join(f"{scene:02d}" for scene in extra))
+    if errors:
+        raise VisualContinuityContractError("；".join(errors))
+    return result
+
+
+def _normalize_constraint_list(value: object, label: str, errors: list[str]) -> tuple[str, ...]:
+    if value is None:
+        return ()
+    if not isinstance(value, list) or any(not isinstance(item, str) or not item.strip() for item in value):
+        errors.append(f"{label} 必须是字符串数组")
+        return ()
+    return tuple(item.strip() for item in value)
+
+
+def continuity_context_from_row(row: Mapping[str, object]) -> VisualContinuityShot | None:
+    """Decode continuity fields embedded in a jobs CSV row."""
+
+    state = str(row.get("continuity_state") or row.get("visual_continuity_state") or "").strip()
+    if not state:
+        return None
+    required = _decode_constraint_field(row.get("continuity_required") or row.get("visual_continuity_required"))
+    forbidden = _decode_constraint_field(row.get("continuity_forbidden") or row.get("visual_continuity_forbidden"))
+    return VisualContinuityShot(scene=int(str(row.get("scene") or "0")), state=state, required=required, forbidden=forbidden)
+
+
+def _decode_constraint_field(value: object) -> tuple[str, ...]:
+    if isinstance(value, (list, tuple)):
+        return tuple(str(item).strip() for item in value if str(item).strip())
+    text = str(value or "").strip()
+    if not text:
+        return ()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        return tuple(part.strip() for part in text.split("\n") if part.strip())
+    if not isinstance(parsed, list):
+        return ()
+    return tuple(str(item).strip() for item in parsed if str(item).strip())
+
+
+def inject_visual_continuity_prompt(
+    prompt: str,
+    continuity: VisualContinuityShot | None = None,
+    *,
+    state: str = "",
+    required: tuple[str, ...] | list[str] = (),
+    forbidden: tuple[str, ...] | list[str] = (),
+) -> str:
+    """Append an immutable, machine-readable continuity clause to a prompt."""
+
+    if continuity is not None:
+        state = continuity.state
+        required = continuity.required
+        forbidden = continuity.forbidden
+    state = str(state or "").strip()
+    if not state:
+        # Legacy projects without a continuity contract must retain the exact
+        # reviewer-edited prompt; normalization belongs to prompt generation,
+        # not to the approval write-back path.
+        return str(prompt or "").strip()
+    required_values = tuple(str(item).strip() for item in required if str(item).strip())
+    forbidden_values = tuple(str(item).strip() for item in forbidden if str(item).strip())
+    base = normalize_image_to_video_prompt(prompt)
+    marker = "视觉连续性硬约束（机器可读）："
+    if marker in base:
+        base = base.split(marker, 1)[0].rstrip(" ；;。")
+    machine = json.dumps(
+        {"current_state": state, "required": list(required_values), "forbidden": list(forbidden_values)},
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    clause = (
+        f"{marker}{machine}。整个视频片段必须始终保持 current_state={state}，不得跨越、改变或提前进入其他状态；"
+        f"必须满足 required：{'；'.join(required_values) if required_values else '无'}；"
+        f"forbidden 严禁生成：{'；'.join(forbidden_values) if forbidden_values else '无'}。"
+    )
+    if base:
+        return f"{base.rstrip('。')}。{clause}"
+    return clause
+
+
+def enforce_prompt_continuity_contract(prompt: str, row: Mapping[str, object]) -> str:
+    """Re-apply row hard constraints after a human/reviewer prompt edit."""
+
+    return inject_visual_continuity_prompt(prompt, continuity_context_from_row(row))
+
+
+def validate_image_video_jobs(jobs_csv: Path) -> list[str]:
+    """Validate continuity fields and prompts immediately before paid calls."""
+
+    jobs_csv = jobs_csv.expanduser()
+    if not jobs_csv.is_file():
+        return [f"任务 CSV 不存在：{jobs_csv}"]
+    try:
+        with jobs_csv.open(encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            rows = list(reader)
+            fieldnames = set(reader.fieldnames or [])
+    except (OSError, csv.Error) as exc:
+        return [f"任务 CSV 不可读：{exc}"]
+    continuity_fields = {"continuity_state", "visual_continuity_state", "continuity_required", "continuity_forbidden"}
+    if not fieldnames.intersection(continuity_fields):
+        # A legacy CSV is still valid when its project has no contract.  If a
+        # contract is present next to this project, though, silently sending
+        # the old prompt would bypass the new hard constraints.
+        slug = jobs_csv.stem.removesuffix("_image_video_jobs")
+        discovered_contract, discovered_plan = discover_visual_continuity_paths(
+            jobs_csv.parent / "images",
+            output_dir=jobs_csv.parent,
+            slug=slug,
+        )
+        if discovered_contract is not None:
+            return [
+                "任务 CSV 未包含视觉连续性机器字段；请重新运行 prepare 以注入合同状态和 required/forbidden 约束",
+                f"合同：{discovered_contract}",
+                f"机器分镜：{discovered_plan or '缺失'}",
+            ]
+        return []
+    errors: list[str] = []
+    scenes: set[int] = set()
+    contract_path = ""
+    plan_path = ""
+    for row in rows:
+        raw_scene = str(row.get("scene") or "").strip()
+        try:
+            scene = int(raw_scene)
+        except ValueError:
+            errors.append(f"任务 CSV scene 非法：{raw_scene!r}")
+            continue
+        if scene in scenes:
+            errors.append(f"任务 CSV 镜头 {scene:02d} 重复")
+        scenes.add(scene)
+        contract_path = contract_path or str(row.get("continuity_contract_path") or "").strip()
+        plan_path = plan_path or str(row.get("storyboard_plan_path") or "").strip()
+        try:
+            context = continuity_context_from_row(row)
+        except (TypeError, ValueError):
+            context = None
+        if context is None:
+            errors.append(f"第 {scene:02d} 镜缺少视觉连续性状态")
+            continue
+        canonical = inject_visual_continuity_prompt(str(row.get("prompt") or ""), context)
+        if str(row.get("prompt") or "") != canonical:
+            errors.append(f"第 {scene:02d} 镜最终提示词未包含不可删除的连续性硬约束")
+    if scenes and scenes != set(range(1, len(rows) + 1)):
+        errors.append("任务 CSV 镜头编号与连续性分镜不匹配")
+    if not contract_path or not plan_path:
+        errors.append("任务 CSV 缺少视觉连续性合同/机器分镜路径")
+    else:
+        try:
+            contexts = load_visual_continuity_contract(
+                Path(contract_path),
+                Path(plan_path),
+                expected_scenes=len(rows),
+            )
+            for row in rows:
+                scene = int(str(row.get("scene") or "0"))
+                context = contexts.get(scene)
+                row_context = continuity_context_from_row(row)
+                if context is None or row_context != context:
+                    errors.append(f"第 {scene:02d} 镜任务状态与合同/分镜不匹配")
+        except VisualContinuityContractError as exc:
+            errors.append(str(exc))
+    return errors
 
 
 def sorted_image_files(image_dir: Path, slug: str | None = None) -> list[Path]:
@@ -123,11 +496,35 @@ def build_jobs(
     output_dir: Path,
     slug: str,
     short_slug: str,
+    continuity_contract_path: Path | None = None,
+    storyboard_plan_path: Path | None = None,
 ) -> tuple[list[ImageVideoJob], list[str]]:
     images = sorted_image_files(image_dir, slug=slug)
     items = parse_storyboard_items(read_storyboard_text(storyboard_path))
     items = _expand_items_for_known_splits(items, len(images))
-    prompt_overrides = read_flow_video_prompts(image_dir, slug, output_dir=output_dir)
+    discovered_contract, discovered_plan = discover_visual_continuity_paths(
+        image_dir,
+        storyboard_path,
+        output_dir,
+        slug,
+    )
+    if continuity_contract_path is None:
+        continuity_contract_path = discovered_contract
+    elif not continuity_contract_path.expanduser().is_file():
+        raise VisualContinuityContractError(f"视觉连续性合同不存在：{continuity_contract_path}")
+    if storyboard_plan_path is None:
+        storyboard_plan_path = discovered_plan
+    continuity_by_scene = load_visual_continuity_contract(
+        continuity_contract_path,
+        storyboard_plan_path,
+        expected_scenes=len(images),
+    )
+    prompt_overrides = read_flow_video_prompts(
+        image_dir,
+        slug,
+        output_dir=output_dir,
+        continuity_by_scene=continuity_by_scene,
+    )
     warnings: list[str] = []
 
     if len(images) != len(items):
@@ -136,6 +533,8 @@ def build_jobs(
         warnings.append(f"已优先使用出图阶段手写的图生视频提示词：{len(prompt_overrides)} 条。")
     else:
         warnings.append("未找到出图阶段手写的图生视频提示词，将根据逐镜头故事文本自动生成差异化提示词。")
+    if continuity_by_scene:
+        warnings.append(f"已注入视觉连续性合同硬约束：{len(continuity_by_scene)} 个镜头。")
 
     jobs: list[ImageVideoJob] = []
     for scene, image_path in enumerate(images, start=1):
@@ -148,7 +547,13 @@ def build_jobs(
             visual,
             image_path.name,
             is_last_scene=scene == len(images),
+            continuity=continuity_by_scene.get(scene),
         )
+        if scene in continuity_by_scene:
+            prompt = inject_visual_continuity_prompt(prompt, continuity_by_scene[scene])
+            continuity = continuity_by_scene[scene]
+        else:
+            continuity = None
         jobs.append(
             ImageVideoJob(
                 scene=scene,
@@ -158,13 +563,23 @@ def build_jobs(
                 visual_description=visual,
                 prompt=prompt,
                 target_video_filename=f"{scene:02d}_{short_slug}.mp4",
+                continuity_state=continuity.state if continuity else "",
+                continuity_required=continuity.required if continuity else (),
+                continuity_forbidden=continuity.forbidden if continuity else (),
+                continuity_contract_path=(str(continuity_contract_path.expanduser().resolve()) if continuity and continuity_contract_path else ""),
+                storyboard_plan_path=(str(storyboard_plan_path.expanduser().resolve()) if continuity and storyboard_plan_path else ""),
             )
         )
 
     return jobs, warnings
 
 
-def read_flow_video_prompts(image_dir: Path, slug: str, output_dir: Path | None = None) -> dict[int, str]:
+def read_flow_video_prompts(
+    image_dir: Path,
+    slug: str,
+    output_dir: Path | None = None,
+    continuity_by_scene: Mapping[int, VisualContinuityShot] | None = None,
+) -> dict[int, str]:
     """Read hand-authored image-to-video prompts saved by the storyboard stage.
 
     The children-storyboard-images flow writes `{slug}_flow_video_prompts.csv`
@@ -203,7 +618,10 @@ def read_flow_video_prompts(image_dir: Path, slug: str, output_dir: Path | None 
                     is_last_scene=False,
                     style_hint="中国风2D绘本",
                 )
-            prompts[scene] = normalize_image_to_video_prompt(prompt)
+            normalized = normalize_image_to_video_prompt(prompt)
+            if continuity_by_scene and scene in continuity_by_scene:
+                normalized = inject_visual_continuity_prompt(normalized, continuity_by_scene[scene])
+            prompts[scene] = normalized
     return prompts
 
 
@@ -278,12 +696,14 @@ def build_video_prompt(
     *,
     is_last_scene: bool = False,
     style_hint: str = "",
+    continuity: VisualContinuityShot | None = None,
 ) -> str:
     source = f"{story_text} {visual_description}"
     action = _infer_action(source, scene, image_filename, is_last_scene=is_last_scene)
-    return normalize_image_to_video_prompt(
+    prompt = normalize_image_to_video_prompt(
         f"参考当前图片，{action}。保持角色、服装、道具、场景和画风不变；不要新增字幕、文字、logo或水印。"
     )
+    return inject_visual_continuity_prompt(prompt, continuity)
 
 
 def normalize_image_to_video_prompt(prompt: str) -> str:
@@ -371,6 +791,8 @@ def write_job_outputs(jobs: list[ImageVideoJob], output_dir: Path, slug: str) ->
     copied_image_dir.mkdir(parents=True, exist_ok=True)
     video_dir = output_dir / "videos"
     video_dir.mkdir(parents=True, exist_ok=True)
+    manifest_csv = output_dir / f"{slug}_image_video_jobs.csv"
+    existing_rows = _read_jobs_rows(manifest_csv)
     prompt_review_csv = output_dir / "prompt_review_decisions.csv"
     prompt_review_decisions = _read_prompt_review_decisions(prompt_review_csv)
 
@@ -398,40 +820,57 @@ def write_job_outputs(jobs: list[ImageVideoJob], output_dir: Path, slug: str) ->
                 "notes": job.notes,
             }
         )
-    _apply_prompt_review_decisions(rows, prompt_review_decisions)
+        if job.continuity_state:
+            rows[-1].update(
+                {
+                    "continuity_state": job.continuity_state,
+                    "continuity_required": json.dumps(list(job.continuity_required), ensure_ascii=False),
+                    "continuity_forbidden": json.dumps(list(job.continuity_forbidden), ensure_ascii=False),
+                    "visual_continuity_state": job.continuity_state,
+                    "visual_continuity_required": json.dumps(list(job.continuity_required), ensure_ascii=False),
+                    "visual_continuity_forbidden": json.dumps(list(job.continuity_forbidden), ensure_ascii=False),
+                    "continuity_contract_path": job.continuity_contract_path,
+                    "storyboard_plan_path": job.storyboard_plan_path,
+                }
+            )
+    prompt_stable = _merge_existing_job_rows(rows, existing_rows)
+    _apply_prompt_review_decisions(rows, prompt_review_decisions, prompt_stable=prompt_stable)
 
-    manifest_csv = output_dir / f"{slug}_image_video_jobs.csv"
     _write_csv(manifest_csv, rows)
 
     prompts_csv = output_dir / f"{slug}_video_prompts.csv"
+    prompt_rows: list[dict[str, str]] = []
+    for row in rows:
+        prompt_row = {
+            "scene": row["scene"],
+            "filename": row["image_filename"],
+            "prompt": row["prompt"],
+        }
+        _copy_continuity_fields(row, prompt_row)
+        prompt_rows.append(prompt_row)
     _write_csv(
         prompts_csv,
-        [
-            {
-                "scene": row["scene"],
-                "filename": row["image_filename"],
-                "prompt": row["prompt"],
-            }
-            for row in rows
-        ],
+        prompt_rows,
     )
 
     prompts_md = output_dir / f"{slug}_video_prompts.md"
     prompts_md.write_text(_render_prompts_md(rows), encoding="utf-8")
 
     checklist_csv = output_dir / f"{slug}_clip_names.csv"
+    checklist_rows: list[dict[str, str]] = []
+    for row in rows:
+        checklist_row = {
+            "scene": row["scene"],
+            "image_filename": row["image_filename"],
+            "clip_name": Path(row["target_video_filename"]).stem,
+            "target_video_filename": row["target_video_filename"],
+            "prompt": row["prompt"],
+        }
+        _copy_continuity_fields(row, checklist_row)
+        checklist_rows.append(checklist_row)
     _write_csv(
         checklist_csv,
-        [
-            {
-                "scene": row["scene"],
-                "image_filename": row["image_filename"],
-                "clip_name": Path(row["target_video_filename"]).stem,
-                "target_video_filename": row["target_video_filename"],
-                "prompt": row["prompt"],
-            }
-            for row in rows
-        ],
+        checklist_rows,
     )
 
     review_html = output_dir / f"{slug}_review.html"
@@ -464,10 +903,134 @@ def _write_csv(path: Path, rows: list[dict[str, str]]) -> None:
     if not rows:
         path.write_text("", encoding="utf-8")
         return
+    fieldnames: list[str] = []
+    for row in rows:
+        for field in row:
+            if field not in fieldnames:
+                fieldnames.append(field)
     with path.open("w", encoding="utf-8-sig", newline="") as file:
-        writer = csv.DictWriter(file, fieldnames=list(rows[0].keys()))
+        writer = csv.DictWriter(file, fieldnames=fieldnames, extrasaction="ignore")
         writer.writeheader()
         writer.writerows(rows)
+
+
+def _read_jobs_rows(path: Path) -> list[dict[str, str]]:
+    if not path.is_file():
+        return []
+    try:
+        with path.open("r", encoding="utf-8-sig", newline="") as file:
+            return list(csv.DictReader(file))
+    except (OSError, csv.Error):
+        return []
+
+
+def _copy_continuity_fields(source: Mapping[str, str], target: dict[str, str]) -> None:
+    for field in (
+        "continuity_state",
+        "continuity_required",
+        "continuity_forbidden",
+        "visual_continuity_state",
+        "visual_continuity_required",
+        "visual_continuity_forbidden",
+        "continuity_contract_path",
+        "storyboard_plan_path",
+    ):
+        if source.get(field, ""):
+            target[field] = source[field]
+_PRESERVED_JOB_FIELDS = (
+    "status",
+    "task_id",
+    "video_url",
+    "error",
+    "api_response",
+    "query_response",
+    "provider_attempt",
+    "duration",
+    "frames",
+    "target_duration",
+    "narration_start",
+    "narration_end",
+    "generation_duration",
+    "duration_mode",
+    "effective_duration",
+    "needs_slowdown",
+    "needs_trim",
+    "timing_source",
+)
+
+_REFRESHED_JOB_FIELDS = {
+    "scene",
+    "image_filename",
+    "source_image",
+    "story_text",
+    "visual_description",
+    "prompt",
+    "target_video_filename",
+    "notes",
+    "continuity_state",
+    "continuity_required",
+    "continuity_forbidden",
+    "visual_continuity_state",
+    "visual_continuity_required",
+    "visual_continuity_forbidden",
+    "continuity_contract_path",
+    "storyboard_plan_path",
+    "prompt_review_status",
+    "prompt_review_notes",
+}
+
+
+def _job_identity(row: Mapping[str, object]) -> tuple[str, str, str]:
+    scene = str(row.get("scene") or "").strip().zfill(2)
+    image = str(row.get("image_filename") or "").strip()
+    story = str(row.get("story_text") or "").strip()
+    return scene, image, story
+
+
+def _merge_existing_job_rows(
+    rows: list[dict[str, str]],
+    existing_rows: list[dict[str, str]],
+) -> dict[str, bool]:
+    """Merge a regenerated manifest without destroying execution metadata.
+
+    A row is considered the same shot only when scene, copied image filename,
+    and locked story text all match.  Prompt-review fields are deliberately
+    dropped when the generated prompt changed; task IDs, downloaded status and
+    timing metadata remain untouched so refreshing continuity constraints is
+    recoverable and never silently deletes provider state.
+    """
+
+    existing_by_identity = {_job_identity(item): item for item in existing_rows}
+    prompt_stable: dict[str, bool] = {}
+    for row in rows:
+        old = existing_by_identity.get(_job_identity(row))
+        scene = str(row.get("scene") or "").strip().zfill(2)
+        if old is None:
+            prompt_stable[scene] = True
+            continue
+        old_prompt = str(old.get("prompt") or "").strip()
+        new_prompt = str(row.get("prompt") or "").strip()
+        stable = old_prompt == new_prompt
+        prompt_stable[scene] = stable
+        for field in _PRESERVED_JOB_FIELDS:
+            if field in old and str(old.get(field) or "") != "":
+                row[field] = str(old.get(field) or "")
+        # Keep newly introduced provider/timing metadata as well.  Only the
+        # content fields rebuilt from the current storyboard are refreshed.
+        for field, value in old.items():
+            if field in _REFRESHED_JOB_FIELDS or not str(value or ""):
+                continue
+            row[field] = str(value)
+        if stable:
+            for field in ("prompt_review_status", "prompt_review_notes"):
+                if field in old and str(old.get(field) or ""):
+                    row[field] = str(old.get(field) or "")
+        else:
+            # The provider execution record remains, but an approval tied to
+            # the previous prompt is no longer evidence for this prompt.
+            row.pop("prompt_review_status", None)
+            row.pop("prompt_review_notes", None)
+    return prompt_stable
 
 
 def _read_prompt_review_decisions(path: Path) -> dict[str, dict[str, str]]:
@@ -482,10 +1045,20 @@ def _read_prompt_review_decisions(path: Path) -> dict[str, dict[str, str]]:
         }
 
 
-def _apply_prompt_review_decisions(rows: list[dict[str, str]], decisions: dict[str, dict[str, str]]) -> None:
+def _apply_prompt_review_decisions(
+    rows: list[dict[str, str]],
+    decisions: dict[str, dict[str, str]],
+    *,
+    prompt_stable: Mapping[str, bool] | None = None,
+) -> None:
     for row in rows:
         decision = decisions.get((row.get("scene") or "").strip().zfill(2))
         if not decision:
+            continue
+        scene = (row.get("scene") or "").strip().zfill(2)
+        if prompt_stable is not None and not prompt_stable.get(scene, True):
+            # This decision was exported for a prior generated prompt.  Keep
+            # the CSV for auditability, but never apply it to a refreshed row.
             continue
         decision_image = (decision.get("image_filename") or "").strip()
         decision_story = (decision.get("story_text") or "").strip()
@@ -499,7 +1072,9 @@ def _apply_prompt_review_decisions(rows: list[dict[str, str]], decisions: dict[s
         status = (decision.get("review_status") or "").strip()
         notes = (decision.get("notes") or "").strip()
         if prompt:
-            row["prompt"] = prompt
+            row["prompt"] = enforce_prompt_continuity_contract(prompt, row)
+        elif continuity_context_from_row(row) is not None:
+            row["prompt"] = enforce_prompt_continuity_contract(row.get("prompt", ""), row)
         if status == "approved":
             row["prompt_review_status"] = "approved"
         if notes:
@@ -528,9 +1103,12 @@ def _render_review_html(rows: list[dict[str, str]], image_dir: Path, video_dir: 
         slowdown = html.escape(row.get("needs_slowdown") or "no")
         trim = html.escape(row.get("needs_trim") or "no")
         prompt_text = html.escape(row["prompt"])
+        continuity_state = html.escape(row.get("continuity_state") or "", quote=True)
+        continuity_required = html.escape(row.get("continuity_required") or "[]", quote=True)
+        continuity_forbidden = html.escape(row.get("continuity_forbidden") or "[]", quote=True)
         cards.append(
             f"""
-            <article class="card" data-scene="{scene}" data-image-filename="{image_name}" data-story-text="{html.escape(row['story_text'], quote=True)}" data-initial-status="{status}">
+            <article class="card" data-scene="{scene}" data-image-filename="{image_name}" data-story-text="{html.escape(row['story_text'], quote=True)}" data-continuity-state="{continuity_state}" data-continuity-required="{continuity_required}" data-continuity-forbidden="{continuity_forbidden}" data-initial-status="{status}">
               <header>
                 <h2>{scene}</h2>
                 <span class="status">通过</span>
@@ -730,11 +1308,11 @@ def _render_review_html(rows: list[dict[str, str]], image_dir: Path, video_dir: 
     }}
 
     function exportRows(filename, label) {{
-      const rows = [["scene", "image_filename", "story_text", "review_status", "prompt", "notes"]];
+      const rows = [["scene", "image_filename", "story_text", "review_status", "prompt", "notes", "continuity_state", "continuity_required", "continuity_forbidden"]];
       cards.forEach(card => {{
         const item = state[card.dataset.scene] || {{}};
         const prompt = card.querySelector(".prompt-editor").value;
-        rows.push([card.dataset.scene, card.dataset.imageFilename || "", card.dataset.storyText || "", statusForExport(item, filename), prompt, item.notes || ""]);
+        rows.push([card.dataset.scene, card.dataset.imageFilename || "", card.dataset.storyText || "", statusForExport(item, filename), prompt, item.notes || "", card.dataset.continuityState || "", card.dataset.continuityRequired || "[]", card.dataset.continuityForbidden || "[]"]);
       }});
       const csv = rows.map(row => row.map(value => `"${{String(value).replaceAll('"', '""')}}"`).join(",")).join("\\n");
       document.getElementById("exportPanel").hidden = false;

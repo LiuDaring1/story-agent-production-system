@@ -22,7 +22,7 @@ from story_video_synthesizer.volcengine_video import (
     read_jobs_csv,
     write_jobs_csv,
 )
-from story_video_synthesizer.image_video import write_review_page_from_rows
+from story_video_synthesizer.image_video import validate_image_video_jobs, write_review_page_from_rows
 from story_video_synthesizer.toapis_video import (
     DEFAULT_MODEL as TOAPIS_DEFAULT_MODEL,
     DEFAULT_RATIO as TOAPIS_DEFAULT_RATIO,
@@ -178,6 +178,12 @@ def main() -> None:
     parser.add_argument("--dry-run", action="store_true", help="只打印请求体，不调用 API")
     parser.add_argument("--extra-body-json", default="", help="额外请求体 JSON，例如 '{\"watermark\": false}'")
     args = parser.parse_args()
+
+    continuity_errors = validate_image_video_jobs(args.jobs_csv)
+    if continuity_errors:
+        raise ValueError(
+            "视觉连续性合同/任务校验失败，已在付费调用前阻断：" + "；".join(continuity_errors)
+        )
 
     is_toapis = urlparse(args.base_url).netloc.lower() in {"toapis.com", "www.toapis.com"}
     configured_model = saved_video_model()

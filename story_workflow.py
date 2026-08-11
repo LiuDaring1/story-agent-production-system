@@ -201,13 +201,36 @@ def main() -> None:
     prepare.add_argument("--slug", required=True)
     prepare.add_argument("--short-slug", required=True)
 
-    timing = subparsers.add_parser("timing", help="根据旁白写入 frames 和目标时长")
+    timing = subparsers.add_parser("timing", help="根据旁白写入 frames、目标时长，以及可选的自适应整数秒请求")
     timing.add_argument("--jobs-csv", required=True, type=Path)
     timing.add_argument("--narration", required=True, type=Path)
     timing.add_argument("--whisper-model", default="base")
     timing.add_argument("--language", default="zh")
     timing.add_argument("--whisper-model-dir", default=None, type=Path)
     timing.add_argument("--max-duration", default=8.0, type=float, help="单镜头推荐默认 8 秒；Grok Video 1.5 支持 1-15 秒")
+    timing.add_argument(
+        "--duration-mode",
+        choices=["fixed", "adaptive", "adaptive-seconds"],
+        default="fixed",
+        help="fixed 保持旧版固定时长；adaptive-seconds 按旁白向上取整并夹在供应商整数秒范围",
+    )
+    timing.add_argument("--adaptive-seconds", action="store_true", help="兼容别名：等同于 --duration-mode adaptive-seconds")
+    timing.add_argument(
+        "--min-generation-seconds",
+        "--generation-min-seconds",
+        dest="min_generation_seconds",
+        default=1.0,
+        type=float,
+        help="adaptive-seconds 的供应商最小整数秒（默认 1）",
+    )
+    timing.add_argument(
+        "--max-generation-seconds",
+        "--generation-max-seconds",
+        dest="max_generation_seconds",
+        default=15.0,
+        type=float,
+        help="adaptive-seconds 的供应商最大整数秒（默认 15）",
+    )
 
     generate = subparsers.add_parser("generate", help="调用视频 API 生成片段")
     generate.add_argument("--jobs-csv", required=True, type=Path)
@@ -587,6 +610,19 @@ def main() -> None:
         ]
         if args.whisper_model_dir is not None:
             command.extend(["--whisper-model-dir", args.whisper_model_dir])
+        if args.adaptive_seconds:
+            command.extend(["--duration-mode", "adaptive-seconds"])
+        elif args.duration_mode != "fixed":
+            command.extend(["--duration-mode", args.duration_mode])
+        if args.adaptive_seconds or args.duration_mode != "fixed":
+            command.extend(
+                [
+                    "--min-generation-seconds",
+                    str(args.min_generation_seconds),
+                    "--max-generation-seconds",
+                    str(args.max_generation_seconds),
+                ]
+            )
         run_script("apply_narration_durations.py", *command)
     elif args.command == "generate":
         provider = resolve_video_provider(load_config(), ROOT, args.provider)

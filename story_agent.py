@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PIL import Image, ImageDraw
-from video_provider_adapter import resolve_video_provider
+from video_provider_adapter import resolve_row_generation_seconds, resolve_video_provider
 
 from story_codex_tasks import (
     build_children_story_handoff,
@@ -1484,6 +1484,29 @@ class StoryAgent:
         model_dir = ROOT / "models" / "whisper"
         if model_dir.exists():
             command.extend(["--whisper-model-dir", str(model_dir)])
+        # Timing strategy follows the selected provider adapter.  Only the
+        # current Grok Video 1.5 adapter advertises whole-second, per-second
+        # generation bounds; legacy providers retain fixed-duration behavior.
+        try:
+            provider = resolve_video_provider(load_config(), ROOT)
+        except Exception:
+            provider = None
+        if (
+            provider is not None
+            and provider.model.strip().lower() == "grok-video-1.5"
+            and provider.min_seconds is not None
+            and provider.max_seconds is not None
+        ):
+            command.extend(
+                [
+                    "--duration-mode",
+                    "adaptive-seconds",
+                    "--min-generation-seconds",
+                    str(int(provider.min_seconds)),
+                    "--max-generation-seconds",
+                    str(int(provider.max_seconds)),
+                ]
+            )
         return self._workflow(command, "写入旁白时长")
 
     def _stage_generate_videos(self, manifest: dict[str, Any]) -> StageResult:
@@ -1498,7 +1521,44 @@ class StoryAgent:
         video_api = config.get("video_api", {}) if isinstance(config.get("video_api"), dict) else {}
         provider = resolve_video_provider(config, ROOT)
         estimated_per_clip = provider.estimated_cost_cny_per_clip
-        estimate = round(pending * estimated_per_clip, 2)
+        try:
+            with jobs.open(encoding="utf-8-sig", newline="") as file:
+                job_rows = list(csv.DictReader(file))
+        except (OSError, csv.Error):
+            job_rows = []
+        before_targets = {
+            str(row.get("target_video_filename") or "").strip()
+            for row in job_rows
+            if str(row.get("target_video_filename") or "").strip()
+            and (videos_dir / str(row.get("target_video_filename") or "").strip()).is_file()
+        }
+        pending_rows = [
+            row
+            for row in job_rows
+            if str(row.get("target_video_filename") or "").strip() not in before_targets
+            and str(row.get("status") or "").strip() not in {"downloaded", "approved"}
+        ]
+
+        def estimate_row_cost(row: dict[str, str]) -> float:
+            if provider.estimated_cost_cny_per_second > 0:
+                if provider.model.strip().lower() == "grok-video-1.5":
+                    seconds = float(
+                        resolve_row_generation_seconds(
+                            row,
+                            model=provider.model,
+                            fallback_seconds=provider.default_seconds or 8,
+                            min_seconds=provider.min_seconds,
+                            max_seconds=provider.max_seconds,
+                        )
+                    )
+                else:
+                    raw = row.get("generation_duration") or row.get("duration")
+                    seconds = float(raw) if raw not in (None, "") else float(provider.default_seconds or 0)
+                return provider.estimate_cost(seconds)
+            return provider.estimate_cost()
+
+        estimated_rows = pending_rows or [{"duration": str(provider.default_seconds or 0)} for _ in range(pending)]
+        estimate = round(sum(estimate_row_cost(row) for row in estimated_rows), 2)
         ledger = BudgetLedger(manifest)
         try:
             reservation = ledger.authorize(estimate, label=f"图生视频 {pending} 个镜头", critical=True)
@@ -1525,9 +1585,24 @@ class StoryAgent:
         after = len(list(videos_dir.glob("*.mp4"))) if videos_dir.exists() else 0
         generated_by_api = max(0, after - actual)
         if result.status == "done" or generated_by_api > 0:
+            try:
+                with jobs.open(encoding="utf-8-sig", newline="") as file:
+                    settled_rows = list(csv.DictReader(file))
+            except (OSError, csv.Error):
+                settled_rows = []
+            newly_generated = [
+                row
+                for row in settled_rows
+                if str(row.get("target_video_filename") or "").strip()
+                and str(row.get("target_video_filename") or "").strip() not in before_targets
+                and (videos_dir / str(row.get("target_video_filename") or "").strip()).is_file()
+            ]
+            actual_cost = round(sum(estimate_row_cost(row) for row in newly_generated), 2)
+            if actual_cost <= 0 and generated_by_api > 0:
+                actual_cost = round(generated_by_api * estimated_per_clip, 2)
             ledger.settle(
                 reservation,
-                round(generated_by_api * estimated_per_clip, 2),
+                actual_cost,
                 provider=provider.name,
             )
         else:
@@ -3054,14 +3129,47 @@ class StoryAgent:
     def _has_timing(self, manifest: dict[str, Any]) -> bool:
         timings = first_existing(manifest.get("outputs", {}).get("timings_json"), self.context.paths.assembly / "timings.json")
         if timings is not None:
-            return True
+            try:
+                payload = json.loads(timings.read_text(encoding="utf-8"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                return False
+            # A real alignment JSON is a non-empty list of timing records.  A
+            # malformed/empty placeholder must not unlock the next stage.
+            if isinstance(payload, list):
+                return bool(payload) and all(isinstance(item, dict) for item in payload)
+            if isinstance(payload, dict):
+                for key in ("timings", "segments", "items"):
+                    items = payload.get(key)
+                    if isinstance(items, list) and items:
+                        return all(isinstance(item, dict) for item in items)
+            return False
         jobs = self._jobs_csv(manifest)
         if jobs is None:
             return False
         try:
             with jobs.open(encoding="utf-8-sig", newline="") as file:
                 rows = list(csv.DictReader(file))
-            return bool(rows) and all(row.get("duration") or row.get("frames") for row in rows)
+            if not rows:
+                return False
+            # ``prepare`` intentionally writes duration=10 as a placeholder.
+            # Require actual narration alignment plus the generated request
+            # duration (or an explicit mode for legacy metadata) before timing
+            # is considered complete.
+            required = ("target_duration", "narration_start", "narration_end")
+            for row in rows:
+                if any(not str(row.get(field, "")).strip() for field in required):
+                    return False
+                if not str(row.get("generation_duration", "")).strip() and not str(row.get("duration_mode", "")).strip():
+                    return False
+                try:
+                    target = float(row["target_duration"])
+                    start = float(row["narration_start"])
+                    end = float(row["narration_end"])
+                except (KeyError, TypeError, ValueError):
+                    return False
+                if target <= 0 or start < 0 or end <= start:
+                    return False
+            return True
         except Exception:
             return False
 

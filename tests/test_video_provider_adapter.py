@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import csv
+import contextlib
+import io
 import subprocess
 import sys
 import tempfile
@@ -10,7 +12,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from video_provider_adapter import VideoProviderConfigError, resolve_video_provider
+from video_provider_adapter import VideoProviderConfigError, resolve_row_generation_seconds, resolve_video_provider
 from story_workflow import run_generate_until_complete
 from story_video_synthesizer.toapis_video import (
     DEFAULT_MODEL as TOAPIS_DEFAULT_MODEL,
@@ -22,10 +24,133 @@ from story_video_synthesizer.toapis_video import (
     build_toapis_task_body,
     extract_toapis_video_url,
 )
-from run_image_video_jobs import reset_retryable_failed_row, toapis_extra_body
+from run_image_video_jobs import reset_retryable_failed_row, row_duration_value, row_request_seconds, toapis_extra_body
+import run_image_video_jobs
+from story_video_synthesizer.volcengine_video import CreateTaskResult
 
 
 class VideoProviderAdapterTests(unittest.TestCase):
+    def test_grok_row_seconds_prioritize_generation_duration_and_clamp_integer_range(self) -> None:
+        for row, expected in [
+            ({"generation_duration": "5", "duration": "9"}, "5"),
+            ({"duration": "8.01"}, "9"),
+            ({"duration": "15"}, "15"),
+            ({"duration": "0.2"}, "1"),
+            ({"duration": "99"}, "15"),
+        ]:
+            self.assertEqual(
+                resolve_row_generation_seconds(
+                    row,
+                    model="grok-video-1.5",
+                    fallback_seconds="8",
+                    min_seconds=1,
+                    max_seconds=15,
+                ),
+                expected,
+            )
+
+    def test_legacy_models_keep_global_seconds_fallback(self) -> None:
+        row = {"generation_duration": "5", "duration": "9"}
+        self.assertEqual(
+            resolve_row_generation_seconds(row, model="grok-video-3", fallback_seconds="provider-default"),
+            "provider-default",
+        )
+        self.assertEqual(
+            row_request_seconds(row, model="grok-video-3", is_toapis=True, fallback_seconds="10"),
+            "10",
+        )
+        self.assertEqual(
+            row_request_seconds(row, model="grok-video-1.5", is_toapis=False, fallback_seconds="10"),
+            "10",
+        )
+
+    def test_row_duration_fallback_order_is_generation_then_duration_then_cli(self) -> None:
+        self.assertEqual(row_duration_value({"generation_duration": "5", "duration": "9"}, 10), 5.0)
+        self.assertEqual(row_duration_value({"duration": "9"}, 10), 9.0)
+        self.assertEqual(row_duration_value({}, 10), 10.0)
+
+    def _write_grok_jobs_fixture(self, root: Path) -> tuple[Path, Path, Path]:
+        images = root / "images"
+        videos = root / "videos"
+        images.mkdir()
+        videos.mkdir()
+        for scene in range(1, 4):
+            Image.new("RGB", (320, 180), (scene * 40, 80, 120)).save(images / f"{scene:02d}.png")
+        jobs = root / "jobs.csv"
+        jobs.write_text(
+            "scene,image_filename,story_text,prompt,target_video_filename,generation_duration,duration,status\n"
+            "1,01.png,甲,甲,01.mp4,5,9,todo\n"
+            "2,02.png,乙,乙,02.mp4,,9,todo\n"
+            "3,03.png,丙,丙,03.mp4,15,4,todo\n",
+            encoding="utf-8-sig",
+        )
+        return images, videos, jobs
+
+    def test_grok_dry_run_prints_each_row_seconds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            images, videos, jobs = self._write_grok_jobs_fixture(root)
+            output = io.StringIO()
+            argv = [
+                "run_image_video_jobs.py",
+                "--jobs-csv",
+                str(jobs),
+                "--images-dir",
+                str(images),
+                "--videos-dir",
+                str(videos),
+                "--base-url",
+                "https://toapis.com/v1",
+                "--model",
+                "grok-video-1.5",
+                "--seconds",
+                "8",
+                "--dry-run",
+            ]
+            with patch.object(sys, "argv", argv), contextlib.redirect_stdout(output):
+                run_image_video_jobs.main()
+            rendered = output.getvalue()
+            self.assertEqual(rendered.count('"seconds": "5"'), 1)
+            self.assertEqual(rendered.count('"seconds": "9"'), 1)
+            self.assertEqual(rendered.count('"seconds": "15"'), 1)
+
+    def test_grok_submit_all_first_passes_each_row_seconds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            images, videos, jobs = self._write_grok_jobs_fixture(root)
+            calls: list[str] = []
+
+            class FakeClient:
+                def __init__(self, *, api_key: str, base_url: str) -> None:
+                    del api_key, base_url
+
+                def create_task(self, **kwargs):
+                    calls.append(str(kwargs["seconds"]))
+                    return CreateTaskResult(task_id=f"task-{len(calls)}", raw={"id": f"task-{len(calls)}"})
+
+            argv = [
+                "run_image_video_jobs.py",
+                "--jobs-csv",
+                str(jobs),
+                "--images-dir",
+                str(images),
+                "--videos-dir",
+                str(videos),
+                "--base-url",
+                "https://toapis.com/v1",
+                "--model",
+                "grok-video-1.5",
+                "--api-key",
+                "test-secret",
+                "--seconds",
+                "8",
+                "--submit-all-first",
+                "--submit-only",
+            ]
+            with patch.object(sys, "argv", argv), patch.object(run_image_video_jobs, "ToAPIsVideoClient", FakeClient):
+                run_image_video_jobs.main()
+            self.assertEqual(calls, ["5", "9", "15"])
+
     def test_api_timeout_or_no_progress_stops_without_infinite_loop(self) -> None:
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:

@@ -1,12 +1,60 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from pathlib import Path
 from typing import Any
 
 
 class VideoProviderConfigError(ValueError):
     pass
+
+
+def resolve_row_generation_seconds(
+    row: dict[str, Any],
+    *,
+    model: str,
+    fallback_seconds: str | int | float,
+    min_seconds: float | None = None,
+    max_seconds: float | None = None,
+) -> str:
+    """Resolve a per-row whole-second request for Grok Video 1.5.
+
+    The row's ``generation_duration`` wins over ``duration`` and the CLI/config
+    fallback.  Older providers deliberately keep their historical global
+    ``--seconds`` behavior, so this helper returns the fallback unchanged for
+    non-Grok models.
+    """
+
+    if str(model).strip().lower() != "grok-video-1.5":
+        return str(fallback_seconds)
+    raw = _first_nonempty_row_value(row, "generation_duration", "duration")
+    value = fallback_seconds if raw is None else raw
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Grok Video 1.5 每镜 seconds 不是数字：{value!r}") from exc
+    if not math.isfinite(numeric):
+        raise ValueError(f"Grok Video 1.5 每镜 seconds 不是有限数字：{value!r}")
+    minimum = max(1, math.ceil(float(1 if min_seconds is None else min_seconds)))
+    maximum = math.floor(float(15 if max_seconds is None else max_seconds))
+    if maximum < minimum:
+        raise ValueError(f"Grok Video 1.5 seconds 范围无效：{minimum}–{maximum}")
+    seconds = max(minimum, min(maximum, math.ceil(numeric)))
+    return str(seconds)
+
+
+def _first_nonempty_row_value(row: dict[str, Any], *keys: str) -> Any:
+    """Return the first non-blank CSV value, including numeric zero."""
+
+    for key in keys:
+        value = row.get(key)
+        if value is None:
+            continue
+        if isinstance(value, str) and not value.strip():
+            continue
+        return value
+    return None
 
 
 @dataclass(frozen=True)

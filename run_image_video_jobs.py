@@ -8,6 +8,7 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 from secret_store import read_secret
+from video_provider_adapter import resolve_row_generation_seconds
 
 from story_video_synthesizer.volcengine_video import (
     DEFAULT_BASE_URL,
@@ -104,6 +105,35 @@ def parse_scene_filter(value: str) -> set[int]:
             continue
         scenes.add(int(part))
     return scenes
+
+
+def row_duration_value(row: dict[str, str], fallback: float) -> float:
+    """Read the actual generation duration before falling back to CLI defaults."""
+
+    raw = row.get("generation_duration") or row.get("duration")
+    if raw is None or str(raw).strip() == "":
+        return float(fallback)
+    try:
+        return float(raw)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"镜头 {row.get('scene', '')} 的 generation_duration/duration 不是数字：{raw!r}") from exc
+
+
+def row_request_seconds(row: dict[str, str], *, model: str, is_toapis: bool, fallback_seconds: str) -> str:
+    """Resolve seconds for one task while preserving legacy provider behavior."""
+
+    if not is_toapis:
+        return str(fallback_seconds)
+    return resolve_row_generation_seconds(row, model=model, fallback_seconds=fallback_seconds)
+
+
+def row_extra_body(jobs_csv: Path, row: dict[str, str], extra_body: dict[str, object] | None, *, model: str) -> dict[str, object]:
+    """Build idempotency metadata without letting extra_body override row seconds."""
+
+    payload = toapis_extra_body(jobs_csv, row, extra_body)
+    if str(model).strip().lower() == TOAPIS_DEFAULT_MODEL:
+        payload.pop("seconds", None)
+    return payload
 
 
 def main() -> None:
@@ -225,11 +255,17 @@ def main() -> None:
                 )
                 break
             image_path = args.images_dir.expanduser() / row["image_filename"]
-            duration = float(row.get("duration") or args.duration)
+            duration = row_duration_value(row, args.duration)
             frames = int(row["frames"]) if args.timing_mode == "frames" and row.get("frames", "").strip() else None
+            request_seconds = row_request_seconds(
+                row,
+                model=args.model,
+                is_toapis=is_toapis,
+                fallback_seconds=args.seconds,
+            )
             print(f"批量创建任务 {row['scene']}：{row['image_filename']}", flush=True)
             try:
-                request_extra = toapis_extra_body(args.jobs_csv, row, extra_body) if is_toapis else extra_body
+                request_extra = row_extra_body(args.jobs_csv, row, extra_body, model=args.model) if is_toapis else extra_body
                 created = client.create_task(
                     model=args.model,
                     prompt=row["prompt"],
@@ -238,7 +274,7 @@ def main() -> None:
                     duration=duration,
                     resolution=args.resolution.strip() or None,
                     frames=frames,
-                    seconds=args.seconds,
+                    seconds=request_seconds,
                     size=args.size,
                     parameter_style=args.parameter_style,
                     camera_fixed=args.camerafixed,
@@ -290,18 +326,24 @@ def main() -> None:
             continue
 
         try:
-            duration = float(row.get("duration") or args.duration)
+            duration = row_duration_value(row, args.duration)
             frames = int(row["frames"]) if args.timing_mode == "frames" and row.get("frames", "").strip() else None
+            request_seconds = row_request_seconds(
+                row,
+                model=args.model,
+                is_toapis=is_toapis,
+                fallback_seconds=args.seconds,
+            )
             if args.dry_run:
                 image_path = args.images_dir.expanduser() / row["image_filename"]
                 if is_toapis:
-                    request_extra = toapis_extra_body(args.jobs_csv, row, extra_body)
+                    request_extra = row_extra_body(args.jobs_csv, row, extra_body, model=args.model)
                     body = build_toapis_task_body(
                         model=args.model,
                         prompt=row["prompt"],
                         image_url=f"UPLOAD_REQUIRED:{image_path.name}",
                         ratio=args.ratio,
-                        seconds=args.seconds,
+                        seconds=request_seconds,
                         resolution=args.resolution.strip() or args.size,
                         extra_body=request_extra,
                     )
@@ -314,7 +356,7 @@ def main() -> None:
                         duration=duration,
                         resolution=args.resolution.strip() or None,
                         frames=frames,
-                        seconds=args.seconds,
+                        seconds=request_seconds,
                         size=args.size,
                         parameter_style=args.parameter_style,
                         camera_fixed=args.camerafixed,
@@ -334,7 +376,7 @@ def main() -> None:
                     image_path = args.images_dir.expanduser() / row["image_filename"]
                     print(f"创建任务 {row['scene']}：{row['image_filename']}", flush=True)
                     assert client is not None
-                    request_extra = toapis_extra_body(args.jobs_csv, row, extra_body) if is_toapis else extra_body
+                    request_extra = row_extra_body(args.jobs_csv, row, extra_body, model=args.model) if is_toapis else extra_body
                     created = client.create_task(
                         model=args.model,
                         prompt=row["prompt"],
@@ -343,7 +385,7 @@ def main() -> None:
                         duration=duration,
                         resolution=args.resolution.strip() or None,
                         frames=frames,
-                        seconds=args.seconds,
+                        seconds=request_seconds,
                         size=args.size,
                         parameter_style=args.parameter_style,
                         camera_fixed=args.camerafixed,

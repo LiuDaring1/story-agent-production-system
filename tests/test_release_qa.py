@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from PIL import Image, ImageDraw
 
@@ -15,6 +16,7 @@ from release_video import (
     release_plate_integrity_issues,
     safe_watermark_motion_expressions,
     story_frame_integrity_issues,
+    validate_release_assets,
 )
 from story_project import init_project, project_paths, qa_release, write_manifest
 
@@ -102,6 +104,66 @@ class ReleaseQaTests(unittest.TestCase):
         draw.rectangle((x + width // 2 - 60, y - 30, x + width // 2 + 60, y + 30), fill=(0, 0, 0, 0))
         issues = story_frame_integrity_issues(image, window)
         self.assertTrue(any("contour_gap" in issue for issue in issues))
+
+    def test_story_frame_integrity_accepts_decorative_curved_corners(self) -> None:
+        image = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        window = (210, 270, 910, 512)
+        x, y, width, height = window
+        # A rounded decorative frame is closed, but its corner transition is
+        # not a straight side and must not be reported as a contour gap.
+        draw.rounded_rectangle(
+            (x - 80, y - 80, x + width + 80, y + height + 80),
+            radius=70,
+            outline=(255, 180, 80, 255),
+            width=18,
+        )
+        draw.ellipse(
+            (x + width - 80, y - 80, x + width + 80, y + 80),
+            fill=(255, 180, 80, 255),
+        )
+        draw.line((x + width, y, x + width, y + height), fill=(255, 180, 80, 255), width=4)
+        issues = story_frame_integrity_issues(image, window)
+        self.assertFalse(issues)
+
+    def test_release_asset_validation_prepares_reused_frame_for_b_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            frame_path = Path(directory) / "story_frame_a.png"
+            image = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            a_window = (170, 250, 990, 557)
+            x, y, width, height = a_window
+            draw.rounded_rectangle(
+                (x - 58, y - 58, x + width + 58, y + height + 58),
+                radius=60,
+                fill=(236, 190, 120, 255),
+                outline=(105, 70, 36, 255),
+                width=8,
+            )
+            draw.rounded_rectangle(
+                (x - 6, y - 6, x + width + 6, y + height + 6),
+                radius=28,
+                outline=(255, 244, 210, 255),
+                width=16,
+            )
+            image.save(frame_path)
+            config = SimpleNamespace(
+                plate_image=None,
+                frame_image=frame_path,
+                story_box=a_window,
+                frame_image_b=frame_path,
+                b_story_box=(150, 88, 1620, 911),
+                b_windows=((0.0, 1.0),),
+            )
+            # The raw A frame is not positioned around B, but preview/render
+            # first fits the reused asset to B and should pass this gate.
+            validate_release_assets(config)
+
+            broken_b = Path(directory) / "broken_frame_b.png"
+            Image.new("RGBA", (1920, 1080), (0, 0, 0, 0)).save(broken_b)
+            broken_config = SimpleNamespace(**{**vars(config), "frame_image_b": broken_b})
+            with self.assertRaisesRegex(ValueError, "frame_empty"):
+                validate_release_assets(broken_config)
 
     def test_release_qa_requires_vertical_video_with_aligned_audio(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

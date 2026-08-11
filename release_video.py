@@ -398,6 +398,31 @@ def prepare_story_frame_assets(
     return frame_output, mask_output, (x1, y1, x2 - x1, y2 - y1)
 
 
+def _prepared_story_frame_for_integrity(
+    frame_image: Path,
+    window: tuple[int, int, int, int],
+) -> Image.Image | Path:
+    """Mirror the render-time frame preparation before validating a window.
+
+    A frame can be authored for the A window and reused for B.  Rendering
+    scales/crops it to the wide canvas and fits its alpha bbox around the
+    active window first; validating the raw source against B would therefore
+    reject a frame that renders correctly.  Preserve the original path for
+    non-RGBA/unreadable sources so the normal integrity diagnostics remain in
+    effect.
+    """
+    try:
+        with Image.open(frame_image) as image:
+            if image.mode != "RGBA":
+                return frame_image
+            frame = image.convert("RGBA")
+    except OSError:
+        return frame_image
+    if frame.size != (WIDE_WIDTH, WIDE_HEIGHT):
+        frame = scale_crop_image(frame, WIDE_WIDTH, WIDE_HEIGHT)
+    return fit_frame_to_window(frame, window)
+
+
 def fit_frame_to_window(frame: Image.Image, window: tuple[int, int, int, int]) -> Image.Image:
     frame = frame.convert("RGBA")
     bbox = frame.getchannel("A").getbbox()
@@ -1256,14 +1281,21 @@ def story_frame_integrity_issues(
             gap_limit = max(corner_probe_radius * 2, baseline_distance + corner_probe_radius)
             gap_run = 0
             has_gap = False
-            for distance in coordinate_distances:
-                if distance > gap_limit:
-                    gap_run += 1
-                    if gap_run >= max(4, len(coordinate_distances) // 20):
-                        has_gap = True
-                        break
-                else:
-                    gap_run = 0
+            # The first and last segments include the curved transition into
+            # a corner.  Their distance profile is intentionally not a
+            # straight side, so a legitimate decorative curve can look like
+            # an open run to the straight-side probe.  Corner probes above and
+            # the overall side visibility check still validate those regions;
+            # reserve gap-run detection for interior (straight-side) segments.
+            if segment_index not in {0, segment_count - 1}:
+                for distance in coordinate_distances:
+                    if distance > gap_limit:
+                        gap_run += 1
+                        if gap_run >= max(4, len(coordinate_distances) // 20):
+                            has_gap = True
+                            break
+                    else:
+                        gap_run = 0
             if segment_visible / max(1, segment_width * segment_height) < 0.001 or has_gap:
                 issues.append(f"frame_contour_gap:{label}:{segment_index}: A镜框闭合轮廓存在缺口")
                 if not any(item.startswith("frame_contour_open:") for item in issues):
@@ -1291,8 +1323,14 @@ def validate_release_assets(config: ReleaseConfig, *, frame_image: Path | None =
     candidate_frame = frame_image or config.frame_image
     if candidate_frame is not None:
         issues.extend(story_frame_integrity_issues(candidate_frame, config.story_box))
-    if config.frame_image_b is not None and config.b_windows:
-        issues.extend(story_frame_integrity_issues(config.frame_image_b, config.b_story_box))
+    if config.b_windows:
+        # B scenes use the explicitly supplied B frame, or the same prepared
+        # A frame when no separate asset is provided.  Validate that exact
+        # render-time preparation rather than the raw A-window coordinates.
+        b_frame_source = config.frame_image_b or candidate_frame
+        if b_frame_source is not None:
+            b_frame = _prepared_story_frame_for_integrity(b_frame_source, config.b_story_box)
+            issues.extend(story_frame_integrity_issues(b_frame, config.b_story_box))
     if issues:
         raise ValueError("发布素材未通过机器完整性检查，已阻止全片渲染：\n" + "\n".join(f"- {issue}" for issue in issues))
 

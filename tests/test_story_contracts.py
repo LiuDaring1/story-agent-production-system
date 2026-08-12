@@ -18,13 +18,21 @@ from story_contracts import (
     load_contract_schema,
     load_story_contract,
     resolve_rule_candidates,
+    schema_validator_parity_issues,
     validate_story_contract,
     validate_story_contract_or_raise,
 )
 
 
 def provenance(source: str = "agent_inference", ref: str = "automatic analysis", order: int = 0) -> dict:
-    return {"source": source, "source_ref": ref, "source_order": order}
+    value = {"source": source, "source_ref": ref, "source_order": order}
+    if source != "agent_inference":
+        value["source_sha256"] = "a" * 64
+        if source == "task_input":
+            value["evidence_quote"] = ref
+        else:
+            value["evidence_pointer"] = "/fixture"
+    return value
 
 
 def valid_contract(*, with_characters: bool = True) -> dict:
@@ -236,6 +244,17 @@ class StoryContractTests(unittest.TestCase):
         for section in ContractSection:
             schema = load_contract_schema(section)
             self.assertEqual(schema["type"], "object")
+
+    def test_json_schema_and_python_validator_contract_are_in_parity(self) -> None:
+        self.assertEqual(schema_validator_parity_issues(), [])
+
+    def test_high_priority_source_requires_hash_bound_evidence(self) -> None:
+        contract = valid_contract()
+        provenance_value = contract["contracts"]["characters"]["characters"][0]["provenance"]
+        provenance_value.pop("source_sha256")
+        provenance_value.pop("evidence_quote")
+        codes = {issue.code for issue in validate_story_contract(contract)}
+        self.assertIn("trusted_source", codes)
 
     def test_valid_contract_passes_and_hash_is_stable(self) -> None:
         contract = valid_contract()

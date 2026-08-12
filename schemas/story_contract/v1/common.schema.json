@@ -11,9 +11,27 @@
           "enum": ["task_input", "project_config", "brand_or_global_default", "agent_inference"]
         },
         "source_ref": {"type": "string", "minLength": 1},
+        "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "evidence_quote": {"type": "string", "minLength": 1},
+        "evidence_pointer": {"type": "string", "pattern": "^/"},
         "source_order": {"type": "integer", "minimum": 0},
         "confidence": {"type": "number", "minimum": 0, "maximum": 1}
-      }
+      },
+      "allOf": [
+        {
+          "if": {"properties": {"source": {"const": "task_input"}}, "required": ["source"]},
+          "then": {"required": ["source_sha256", "evidence_quote"]}
+        },
+        {
+          "if": {
+            "properties": {
+              "source": {"enum": ["project_config", "brand_or_global_default"]}
+            },
+            "required": ["source"]
+          },
+          "then": {"required": ["source_sha256", "evidence_pointer"]}
+        }
+      ]
     },
     "rule": {
       "type": "object",

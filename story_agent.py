@@ -18,6 +18,17 @@ from typing import Any, Callable
 from PIL import Image, ImageDraw
 from video_provider_adapter import resolve_row_generation_seconds, resolve_video_provider
 from story_video_synthesizer.image_video import validate_image_video_jobs
+from story_contract_runtime import (
+    CONTRACT_POLICY_LEGACY,
+    build_trusted_input_chain,
+    contract_lock_is_current,
+    contract_paths,
+    contract_review_artifacts,
+    contract_review_payload_issues,
+    contract_runtime_issues,
+    write_contract_lock,
+    write_trusted_input_chain,
+)
 
 from story_codex_tasks import (
     build_children_story_handoff,
@@ -93,6 +104,7 @@ AGENT_STATE_NAME = "story_agent_state.json"
 # process.  Keep production/imagegen/browser/Suno stages out of this set.
 NATIVE_VISION_REVIEW_STAGES = frozenset(
     {
+        "story_contract_review",
         "story_images_review",
         "video_prompt_review",
         "video_review",
@@ -165,6 +177,7 @@ class AgentContext:
         """Return the fixed two-role route: commander for judgment, worker otherwise."""
         commander_stages = {
             "source_edit_review",
+            "story_contract_review",
             "story_images_review",
             "video_prompt_review",
             "video_review",
@@ -904,6 +917,8 @@ class StoryAgent:
             ("source_text_correction", self._has_source_text_correction, self._stage_source_text_correction),
             ("source_edit_review", self._has_source_edit_review, self._stage_source_edit_review),
             ("setup_project", self._has_setup_project, self._stage_setup_project),
+            ("story_contract", self._has_story_contract, self._stage_story_contract),
+            ("story_contract_review", self._has_story_contract_review, self._stage_story_contract_review),
             ("codex_story_images", self._has_story_images, self._stage_codex_story_images),
             ("story_images_review", self._has_story_images_review, self._stage_story_images_review),
             ("prepare_jobs", self._has_jobs_csv, self._stage_prepare_jobs),
@@ -1019,6 +1034,109 @@ class StoryAgent:
 
                 write_manifest(self.context.paths, current)
         return result
+
+    def _stage_story_contract(self, manifest: dict[str, Any]) -> StageResult:
+        if self._legacy_contract_policy(manifest):
+            return StageResult("done", "V3 冻结项目采用 legacy_passthrough，不补写或重做合同。")
+        paths = contract_paths(self.context.project_dir)
+        paths["directory"].mkdir(parents=True, exist_ok=True)
+        # A regeneration attempt immediately revokes any prior approval lock.
+        # If the worker crashes or emits an invalid draft, stale approval must
+        # not remain visually or mechanically plausible.
+        paths["lock"].unlink(missing_ok=True)
+        trusted = build_trusted_input_chain(self.context.project_dir, manifest, load_config())
+        write_trusted_input_chain(paths["trusted_inputs"], trusted)
+        story_text = Path(str(manifest.get("inputs", {}).get("story_text") or ""))
+        if not story_text.is_file():
+            return StageResult("blocked", "缺少可信故事文本，无法生成 Story Production Contract。")
+        paths["handoff"].write_text(
+            "\n".join(
+                [
+                    "# Story Production Contract 生成任务",
+                    "",
+                    f"- 故事文本：`{story_text}`",
+                    f"- Runtime 可信来源链：`{paths['trusted_inputs']}`",
+                    f"- 根 Schema：`{ROOT / 'schemas/story_contract/v1/story_production_contract.schema.json'}`",
+                    f"- 输出 JSON：`{paths['contract']}`",
+                    f"- 输出说明：`{paths['summary']}`",
+                    "",
+                    "必须按故事实际需要决定预览资产；无角色不得生成角色卡，无可靠尺度依据不得编造数值比例。",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        prompt = "\n".join(
+            [
+                "以执行工人身份，为这个新故事生成通用 Story Production Contract 草案。",
+                f"完整读取 handoff：`{paths['handoff']}`。",
+                "严格遵守根 Schema 及其七个 section Schema；不要修改 Schema 或生产代码。",
+                "规则冲突自动采用 task_input > project_config > brand_or_global_default > agent_inference。",
+                "可信高优先级来源只能使用 Runtime 可信来源链中已有的 source/source_ref/sha256：",
+                "task_input 必须附逐字存在的 evidence_quote；配置/品牌默认必须附可解析的 evidence_pointer。",
+                "你自己的分析、视觉补全和推断一律标记 agent_inference；禁止伪装成高优先级来源。",
+                "角色卡、尺度锚点、风格锚点、布局预览按故事实际需要条件生成；无需预览的类型不要创建占位。",
+                "尺度优先 qualitative_relation；只有可信依据或机器布局需要时才写宽容数值区间及 numeric_basis。",
+                "如实际生成预览文件，写入项目 99_项目状态/contracts/previews 下，并在合同记录项目相对 path 和真实 SHA-256。",
+                f"写入 `{paths['contract']}` 和便于人读的 `{paths['summary']}`。不要写合同锁，锁只能由 Runtime 在独立审核通过后生成。",
+            ]
+        )
+        result = self._codex_task(
+            stage="story_contract",
+            label="Story Production Contract 草案生成",
+            handoff=paths["handoff"],
+            prompt=prompt,
+        )
+        if result.status != "done":
+            return result
+        if not self.context.execute:
+            return result
+        if not paths["contract"].is_file() or not paths["summary"].is_file():
+            return StageResult("blocked", "合同生成任务未写入 JSON 与说明文档。", paths["handoff"])
+        issues = contract_runtime_issues(self.context.project_dir)
+        if issues:
+            return StageResult("blocked", "合同机器校验或可信来源校验失败：" + "；".join(issues[:12]), paths["contract"])
+        return StageResult("done", "合同草案通过 Schema、Python Validator 与可信来源链校验。", paths["contract"])
+
+    def _stage_story_contract_review(self, manifest: dict[str, Any]) -> StageResult:
+        if self._legacy_contract_policy(manifest):
+            return StageResult("done", "V3 冻结项目采用 legacy_passthrough，不新增合同审核。")
+        paths = contract_paths(self.context.project_dir)
+        issues = contract_runtime_issues(self.context.project_dir)
+        if issues:
+            paths["lock"].unlink(missing_ok=True)
+            return StageResult("blocked", "独立审核前合同校验失败：" + "；".join(issues[:12]), paths["contract"])
+        try:
+            artifacts, images = contract_review_artifacts(self.context.project_dir)
+        except Exception as exc:
+            return StageResult("blocked", f"无法构建合同审核证据：{exc}", paths["contract"])
+        if not paths["summary"].is_file():
+            return StageResult("blocked", "合同缺少人类可读说明，不能独立审核。", paths["contract"])
+        bundle = write_review_bundle(paths["bundle"], artifacts)
+        result, payload = self._structured_review(
+            stage="story_contract_review",
+            label="Story Production Contract 独立审核",
+            bundle=bundle,
+            images=images,
+            rubric=(
+                "逐项审核七类合同是否忠于可信输入、是否把推断错误伪装成高优先级来源、语义/角色/状态/尺度/品牌/布局是否互相一致；"
+                "预览资产必须按故事实际需要条件存在，不得为了模板造角色或假精度。"
+                "必须提供 evidence_matrix，逐节引用合同 JSON 路径、可信来源记录及必要预览文件。"
+            ),
+        )
+        if result.status != "done" or payload is None:
+            paths["lock"].unlink(missing_ok=True)
+            return result
+        review_issues = contract_review_payload_issues(payload)
+        if review_issues:
+            paths["lock"].unlink(missing_ok=True)
+            return StageResult(
+                "blocked",
+                "合同独立审核缺少可验证的逐节证据：" + "；".join(review_issues),
+                paths["review"],
+            )
+        lock = write_contract_lock(self.context.project_dir, bundle=bundle, review=paths["review"])
+        return StageResult("done", f"合同独立审核通过并由 Runtime 确定性锁定：{payload.get('score')} 分", lock)
 
     def _stage_source_edit(self, manifest: dict[str, Any]) -> StageResult:
         contract = manifest.get("agent", {}).get("input_contract", {})
@@ -3186,6 +3304,42 @@ class StoryAgent:
     def _has_setup_project(self, manifest: dict[str, Any]) -> bool:
         inputs = manifest.get("inputs", {})
         return self.context.paths.manifest.exists() and bool(inputs.get("story_text")) and bool(inputs.get("narration") or inputs.get("extracted_narration"))
+
+    def _legacy_contract_policy(self, manifest: dict[str, Any]) -> bool:
+        return (
+            manifest.get("agent", {}).get("story_contract", {}).get("policy")
+            == CONTRACT_POLICY_LEGACY
+        )
+
+    def _has_story_contract(self, manifest: dict[str, Any]) -> bool:
+        if self._legacy_contract_policy(manifest):
+            return True
+        paths = contract_paths(self.context.project_dir)
+        return paths["summary"].is_file() and not contract_runtime_issues(self.context.project_dir)
+
+    def _has_story_contract_review(self, manifest: dict[str, Any]) -> bool:
+        if self._legacy_contract_policy(manifest):
+            return True
+        paths = contract_paths(self.context.project_dir)
+        if contract_runtime_issues(self.context.project_dir):
+            return False
+        if not paths["bundle"].is_file() or not paths["review"].is_file():
+            return False
+        if not review_bundle_is_current(paths["bundle"]):
+            return False
+        try:
+            payload = json.loads(paths["review"].read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return (
+            review_passes(payload, artifact=paths["bundle"])
+            and not contract_review_payload_issues(payload)
+            and contract_lock_is_current(
+                self.context.project_dir,
+                bundle=paths["bundle"],
+                review=paths["review"],
+            )
+        )
 
     def _has_story_images(self, manifest: dict[str, Any]) -> bool:
         image_dir = self._image_dir()

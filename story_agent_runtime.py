@@ -18,6 +18,7 @@ from typing import Any, Iterator
 
 from story_project import init_project, load_manifest, project_paths, save_json, slugify, write_internal_agent_reports, write_manifest
 from story_semantics import StoryOutput, classify_story, lines_for_output
+from story_contract_runtime import CONTRACT_POLICY_LEGACY, CONTRACT_POLICY_REQUIRED
 
 
 MANIFEST_VERSION = 2
@@ -33,6 +34,8 @@ STORY_STAGE_SEQUENCE = (
     "source_text_correction",
     "source_edit_review",
     "setup_project",
+    "story_contract",
+    "story_contract_review",
     "codex_story_images",
     "story_images_review",
     "prepare_jobs",
@@ -68,6 +71,8 @@ STAGE_ESTIMATES_MINUTES = {
     "source_text_correction": 8,
     "source_edit_review": 8,
     "setup_project": 2,
+    "story_contract": 15,
+    "story_contract_review": 10,
     "codex_story_images": 45,
     "story_images_review": 12,
     "prepare_jobs": 2,
@@ -106,7 +111,9 @@ STORY_STAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "source_text_correction": ("source_edit",),
     "source_edit_review": ("source_text_correction",),
     "setup_project": ("source_edit_review",),
-    "codex_story_images": ("setup_project",),
+    "story_contract": ("setup_project",),
+    "story_contract_review": ("story_contract",),
+    "codex_story_images": ("story_contract_review",),
     "story_images_review": ("codex_story_images",),
     "prepare_jobs": ("story_images_review",),
     "timing": ("prepare_jobs",),
@@ -115,12 +122,12 @@ STORY_STAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "video_qa": ("generate_videos",),
     "video_review": ("video_qa",),
     "apply_review": ("video_review",),
-    "music_request": ("setup_project",),
+    "music_request": ("story_contract_review",),
     "suno_generate": ("music_request",),
     "assemble_music": ("suno_generate",),
     "music_qa": ("assemble_music",),
     "assemble_final": ("apply_review", "music_qa"),
-    "release_assets": ("setup_project",),
+    "release_assets": ("story_contract_review",),
     "release_preview": ("assemble_final", "release_assets"),
     "package_release": ("release_preview",),
     "release_qa": ("package_release",),
@@ -138,6 +145,7 @@ STORY_STAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
 
 STAGE_BRANCHES = {
     **{name: "source" for name in ("import_inbox", "source_edit", "source_text_correction", "source_edit_review", "setup_project")},
+    **{name: "contract" for name in ("story_contract", "story_contract_review")},
     **{name: "visual" for name in ("codex_story_images", "story_images_review", "prepare_jobs", "timing", "video_prompt_review", "generate_videos", "video_qa", "video_review", "apply_review")},
     **{name: "music" for name in ("music_request", "suno_generate", "assemble_music", "music_qa")},
     "assemble_final": "assembly",
@@ -158,6 +166,8 @@ STAGE_WRITE_SETS = {
     "source_text_correction": ("inputs", "status/source_edit"),
     "source_edit_review": ("status/source_edit",),
     "setup_project": ("inputs", "release/person_reference"),
+    "story_contract": ("status/contracts",),
+    "story_contract_review": ("status/contracts", "status/reviews/story_contract"),
     "codex_story_images": ("images", "status/story_image_progress"),
     "story_images_review": ("status/reviews/story_images",),
     "prepare_jobs": ("video_jobs/jobs",),
@@ -189,6 +199,8 @@ STAGE_WRITE_SETS = {
 }
 
 STAGE_RESOURCES = {
+    "story_contract": ("codex_exec", "imagegen"),
+    "story_contract_review": ("codex_exec",),
     "codex_story_images": ("codex_exec", "imagegen"),
     "story_images_review": ("codex_exec",),
     "video_prompt_review": ("codex_exec",),
@@ -356,6 +368,13 @@ def ensure_manifest_v2(
     budget.setdefault("entries", [])
     agent.setdefault("source", {})
     agent.setdefault("input_contract", {})
+    contract_runtime = agent.setdefault("story_contract", {})
+    # A manifest without an explicit policy may have been created by any V3
+    # entry point before contracts existed.  Treat it as legacy here.  The
+    # normal V3.5 submit path opts newly-created jobs into the required policy
+    # explicitly below, so merely loading/migrating an old manifest can never
+    # silently insert new blocking stages.
+    contract_runtime.setdefault("policy", CONTRACT_POLICY_LEGACY)
     agent.setdefault("external_blockers", [])
     agent.setdefault("branch_blockers", {})
     scheduler = agent.setdefault("scheduler", {})
@@ -1298,6 +1317,10 @@ def submit_video_job(
         hard_budget_cny=hard_budget_cny,
         deadline_hours=deadline_hours,
     )
+    # This manifest is being created by the V3.5 submit path, so it is safe to
+    # opt it into contract-first production.  Existing registry jobs return
+    # above and retain their frozen legacy policy.
+    manifest["agent"]["story_contract"]["policy"] = CONTRACT_POLICY_REQUIRED
     manifest["inputs"]["greenscreen_video"] = str(target)
     if normalized_mode == "prepared":
         assert confirmed_target is not None and story_text_target is not None and consumer_target is not None

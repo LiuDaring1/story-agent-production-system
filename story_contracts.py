@@ -362,6 +362,180 @@ def _validate_provenance(value: object, path: str, issues: list[ContractIssue]) 
     source_order = value.get("source_order", 0)
     if isinstance(source_order, bool) or not isinstance(source_order, int) or source_order < 0:
         issues.append(ContractIssue(path + ".source_order", "type", "must be a non-negative integer"))
+    source_hash = value.get("source_sha256")
+    if source != RuleSource.AGENT_INFERENCE.value:
+        if not isinstance(source_hash, str) or not _is_sha256(source_hash):
+            issues.append(
+                ContractIssue(path + ".source_sha256", "trusted_source", "non-inferred provenance requires a source SHA-256")
+            )
+    if source == RuleSource.TASK_INPUT.value:
+        quote = value.get("evidence_quote")
+        if not isinstance(quote, str) or not quote.strip():
+            issues.append(
+                ContractIssue(path + ".evidence_quote", "trusted_source", "task_input provenance requires an exact evidence quote")
+            )
+    if source in {RuleSource.PROJECT_CONFIG.value, RuleSource.BRAND_OR_GLOBAL_DEFAULT.value}:
+        pointer = value.get("evidence_pointer")
+        if not isinstance(pointer, str) or not pointer.startswith("/"):
+            issues.append(
+                ContractIssue(path + ".evidence_pointer", "trusted_source", "configuration provenance requires a JSON pointer")
+            )
+
+
+def schema_validator_parity_issues() -> list[ContractIssue]:
+    """Detect drift between static JSON Schemas and the package-free validator.
+
+    This deliberately checks the shared enums, required section set and trusted
+    provenance conditions that are also enforced above.  It adds no production
+    dependency on a JSON Schema implementation.
+    """
+
+    issues: list[ContractIssue] = []
+    root = load_contract_schema()
+    common = json.loads((SCHEMA_ROOT / "common.schema.json").read_text(encoding="utf-8"))
+    schema_version = root.get("properties", {}).get("schema_version", {}).get("const")
+    if schema_version != STORY_CONTRACT_SCHEMA_VERSION:
+        issues.append(ContractIssue("schema.root.schema_version", "parity", "schema version differs from validator"))
+    required_sections = tuple(root.get("properties", {}).get("contracts", {}).get("required", []))
+    if set(required_sections) != set(REQUIRED_CONTRACT_SECTIONS):
+        issues.append(ContractIssue("schema.root.contracts.required", "parity", "required sections differ from validator"))
+    preview_enum = set(
+        root.get("properties", {}).get("preview_assets", {}).get("items", {}).get("properties", {}).get("kind", {}).get("enum", [])
+    )
+    if preview_enum != set(PREVIEW_KINDS):
+        issues.append(ContractIssue("schema.root.preview_assets.kind", "parity", "preview kinds differ from validator"))
+    provenance = common.get("$defs", {}).get("provenance", {})
+    source_enum = set(provenance.get("properties", {}).get("source", {}).get("enum", []))
+    if source_enum != {source.value for source in RuleSource}:
+        issues.append(ContractIssue("schema.common.provenance.source", "parity", "rule sources differ from validator"))
+    property_names = set(provenance.get("properties", {}))
+    expected_evidence = {"source_sha256", "evidence_quote", "evidence_pointer"}
+    if not expected_evidence.issubset(property_names):
+        issues.append(ContractIssue("schema.common.provenance", "parity", "trusted evidence fields are missing"))
+    serialized = json.dumps(provenance.get("allOf", []), ensure_ascii=False, sort_keys=True)
+    for required_name in expected_evidence:
+        if required_name not in serialized:
+            issues.append(ContractIssue("schema.common.provenance.allOf", "parity", f"{required_name} is not conditionally required"))
+    for section in ContractSection:
+        schema = load_contract_schema(section)
+        qualitative = schema.get("$defs", {}).get("scaleRelationship", {}).get("properties", {}).get("qualitative_relation", {}).get("enum")
+        if qualitative is not None and set(qualitative) != set(QUALITATIVE_SCALE_RELATIONS):
+            issues.append(ContractIssue(f"schema.{section.value}.qualitative_relation", "parity", "scale relations differ from validator"))
+    return issues
+
+
+def validate_trusted_provenance(
+    contract: Mapping[str, Any], trusted_chain: Mapping[str, Any]
+) -> list[ContractIssue]:
+    """Verify every elevated provenance claim against Runtime-owned evidence.
+
+    The generator may freely use ``agent_inference``.  It cannot mint a
+    task/config/default source: those claims must bind to an immutable source
+    receipt emitted by Runtime before generation.
+    """
+
+    issues: list[ContractIssue] = []
+    sources_value = trusted_chain.get("sources")
+    if not isinstance(sources_value, list):
+        return [ContractIssue("$.trusted_chain.sources", "trusted_chain", "sources must be an array")]
+    sources: dict[tuple[str, str], Mapping[str, Any]] = {}
+    for index, item in enumerate(sources_value):
+        path = f"$.trusted_chain.sources[{index}]"
+        if not isinstance(item, Mapping):
+            issues.append(ContractIssue(path, "trusted_chain", "source receipt must be an object"))
+            continue
+        source = str(item.get("source") or "")
+        source_ref = str(item.get("source_ref") or "")
+        if source not in {value.value for value in RuleSource if value is not RuleSource.AGENT_INFERENCE}:
+            issues.append(ContractIssue(path + ".source", "trusted_chain", "invalid elevated source"))
+            continue
+        if not source_ref or not _is_sha256(str(item.get("sha256") or "")):
+            issues.append(ContractIssue(path, "trusted_chain", "receipt requires source_ref and SHA-256"))
+            continue
+        key = (source, source_ref)
+        if key in sources:
+            issues.append(ContractIssue(path, "trusted_chain", "duplicate source receipt"))
+        sources[key] = item
+
+    for path, provenance in _walk_provenance(contract):
+        source = str(provenance.get("source") or "")
+        if source == RuleSource.AGENT_INFERENCE.value:
+            continue
+        key = (source, str(provenance.get("source_ref") or ""))
+        receipt = sources.get(key)
+        if receipt is None:
+            issues.append(ContractIssue(path, "untrusted_provenance", "source_ref is not in Runtime trusted chain"))
+            continue
+        if provenance.get("source_sha256") != receipt.get("sha256"):
+            issues.append(ContractIssue(path + ".source_sha256", "untrusted_provenance", "source hash does not match receipt"))
+            continue
+        if source == RuleSource.TASK_INPUT.value:
+            quote = str(provenance.get("evidence_quote") or "")
+            text = str(receipt.get("text") or "")
+            if not quote or quote not in text:
+                issues.append(ContractIssue(path + ".evidence_quote", "untrusted_provenance", "quote is absent from trusted task input"))
+        else:
+            pointer = str(provenance.get("evidence_pointer") or "")
+            try:
+                _resolve_json_pointer(receipt.get("json"), pointer)
+            except (KeyError, IndexError, TypeError, ValueError):
+                issues.append(ContractIssue(path + ".evidence_pointer", "untrusted_provenance", "pointer is absent from trusted configuration"))
+    return issues
+
+
+def _walk_provenance(value: Any, path: str = "$") -> Iterable[tuple[str, Mapping[str, Any]]]:
+    if isinstance(value, Mapping):
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if key in {"provenance", "mode_provenance"} and isinstance(child, Mapping):
+                yield child_path, child
+            yield from _walk_provenance(child, child_path)
+    elif isinstance(value, list):
+        for index, child in enumerate(value):
+            yield from _walk_provenance(child, f"{path}[{index}]")
+
+
+def _resolve_json_pointer(value: Any, pointer: str) -> Any:
+    if not pointer.startswith("/"):
+        raise ValueError("not a JSON pointer")
+    current = value
+    for raw in pointer[1:].split("/"):
+        token = raw.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, Mapping):
+            current = current[token]
+        elif isinstance(current, list):
+            current = current[int(token)]
+        else:
+            raise TypeError("pointer crosses scalar")
+    return current
+
+
+def validate_preview_asset_files(contract: Mapping[str, Any], project_root: Path | str) -> list[ContractIssue]:
+    """Hash-check only previews that the story contract chose to generate."""
+
+    issues: list[ContractIssue] = []
+    root = Path(project_root).resolve()
+    previews = contract.get("preview_assets", [])
+    if not isinstance(previews, list):
+        return issues
+    for index, preview in enumerate(previews):
+        if not isinstance(preview, Mapping) or not preview.get("path"):
+            continue
+        relative = Path(str(preview["path"]))
+        target = (root / relative).resolve()
+        path = f"$.preview_assets[{index}].path"
+        try:
+            target.relative_to(root)
+        except ValueError:
+            issues.append(ContractIssue(path, "portable_path", "preview escapes project root"))
+            continue
+        if not target.is_file():
+            issues.append(ContractIssue(path, "missing_preview", "declared preview file does not exist"))
+            continue
+        digest = hashlib.sha256(target.read_bytes()).hexdigest()
+        if digest != preview.get("sha256"):
+            issues.append(ContractIssue(path, "preview_sha256", "preview hash does not match file"))
+    return issues
 
 
 def _validate_rules(value: object, path: str, issues: list[ContractIssue]) -> None:
@@ -792,6 +966,9 @@ __all__ = [
     "load_story_contract",
     "resolve_rule_candidates",
     "source_priority",
+    "schema_validator_parity_issues",
+    "validate_preview_asset_files",
+    "validate_trusted_provenance",
     "validate_story_contract",
     "validate_story_contract_or_raise",
 ]

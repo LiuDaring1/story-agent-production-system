@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "characters.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["rules", "mode", "mode_provenance", "characters"],
+  "properties": {
+    "rules": {"$ref": "common.schema.json#/$defs/rules"},
+    "mode": {"enum": ["present", "none"]},
+    "mode_provenance": {"$ref": "common.schema.json#/$defs/provenance"},
+    "no_character_reason": {"type": "string", "minLength": 1},
+    "characters": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["character_id", "role", "identity_anchors", "required_features", "forbidden_features", "provenance"],
+        "properties": {
+          "character_id": {"type": "string", "minLength": 1},
+          "display_name": {"type": "string", "minLength": 1},
+          "role": {"type": "string", "minLength": 1},
+          "species_or_form": {"type": "string", "minLength": 1},
+          "identity_anchors": {"$ref": "common.schema.json#/$defs/stringList"},
+          "required_features": {"$ref": "common.schema.json#/$defs/stringList"},
+          "forbidden_features": {"$ref": "common.schema.json#/$defs/stringList"},
+          "appearance_variants": {"$ref": "common.schema.json#/$defs/stringList"},
+          "provenance": {"$ref": "common.schema.json#/$defs/provenance"}
+        }
+      }
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"mode": {"const": "none"}}},
+      "then": {"properties": {"characters": {"maxItems": 0}}, "required": ["no_character_reason"]},
+      "else": {"properties": {"characters": {"minItems": 1}}}
+    }
+  ]
+}

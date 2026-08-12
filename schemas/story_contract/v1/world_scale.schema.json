@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "world_scale.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["rules", "relationships"],
+  "properties": {
+    "rules": {"$ref": "common.schema.json#/$defs/rules"},
+    "relationships": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["relationship_id", "subject", "reference", "qualitative_relation", "provenance"],
+        "properties": {
+          "relationship_id": {"type": "string", "minLength": 1},
+          "subject": {"type": "string", "minLength": 1},
+          "reference": {"type": "string", "minLength": 1},
+          "qualitative_relation": {
+            "enum": ["much_smaller", "slightly_smaller", "similar", "slightly_larger", "much_larger", "environment_reference"]
+          },
+          "visual_guidance": {"type": "string", "minLength": 1},
+          "numeric_range": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["min_ratio", "target_ratio", "max_ratio", "basis"],
+            "properties": {
+              "min_ratio": {"type": "number", "exclusiveMinimum": 0},
+              "target_ratio": {"type": "number", "exclusiveMinimum": 0},
+              "max_ratio": {"type": "number", "exclusiveMinimum": 0},
+              "basis": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["kind", "evidence"],
+                "properties": {
+                  "kind": {"enum": ["story_explicit", "project_config", "brand_default", "visual_derivation", "machine_qa"]},
+                  "evidence": {"type": "string", "minLength": 1}
+                }
+              }
+            }
+          },
+          "provenance": {"$ref": "common.schema.json#/$defs/provenance"}
+        }
+      }
+    }
+  }
+}

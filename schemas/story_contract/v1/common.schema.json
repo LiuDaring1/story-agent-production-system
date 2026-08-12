@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "common.schema.json",
+  "$defs": {
+    "provenance": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source", "source_ref"],
+      "properties": {
+        "source": {
+          "enum": ["task_input", "project_config", "brand_or_global_default", "agent_inference"]
+        },
+        "source_ref": {"type": "string", "minLength": 1},
+        "source_order": {"type": "integer", "minimum": 0},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "rule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["rule_id", "value", "provenance"],
+      "properties": {
+        "rule_id": {"type": "string", "minLength": 1},
+        "value": true,
+        "provenance": {"$ref": "#/$defs/provenance"}
+      }
+    },
+    "rules": {
+      "type": "array",
+      "items": {"$ref": "#/$defs/rule"}
+    },
+    "stringList": {
+      "type": "array",
+      "items": {"type": "string", "minLength": 1},
+      "uniqueItems": true
+    },
+    "normalizedRegion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["region_id", "x", "y", "width", "height", "provenance"],
+      "properties": {
+        "region_id": {"type": "string", "minLength": 1},
+        "role": {"type": "string", "minLength": 1},
+        "x": {"type": "number", "minimum": 0, "maximum": 1},
+        "y": {"type": "number", "minimum": 0, "maximum": 1},
+        "width": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "height": {"type": "number", "exclusiveMinimum": 0, "maximum": 1},
+        "provenance": {"$ref": "#/$defs/provenance"}
+      }
+    }
+  }
+}

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "release_layout.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["rules", "variants"],
+  "properties": {
+    "rules": {"$ref": "common.schema.json#/$defs/rules"},
+    "variants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["variant_id", "aspect_ratio", "regions", "provenance"],
+        "properties": {
+          "variant_id": {"type": "string", "minLength": 1},
+          "aspect_ratio": {"type": "string", "pattern": "^[1-9][0-9]*:[1-9][0-9]*$"},
+          "regions": {
+            "type": "array",
+            "items": {"$ref": "common.schema.json#/$defs/normalizedRegion"}
+          },
+          "provenance": {"$ref": "common.schema.json#/$defs/provenance"}
+        }
+      }
+    }
+  }
+}

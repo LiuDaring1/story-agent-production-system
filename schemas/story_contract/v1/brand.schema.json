@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "brand.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["rules", "assets"],
+  "properties": {
+    "rules": {"$ref": "common.schema.json#/$defs/rules"},
+    "assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["asset_id", "sha256", "allowed_uses", "max_per_frame", "provenance"],
+        "properties": {
+          "asset_id": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "allowed_uses": {"$ref": "common.schema.json#/$defs/stringList"},
+          "max_per_frame": {"type": "integer", "minimum": 0},
+          "provenance": {"$ref": "common.schema.json#/$defs/provenance"}
+        }
+      }
+    }
+  }
+}

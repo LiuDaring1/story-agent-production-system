@@ -1,0 +1,55 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "story_state.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["rules", "machines"],
+  "properties": {
+    "rules": {"$ref": "common.schema.json#/$defs/rules"},
+    "machines": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["machine_id", "entity_ref", "initial_state", "states", "transitions", "provenance"],
+        "properties": {
+          "machine_id": {"type": "string", "minLength": 1},
+          "entity_ref": {"type": "string", "minLength": 1},
+          "initial_state": {"type": "string", "minLength": 1},
+          "states": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["state_id", "required", "forbidden", "provenance"],
+              "properties": {
+                "state_id": {"type": "string", "minLength": 1},
+                "description": {"type": "string", "minLength": 1},
+                "required": {"$ref": "common.schema.json#/$defs/stringList"},
+                "forbidden": {"$ref": "common.schema.json#/$defs/stringList"},
+                "provenance": {"$ref": "common.schema.json#/$defs/provenance"}
+              }
+            }
+          },
+          "transitions": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["from", "to", "trigger", "provenance"],
+              "properties": {
+                "from": {"type": "string", "minLength": 1},
+                "to": {"type": "string", "minLength": 1},
+                "trigger": {"type": "string", "minLength": 1},
+                "boundary_ref": {"type": "string", "minLength": 1},
+                "provenance": {"$ref": "common.schema.json#/$defs/provenance"}
+              }
+            }
+          },
+          "provenance": {"$ref": "common.schema.json#/$defs/provenance"}
+        }
+      }
+    }
+  }
+}

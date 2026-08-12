@@ -1,0 +1,28 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "semantic_artifacts.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["rules", "mappings"],
+  "properties": {
+    "rules": {"$ref": "common.schema.json#/$defs/rules"},
+    "mappings": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["semantic_kind", "artifact", "action", "subtitle_policy", "provenance"],
+        "properties": {
+          "semantic_kind": {"type": "string", "minLength": 1},
+          "artifact": {"type": "string", "minLength": 1},
+          "action": {"enum": ["include", "exclude", "visual_substitute"]},
+          "subtitle_policy": {"enum": ["show", "hide", "inherit"]},
+          "visual_substitute": {"type": "string", "minLength": 1},
+          "mutual_exclusion_group": {"type": "string", "minLength": 1},
+          "provenance": {"$ref": "common.schema.json#/$defs/provenance"}
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,54 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "story_production_contract.schema.json",
+  "title": "Story Production Contract",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "contract_id", "story", "contracts", "preview_assets"],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "contract_id": {"type": "string", "minLength": 1},
+    "story": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["story_id", "title", "source_sha256"],
+      "properties": {
+        "story_id": {"type": "string", "minLength": 1},
+        "title": {"type": "string", "minLength": 1},
+        "source_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+      }
+    },
+    "contracts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["semantic_artifacts", "visual_style", "characters", "world_scale", "story_state", "brand", "release_layout"],
+      "properties": {
+        "semantic_artifacts": {"$ref": "semantic_artifacts.schema.json"},
+        "visual_style": {"$ref": "visual_style.schema.json"},
+        "characters": {"$ref": "characters.schema.json"},
+        "world_scale": {"$ref": "world_scale.schema.json"},
+        "story_state": {"$ref": "story_state.schema.json"},
+        "brand": {"$ref": "brand.schema.json"},
+        "release_layout": {"$ref": "release_layout.schema.json"}
+      }
+    },
+    "preview_assets": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["preview_id", "kind", "need_reason", "content_refs", "provenance"],
+        "properties": {
+          "preview_id": {"type": "string", "minLength": 1},
+          "kind": {"enum": ["style_anchor", "character_sheet", "scale_anchor", "layout_preview"]},
+          "need_reason": {"type": "string", "minLength": 1},
+          "content_refs": {"$ref": "common.schema.json#/$defs/stringList"},
+          "path": {"type": "string", "minLength": 1},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "provenance": {"$ref": "common.schema.json#/$defs/provenance"}
+        },
+        "dependentRequired": {"path": ["sha256"], "sha256": ["path"]}
+      }
+    }
+  }
+}

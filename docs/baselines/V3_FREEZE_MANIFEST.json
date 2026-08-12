@@ -1,0 +1,185 @@
+{
+  "schema_version": 1,
+  "baseline": "story-agent-v3",
+  "frozen_at": "2026-08-12",
+  "formal_baseline_tag": "story-agent-v3-baseline-2026-08-12",
+  "previous_technical_snapshot_tag": "v3.1-lizard-tail-baseline",
+  "code_delivery_commit": "cf587c6",
+  "knowledge_snapshot_commit": "eb72131",
+  "sample_project": "故事剪辑：小壁虎借尾巴",
+  "privacy": {
+    "media_committed_to_git": false,
+    "raw_feedback_committed_to_git": false,
+    "screenshots_committed_to_git": false,
+    "secrets_committed_to_git": false
+  },
+  "evidence": [
+    {
+      "role": "user_feedback_txt",
+      "path": "external/user-feedback-retained-locally",
+      "bytes": 38107,
+      "sha256": "2347ad2c92172ab05b504254d162827fd589eee93b6d0ac2a8db0c8f8ff79488"
+    },
+    {
+      "role": "project_manifest",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/99_项目状态/project_manifest.json",
+      "bytes": 82813,
+      "sha256": "31bf2ffb032360e191fcdcdaf7176485ab134eaf75e83e96361b72166299b1ce"
+    },
+    {
+      "role": "visual_bible",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/01_分镜与图片/xiaobihu-jieweiba_visual_bible.md",
+      "bytes": 7654,
+      "sha256": "1e15a0aa7017dd33e0990e0c240df9417db9c1a2bc0cc6609298cf7a34a7437c"
+    },
+    {
+      "role": "storyboard_plan",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/01_分镜与图片/xiaobihu-jieweiba_storyboard_plan.json",
+      "bytes": 20098,
+      "sha256": "4d0b433355b7e8bfb9940244e4c62b1bb49268622527e655c19f877a058e545b"
+    },
+    {
+      "role": "visual_continuity_contract",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/99_项目状态/visual_continuity_contract.json",
+      "bytes": 1851,
+      "sha256": "732560369e3278620e3c233cf034f21d5b21dcfab99033df322f4920c2100b34"
+    },
+    {
+      "role": "image_video_jobs",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/02_图生视频/xiaobihu-jieweiba_image_video_jobs.csv",
+      "bytes": 52544,
+      "sha256": "86d8bf152b51be8f8c930ee5441c4409dd11f135f482ce3db4aa02490a5eb0a9"
+    },
+    {
+      "role": "background_video_no_subtitles",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/03_背景成片/story_no_subs_bgm.mp4",
+      "bytes": 111099772,
+      "sha256": "cddc445ced30bec79b44421841c02c3e293f647a56940fb46c862b4ecbb1cd46"
+    },
+    {
+      "role": "background_video_sales_subtitles",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/03_背景成片/story_sales_subs_bgm.mp4",
+      "bytes": 97140786,
+      "sha256": "52e8f11b09ee950ae8634a46b3310240a39ac75b08bae32337c995cedf486e70"
+    },
+    {
+      "role": "performance_demo_video",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/99_项目状态/product_package_work/assets/示范表演：小壁虎借尾巴.mp4",
+      "bytes": 77217201,
+      "sha256": "e0f91acf5d8646521174d159e88eca7d1e44c852d81bb00127208e43a044d9df"
+    },
+    {
+      "role": "main_release_video",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/04_发布视频/主账号发布视频.mp4",
+      "bytes": 165197719,
+      "sha256": "eb8899844afb1aba3938565de8356a41318868e53522e5db93551ded41ac1f1e"
+    },
+    {
+      "role": "library_release_video",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/04_发布视频/宝库号发布视频.mp4",
+      "bytes": 93500188,
+      "sha256": "7c02aa6e414383f39337da73c731c6e5d95f91d646ede8bd5307390fb218e8af"
+    },
+    {
+      "role": "main_cover_3x4",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/05_发布物料/main/covers/cover_3x4.png",
+      "bytes": 2616106,
+      "sha256": "4f8223371921cb397c67db1cd35673e8873e2ba14bdc300ddb44efd235afe8ea"
+    },
+    {
+      "role": "main_cover_4x3",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/05_发布物料/main/covers/cover_4x3.png",
+      "bytes": 2490183,
+      "sha256": "cbb8276199f36faeabc2d0ac420d98b821c9ec87c9f1e240f9eadc54048769b5"
+    },
+    {
+      "role": "main_cover_16x9",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/05_发布物料/main/covers/cover_16x9.png",
+      "bytes": 3214006,
+      "sha256": "12132d634dbd9cf56c765939782365b955fad5ff459a7052464fe6e10049bdc8"
+    },
+    {
+      "role": "library_cover_3x4",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/05_发布物料/library/covers/cover_3x4.png",
+      "bytes": 2697377,
+      "sha256": "f3f2f6783c4c7602ee423840f12675b9fe9cc23e64908c6591fa2b667b7cef3c"
+    },
+    {
+      "role": "library_cover_4x3",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/05_发布物料/library/covers/cover_4x3.png",
+      "bytes": 2642657,
+      "sha256": "38ce74db4ed444210a241907e8514db809cc335be18d02425ce39741c2bdd973"
+    },
+    {
+      "role": "library_cover_16x9",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/05_发布物料/library/covers/cover_16x9.png",
+      "bytes": 3508361,
+      "sha256": "4ea50477ca113f733c17401a6fb43100f4db08b2ac19211d077ea6be5f7c0812"
+    },
+    {
+      "role": "story_images_review",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/99_项目状态/reviews/story_images_review_review.json",
+      "bytes": 22942,
+      "sha256": "a6c8357c58e0d2ad54b096c5152e607dfc5e8e0f12b533938193bc6d4baf6aaf"
+    },
+    {
+      "role": "video_review",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/99_项目状态/reviews/video_review_review.json",
+      "bytes": 79277,
+      "sha256": "fff91d32e6d96e99c60b1bdadfdc102f8443dc9e261a497aa124a633feaf38d1"
+    },
+    {
+      "role": "keying_review",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/99_项目状态/reviews/keying_preview_review_review.json",
+      "bytes": 4179,
+      "sha256": "ab377988b7e4a53beb737b8d7b8a6b34e85bb06a0c891038cec5161d2c4b820e"
+    },
+    {
+      "role": "release_video_review",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/99_项目状态/reviews/release_video_review_review.json",
+      "bytes": 15419,
+      "sha256": "68d6fab32d7df73454ce0b73816448d0f2b0b898482c0b104f2e5bb0121ce964"
+    },
+    {
+      "role": "publish_package_review",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/99_项目状态/reviews/publish_package_review_review.json",
+      "bytes": 9695,
+      "sha256": "c451d6bef9fd9f71fd81ae79bc70d0ea08338f3a7827f5a8e8fd1d403c84041d"
+    },
+    {
+      "role": "product_annotation_review",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/99_项目状态/reviews/product_annotation_review_review.json",
+      "bytes": 3631,
+      "sha256": "9ca0405f2b6ebedee9ee74ea047d52e7e64198f25b0512888ed3eea3c8327bee"
+    },
+    {
+      "role": "product_package_review",
+      "path": "auto-project/runs/故事剪辑：小壁虎借尾巴/99_项目状态/reviews/product_package_review_review.json",
+      "bytes": 7636,
+      "sha256": "3c83009159bf1bd6ad42a1a50545ee2eef4f4140b21eefab0369ae8ae01327b6"
+    }
+  ],
+  "known_accounting_correction": {
+    "manifest_claim": {
+      "currency": "CNY",
+      "amount": 2.37,
+      "requests": 27,
+      "billable_seconds": 237
+    },
+    "reconstructed": {
+      "requests_at_least": 30,
+      "billable_seconds": 267,
+      "provider_credits": 534,
+      "provider_list_price_currency": "USD",
+      "provider_list_price_amount": 2.67,
+      "actual_cny_charge": null
+    },
+    "status": "manifest estimate is not a settled invoice"
+  },
+  "verification": {
+    "verified_at": "2026-08-12",
+    "command": "/opt/miniconda3/bin/python3 -m unittest discover -s tests -v",
+    "tests_run": 176,
+    "result": "passed"
+  }
+}

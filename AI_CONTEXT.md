@@ -17,6 +17,9 @@ Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_ru
 5. [`docs/contracts/review-and-safety.md`](docs/contracts/review-and-safety.md)：审核、哈希、预算和密钥合同。
 6. [`docs/operations/runbook.md`](docs/operations/runbook.md)：提交、启动、恢复、诊断和验证。
 7. [`docs/postmortems/2026-08-lizard-tail.md`](docs/postmortems/2026-08-lizard-tail.md)：《小壁虎借尾巴》真实生产复盘。
+8. [`docs/baselines/V3_BASELINE_2026-08-12.md`](docs/baselines/V3_BASELINE_2026-08-12.md)：正式 V3 能力边界、冻结规则和证据入口。
+9. [`docs/baselines/V3_FEEDBACK_REGISTER_XIAOBIHU.md`](docs/baselines/V3_FEEDBACK_REGISTER_XIAOBIHU.md)：用户终验问题、模块归因和根因。
+10. [`docs/roadmaps/V3.5_QUALITY_AND_MODULARIZATION.md`](docs/roadmaps/V3.5_QUALITY_AND_MODULARIZATION.md)：V3.5 范围与非目标。
 
 ## 核心代码地图
 
@@ -68,6 +71,8 @@ python3 story_agent.py --help
 
 ## 当前已知重点
 
-- 《小壁虎借尾巴》基线已交付，但暴露出返工粒度过大、上下文重复、运行账本不足和成本币种错误等问题。
+- 《小壁虎借尾巴》已经冻结为正式 V3 基线：工程交付和内部 QA 完成，用户产品验收不通过，现有产物不重做。
+- 最大缺口不是“审核没运行”，而是合同本身未先接受产品意图审核；高分审核无法发现错误画风、奇怪身份标记、尺度、版式和用户审美问题。
+- V3.5 同时修真实质量、安装模块接口、改进 Runtime；继续使用 Codex + GPT 体系，不在第一阶段接 DeepSeek 或多供应商自动路由。
 - 当前成本字段名以 CNY 表示，但 ToAPIs 模型页按美元报价；在修正前不能把本地估算当作人民币实扣。
 - 优化应先解决可观察性、增量返工、上下文包和真实账单，再比较模型档位。

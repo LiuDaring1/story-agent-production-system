@@ -30,6 +30,7 @@ def main() -> None:
         default=None,
         help="可选机器可读 storyboard_plan.json；合同存在时必填",
     )
+    parser.add_argument("--story-contract-context", type=Path, default=None, help="已审核合同的 image_video 请求清单")
     args = parser.parse_args()
 
     discovered_contract, discovered_plan = discover_visual_continuity_paths(
@@ -50,6 +51,7 @@ def main() -> None:
             short_slug=args.short_slug,
             continuity_contract_path=continuity_contract,
             storyboard_plan_path=storyboard_plan,
+            story_contract_context_path=args.story_contract_context.expanduser() if args.story_contract_context else None,
         )
     except VisualContinuityContractError as exc:
         raise SystemExit(f"视觉连续性合同校验失败，未生成/付费：{exc}") from exc

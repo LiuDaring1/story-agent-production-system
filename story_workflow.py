@@ -203,6 +203,7 @@ def main() -> None:
     prepare.add_argument("--image-dir", required=True, type=Path)
     prepare.add_argument("--storyboard", required=True, type=Path)
     prepare.add_argument("--output-dir", required=True, type=Path)
+    prepare.add_argument("--story-contract-context", type=Path)
     prepare.add_argument("--slug", required=True)
     prepare.add_argument("--short-slug", required=True)
     prepare.add_argument("--continuity-contract", type=Path, default=None, help="视觉连续性合同 JSON")
@@ -253,6 +254,7 @@ def main() -> None:
     generate.add_argument("--prompt-review-csv", default="", help="提示词确认页导出的 prompt_review_decisions.csv")
     generate.add_argument("--skip-prompt-review", action="store_true", help="跳过图生视频提示词确认闸门")
     generate.add_argument("--provider", default="", help="覆盖 pipeline_config.json 中的图生视频 provider")
+    generate.add_argument("--project-dir", default="", type=Path, help="V3.5 合同锁所属项目目录；合同绑定任务必填")
 
     rerun_review = subparsers.add_parser("rerun-review", help="根据审核 CSV 只重跑标记为重做的片段")
     rerun_review.add_argument("--jobs-csv", required=True, type=Path)
@@ -276,6 +278,7 @@ def main() -> None:
     music_request.add_argument("--narration", default=None, type=Path)
     music_request.add_argument("--jobs-csv", default=None, type=Path)
     music_request.add_argument("--skill-path", default=None, type=Path)
+    music_request.add_argument("--story-contract-context", default=None, type=Path)
 
     assemble_music = subparsers.add_parser("assemble-music", help="按分段表拼接 Suno 背景音乐")
     assemble_music.add_argument("--plan-csv", required=True, type=Path)
@@ -605,6 +608,8 @@ def main() -> None:
             command.extend(["--continuity-contract", args.continuity_contract])
         if args.storyboard_plan is not None:
             command.extend(["--storyboard-plan", args.storyboard_plan])
+        if args.story_contract_context is not None:
+            command.extend(["--story-contract-context", args.story_contract_context])
         run_script("prepare_image_video_jobs.py", *command)
     elif args.command == "timing":
         command = [
@@ -666,6 +671,8 @@ def main() -> None:
             "--end-scene",
             str(args.end_scene),
         ]
+        if args.project_dir:
+            command.extend(["--project-dir", str(args.project_dir)])
         if args.scenes:
             command.extend(["--scenes", args.scenes])
         if args.limit:
@@ -740,6 +747,8 @@ def main() -> None:
             command.extend(["--narration", args.narration])
         if args.jobs_csv:
             command.extend(["--jobs-csv", args.jobs_csv])
+        if args.story_contract_context:
+            command.extend(["--story-contract-context", args.story_contract_context])
         run_script("prepare_suno_music_request.py", *command)
     elif args.command == "assemble-music":
         run_script(

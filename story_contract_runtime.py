@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from pathlib import Path
+import tempfile
 from typing import Any, Mapping
 
 from story_contracts import (
@@ -24,6 +26,23 @@ CONTRACT_POLICY_REQUIRED = "required_v1"
 CONTRACT_POLICY_LEGACY = "legacy_passthrough"
 TRUST_CHAIN_VERSION = 1
 LOCK_VERSION = 1
+LEGACY_ELIGIBILITY_VERSION = 1
+V3_BASELINE_TAG = "story-agent-v3-baseline-2026-08-12"
+V3_BASELINE_COMMIT = "7e47efe9abd517fc999d3b0505ad9195c2d1e650"
+V3_BASELINE_CREATED_AT = "2026-08-12 19:06:01"
+
+# A consumer hash intentionally covers only the contract sections that can
+# affect that output family.  The full contract hash is still recorded for
+# audit, but an unrelated brand edit must not invalidate story images and an
+# unrelated music/semantic edit must not invalidate a release layout.
+CONTRACT_CONSUMER_SECTIONS: dict[str, tuple[str, ...]] = {
+    "storyboard_images": ("semantic_artifacts", "visual_style", "characters", "world_scale", "story_state"),
+    "image_video": ("characters", "story_state"),
+    "music": ("semantic_artifacts", "story_state"),
+    "cover": ("brand", "characters", "release_layout"),
+    "release_video": ("brand", "release_layout"),
+    "product_package": ("semantic_artifacts",),
+}
 
 
 def contract_paths(project_root: Path | str) -> dict[str, Path]:
@@ -40,6 +59,7 @@ def contract_paths(project_root: Path | str) -> dict[str, Path]:
         "lock": contracts / "story_contract.lock.json",
         "bundle": reviews / "story_contract_bundle.json",
         "review": reviews / "story_contract_review_review.json",
+        "consumers": contracts / "consumers",
     }
 
 
@@ -201,7 +221,10 @@ def expected_contract_lock(
 
 def write_contract_lock(project_root: Path | str, *, bundle: Path, review: Path) -> Path:
     paths = contract_paths(project_root)
-    save_json(paths["lock"], expected_contract_lock(project_root, bundle=bundle, review=review))
+    _write_crash_safe_json(
+        paths["lock"],
+        expected_contract_lock(project_root, bundle=bundle, review=review),
+    )
     return paths["lock"]
 
 
@@ -212,7 +235,330 @@ def contract_lock_is_current(project_root: Path | str, *, bundle: Path, review: 
         expected = expected_contract_lock(project_root, bundle=bundle, review=review)
     except (OSError, ValueError, json.JSONDecodeError, StoryContractValidationError):
         return False
-    return current == expected
+    return _lock_shape_is_complete(current) and current == expected
+
+
+def legacy_eligibility_receipt(manifest: Mapping[str, Any]) -> dict[str, Any] | None:
+    """Return a deterministic receipt only for a demonstrably pre-V3.5 run.
+
+    Merely writing ``policy=legacy_passthrough`` is never enough.  The
+    manifest must predate the frozen V3 baseline and contain a completed
+    pre-contract stage.  The receipt binds those immutable migration facts.
+    """
+
+    created_at = str(manifest.get("created_at") or "").strip()
+    if not created_at or created_at > V3_BASELINE_CREATED_AT:
+        return None
+    agent = manifest.get("agent") if isinstance(manifest.get("agent"), Mapping) else {}
+    stages = agent.get("stages") if isinstance(agent.get("stages"), Mapping) else {}
+    anchors: list[dict[str, str]] = []
+    for stage, record in stages.items():
+        if stage in {"story_contract", "story_contract_review"} or not isinstance(record, Mapping):
+            continue
+        status = str(record.get("status") or "")
+        if status == "passed":
+            anchors.append({"stage": str(stage), "status": status})
+    if not anchors:
+        return None
+    anchors.sort(key=lambda item: item["stage"])
+    facts = {
+        "created_at": created_at,
+        "story_name": str((manifest.get("story") or {}).get("name") or "")
+        if isinstance(manifest.get("story"), Mapping)
+        else "",
+        "story_slug": str((manifest.get("story") or {}).get("slug") or "")
+        if isinstance(manifest.get("story"), Mapping)
+        else "",
+        "anchors": anchors,
+    }
+    return {
+        "version": LEGACY_ELIGIBILITY_VERSION,
+        "baseline_tag": V3_BASELINE_TAG,
+        "baseline_commit": V3_BASELINE_COMMIT,
+        "facts": facts,
+        "facts_sha256": _json_sha256(facts),
+    }
+
+
+def legacy_passthrough_allowed(manifest: Mapping[str, Any]) -> bool:
+    agent = manifest.get("agent") if isinstance(manifest.get("agent"), Mapping) else {}
+    runtime = agent.get("story_contract") if isinstance(agent.get("story_contract"), Mapping) else {}
+    if runtime.get("policy") != CONTRACT_POLICY_LEGACY:
+        return False
+    receipt = runtime.get("legacy_eligibility")
+    expected = legacy_eligibility_receipt(manifest)
+    return isinstance(receipt, Mapping) and expected is not None and dict(receipt) == expected
+
+
+def contract_consumer_path(project_root: Path | str, consumer: str) -> Path:
+    if consumer not in CONTRACT_CONSUMER_SECTIONS:
+        raise ValueError(f"unknown story contract consumer: {consumer}")
+    return contract_paths(project_root)["consumers"] / f"{consumer}.json"
+
+
+def contract_consumer_receipt_path(project_root: Path | str, consumer: str) -> Path:
+    if consumer not in CONTRACT_CONSUMER_SECTIONS:
+        raise ValueError(f"unknown story contract consumer: {consumer}")
+    return contract_paths(project_root)["consumers"] / f"{consumer}.completed.json"
+
+
+def locked_contract_binding(project_root: Path | str, consumer: str) -> dict[str, Any]:
+    """Load a fully reviewed lock and return a fine-grained consumer view."""
+
+    if consumer not in CONTRACT_CONSUMER_SECTIONS:
+        raise ValueError(f"unknown story contract consumer: {consumer}")
+    root = Path(project_root)
+    manifest_path = root / "99_项目状态" / "project_manifest.json"
+    try:
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"project manifest unavailable: {exc}") from exc
+    if legacy_passthrough_allowed(manifest):
+        return {
+            "version": 1,
+            "mode": CONTRACT_POLICY_LEGACY,
+            "consumer": consumer,
+            "contract_schema_version": "legacy-v3",
+            "story_contract_sha256": "",
+            "story_contract_dependency_sha256": "legacy-v3",
+            "contract_sections": list(CONTRACT_CONSUMER_SECTIONS[consumer]),
+            "contract_projection": {},
+        }
+    runtime = manifest.get("agent", {}).get("story_contract", {})
+    if runtime.get("policy") != CONTRACT_POLICY_REQUIRED:
+        raise ValueError("manifest is neither an eligible V3 legacy project nor required_v1")
+    issues = contract_runtime_issues(root)
+    if issues:
+        raise ValueError("story contract invalid: " + ";".join(issues[:12]))
+    paths = contract_paths(root)
+    if not _review_bundle_is_current(paths["bundle"]):
+        raise ValueError("story contract review bundle is missing or stale")
+    try:
+        review_payload = json.loads(paths["review"].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError(f"story contract review is invalid: {exc}") from exc
+    if not _review_payload_passes(review_payload, paths["bundle"]):
+        raise ValueError("story contract independent review is not approved/hash-bound")
+    if contract_review_payload_issues(review_payload):
+        raise ValueError("story contract independent review lacks seven-section evidence")
+    if not contract_lock_is_current(root, bundle=paths["bundle"], review=paths["review"]):
+        raise ValueError("story contract lock is missing, damaged, incomplete, or stale")
+    contract = load_story_contract(paths["contract"])
+    sections = CONTRACT_CONSUMER_SECTIONS[consumer]
+    projection = {name: contract["contracts"][name] for name in sections}
+    dependency_payload = {
+        "contract_schema_version": str(contract["schema_version"]),
+        "consumer": consumer,
+        "contract_projection": projection,
+    }
+    return {
+        "version": 1,
+        "mode": CONTRACT_POLICY_REQUIRED,
+        "consumer": consumer,
+        "contract_schema_version": str(contract["schema_version"]),
+        "story_contract_sha256": contract_sha256(contract),
+        "story_contract_dependency_sha256": _json_sha256(dependency_payload),
+        "contract_sections": list(sections),
+        "contract_projection": projection,
+    }
+
+
+def write_contract_consumer_context(project_root: Path | str, consumer: str) -> Path:
+    """Persist a request/plan binding without rewriting an equivalent output."""
+
+    path = contract_consumer_path(project_root, consumer)
+    expected = locked_contract_binding(project_root, consumer)
+    try:
+        current = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        current = None
+    # Preserve the original full-contract audit hash when this output family's
+    # dependency projection is unchanged.  That records which reviewed
+    # contract actually produced the artifact while avoiding unrelated redo.
+    if (
+        isinstance(current, Mapping)
+        and _consumer_context_shape_is_complete(current, consumer)
+        and current.get("contract_schema_version") == expected["contract_schema_version"]
+        and current.get("story_contract_dependency_sha256") == expected["story_contract_dependency_sha256"]
+        and current.get("contract_projection") == expected["contract_projection"]
+    ):
+        return path
+    save_json(path, expected)
+    return path
+
+
+def contract_consumer_context_is_current(project_root: Path | str, consumer: str, path: Path | None = None) -> bool:
+    target = path or contract_consumer_path(project_root, consumer)
+    try:
+        current = json.loads(target.read_text(encoding="utf-8"))
+        expected = locked_contract_binding(project_root, consumer)
+    except (OSError, ValueError, json.JSONDecodeError, StoryContractValidationError):
+        return False
+    return (
+        _consumer_context_shape_is_complete(current, consumer)
+        and current.get("contract_schema_version") == expected["contract_schema_version"]
+        and current.get("story_contract_dependency_sha256") == expected["story_contract_dependency_sha256"]
+        and current.get("contract_projection") == expected["contract_projection"]
+    )
+
+
+def mark_contract_consumer_completed(project_root: Path | str, consumer: str) -> Path:
+    """Atomically bind a successfully produced output family to its request."""
+
+    context = contract_consumer_path(project_root, consumer)
+    if not contract_consumer_context_is_current(project_root, consumer, context):
+        raise ValueError(f"cannot complete {consumer}: request context is missing or stale")
+    payload = json.loads(context.read_text(encoding="utf-8"))
+    receipt = {
+        "version": 1,
+        "consumer": consumer,
+        "contract_schema_version": payload["contract_schema_version"],
+        "story_contract_sha256": payload["story_contract_sha256"],
+        "story_contract_dependency_sha256": payload["story_contract_dependency_sha256"],
+        "request_manifest_sha256": _file_sha256(context),
+    }
+    target = contract_consumer_receipt_path(project_root, consumer)
+    _write_crash_safe_json(target, receipt)
+    return target
+
+
+def contract_consumer_completion_is_current(project_root: Path | str, consumer: str) -> bool:
+    context = contract_consumer_path(project_root, consumer)
+    receipt = contract_consumer_receipt_path(project_root, consumer)
+    try:
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        context_payload = json.loads(context.read_text(encoding="utf-8"))
+        expected = locked_contract_binding(project_root, consumer)
+    except (OSError, ValueError, json.JSONDecodeError, StoryContractValidationError):
+        return False
+    return (
+        contract_consumer_context_is_current(project_root, consumer, context)
+        and set(payload) == {
+            "version", "consumer", "contract_schema_version", "story_contract_sha256",
+            "story_contract_dependency_sha256", "request_manifest_sha256",
+        }
+        and payload.get("version") == 1
+        and payload.get("consumer") == consumer
+        and payload.get("contract_schema_version") == expected["contract_schema_version"]
+        and payload.get("story_contract_sha256") == context_payload.get("story_contract_sha256")
+        and payload.get("story_contract_dependency_sha256") == expected["story_contract_dependency_sha256"]
+        and payload.get("request_manifest_sha256") == _file_sha256(context)
+    )
+
+
+def assert_request_contract_binding(project_root: Path | str, consumer: str, request: Mapping[str, Any]) -> dict[str, Any]:
+    """Revalidate the live lock and a request row immediately before payment."""
+
+    expected = locked_contract_binding(project_root, consumer)
+    if expected["mode"] == CONTRACT_POLICY_LEGACY:
+        return expected
+    if str(request.get("contract_schema_version") or "") != expected["contract_schema_version"]:
+        raise ValueError("request contract_schema_version does not match the current locked contract")
+    if str(request.get("story_contract_dependency_sha256") or "") != expected["story_contract_dependency_sha256"]:
+        raise ValueError("request story contract dependency hash is stale")
+    context_path = contract_consumer_path(project_root, consumer)
+    if not contract_consumer_context_is_current(project_root, consumer, context_path):
+        raise ValueError("consumer request manifest is missing, damaged, or stale")
+    context = json.loads(context_path.read_text(encoding="utf-8"))
+    recorded_full = str(request.get("story_contract_sha256") or "")
+    if recorded_full != context.get("story_contract_sha256"):
+        raise ValueError("request story_contract_sha256 does not match its audited request manifest")
+    return expected
+
+
+def _write_crash_safe_json(path: Path, payload: Mapping[str, Any]) -> None:
+    """Durably replace a deterministic JSON lock in the same directory."""
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    encoded = json.dumps(dict(payload), ensure_ascii=False, sort_keys=True, indent=2).encode("utf-8") + b"\n"
+    descriptor, raw_temp = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=path.parent)
+    temp_path = Path(raw_temp)
+    try:
+        with os.fdopen(descriptor, "wb") as file:
+            file.write(encoded)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp_path, path)
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        temp_path.unlink(missing_ok=True)
+
+
+def _lock_shape_is_complete(payload: Any) -> bool:
+    required = {
+        "version",
+        "schema_version",
+        "contract_id",
+        "contract_file_sha256",
+        "contract_canonical_sha256",
+        "trusted_inputs_sha256",
+        "review_bundle_sha256",
+        "review_sha256",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != required:
+        return False
+    return (
+        payload.get("version") == LOCK_VERSION
+        and all(str(payload.get(key) or "") for key in ("schema_version", "contract_id"))
+        and all(
+            len(str(payload.get(key) or "")) == 64
+            for key in required
+            if key.endswith("sha256")
+        )
+    )
+
+
+def _consumer_context_shape_is_complete(payload: Any, consumer: str) -> bool:
+    required = {
+        "version", "mode", "consumer", "contract_schema_version",
+        "story_contract_sha256", "story_contract_dependency_sha256",
+        "contract_sections", "contract_projection",
+    }
+    if not isinstance(payload, Mapping) or set(payload) != required:
+        return False
+    return (
+        payload.get("version") == 1
+        and payload.get("mode") == CONTRACT_POLICY_REQUIRED
+        and payload.get("consumer") == consumer
+        and payload.get("contract_sections") == list(CONTRACT_CONSUMER_SECTIONS[consumer])
+        and isinstance(payload.get("contract_projection"), Mapping)
+        and len(str(payload.get("story_contract_sha256") or "")) == 64
+        and len(str(payload.get("story_contract_dependency_sha256") or "")) == 64
+    )
+
+
+def _review_bundle_is_current(path: Path) -> bool:
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    artifacts = payload.get("artifacts") if isinstance(payload, Mapping) else None
+    if not isinstance(artifacts, list) or not artifacts:
+        return False
+    for item in artifacts:
+        if not isinstance(item, Mapping):
+            return False
+        target = Path(str(item.get("path") or ""))
+        if not target.is_file() or item.get("sha256") != _file_sha256(target):
+            return False
+    return True
+
+
+def _review_payload_passes(payload: Mapping[str, Any], bundle: Path) -> bool:
+    try:
+        score = float(payload.get("score") or 0)
+    except (TypeError, ValueError):
+        return False
+    return (
+        payload.get("approved") is True
+        and score >= 85
+        and not payload.get("critical_errors")
+        and payload.get("artifact_sha256") == _file_sha256(bundle)
+    )
 
 
 def _load_manifest_story_text(project_root: Path) -> Path | None:
@@ -247,13 +593,26 @@ def _json_sha256(value: Any) -> str:
 __all__ = [
     "CONTRACT_POLICY_LEGACY",
     "CONTRACT_POLICY_REQUIRED",
+    "CONTRACT_CONSUMER_SECTIONS",
+    "V3_BASELINE_COMMIT",
+    "V3_BASELINE_TAG",
+    "assert_request_contract_binding",
     "build_trusted_input_chain",
     "contract_lock_is_current",
+    "contract_consumer_context_is_current",
+    "contract_consumer_completion_is_current",
+    "contract_consumer_path",
+    "contract_consumer_receipt_path",
     "contract_paths",
     "contract_review_artifacts",
     "contract_review_payload_issues",
     "contract_runtime_issues",
     "expected_contract_lock",
+    "legacy_eligibility_receipt",
+    "legacy_passthrough_allowed",
+    "mark_contract_consumer_completed",
+    "locked_contract_binding",
     "write_contract_lock",
+    "write_contract_consumer_context",
     "write_trusted_input_chain",
 ]

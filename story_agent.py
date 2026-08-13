@@ -20,12 +20,19 @@ from video_provider_adapter import resolve_row_generation_seconds, resolve_video
 from story_video_synthesizer.image_video import validate_image_video_jobs
 from story_contract_runtime import (
     CONTRACT_POLICY_LEGACY,
+    CONTRACT_POLICY_REQUIRED,
     build_trusted_input_chain,
+    contract_consumer_context_is_current,
+    contract_consumer_completion_is_current,
+    contract_consumer_path,
     contract_lock_is_current,
     contract_paths,
     contract_review_artifacts,
     contract_review_payload_issues,
     contract_runtime_issues,
+    legacy_passthrough_allowed,
+    mark_contract_consumer_completed,
+    write_contract_consumer_context,
     write_contract_lock,
     write_trusted_input_chain,
 )
@@ -1456,6 +1463,9 @@ class StoryAgent:
         return merged
 
     def _stage_codex_story_images(self, manifest: dict[str, Any]) -> StageResult:
+        contract_context = self._prepare_contract_consumer(manifest, "storyboard_images")
+        if isinstance(contract_context, StageResult):
+            return contract_context
         staging = self._codex_stage_dir("codex_story_images")
         staging_images = staging / "images"
         staging_storyboard = staging / f"{self.context.slug}_storyboard_lines.txt"
@@ -1468,9 +1478,16 @@ class StoryAgent:
             self._invalidate_story_image_derivatives(staging_images)
         authoritative_storyboard_sha = file_sha256(staging_storyboard)
         handoff = self._write_story_image_handoff(manifest, staging_images=staging_images, staging_storyboard=staging_storyboard)
+        if contract_context is not None:
+            self._append_contract_handoff(
+                handoff,
+                contract_context,
+                "分镜/生图的产物语义、视觉风格、角色身份、世界尺度与故事状态",
+            )
         self._sync_story_images_from_staging(staging, staging_storyboard, staging_images)
         missing = self._missing_story_image_indices(story_lines)
         if not missing:
+            self._complete_contract_consumer(manifest, "storyboard_images")
             return StageResult("done", f"故事图片已完整：{len(story_lines)}/{len(story_lines)} 张。", handoff)
 
         batch_size = max(1, self.context.codex_story_image_batch_size)
@@ -1519,7 +1536,8 @@ class StoryAgent:
             )
 
         manifest = self._manifest()
-        if self._has_story_images(manifest):
+        if self._has_story_image_files(manifest):
+            self._complete_contract_consumer(manifest, "storyboard_images")
             return StageResult("done", f"故事图片已完整生成：{len(story_lines)}/{len(story_lines)} 张。", handoff)
         image_dir = self._image_dir()
         current = self._expected_named_story_image_count(image_dir, manifest, self._storyboard_path(manifest))
@@ -1530,6 +1548,9 @@ class StoryAgent:
         image_dir = self._image_dir()
         if storyboard is None or image_dir is None:
             return StageResult("blocked", "缺少分镜文本或图片目录，无法准备图生视频任务。")
+        contract_context = self._prepare_contract_consumer(manifest, "image_video")
+        if isinstance(contract_context, StageResult):
+            return contract_context
         continuity_contract = self._visual_continuity_contract_path()
         storyboard_plan = self.context.paths.images / f"{self.context.slug}_storyboard_plan.json"
         if continuity_contract is not None:
@@ -1557,7 +1578,10 @@ class StoryAgent:
             command.extend(["--continuity-contract", str(continuity_contract)])
         if storyboard_plan.is_file():
             command.extend(["--storyboard-plan", str(storyboard_plan)])
-        return self._workflow(command, "准备图生视频任务")
+        if contract_context is not None:
+            command.extend(["--story-contract-context", str(contract_context)])
+        result = self._workflow(command, "准备图生视频任务")
+        return result
 
     def _stage_story_images_review(self, manifest: dict[str, Any]) -> StageResult:
         image_dir = self._image_dir()
@@ -1595,7 +1619,12 @@ class StoryAgent:
             return StageResult("blocked", "视觉连续性合同校验失败（关键错误）：" + "；".join(continuity_errors), continuity_contract)
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "story_images_bundle.json",
-            [storyboard, *(path for path in control_files if path.exists()), *scene_images],
+            [
+                storyboard,
+                *(path for path in control_files if path.exists()),
+                *(path for path in [contract_consumer_path(self.context.project_dir, "storyboard_images")] if path.exists()),
+                *scene_images,
+            ],
         )
         result, payload = self._structured_review(
             stage="story_images_review",
@@ -1663,6 +1692,8 @@ class StoryAgent:
         image_dir = self._image_dir()
         if jobs is None or image_dir is None:
             return StageResult("blocked", "缺少 jobs CSV 或图片目录，无法生成视频片段。")
+        if not self._legacy_contract_policy(manifest) and not contract_consumer_context_is_current(self.context.project_dir, "image_video"):
+            return StageResult("blocked", "image_video 合同请求清单已失效，未发起付费调用。")
         continuity_errors = validate_image_video_jobs(jobs)
         if continuity_errors:
             return StageResult(
@@ -1731,6 +1762,8 @@ class StoryAgent:
             str(image_dir),
             "--videos-dir",
             str(self.context.paths.video_jobs / "videos"),
+            "--project-dir",
+            str(self.context.project_dir),
         ]
         if bool(video_api.get("submit_all_first", False)):
             generate_command.append("--submit-all-first")
@@ -1764,6 +1797,8 @@ class StoryAgent:
         else:
             ledger.release(reservation, reason=result.message)
         write_manifest(self.context.paths, manifest)
+        if result.status == "done" and self._has_generated_video_files(manifest):
+            self._complete_contract_consumer(manifest, "image_video")
         if result.status != "done" and str(video_api.get("fallback_provider", "")).lower() == "browser":
             remaining = max(0, self._job_count(jobs) - after)
             provider_name = str(video_api.get("browser_provider_name", "Flow"))
@@ -1808,6 +1843,7 @@ class StoryAgent:
         control_files = [
             self.context.paths.images / f"{self.context.slug}_storyboard_plan.json",
             self._visual_continuity_contract_path(),
+            contract_consumer_path(self.context.project_dir, "image_video"),
         ]
         bundle = write_review_bundle(
             review_dir / "video_prompt_bundle.json",
@@ -1891,6 +1927,7 @@ class StoryAgent:
                 qa_report,
                 videos_dir,
                 frames_dir,
+                *(path for path in [contract_consumer_path(self.context.project_dir, "image_video")] if path.exists()),
                 *(item for item in [self._visual_continuity_contract_path()] if item is not None),
             ],
         )
@@ -1948,6 +1985,9 @@ class StoryAgent:
         story_text = first_existing(manifest.get("inputs", {}).get("story_text"))
         if story_text is None:
             return StageResult("blocked", "缺少故事正文，无法生成配乐任务。")
+        contract_context = self._prepare_contract_consumer(manifest, "music")
+        if isinstance(contract_context, StageResult):
+            return contract_context
         command = [
             "music-request",
             "--story-file",
@@ -1965,12 +2005,17 @@ class StoryAgent:
             command.extend(["--narration", str(narration)])
         if jobs is not None:
             command.extend(["--jobs-csv", str(jobs)])
-        return self._workflow(command, "生成配乐任务")
+        if contract_context is not None:
+            command.extend(["--story-contract-context", str(contract_context)])
+        result = self._workflow(command, "生成配乐任务")
+        return result
 
     def _stage_suno_generate(self, manifest: dict[str, Any]) -> StageResult:
         provided_music = self._provided_music(manifest)
         if provided_music is not None:
             return StageResult("done", f"已检测到用户提供的背景音乐，跳过 Suno 生成：{provided_music}")
+        if not self._legacy_contract_policy(manifest) and not contract_consumer_context_is_current(self.context.project_dir, "music"):
+            return StageResult("blocked", "music 合同请求清单已失效，未打开 Suno 付费生产。")
         handoff = self._write_suno_handoff()
         result = self._codex_task(
             stage="suno_generate",
@@ -2003,6 +2048,9 @@ class StoryAgent:
             return StageResult("blocked", f"Suno 需要在 Codex 主任务恢复浏览器能力：{blocker}", blocker)
         if result.status != "done":
             return result
+        if not self._music_plan_contract_bound(manifest):
+            return StageResult("blocked", "Suno 音乐计划缺少当前合同绑定字段。", self._music_plan())
+        self._complete_contract_consumer(manifest, "music")
         if self._has_suno_audio(self._manifest()):
             return result
         blocker = self._music_dir() / "suno_cli_blocker.md"
@@ -2088,10 +2136,15 @@ class StoryAgent:
         return self._workflow(command, "合成背景成片")
 
     def _stage_release_assets(self, manifest: dict[str, Any]) -> StageResult:
+        contract_context = self._prepare_contract_consumer(manifest, "release_video")
+        if isinstance(contract_context, StageResult):
+            return contract_context
         result = self._workflow(["prepare-release-assets-project", "--project-dir", str(self.context.project_dir)], "生成发布视觉任务书")
         if result.status != "done":
             return result
         handoff = self.context.paths.release / "theme_assets" / "theme_assets_codex_handoff.txt"
+        if contract_context is not None and handoff.exists():
+            self._append_contract_handoff(handoff, contract_context, "品牌、发布布局、真人与故事画面安全区")
         result = self._codex_task(
             stage="release_assets",
             label="Codex 原生发布视觉素材生成",
@@ -2116,7 +2169,10 @@ class StoryAgent:
             images = [keying_candidates, *images]
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "release_preview_bundle.json",
-            [preset, keying_search, keying_candidates, preview_dir],
+            [
+                preset, keying_search, keying_candidates, preview_dir,
+                *(path for path in [contract_consumer_path(self.context.project_dir, "release_video")] if path.exists()),
+            ],
         )
         result, payload = self._structured_review(
             stage="release_preview",
@@ -2163,7 +2219,12 @@ class StoryAgent:
         return result
 
     def _stage_package_release(self, manifest: dict[str, Any]) -> StageResult:
-        return self._workflow(["package-release-project", "--project-dir", str(self.context.project_dir)], "生成主账号/宝库号发布视频")
+        if not self._consumer_request_current(manifest, "release_video"):
+            return StageResult("blocked", "release_video 合同请求清单已失效，拒绝渲染发布视频。")
+        result = self._workflow(["package-release-project", "--project-dir", str(self.context.project_dir)], "生成主账号/宝库号发布视频")
+        if result.status == "done":
+            self._complete_contract_consumer(manifest, "release_video")
+        return result
 
     def _stage_release_qa(self, manifest: dict[str, Any]) -> StageResult:
         result = self._workflow(["qa-release", "--project-dir", str(self.context.project_dir)], "发布终片编码与音画同步 QA")
@@ -2223,7 +2284,13 @@ class StoryAgent:
         if not frames:
             return StageResult("blocked", "发布终片无法抽帧，拒绝仅凭文件存在放行。")
         contact_sheet = self._make_contact_sheet(frames, self.context.paths.status / "reviews" / "release_videos_contact_sheet.jpg", columns=5)
-        bundle = write_review_bundle(self.context.paths.status / "reviews" / "release_video_bundle.json", [*videos, frame_dir])
+        bundle = write_review_bundle(
+            self.context.paths.status / "reviews" / "release_video_bundle.json",
+            [
+                *videos, frame_dir,
+                *(path for path in [contract_consumer_path(self.context.project_dir, "release_video")] if path.exists()),
+            ],
+        )
         result, payload = self._structured_review(
             stage="release_video_review",
             label="发布终片独立审核",
@@ -2267,10 +2334,15 @@ class StoryAgent:
         return result
 
     def _stage_publish_package(self, manifest: dict[str, Any]) -> StageResult:
+        contract_context = self._prepare_contract_consumer(manifest, "cover")
+        if isinstance(contract_context, StageResult):
+            return contract_context
         result = self._workflow(["publish-package-project", "--project-dir", str(self.context.project_dir)], "生成发布物料任务包")
         if result.status != "done":
             return result
         handoff = self.context.paths.publish / "publish_package_codex_handoff.md"
+        if contract_context is not None and handoff.exists():
+            self._append_contract_handoff(handoff, contract_context, "品牌、角色身份与封面布局安全区")
         if handoff.exists():
             result = self._codex_task(
                 stage="publish_package",
@@ -2278,13 +2350,14 @@ class StoryAgent:
                 handoff=handoff,
                 prompt=build_publish_package_agent_prompt(handoff, self.context.project_dir),
             )
-            if result.status == "done" and not self._has_publish_package(self._manifest()):
+            if result.status == "done" and not self._has_publish_package_files():
                 return StageResult("blocked", "Codex CLI 子任务已返回，但主账号/宝库号 4:3 封面没有完整落盘。", handoff)
             if result.status == "done":
                 try:
                     receipt = apply_fixed_cover_branding(self.context.project_dir)
                 except (OSError, ValueError) as exc:
                     return StageResult("blocked", f"封面固定品牌 Logo 定版失败：{exc}", handoff)
+                self._complete_contract_consumer(manifest, "cover")
                 return StageResult("done", "已生成六张封面并原样叠加固定品牌 Logo。", receipt)
             return result
         return result
@@ -2319,7 +2392,11 @@ class StoryAgent:
         lineage = publish / "cover_lineage.json"
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "publish_package_bundle.json",
-            [*covers, *copy_files, qa_report, qa_json, lineage, self.context.paths.status / "publish_cover_branding.json"],
+            [
+                *covers, *copy_files, qa_report, qa_json, lineage,
+                self.context.paths.status / "publish_cover_branding.json",
+                *(path for path in [contract_consumer_path(self.context.project_dir, "cover")] if path.exists()),
+            ],
         )
         result, payload = self._structured_review(
             stage="publish_package_review",
@@ -2346,7 +2423,14 @@ class StoryAgent:
         return result
 
     def _stage_product_preflight(self, manifest: dict[str, Any]) -> StageResult:
-        return self._workflow(["product-package-preflight-project", "--project-dir", str(self.context.project_dir)], "资料包前置审查")
+        contract_context = self._prepare_contract_consumer(manifest, "product_package")
+        if isinstance(contract_context, StageResult):
+            return contract_context
+        result = self._workflow(["product-package-preflight-project", "--project-dir", str(self.context.project_dir)], "资料包前置审查")
+        handoff = self.context.paths.status / "product_package_work" / "第16步资料包_Codex前置审查.md"
+        if result.status == "done" and contract_context is not None and handoff.exists():
+            self._append_contract_handoff(handoff, contract_context, "PPT、文稿、朗读标注、示范视频的产物语义矩阵")
+        return result
 
     def _stage_product_annotation(self, manifest: dict[str, Any]) -> StageResult:
         handoff = self.context.paths.status / "product_package_work" / "第16步资料包_Codex前置审查.md"
@@ -2367,6 +2451,8 @@ class StoryAgent:
         return result
 
     def _stage_product_package(self, manifest: dict[str, Any]) -> StageResult:
+        if not self._consumer_request_current(manifest, "product_package"):
+            return StageResult("blocked", "product_package 合同请求清单已失效，拒绝生成 PPT/资料包。")
         annotation = self._product_annotation()
         if annotation is None:
             return StageResult("blocked", "缺少精修朗读标注。")
@@ -2388,7 +2474,10 @@ class StoryAgent:
                         command.extend([flag, str(data[key])])
             except Exception:
                 pass
-        return self._workflow(command, "正式打包资料包")
+        result = self._workflow(command, "正式打包资料包")
+        if result.status == "done":
+            self._complete_contract_consumer(manifest, "product_package")
+        return result
 
     def _stage_product_annotation_review(self, manifest: dict[str, Any]) -> StageResult:
         annotation = self._product_annotation()
@@ -2405,6 +2494,9 @@ class StoryAgent:
         consumer_manuscript = first_existing(manifest.get("outputs", {}).get("consumer_manuscript"))
         if consumer_manuscript is not None:
             artifacts.append(consumer_manuscript)
+        contract_context = contract_consumer_path(self.context.project_dir, "product_package")
+        if contract_context.exists():
+            artifacts.append(contract_context)
         bundle = write_review_bundle(self.context.paths.status / "reviews" / "product_annotation_bundle.json", artifacts)
         images = self._product_preview_images()
         result, payload = self._structured_review(
@@ -2466,7 +2558,13 @@ class StoryAgent:
                         shutil.move(str(directory), str(archive / directory.name))
                 return StageResult("retrying", f"资料包机器 QA 未通过，已保留失败包并排队重新打包：{report_json}", report_json)
             return StageResult("blocked", f"资料包机器 QA 未通过且已达到重做上限：{report_json}", report_json)
-        bundle = write_review_bundle(self.context.paths.status / "reviews" / "product_package_bundle.json", [base, advanced, report, report_json])
+        bundle = write_review_bundle(
+            self.context.paths.status / "reviews" / "product_package_bundle.json",
+            [
+                base, advanced, report, report_json,
+                *(path for path in [contract_consumer_path(self.context.project_dir, "product_package")] if path.exists()),
+            ],
+        )
         result, payload = self._structured_review(
             stage="product_package_review",
             label="资料包独立审核",
@@ -2824,6 +2922,7 @@ class StoryAgent:
                 "这是全自动 Agent 模式，不需要向用户确认分镜。状态机已经写好并锁定分镜文本；必须只读使用该文件，绝对不得改写、合并、删减或重排任何一行。",
                 "可以创建或更新视觉圣经和图生视频提示词文件，然后连续生成图片；镜头编号必须逐行对应锁定分镜。",
                 f"必须先写入机器可读分镜计划：`{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}`。每镜包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description；story_text 必须逐行等于锁定分镜。",
+                "机器可读分镜计划的顶层还必须原样记录合同请求清单中的 contract_schema_version、story_contract_sha256、story_contract_dependency_sha256，并把逐镜列表放在 shots 字段。",
                 "每个唱歌、关键发言、关键动作或明显受挫的角色都要获得焦点镜头；连续场景要安排建立全景、表演者中近景、反应镜头等景别变化，不能所有角色都和主角挤在同一种双人中景。",
                 "为反复出现的角色固定 appearance_id；生成后续镜头时必须同时引用风格锚点和该角色最近一张已通过图片，禁止只靠文字重新随机生成角色。",
                 "图生视频提示词文件的 CSV 必须包含 `scene,story_text,visual_description,prompt`；`prompt` 要作为后续图生视频 API 和审核页直接使用的最终提示词。图生视频已经有当前图片作为视觉约束，只写具体动作、表情、道具运动、镜头运动和少量禁止项，不要复制文生图视觉圣经、服装细节或画风长描述，也不能用“角色动作自然克制、镜头缓慢推进或轻移”之类通用模板充数。",
@@ -2876,6 +2975,22 @@ class StoryAgent:
             return False
         if not isinstance(rows, list) or len(rows) != len(story_lines):
             return False
+        if not self._legacy_contract_policy(self._manifest()):
+            try:
+                expected = json.loads(
+                    contract_consumer_path(self.context.project_dir, "storyboard_images").read_text(encoding="utf-8")
+                )
+            except (OSError, json.JSONDecodeError):
+                return False
+            if not isinstance(payload, dict) or any(
+                payload.get(field) != expected.get(field)
+                for field in (
+                    "contract_schema_version",
+                    "story_contract_sha256",
+                    "story_contract_dependency_sha256",
+                )
+            ):
+                return False
         required = {
             "scene", "story_text", "narrative_function", "shot_size", "focal_character",
             "visible_characters", "excluded_characters", "continuity_group", "appearance_ids", "visual_description",
@@ -3306,10 +3421,91 @@ class StoryAgent:
         return self.context.paths.manifest.exists() and bool(inputs.get("story_text")) and bool(inputs.get("narration") or inputs.get("extracted_narration"))
 
     def _legacy_contract_policy(self, manifest: dict[str, Any]) -> bool:
-        return (
-            manifest.get("agent", {}).get("story_contract", {}).get("policy")
-            == CONTRACT_POLICY_LEGACY
-        )
+        return legacy_passthrough_allowed(manifest)
+
+    def _prepare_contract_consumer(self, manifest: dict[str, Any], consumer: str) -> Path | StageResult | None:
+        if self._legacy_contract_policy(manifest):
+            return None
+        try:
+            existing = contract_consumer_path(self.context.project_dir, consumer)
+            if not existing.exists() or not contract_consumer_context_is_current(self.context.project_dir, consumer, existing):
+                self._archive_contract_consumer_outputs(consumer)
+            return write_contract_consumer_context(self.context.project_dir, consumer)
+        except (OSError, ValueError) as exc:
+            return StageResult("blocked", f"{consumer} 无法读取已审核合同锁：{exc}")
+
+    def _complete_contract_consumer(self, manifest: dict[str, Any], consumer: str) -> Path | None:
+        if self._legacy_contract_policy(manifest):
+            return None
+        return mark_contract_consumer_completed(self.context.project_dir, consumer)
+
+    def _consumer_request_current(self, manifest: dict[str, Any], consumer: str) -> bool:
+        return self._legacy_contract_policy(manifest) or contract_consumer_context_is_current(self.context.project_dir, consumer)
+
+    def _consumer_output_current(self, manifest: dict[str, Any], consumer: str) -> bool:
+        return self._legacy_contract_policy(manifest) or contract_consumer_completion_is_current(self.context.project_dir, consumer)
+
+    def _append_contract_handoff(self, handoff: Path, context: Path, purpose: str) -> None:
+        marker = "<!-- STORY_CONTRACT_CONTEXT_V1 -->"
+        text = handoff.read_text(encoding="utf-8-sig", errors="strict")
+        if marker in text:
+            text = text.split(marker, 1)[0].rstrip() + "\n"
+        payload = json.loads(context.read_text(encoding="utf-8"))
+        block = "\n".join([
+            "", marker, "## 已审核 Story Production Contract（强制）", "",
+            f"- 使用范围：{purpose}", f"- 请求清单：`{context}`",
+            f"- contract_schema_version：`{payload.get('contract_schema_version', '')}`",
+            f"- story_contract_sha256：`{payload.get('story_contract_sha256', '')}`",
+            f"- story_contract_dependency_sha256：`{payload.get('story_contract_dependency_sha256', '')}`",
+            "- 必须读取请求清单的 contract_projection；不得用旧项目、历史样例或自行推断覆盖合同规则。",
+            "- 本任务产生的 plan/request manifest 必须原样记录上述三个绑定字段。", "",
+        ])
+        handoff.write_text(text + block, encoding="utf-8")
+
+    def _archive_contract_consumer_outputs(self, consumer: str) -> Path:
+        """Archive only the output family whose dependency projection changed.
+
+        V3.5 currently maps dependencies at output-family granularity.  A
+        later Runtime increment may narrow storyboard/video invalidation to
+        individual scenes, but unrelated families are deliberately untouched.
+        """
+
+        stamp = time.strftime("%Y%m%d-%H%M%S")
+        archive = self.context.paths.status / "rejected" / "contract_invalidation" / stamp / consumer
+        archive.mkdir(parents=True, exist_ok=True)
+        candidates: list[Path] = []
+        if consumer == "storyboard_images":
+            candidates.extend((self.context.paths.images / "images").glob(f"{self.context.slug}_scene_*.png"))
+            candidates.extend(self.context.paths.images.glob(f"{self.context.slug}_visual_bible.md"))
+            candidates.extend(self.context.paths.images.glob(f"{self.context.slug}_storyboard_plan.json"))
+        elif consumer == "image_video":
+            candidates.extend((self.context.paths.video_jobs / "videos").glob("*.mp4"))
+        elif consumer == "music":
+            candidates.extend(self._music_dir().glob(f"{self.context.slug}_music_plan.csv"))
+            candidates.extend(self._music_dir().glob(f"{self.context.slug}_suno_prompts.md"))
+            candidates.extend(self._music_dir().glob(f"{self.context.slug}_background_music.*"))
+            candidates.extend(self._suno_downloads_dir().glob("*"))
+        elif consumer == "cover":
+            candidates.extend(self.context.paths.publish.glob("*/covers/cover_*"))
+            candidates.extend(self.context.paths.publish.glob("*/copy.md"))
+        elif consumer == "release_video":
+            candidates.extend((self.context.paths.release / "theme_assets").glob("*.png"))
+            candidates.extend(self.context.paths.release.glob("*发布视频.mp4"))
+        elif consumer == "product_package":
+            for key in ("product_base", "product_advanced"):
+                target = first_existing(self._manifest().get("outputs", {}).get(key))
+                if target is not None:
+                    candidates.append(target)
+        for source in candidates:
+            if not source.exists():
+                continue
+            target = archive / source.name
+            counter = 1
+            while target.exists():
+                target = archive / f"{source.stem}_{counter}{source.suffix}"
+                counter += 1
+            shutil.move(str(source), str(target))
+        return archive
 
     def _has_story_contract(self, manifest: dict[str, Any]) -> bool:
         if self._legacy_contract_policy(manifest):
@@ -3342,6 +3538,11 @@ class StoryAgent:
         )
 
     def _has_story_images(self, manifest: dict[str, Any]) -> bool:
+        if not self._consumer_output_current(manifest, "storyboard_images"):
+            return False
+        return self._has_story_image_files(manifest)
+
+    def _has_story_image_files(self, manifest: dict[str, Any]) -> bool:
         image_dir = self._image_dir()
         storyboard = self._storyboard_path(manifest)
         if image_dir is None or storyboard is None:
@@ -3353,7 +3554,7 @@ class StoryAgent:
         return self._review_stage_current("story_images_review")
 
     def _has_jobs_csv(self, manifest: dict[str, Any]) -> bool:
-        return self._jobs_csv(manifest) is not None
+        return self._consumer_request_current(manifest, "image_video") and self._jobs_csv(manifest) is not None
 
     def _has_timing(self, manifest: dict[str, Any]) -> bool:
         timings = first_existing(manifest.get("outputs", {}).get("timings_json"), self.context.paths.assembly / "timings.json")
@@ -3403,6 +3604,11 @@ class StoryAgent:
             return False
 
     def _has_generated_videos(self, manifest: dict[str, Any]) -> bool:
+        if not self._consumer_output_current(manifest, "image_video"):
+            return False
+        return self._has_generated_video_files(manifest)
+
+    def _has_generated_video_files(self, manifest: dict[str, Any]) -> bool:
         jobs = self._jobs_csv(manifest)
         videos = self.context.paths.video_jobs / "videos"
         if jobs is None or not videos.exists():
@@ -3444,7 +3650,11 @@ class StoryAgent:
     def _has_music_request(self, manifest: dict[str, Any]) -> bool:
         if self._provided_music(manifest) is not None:
             return True
-        return self._music_plan().exists() or (self._music_dir() / f"{self.context.slug}_suno_music_request.md").exists() or self._background_music().exists()
+        return self._consumer_request_current(manifest, "music") and (
+            self._music_plan().exists()
+            or (self._music_dir() / f"{self.context.slug}_suno_music_request.md").exists()
+            or self._background_music().exists()
+        )
 
     def _has_suno_audio(self, manifest: dict[str, Any]) -> bool:
         if self._provided_music(manifest) is not None:
@@ -3462,6 +3672,23 @@ class StoryAgent:
 
     def _music_qa_report_passes(self, report: Path) -> bool:
         return self._json_qa_report_passes(report)
+
+    def _music_plan_contract_bound(self, manifest: dict[str, Any]) -> bool:
+        if self._legacy_contract_policy(manifest):
+            return True
+        plan = self._music_plan()
+        try:
+            expected = json.loads(contract_consumer_path(self.context.project_dir, "music").read_text(encoding="utf-8"))
+            with plan.open(encoding="utf-8-sig", newline="") as file:
+                rows = list(csv.DictReader(file))
+        except (OSError, json.JSONDecodeError, csv.Error):
+            return False
+        return bool(rows) and all(
+            row.get("contract_schema_version") == expected.get("contract_schema_version")
+            and row.get("story_contract_sha256") == expected.get("story_contract_sha256")
+            and row.get("story_contract_dependency_sha256") == expected.get("story_contract_dependency_sha256")
+            for row in rows
+        )
 
     def _json_qa_report_passes(self, report: Path) -> bool:
         try:
@@ -3486,13 +3713,13 @@ class StoryAgent:
 
     def _has_release_assets(self, manifest: dict[str, Any]) -> bool:
         theme = self.context.paths.release / "theme_assets"
-        return all((theme / name).exists() for name in ("main_release_plate.png", "library_release_plate.png", "main_background_16x9.png", "story_frame_a.png")) and (self.context.paths.release / "keying" / "keying_preset.json").exists()
+        return self._consumer_request_current(manifest, "release_video") and all((theme / name).exists() for name in ("main_release_plate.png", "library_release_plate.png", "main_background_16x9.png", "story_frame_a.png")) and (self.context.paths.release / "keying" / "keying_preset.json").exists()
 
     def _has_release_preview(self, manifest: dict[str, Any]) -> bool:
         return self._review_stage_current("release_preview")
 
     def _has_release_videos(self, manifest: dict[str, Any]) -> bool:
-        return (self.context.paths.release / "主账号发布视频.mp4").exists() and (self.context.paths.release / "宝库号发布视频.mp4").exists()
+        return self._consumer_output_current(manifest, "release_video") and (self.context.paths.release / "主账号发布视频.mp4").exists() and (self.context.paths.release / "宝库号发布视频.mp4").exists()
 
     def _has_release_qa(self, manifest: dict[str, Any]) -> bool:
         return self._json_qa_report_passes(self.context.paths.status / "qa_release_report.json")
@@ -3501,6 +3728,9 @@ class StoryAgent:
         return self._review_stage_current("release_video_review")
 
     def _has_publish_package(self, manifest: dict[str, Any]) -> bool:
+        return self._consumer_output_current(manifest, "cover") and self._has_publish_package_files()
+
+    def _has_publish_package_files(self) -> bool:
         publish = self.context.paths.publish
         required = [
             publish / account / "covers" / f"cover_{ratio}.png"
@@ -3514,7 +3744,7 @@ class StoryAgent:
         return self._review_stage_current("publish_package_review")
 
     def _has_product_preflight(self, manifest: dict[str, Any]) -> bool:
-        return (self.context.paths.status / "product_package_work" / "第16步资料包_Codex前置审查.md").exists()
+        return self._consumer_request_current(manifest, "product_package") and (self.context.paths.status / "product_package_work" / "第16步资料包_Codex前置审查.md").exists()
 
     def _has_product_annotation(self, manifest: dict[str, Any]) -> bool:
         return self._product_annotation() is not None
@@ -3524,7 +3754,7 @@ class StoryAgent:
 
     def _has_product_package(self, manifest: dict[str, Any]) -> bool:
         outputs = manifest.get("outputs", {})
-        return first_existing(outputs.get("product_base")) is not None and first_existing(outputs.get("product_advanced")) is not None
+        return self._consumer_output_current(manifest, "product_package") and first_existing(outputs.get("product_base")) is not None and first_existing(outputs.get("product_advanced")) is not None
 
     def _has_product_package_review(self, manifest: dict[str, Any]) -> bool:
         return self._review_stage_current("product_package_review")

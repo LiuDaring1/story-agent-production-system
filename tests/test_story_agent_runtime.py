@@ -45,6 +45,19 @@ from story_project import load_manifest, project_paths, save_json, write_manifes
 from story_project import detect_project_assets, final_delivery, init_project, refresh_project_outputs, write_internal_agent_reports
 
 
+def as_frozen_v3_legacy(manifest: dict) -> dict:
+    """Turn a fixture into an evidence-bearing pre-V3.5 project.
+
+    Tests for behavior that predates the production-contract gate must opt in
+    explicitly; merely changing ``policy`` is intentionally insufficient.
+    """
+
+    manifest["created_at"] = "2026-08-11 12:00:00"
+    stages = manifest.setdefault("agent", {}).setdefault("stages", {})
+    stages["setup_project"] = {"status": "passed"}
+    return ensure_manifest_v2(manifest)
+
+
 class StoryAgentRuntimeTests(unittest.TestCase):
     def test_two_role_model_routing_uses_commander_for_judgment_and_worker_for_execution(self) -> None:
         context = AgentContext(
@@ -742,7 +755,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_partial_story_image_batch_is_retrying_not_passed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：图片分批"
-            manifest = ensure_manifest_v2(init_project(project, story_name="图片分批", slug="image-batch"))
+            manifest = as_frozen_v3_legacy(init_project(project, story_name="图片分批", slug="image-batch"))
             paths = project_paths(project)
             story = paths.inputs / "image-batch_source.txt"
             story.write_text("第一镜。\n第二镜。\n", encoding="utf-8")
@@ -785,7 +798,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_story_image_batch_rejects_producer_storyboard_rewrite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：分镜只读"
-            manifest = ensure_manifest_v2(init_project(project, story_name="分镜只读", slug="readonly-board"))
+            manifest = as_frozen_v3_legacy(init_project(project, story_name="分镜只读", slug="readonly-board"))
             paths = project_paths(project)
             story = paths.inputs / "readonly-board_source.txt"
             story.write_text("第一镜。\n第二镜。\n", encoding="utf-8")
@@ -1312,7 +1325,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_missing_target_video_is_not_hidden_by_unrelated_mp4(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：缺帧"
-            manifest = init_project(project, story_name="缺帧", slug="missing-frame")
+            manifest = as_frozen_v3_legacy(init_project(project, story_name="缺帧", slug="missing-frame"))
             paths = project_paths(project)
             jobs = paths.video_jobs / "missing-frame_image_video_jobs.csv"
             jobs.write_text(
@@ -1349,7 +1362,8 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_suno_login_or_browser_loss_writes_recoverable_blocker(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：Suno阻塞"
-            manifest = init_project(project, story_name="Suno阻塞", slug="suno-block")
+            manifest = as_frozen_v3_legacy(init_project(project, story_name="Suno阻塞", slug="suno-block"))
+            write_manifest(project_paths(project), manifest)
             context = AgentContext(
                 project_dir=project,
                 inbox=None,

@@ -18,7 +18,11 @@ from typing import Any, Iterator
 
 from story_project import init_project, load_manifest, project_paths, save_json, slugify, write_internal_agent_reports, write_manifest
 from story_semantics import StoryOutput, classify_story, lines_for_output
-from story_contract_runtime import CONTRACT_POLICY_LEGACY, CONTRACT_POLICY_REQUIRED
+from story_contract_runtime import (
+    CONTRACT_POLICY_LEGACY,
+    CONTRACT_POLICY_REQUIRED,
+    legacy_eligibility_receipt,
+)
 
 
 MANIFEST_VERSION = 2
@@ -369,12 +373,19 @@ def ensure_manifest_v2(
     agent.setdefault("source", {})
     agent.setdefault("input_contract", {})
     contract_runtime = agent.setdefault("story_contract", {})
-    # A manifest without an explicit policy may have been created by any V3
-    # entry point before contracts existed.  Treat it as legacy here.  The
-    # normal V3.5 submit path opts newly-created jobs into the required policy
-    # explicitly below, so merely loading/migrating an old manifest can never
-    # silently insert new blocking stages.
-    contract_runtime.setdefault("policy", CONTRACT_POLICY_LEGACY)
+    # Legacy is an evidence-bound migration state, not a user-selectable
+    # escape hatch.  A fresh/new manifest defaults to required_v1.  Only a
+    # manifest that predates the frozen V3 baseline and already has completed
+    # pre-contract production history receives a deterministic eligibility
+    # receipt.  Changing just ``policy`` can therefore never bypass the gate.
+    eligibility = legacy_eligibility_receipt(manifest)
+    if eligibility is not None and contract_runtime.get("policy") in (None, CONTRACT_POLICY_LEGACY):
+        contract_runtime["policy"] = CONTRACT_POLICY_LEGACY
+        contract_runtime["legacy_eligibility"] = eligibility
+    else:
+        if contract_runtime.get("policy") != CONTRACT_POLICY_REQUIRED:
+            contract_runtime["policy"] = CONTRACT_POLICY_REQUIRED
+        contract_runtime.pop("legacy_eligibility", None)
     agent.setdefault("external_blockers", [])
     agent.setdefault("branch_blockers", {})
     scheduler = agent.setdefault("scheduler", {})

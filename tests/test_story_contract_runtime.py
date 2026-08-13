@@ -25,6 +25,14 @@ from story_contract_runtime import (
     contract_paths,
     contract_runtime_issues,
     contract_review_payload_issues,
+    contract_consumer_completion_is_current,
+    contract_consumer_context_is_current,
+    contract_consumer_path,
+    legacy_passthrough_allowed,
+    locked_contract_binding,
+    mark_contract_consumer_completed,
+    write_contract_lock,
+    write_contract_consumer_context,
     write_trusted_input_chain,
 )
 from story_project import init_project, load_config, project_paths, save_json, write_manifest
@@ -117,10 +125,45 @@ def _runtime_valid_contract(project: Path, manifest: dict) -> dict:
     return contract
 
 
+def _lock_contract(project: Path, manifest: dict, *, contract_payload: dict | None = None) -> tuple[StoryAgent, dict[str, Path]]:
+    agent = StoryAgent(_context(project))
+    paths = contract_paths(project)
+    write_trusted_input_chain(paths["trusted_inputs"], build_trusted_input_chain(project, manifest, load_config()))
+    save_json(paths["contract"], contract_payload or _runtime_valid_contract(project, manifest))
+    paths["summary"].write_text("# 已验证合同\n", encoding="utf-8")
+
+    def fake_review(**kwargs):
+        payload = {
+            "approved": True,
+            "score": 96,
+            "critical_errors": [],
+            "issues": [],
+            "retry_indices": [],
+            "retry_files": [],
+            "retry_instructions": [],
+            "evidence_matrix": [
+                {"section": section, "evidence": f"contracts.{section}"}
+                for section in (
+                    "semantic_artifacts", "visual_style", "characters", "world_scale",
+                    "story_state", "brand", "release_layout",
+                )
+            ],
+            "artifact_sha256": file_sha256(kwargs["bundle"]),
+        }
+        save_json(paths["review"], payload)
+        return StageResult("done", "reviewed", paths["review"]), payload
+
+    with patch.object(agent, "_structured_review", side_effect=fake_review):
+        result = agent._stage_story_contract_review(manifest)
+    if result.status != "done":
+        raise AssertionError(result.message)
+    return agent, paths
+
+
 class StoryContractRuntimeTests(unittest.TestCase):
-    def test_manifest_migration_is_legacy_but_new_submit_opts_in(self) -> None:
+    def test_manifest_without_historical_evidence_requires_contract(self) -> None:
         migrated = ensure_manifest_v2({"story": {"name": "possibly-v3"}})
-        self.assertEqual(migrated["agent"]["story_contract"]["policy"], CONTRACT_POLICY_LEGACY)
+        self.assertEqual(migrated["agent"]["story_contract"]["policy"], CONTRACT_POLICY_REQUIRED)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source = root / "new.mp4"
@@ -265,6 +308,7 @@ class StoryContractRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "legacy"
             manifest = init_project(project, story_name="legacy", slug="legacy")
+            manifest["created_at"] = "2026-08-11 12:00:00"
             manifest["agent"]["stages"]["setup_project"] = {"status": "passed"}
             manifest = ensure_manifest_v2(manifest)
             agent = StoryAgent(_context(project), read_only=True)
@@ -272,6 +316,97 @@ class StoryContractRuntimeTests(unittest.TestCase):
             self.assertTrue(agent._has_story_contract_review(manifest))
             self.assertEqual(agent._stage_story_contract(manifest).status, "done")
             self.assertEqual(agent._stage_story_contract_review(manifest).status, "done")
+
+    def test_fresh_manifest_cannot_self_declare_legacy_passthrough(self) -> None:
+        manifest = {
+            "created_at": "2026-08-13 12:00:00",
+            "story": {"name": "new", "slug": "new"},
+            "agent": {
+                "story_contract": {"policy": CONTRACT_POLICY_LEGACY},
+                "stages": {"setup_project": {"status": "passed"}},
+            },
+        }
+        migrated = ensure_manifest_v2(manifest)
+        self.assertEqual(migrated["agent"]["story_contract"]["policy"], CONTRACT_POLICY_REQUIRED)
+        self.assertFalse(legacy_passthrough_allowed(migrated))
+
+    def test_legacy_receipt_is_bound_and_policy_edit_cannot_forge_it(self) -> None:
+        manifest = {
+            "created_at": "2026-08-11 12:00:00",
+            "story": {"name": "old", "slug": "old"},
+            "agent": {"stages": {"setup_project": {"status": "passed"}}},
+        }
+        migrated = ensure_manifest_v2(manifest)
+        self.assertTrue(legacy_passthrough_allowed(migrated))
+        migrated["story"]["slug"] = "forged"
+        self.assertFalse(legacy_passthrough_allowed(migrated))
+
+    def test_damaged_or_incomplete_lock_never_unlocks_consumer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            _agent, paths = _lock_contract(project, manifest)
+            self.assertEqual(locked_contract_binding(project, "image_video")["consumer"], "image_video")
+            valid = paths["lock"].read_bytes()
+            for damaged in (b'{"version":1}\n', valid[: max(1, len(valid) // 2)], b"not-json\n"):
+                paths["lock"].write_bytes(damaged)
+                self.assertFalse(contract_lock_is_current(project, bundle=paths["bundle"], review=paths["review"]))
+                with self.assertRaises(ValueError):
+                    locked_contract_binding(project, "image_video")
+                paths["lock"].write_bytes(valid)
+
+    def test_failed_lock_replace_preserves_last_valid_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            _agent, paths = _lock_contract(project, manifest)
+            previous = paths["lock"].read_bytes()
+            with patch("story_contract_runtime.os.replace", side_effect=OSError("simulated crash")):
+                with self.assertRaises(OSError):
+                    write_contract_lock(project, bundle=paths["bundle"], review=paths["review"])
+            self.assertEqual(paths["lock"].read_bytes(), previous)
+            self.assertTrue(contract_lock_is_current(project, bundle=paths["bundle"], review=paths["review"]))
+            self.assertEqual(list(paths["lock"].parent.glob(f".{paths['lock'].name}.*.tmp")), [])
+
+    def test_consumer_receipt_requires_complete_current_context(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            _lock_contract(project, manifest)
+            context = write_contract_consumer_context(project, "cover")
+            self.assertTrue(contract_consumer_context_is_current(project, "cover"))
+            mark_contract_consumer_completed(project, "cover")
+            self.assertTrue(contract_consumer_completion_is_current(project, "cover"))
+            payload = json.loads(context.read_text(encoding="utf-8"))
+            payload.pop("contract_projection")
+            save_json(context, payload)
+            self.assertFalse(contract_consumer_context_is_current(project, "cover"))
+            self.assertFalse(contract_consumer_completion_is_current(project, "cover"))
+
+    def test_unrelated_contract_section_does_not_invalidate_consumer_projection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            _agent, paths = _lock_contract(project, manifest)
+            before = write_contract_consumer_context(project, "image_video")
+            before_payload = json.loads(before.read_text(encoding="utf-8"))
+            # image_video depends on characters + story_state, not brand.
+            contract = json.loads(paths["contract"].read_text(encoding="utf-8"))
+            contract["contracts"]["brand"]["rules"].append({
+                "rule_id": "brand-extra",
+                "value": "额外品牌规则",
+                "provenance": {
+                    "source": "agent_inference",
+                    "source_ref": "agent_inference.brand-extra",
+                    "confidence": 0.5,
+                },
+            })
+            save_json(paths["contract"], contract)
+            # Re-review/re-lock the changed contract.
+            _lock_contract(project, manifest, contract_payload=contract)
+            current = locked_contract_binding(project, "image_video")
+            self.assertEqual(
+                before_payload["story_contract_dependency_sha256"],
+                current["story_contract_dependency_sha256"],
+            )
+            self.assertTrue(contract_consumer_context_is_current(project, "image_video"))
+            self.assertNotEqual(before_payload["story_contract_sha256"], current["story_contract_sha256"])
 
 
 if __name__ == "__main__":

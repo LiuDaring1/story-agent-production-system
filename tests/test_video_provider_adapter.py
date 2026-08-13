@@ -151,6 +151,59 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 run_image_video_jobs.main()
             self.assertEqual(calls, ["5", "9", "15"])
 
+    def test_contract_gate_failure_happens_before_any_paid_create_task(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            images, videos, jobs = self._write_grok_jobs_fixture(root)
+            with jobs.open(encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            for row in rows:
+                row.update(
+                    {
+                        "contract_schema_version": "1.0.0",
+                        "story_contract_sha256": "a" * 64,
+                        "story_contract_dependency_sha256": "b" * 64,
+                    }
+                )
+            with jobs.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+            paid_calls: list[dict] = []
+
+            class FakeClient:
+                def __init__(self, *, api_key: str, base_url: str) -> None:
+                    del api_key, base_url
+
+                def create_task(self, **kwargs):
+                    paid_calls.append(kwargs)
+                    return CreateTaskResult(task_id="must-not-run", raw={})
+
+            argv = [
+                "run_image_video_jobs.py",
+                "--jobs-csv", str(jobs),
+                "--project-dir", str(root),
+                "--images-dir", str(images),
+                "--videos-dir", str(videos),
+                "--base-url", "https://toapis.com/v1",
+                "--model", "grok-video-1.5",
+                "--api-key", "test-secret",
+                "--submit-only",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(run_image_video_jobs, "ToAPIsVideoClient", FakeClient),
+                patch.object(
+                    run_image_video_jobs,
+                    "assert_request_contract_binding",
+                    side_effect=ValueError("lock damaged"),
+                ) as gate,
+            ):
+                with self.assertRaisesRegex(ValueError, "lock damaged"):
+                    run_image_video_jobs.main()
+            gate.assert_called_once()
+            self.assertEqual(paid_calls, [])
+
     def test_api_timeout_or_no_progress_stops_without_infinite_loop(self) -> None:
         root = Path(__file__).resolve().parents[1]
         with tempfile.TemporaryDirectory() as directory:

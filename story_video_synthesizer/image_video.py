@@ -63,6 +63,12 @@ class ImageVideoJob:
     continuity_forbidden: tuple[str, ...] = ()
     continuity_contract_path: str = ""
     storyboard_plan_path: str = ""
+    contract_schema_version: str = ""
+    story_contract_sha256: str = ""
+    story_contract_dependency_sha256: str = ""
+    story_contract_context_path: str = ""
+    story_contract_characters: str = ""
+    story_contract_state: str = ""
 
 
 def discover_visual_continuity_paths(
@@ -499,6 +505,7 @@ def build_jobs(
     short_slug: str,
     continuity_contract_path: Path | None = None,
     storyboard_plan_path: Path | None = None,
+    story_contract_context_path: Path | None = None,
 ) -> tuple[list[ImageVideoJob], list[str]]:
     images = sorted_image_files(image_dir, slug=slug)
     items = parse_storyboard_items(read_storyboard_text(storyboard_path))
@@ -520,6 +527,10 @@ def build_jobs(
         storyboard_plan_path,
         expected_scenes=len(images),
     )
+    contract_context = _load_story_contract_context(story_contract_context_path, consumer="image_video")
+    contract_projection = contract_context.get("contract_projection", {}) if contract_context else {}
+    contract_characters = contract_projection.get("characters", {}) if isinstance(contract_projection, dict) else {}
+    contract_state = contract_projection.get("story_state", {}) if isinstance(contract_projection, dict) else {}
     prompt_overrides = read_flow_video_prompts(
         image_dir,
         slug,
@@ -555,6 +566,8 @@ def build_jobs(
             continuity = continuity_by_scene[scene]
         else:
             continuity = None
+        if contract_context:
+            prompt = _inject_story_contract_prompt(prompt, contract_characters, contract_state)
         jobs.append(
             ImageVideoJob(
                 scene=scene,
@@ -569,10 +582,44 @@ def build_jobs(
                 continuity_forbidden=continuity.forbidden if continuity else (),
                 continuity_contract_path=(str(continuity_contract_path.expanduser().resolve()) if continuity and continuity_contract_path else ""),
                 storyboard_plan_path=(str(storyboard_plan_path.expanduser().resolve()) if continuity and storyboard_plan_path else ""),
+                contract_schema_version=str(contract_context.get("contract_schema_version") or ""),
+                story_contract_sha256=str(contract_context.get("story_contract_sha256") or ""),
+                story_contract_dependency_sha256=str(contract_context.get("story_contract_dependency_sha256") or ""),
+                story_contract_context_path=str(story_contract_context_path.expanduser().resolve()) if story_contract_context_path else "",
+                story_contract_characters=json.dumps(contract_characters, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if contract_characters else "",
+                story_contract_state=json.dumps(contract_state, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if contract_state else "",
             )
         )
 
     return jobs, warnings
+
+
+def _load_story_contract_context(path: Path | None, *, consumer: str) -> dict[str, Any]:
+    if path is None:
+        return {}
+    target = path.expanduser()
+    try:
+        payload = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise VisualContinuityContractError(f"Story Contract 消费者上下文不可读：{exc}") from exc
+    if not isinstance(payload, dict) or payload.get("consumer") != consumer:
+        raise VisualContinuityContractError(f"Story Contract 消费者上下文必须绑定 {consumer}")
+    required = ("contract_schema_version", "story_contract_sha256", "story_contract_dependency_sha256")
+    if payload.get("mode") != "legacy_passthrough" and any(not str(payload.get(key) or "") for key in required):
+        raise VisualContinuityContractError("Story Contract 消费者上下文缺少合同版本或绑定哈希")
+    return payload
+
+
+def _inject_story_contract_prompt(prompt: str, characters: Mapping[str, Any], state: Mapping[str, Any]) -> str:
+    machine = json.dumps(
+        {"characters": characters, "story_state": state},
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    marker = "[STORY_CONTRACT_V1]"
+    base = prompt.split(marker, 1)[0].rstrip()
+    return f"{base}\n{marker}{machine}\n必须保持合同角色身份和当前故事状态；逐镜 required 必须出现，forbidden 严禁出现。"
 
 
 def read_flow_video_prompts(
@@ -834,6 +881,17 @@ def write_job_outputs(jobs: list[ImageVideoJob], output_dir: Path, slug: str) ->
                     "storyboard_plan_path": job.storyboard_plan_path,
                 }
             )
+        if job.contract_schema_version:
+            rows[-1].update(
+                {
+                    "contract_schema_version": job.contract_schema_version,
+                    "story_contract_sha256": job.story_contract_sha256,
+                    "story_contract_dependency_sha256": job.story_contract_dependency_sha256,
+                    "story_contract_context_path": job.story_contract_context_path,
+                    "story_contract_characters": job.story_contract_characters,
+                    "story_contract_state": job.story_contract_state,
+                }
+            )
     prompt_stable = _merge_existing_job_rows(rows, existing_rows)
     _apply_prompt_review_decisions(rows, prompt_review_decisions, prompt_stable=prompt_stable)
 
@@ -935,6 +993,12 @@ def _copy_continuity_fields(source: Mapping[str, str], target: dict[str, str]) -
         "visual_continuity_forbidden",
         "continuity_contract_path",
         "storyboard_plan_path",
+        "contract_schema_version",
+        "story_contract_sha256",
+        "story_contract_dependency_sha256",
+        "story_contract_context_path",
+        "story_contract_characters",
+        "story_contract_state",
     ):
         if source.get(field, ""):
             target[field] = source[field]
@@ -976,6 +1040,12 @@ _REFRESHED_JOB_FIELDS = {
     "visual_continuity_forbidden",
     "continuity_contract_path",
     "storyboard_plan_path",
+    "contract_schema_version",
+    "story_contract_sha256",
+    "story_contract_dependency_sha256",
+    "story_contract_context_path",
+    "story_contract_characters",
+    "story_contract_state",
     "prompt_review_status",
     "prompt_review_notes",
 }

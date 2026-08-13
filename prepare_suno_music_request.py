@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import json
 import re
 import time
 from pathlib import Path
@@ -19,6 +20,7 @@ def main() -> None:
     parser.add_argument("--narration", default=None, type=Path)
     parser.add_argument("--jobs-csv", default=None, type=Path)
     parser.add_argument("--skill-path", default=Path.home() / "Downloads" / "suno-story-score.skill", type=Path)
+    parser.add_argument("--story-contract-context", default=None, type=Path)
     args = parser.parse_args()
 
     story_file = args.story_file.expanduser()
@@ -40,11 +42,13 @@ def main() -> None:
 
     timeline_rows = _timeline_rows(args.jobs_csv.expanduser()) if args.jobs_csv and args.jobs_csv.expanduser().exists() else []
     timeline = _format_timeline(timeline_rows)
+    contract_context = _load_music_contract_context(args.story_contract_context)
 
     request_path = music_dir / f"{args.slug}_suno_music_request.md"
     prompts_path = music_dir / f"{args.slug}_suno_prompts.md"
     plan_path = music_dir / f"{args.slug}_music_plan.csv"
     final_music_path = music_dir / f"{args.slug}_background_music.mp3"
+    request_manifest_path = music_dir / f"{args.slug}_music_request_manifest.json"
     for stale_path in (prompts_path, plan_path):
         archived = _archive_stale_generated_file(stale_path)
         if archived:
@@ -67,12 +71,37 @@ def main() -> None:
         ),
         encoding="utf-8",
     )
+    if contract_context:
+        request_manifest_path.write_text(json.dumps(contract_context, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        with request_path.open("a", encoding="utf-8") as file:
+            file.write(
+                "\n## 已审核故事合同（强制）\n\n"
+                f"- 请求清单：`{args.story_contract_context.expanduser()}`\n"
+                f"- story_contract_sha256：`{contract_context['story_contract_sha256']}`\n"
+                f"- contract_schema_version：`{contract_context['contract_schema_version']}`\n"
+                f"- story_contract_dependency_sha256：`{contract_context['story_contract_dependency_sha256']}`\n"
+                "- 必须使用 contract_projection.semantic_artifacts 的故事边界/产物语义和 story_state 的阶段/情绪变化设计音乐段；不得让音乐覆盖对白或跨越不兼容的故事边界。\n"
+                "- 生成的 prompts 与 music_plan 每行/每段必须记录上述三个合同绑定字段。\n"
+                "\n```json\n" + json.dumps(contract_context.get("contract_projection", {}), ensure_ascii=False, indent=2) + "\n```\n"
+            )
 
     print(f"已生成 Codex 智能配乐任务：{request_path}")
     print(f"待 Codex 生成 Suno 提示词：{prompts_path}")
     print(f"待 Codex 生成音乐分段表：{plan_path}")
     print(f"Suno 下载目录：{clips_dir}")
     print(f"最终背景音乐：{final_music_path}")
+
+
+def _load_music_contract_context(path: Path | None) -> dict[str, object]:
+    if path is None:
+        return {}
+    payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    if payload.get("consumer") != "music":
+        raise ValueError("story contract context consumer must be music")
+    for key in ("contract_schema_version", "story_contract_sha256", "story_contract_dependency_sha256"):
+        if not str(payload.get(key) or "").strip():
+            raise ValueError(f"music contract context missing {key}")
+    return payload
 
 
 def _archive_stale_generated_file(path: Path) -> Path | None:

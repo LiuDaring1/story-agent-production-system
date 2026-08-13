@@ -23,6 +23,7 @@ from story_video_synthesizer.volcengine_video import (
     write_jobs_csv,
 )
 from story_video_synthesizer.image_video import validate_image_video_jobs, write_review_page_from_rows
+from story_contract_runtime import assert_request_contract_binding
 from story_video_synthesizer.toapis_video import (
     DEFAULT_MODEL as TOAPIS_DEFAULT_MODEL,
     DEFAULT_RATIO as TOAPIS_DEFAULT_RATIO,
@@ -136,9 +137,20 @@ def row_extra_body(jobs_csv: Path, row: dict[str, str], extra_body: dict[str, ob
     return payload
 
 
+def _discover_project_root(jobs_csv: Path) -> Path | None:
+    """Find the owning project without accepting an arbitrary manifest path."""
+
+    current = jobs_csv.expanduser().resolve().parent
+    for candidate in (current, *current.parents):
+        if (candidate / "99_项目状态" / "project_manifest.json").is_file():
+            return candidate
+    return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="通过已配置的视频供应商批量生成图片转视频片段")
     parser.add_argument("--jobs-csv", required=True, type=Path, help="prepare_image_video_jobs.py 生成的任务 CSV")
+    parser.add_argument("--project-dir", type=Path, help="V3.5 合同锁项目根目录；合同绑定 jobs 必填（可自动发现）")
     parser.add_argument("--images-dir", required=True, type=Path, help="稳定命名图片文件夹")
     parser.add_argument("--videos-dir", required=True, type=Path, help="生成视频保存文件夹")
     parser.add_argument("--api-key-env", default=saved_video_adapter_value("api_key_env", "QINGYUN_API_KEY"), help="只读取这个环境变量或同名 macOS Keychain 服务中的 API Key；不会写入 CSV 或日志")
@@ -209,6 +221,10 @@ def main() -> None:
         args.size = os.getenv("VIDEO_SIZE") or DEFAULT_SIZE
 
     rows = read_jobs_csv(args.jobs_csv.expanduser())
+    contract_bound = any(str(row.get("story_contract_dependency_sha256") or "").strip() for row in rows)
+    project_dir = args.project_dir.expanduser() if args.project_dir else _discover_project_root(args.jobs_csv)
+    if contract_bound and project_dir is None:
+        raise ValueError("合同绑定 jobs 无法定位 project_dir，已在付费调用前阻断")
     args.videos_dir.expanduser().mkdir(parents=True, exist_ok=True)
     api_key = read_secret(args.api_key_env) or args.api_key.strip()
     client_type = ToAPIsVideoClient if is_toapis else QingyunVideoClient
@@ -272,6 +288,8 @@ def main() -> None:
             print(f"批量创建任务 {row['scene']}：{row['image_filename']}", flush=True)
             try:
                 request_extra = row_extra_body(args.jobs_csv, row, extra_body, model=args.model) if is_toapis else extra_body
+                if contract_bound:
+                    assert_request_contract_binding(project_dir, "image_video", row)
                 created = client.create_task(
                     model=args.model,
                     prompt=row["prompt"],
@@ -383,6 +401,8 @@ def main() -> None:
                     print(f"创建任务 {row['scene']}：{row['image_filename']}", flush=True)
                     assert client is not None
                     request_extra = row_extra_body(args.jobs_csv, row, extra_body, model=args.model) if is_toapis else extra_body
+                    if contract_bound:
+                        assert_request_contract_binding(project_dir, "image_video", row)
                     created = client.create_task(
                         model=args.model,
                         prompt=row["prompt"],

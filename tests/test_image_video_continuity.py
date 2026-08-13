@@ -53,6 +53,46 @@ class ImageVideoContinuityTests(unittest.TestCase):
             self.assertIn("禁止状态", prompt)
             self.assertIn("整个视频片段必须始终保持 current_state=state_a", prompt)
 
+    def test_story_production_contract_binding_is_written_to_every_job(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            image_dir, storyboard, continuity, plan = self._fixture(root)
+            context = root / "image_video.json"
+            context.write_text(
+                json.dumps(
+                    {
+                        "consumer": "image_video",
+                        "contract_schema_version": "1.0.0",
+                        "story_contract_sha256": "a" * 64,
+                        "story_contract_dependency_sha256": "b" * 64,
+                        "contract_projection": {
+                            "characters": {"mode": "character_driven", "items": [{"character_id": "hero"}]},
+                            "story_state": {"states": [{"state_id": "state_a"}]},
+                        },
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            jobs, _warnings = build_jobs(
+                image_dir,
+                storyboard,
+                root / "jobs",
+                "demo",
+                "demo",
+                continuity,
+                plan,
+                context,
+            )
+            outputs = write_job_outputs(jobs, root / "jobs", "demo")
+            with outputs["manifest_csv"].open(encoding="utf-8-sig", newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertEqual(row["contract_schema_version"], "1.0.0")
+            self.assertEqual(row["story_contract_sha256"], "a" * 64)
+            self.assertEqual(row["story_contract_dependency_sha256"], "b" * 64)
+            self.assertIn("STORY_CONTRACT_V1", row["prompt"])
+            self.assertIn('"character_id":"hero"', row["prompt"])
+
     def test_old_review_csv_cannot_erase_contract_constraints(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

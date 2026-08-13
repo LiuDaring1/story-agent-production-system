@@ -25,6 +25,7 @@ from story_contract_runtime import (
     contract_consumer_context_is_current,
     contract_consumer_completion_is_current,
     contract_consumer_path,
+    contract_diagnostics,
     contract_lock_is_current,
     contract_paths,
     contract_review_artifacts,
@@ -849,6 +850,7 @@ class StoryAgent:
                     "reasoning_effort": self.context.codex_worker_reasoning_effort,
                 },
             },
+            "story_contract": contract_diagnostics(self.context.project_dir, manifest),
             "story_images": {
                 "actual": self._story_image_count(image_dir),
                 "expected_named_actual": self._expected_named_story_image_count(image_dir, manifest, storyboard),

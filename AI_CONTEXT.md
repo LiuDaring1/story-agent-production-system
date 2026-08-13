@@ -12,7 +12,7 @@ Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_ru
 
 1. [`AGENTS.md`](AGENTS.md)：不可破坏规则。
 2. [`docs/architecture/overall-architecture.md`](docs/architecture/overall-architecture.md)：五层架构和数据流。
-3. [`docs/architecture/stage-dag.md`](docs/architecture/stage-dag.md)：33 个阶段、依赖和并行边界。
+3. [`docs/architecture/stage-dag.md`](docs/architecture/stage-dag.md)：V3.5 的 35 个阶段、依赖和并行边界。
 4. [`docs/architecture/model-routing.md`](docs/architecture/model-routing.md)：Sol/Luna 两角色路由。
 5. [`docs/contracts/review-and-safety.md`](docs/contracts/review-and-safety.md)：审核、哈希、预算和密钥合同。
 6. [`docs/operations/runbook.md`](docs/operations/runbook.md)：提交、启动、恢复、诊断和验证。
@@ -20,13 +20,17 @@ Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_ru
 8. [`docs/baselines/V3_BASELINE_2026-08-12.md`](docs/baselines/V3_BASELINE_2026-08-12.md)：正式 V3 能力边界、冻结规则和证据入口。
 9. [`docs/baselines/V3_FEEDBACK_REGISTER_XIAOBIHU.md`](docs/baselines/V3_FEEDBACK_REGISTER_XIAOBIHU.md)：用户终验问题、模块归因和根因。
 10. [`docs/roadmaps/V3.5_QUALITY_AND_MODULARIZATION.md`](docs/roadmaps/V3.5_QUALITY_AND_MODULARIZATION.md)：V3.5 范围与非目标。
+11. [`docs/contracts/story-production-contract.md`](docs/contracts/story-production-contract.md)：合同前置、七类合同、锁和消费者失效语义。
 
 ## 核心代码地图
 
 | 文件 | 责任 |
 | --- | --- |
 | `story_agent.py` | 用户任务、阶段执行、DAG worker、模型路由、恢复与 supervisor |
-| `story_agent_runtime.py` | manifest v2、33 阶段 DAG、资源锁、预算、审核与哈希合同 |
+| `story_agent_runtime.py` | manifest v2、35 阶段 DAG、资源锁、预算、审核与哈希合同 |
+| `story_contracts.py` | Story Production Contract Schema/Python 验证和 provenance 规则 |
+| `story_contract_runtime.py` | 合同生成输入链、审核、锁、消费者 projection/receipt 和只读诊断 |
+| `story_contract_consumers.py` | 六类消费者的最小编译投影和确定性 render/content spec |
 | `story_workflow.py` | 把阶段翻译为本地脚本、FFmpeg 和产品制作命令 |
 | `story_project.py` | 项目目录、产物检测、机器 QA、交付和内部报告 |
 | `story_semantics.py` | 标题、主持人口播、正文、道理和结尾的语义合同 |
@@ -76,3 +80,5 @@ python3 story_agent.py --help
 - V3.5 同时修真实质量、安装模块接口、改进 Runtime；继续使用 Codex + GPT 体系，不在第一阶段接 DeepSeek 或多供应商自动路由。
 - 当前成本字段名以 CNY 表示，但 ToAPIs 模型页按美元报价；在修正前不能把本地估算当作人民币实扣。
 - 优化应先解决可观察性、增量返工、上下文包和真实账单，再比较模型档位。
+- V3.5 Milestone 1 已完成合同前置：新任务在批量生产前必须形成七类合同，由 Luna 起草、Sol 独立审核、Runtime 确定性锁定；V3 冻结项目仅在绑定的历史资格成立时 legacy passthrough。
+- 当前增量失效只到模块族级，不是逐镜头 dependency graph；质量修正、Port/adapter 正式化、请求账本和新故事实跑仍属于后续 Milestone。

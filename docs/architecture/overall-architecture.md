@@ -12,9 +12,10 @@ flowchart TB
     A --> D["DAG 调度器 / 最多并行三个阶段"]
 
     D --> S["素材链"]
-    S --> V["视觉与图生视频链"]
-    S --> MU["Suno 配乐链"]
-    S --> RA["发布视觉资产链"]
+    S --> CT["Story Production Contract<br/>Luna 草案 / Sol 审核 / Runtime 锁"]
+    CT --> V["视觉与图生视频链"]
+    CT --> MU["Suno 配乐链"]
+    CT --> RA["发布视觉资产链"]
 
     V --> AS["横屏最终合成"]
     MU --> AS
@@ -58,6 +59,10 @@ flowchart TB
 ### 5. 确定性工具
 
 FFmpeg、文件复制、哈希、CSV、JSON、LibreOffice 和测试属于确定性执行。能由脚本完成的工作不应消耗大模型上下文。
+
+## 合同层
+
+新任务在高成本分支前形成七节 Story Production Contract。它不是另一个人工表单：Runtime 编译可信输入链，Luna 起草，Sol 独立审核，Runtime 原子锁定。下游只消费所需 projection；分镜和音乐通过结构化 Agent 指令消费，图生视频、封面、发布视频和资料包的可确定部分进入底层 jobs/render/content spec。合同变化目前按模块族失效，逐镜头图属于后续 Runtime 里程碑。
 
 ## 项目目录角色
 

@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import hashlib
+import io
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -15,9 +17,12 @@ from story_agent_runtime import (
     JobRegistry,
     ensure_manifest_v2,
     file_sha256,
+    render_job_report,
+    resume_job,
     submit_video_job,
 )
 from story_contract_runtime import (
+    CONTRACT_CONSUMER_SECTIONS,
     CONTRACT_POLICY_LEGACY,
     CONTRACT_POLICY_REQUIRED,
     build_trusted_input_chain,
@@ -28,6 +33,7 @@ from story_contract_runtime import (
     contract_consumer_completion_is_current,
     contract_consumer_context_is_current,
     contract_consumer_path,
+    contract_diagnostics,
     legacy_passthrough_allowed,
     locked_contract_binding,
     mark_contract_consumer_completed,
@@ -407,6 +413,128 @@ class StoryContractRuntimeTests(unittest.TestCase):
             )
             self.assertTrue(contract_consumer_context_is_current(project, "image_video"))
             self.assertNotEqual(before_payload["story_contract_sha256"], current["story_contract_sha256"])
+
+    def test_diagnostics_report_contract_review_lock_and_consumer_corruption(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            _agent, paths = _lock_contract(project, manifest)
+            for consumer in CONTRACT_CONSUMER_SECTIONS:
+                write_contract_consumer_context(project, consumer)
+                mark_contract_consumer_completed(project, consumer)
+            status = contract_diagnostics(project, manifest)
+            self.assertEqual(status["policy"], CONTRACT_POLICY_REQUIRED)
+            self.assertTrue(status["contract"]["valid"])
+            self.assertTrue(status["review"]["current_and_approved"])
+            self.assertTrue(status["lock"]["valid"])
+            self.assertTrue(all(item["request_manifest"] == "current" for item in status["consumers"].values()))
+            self.assertTrue(all(item["completed_receipt"] == "current" for item in status["consumers"].values()))
+
+            contract_consumer_path(project, "cover").write_text("not-json\n", encoding="utf-8")
+            paths["lock"].write_text('{"status":"locked"}\n', encoding="utf-8")
+            resumed = resume_job(project)
+            status = contract_diagnostics(project, resumed)
+            self.assertFalse(status["lock"]["valid"])
+            self.assertEqual(status["consumers"]["cover"]["request_manifest"], "damaged")
+            self.assertNotEqual(status["consumers"]["cover"]["completed_receipt"], "current")
+            report = render_job_report(project).read_text(encoding="utf-8")
+            self.assertIn("## Story Production Contract", report)
+            self.assertIn("| cover | brand, characters, release_layout | damaged |", report)
+
+    def test_existing_status_cli_exposes_read_only_contract_diagnostics(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            _lock_contract(project, manifest)
+            output = io.StringIO()
+            with redirect_stdout(output):
+                StoryAgent(_context(project), read_only=True).status()
+            payload = json.loads(output.getvalue())
+            self.assertEqual(payload["story_contract"]["policy"], CONTRACT_POLICY_REQUIRED)
+            self.assertTrue(payload["story_contract"]["lock"]["valid"])
+            self.assertEqual(
+                set(payload["story_contract"]["consumers"]),
+                set(CONTRACT_CONSUMER_SECTIONS),
+            )
+
+    def test_diagnostics_never_forges_contract_state_for_eligible_legacy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "legacy"
+            manifest = init_project(project, story_name="legacy", slug="legacy")
+            manifest["created_at"] = "2026-08-11 12:00:00"
+            manifest["agent"]["stages"]["setup_project"] = {"status": "passed"}
+            manifest = ensure_manifest_v2(manifest)
+            write_manifest(project_paths(project), manifest)
+            status = contract_diagnostics(project, manifest)
+            self.assertEqual(status["policy"], CONTRACT_POLICY_LEGACY)
+            self.assertTrue(status["legacy_eligible"])
+            self.assertFalse(status["contract"]["exists"])
+            self.assertFalse(status["review"]["review_exists"])
+            self.assertFalse(status["lock"]["exists"])
+            self.assertTrue(all(item["request_manifest"] == "legacy_passthrough" for item in status["consumers"].values()))
+
+    def test_section_changes_invalidate_only_declared_consumer_families(self) -> None:
+        expected_stale = {
+            "semantic_artifacts": {"storyboard_images", "music", "product_package"},
+            "visual_style": {"storyboard_images"},
+            "characters": {"storyboard_images", "image_video", "cover"},
+            "world_scale": {"storyboard_images"},
+            "story_state": {"storyboard_images", "image_video", "music"},
+            "brand": {"cover", "release_video"},
+            "release_layout": {"cover", "release_video"},
+        }
+        for changed_section, expected in expected_stale.items():
+            with self.subTest(section=changed_section), tempfile.TemporaryDirectory() as directory:
+                project, manifest = _new_project(Path(directory))
+                _agent, paths = _lock_contract(project, manifest)
+                for consumer in CONTRACT_CONSUMER_SECTIONS:
+                    write_contract_consumer_context(project, consumer)
+                    mark_contract_consumer_completed(project, consumer)
+                contract = json.loads(paths["contract"].read_text(encoding="utf-8"))
+                contract["contracts"][changed_section]["rules"].append({
+                    "rule_id": f"diagnostic.{changed_section}",
+                    "value": f"changed-{changed_section}",
+                    "provenance": {
+                        "source": "agent_inference",
+                        "source_ref": f"agent_inference.diagnostic.{changed_section}",
+                        "confidence": 0.5,
+                    },
+                })
+                _lock_contract(project, manifest, contract_payload=contract)
+                status = contract_diagnostics(project, manifest)
+                stale = {
+                    name
+                    for name, item in status["consumers"].items()
+                    if item["request_manifest"] == "stale"
+                }
+                self.assertEqual(stale, expected)
+                for name, item in status["consumers"].items():
+                    self.assertEqual(item["changed_sections"], [changed_section] if name in expected else [])
+                    self.assertEqual(
+                        item["completed_receipt"],
+                        "stale" if name in expected else "current",
+                    )
+
+    def test_interrupted_generation_or_failed_review_cannot_leave_a_valid_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            agent, paths = _lock_contract(project, manifest)
+            with patch.object(agent, "_codex_task", return_value=StageResult("blocked", "worker interrupted")):
+                result = agent._stage_story_contract(manifest)
+            self.assertEqual(result.status, "blocked")
+            self.assertFalse(paths["lock"].exists())
+
+            save_json(paths["contract"], _runtime_valid_contract(project, manifest))
+            paths["summary"].write_text("# regenerated\n", encoding="utf-8")
+            write_trusted_input_chain(
+                paths["trusted_inputs"], build_trusted_input_chain(project, manifest, load_config())
+            )
+            with patch.object(
+                agent,
+                "_structured_review",
+                return_value=(StageResult("blocked", "review rejected"), None),
+            ):
+                result = agent._stage_story_contract_review(manifest)
+            self.assertEqual(result.status, "blocked")
+            self.assertFalse(paths["lock"].exists())
 
 
 if __name__ == "__main__":

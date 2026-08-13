@@ -14,6 +14,12 @@
 
 文件存在、命令返回 0、模型声称完成均不是通过证据。
 
+## 合同前置门禁
+
+V3.5 新任务先执行 `story_contract` 与 `story_contract_review`。合同包含 `semantic_artifacts / visual_style / characters / world_scale / story_state / brand / release_layout` 七节；Luna 只生成草案，Sol 独立审核，Runtime 在重新验证全部绑定后写 crash-safe 锁。规则来源固定为 `task_input > project_config > brand_or_global_default > agent_inference`，模型推断不得伪装为前三类。
+
+锁不是一个状态字段，而是合同文件、canonical contract、可信来源链、审核 bundle、审核 JSON 的完整 SHA-256 等式。半写、损坏、缺字段或任一哈希变化都阻断生产。六类消费者使用最小 section projection 和 completed receipt；当前实现模块族级增量失效，不是逐镜头依赖图。详见 [`story-production-contract.md`](story-production-contract.md)。
+
 ## 预算合同
 
 - 默认软预算：¥50。

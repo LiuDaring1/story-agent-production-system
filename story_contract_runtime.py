@@ -446,6 +446,128 @@ def contract_consumer_completion_is_current(project_root: Path | str, consumer: 
     )
 
 
+def contract_diagnostics(
+    project_root: Path | str, manifest: Mapping[str, Any] | None = None
+) -> dict[str, Any]:
+    """Return a read-only, failure-tolerant view of contract and consumer state.
+
+    This deliberately reuses the same validators as production gates.  It
+    never repairs files, creates legacy receipts, or treats a recorded
+    ``status=locked`` value as evidence that a lock is current.
+    """
+
+    root = Path(project_root)
+    paths = contract_paths(root)
+    if manifest is None:
+        try:
+            loaded = json.loads((root / "99_项目状态" / "project_manifest.json").read_text(encoding="utf-8"))
+            manifest = loaded if isinstance(loaded, Mapping) else {}
+        except (OSError, json.JSONDecodeError):
+            manifest = {}
+    agent = manifest.get("agent") if isinstance(manifest.get("agent"), Mapping) else {}
+    runtime = agent.get("story_contract") if isinstance(agent.get("story_contract"), Mapping) else {}
+    recorded_policy = str(runtime.get("policy") or CONTRACT_POLICY_REQUIRED)
+    legacy = legacy_passthrough_allowed(manifest)
+
+    contract: Mapping[str, Any] | None = None
+    runtime_issues: list[str] = []
+    try:
+        contract = load_story_contract(paths["contract"])
+        runtime_issues = contract_runtime_issues(root)
+    except StoryContractValidationError as exc:
+        runtime_issues = [f"{issue.path}:{issue.code}:{issue.message}" for issue in exc.issues]
+
+    bundle_current = _review_bundle_is_current(paths["bundle"])
+    review_payload: Mapping[str, Any] | None = None
+    try:
+        loaded_review = json.loads(paths["review"].read_text(encoding="utf-8"))
+        review_payload = loaded_review if isinstance(loaded_review, Mapping) else None
+    except (OSError, json.JSONDecodeError):
+        review_payload = None
+    review_evidence_issues = contract_review_payload_issues(review_payload or {})
+    review_current = bool(
+        bundle_current
+        and review_payload is not None
+        and _review_payload_passes(review_payload, paths["bundle"])
+        and not review_evidence_issues
+    )
+    lock_current = bool(
+        review_current
+        and not runtime_issues
+        and contract_lock_is_current(root, bundle=paths["bundle"], review=paths["review"])
+    )
+
+    consumers: dict[str, Any] = {}
+    for consumer, sections in CONTRACT_CONSUMER_SECTIONS.items():
+        request_path = contract_consumer_path(root, consumer)
+        receipt_path = contract_consumer_receipt_path(root, consumer)
+        if legacy:
+            consumers[consumer] = {
+                "sections": list(sections),
+                "request_manifest": "legacy_passthrough",
+                "completed_receipt": "legacy_passthrough",
+                "changed_sections": [],
+            }
+            continue
+        request_state, request_payload = _diagnostic_json_state(request_path)
+        if request_state == "present":
+            if not _consumer_context_shape_is_complete(request_payload, consumer):
+                request_state = "damaged"
+            elif contract_consumer_context_is_current(root, consumer, request_path):
+                request_state = "current"
+            else:
+                request_state = "stale"
+        receipt_state, receipt_payload = _diagnostic_json_state(receipt_path)
+        if receipt_state == "present":
+            if not _consumer_receipt_shape_is_complete(receipt_payload, consumer):
+                receipt_state = "damaged"
+            elif contract_consumer_completion_is_current(root, consumer):
+                receipt_state = "current"
+            else:
+                receipt_state = "stale"
+        changed_sections: list[str] = []
+        old_projection = request_payload.get("contract_projection") if isinstance(request_payload, Mapping) else None
+        current_contracts = contract.get("contracts") if isinstance(contract, Mapping) else None
+        if isinstance(old_projection, Mapping) and isinstance(current_contracts, Mapping):
+            changed_sections = [
+                section
+                for section in sections
+                if old_projection.get(section) != current_contracts.get(section)
+            ]
+        consumers[consumer] = {
+            "sections": list(sections),
+            "request_manifest": request_state,
+            "completed_receipt": receipt_state,
+            "changed_sections": changed_sections,
+        }
+
+    contract_valid = bool(contract is not None and not runtime_issues)
+    return {
+        "policy": CONTRACT_POLICY_LEGACY if legacy else recorded_policy,
+        "legacy_eligible": legacy,
+        "contract": {
+            "exists": paths["contract"].is_file(),
+            "valid": contract_valid,
+            "schema_version": str(contract.get("schema_version") or "") if contract else "",
+            "sha256": contract_sha256(contract) if contract_valid and contract else "",
+            "file_sha256": _file_sha256(paths["contract"]) if paths["contract"].is_file() else "",
+            "issues": runtime_issues,
+        },
+        "review": {
+            "bundle_exists": paths["bundle"].is_file(),
+            "bundle_current": bundle_current,
+            "review_exists": paths["review"].is_file(),
+            "current_and_approved": review_current,
+            "evidence_issues": review_evidence_issues,
+        },
+        "lock": {
+            "exists": paths["lock"].is_file(),
+            "valid": lock_current,
+        },
+        "consumers": consumers,
+    }
+
+
 def assert_request_contract_binding(project_root: Path | str, consumer: str, request: Mapping[str, Any]) -> dict[str, Any]:
     """Revalidate the live lock and a request row immediately before payment."""
 
@@ -529,6 +651,32 @@ def _consumer_context_shape_is_complete(payload: Any, consumer: str) -> bool:
         and len(str(payload.get("story_contract_sha256") or "")) == 64
         and len(str(payload.get("story_contract_dependency_sha256") or "")) == 64
     )
+
+
+def _consumer_receipt_shape_is_complete(payload: Any, consumer: str) -> bool:
+    required = {
+        "version", "consumer", "contract_schema_version", "story_contract_sha256",
+        "story_contract_dependency_sha256", "request_manifest_sha256",
+    }
+    return (
+        isinstance(payload, Mapping)
+        and set(payload) == required
+        and payload.get("version") == 1
+        and payload.get("consumer") == consumer
+        and len(str(payload.get("story_contract_sha256") or "")) == 64
+        and len(str(payload.get("story_contract_dependency_sha256") or "")) == 64
+        and len(str(payload.get("request_manifest_sha256") or "")) == 64
+    )
+
+
+def _diagnostic_json_state(path: Path) -> tuple[str, Mapping[str, Any]]:
+    if not path.exists():
+        return "missing", {}
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return "damaged", {}
+    return ("present", payload) if isinstance(payload, Mapping) else ("damaged", {})
 
 
 def _review_bundle_is_current(path: Path) -> bool:

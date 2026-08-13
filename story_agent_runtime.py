@@ -21,6 +21,7 @@ from story_semantics import StoryOutput, classify_story, lines_for_output
 from story_contract_runtime import (
     CONTRACT_POLICY_LEGACY,
     CONTRACT_POLICY_REQUIRED,
+    contract_diagnostics,
     legacy_eligibility_receipt,
 )
 
@@ -1879,6 +1880,7 @@ def render_job_report(project_dir: Path) -> Path:
     remaining = [name for name in STORY_STAGE_SEQUENCE if stages.get(name, {}).get("status") != "passed"]
     nominal_minutes = sum(STAGE_ESTIMATES_MINUTES.get(name, 10) for name in remaining)
     open_reservations = [entry for entry in budget.get("entries", []) if entry.get("status") == "open"]
+    contract_status = contract_diagnostics(project_dir, manifest)
     lines = [
         "# 故事生产 Agent 交付摘要",
         "",
@@ -1906,6 +1908,23 @@ def render_job_report(project_dir: Path) -> Path:
         lines.append(
             f"| {name} | {record.get('status', 'pending')} | {record.get('attempts', 0)} | {record.get('provider', '')} | "
             f"¥{float(record.get('actual_cost', 0.0)):.2f} | {score} | {str(detail).replace('|', '/')} |"
+        )
+    lines.extend([
+        "",
+        "## Story Production Contract",
+        "",
+        f"- 策略：`{contract_status['policy']}`；V3 legacy 资格：`{contract_status['legacy_eligible']}`",
+        f"- 合同：exists=`{contract_status['contract']['exists']}` / valid=`{contract_status['contract']['valid']}` / schema=`{contract_status['contract']['schema_version'] or '无'}` / SHA-256=`{contract_status['contract']['sha256'] or '无'}`",
+        f"- 独立审核：bundle_current=`{contract_status['review']['bundle_current']}` / approved_current=`{contract_status['review']['current_and_approved']}`",
+        f"- 确定性锁：exists=`{contract_status['lock']['exists']}` / valid=`{contract_status['lock']['valid']}`",
+        "",
+        "| 消费者 | 合同节 | request manifest | completed receipt | 失效合同节 |",
+        "| --- | --- | --- | --- | --- |",
+    ])
+    for consumer, state in contract_status["consumers"].items():
+        lines.append(
+            f"| {consumer} | {', '.join(state['sections'])} | {state['request_manifest']} | "
+            f"{state['completed_receipt']} | {', '.join(state['changed_sections']) or '-'} |"
         )
     lines.extend(["", "## 剩余工作", ""])
     if remaining:

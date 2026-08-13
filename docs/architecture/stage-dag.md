@@ -1,4 +1,4 @@
-# 33 阶段 DAG
+# V3.5 的 35 阶段 DAG
 
 权威定义位于 `story_agent_runtime.py` 的 `STORY_STAGE_SEQUENCE`、`STORY_STAGE_DEPENDENCIES`、`STAGE_WRITE_SETS` 和 `STAGE_RESOURCES`。
 
@@ -7,21 +7,23 @@
 | 分支 | 顺序 | 阶段 |
 | --- | --- | --- |
 | 素材 | 1—5 | `import_inbox` → `source_edit` → `source_text_correction` → `source_edit_review` → `setup_project` |
-| 视觉 | 6—14 | `codex_story_images` → `story_images_review` → `prepare_jobs` → `timing` → `video_prompt_review` → `generate_videos` → `video_qa` → `video_review` → `apply_review` |
-| 配乐 | 15—18 | `music_request` → `suno_generate` → `assemble_music` → `music_qa` |
-| 汇合 | 19 | `assemble_final` 同时等待 `apply_review` 与 `music_qa` |
-| 发布资产 | 20 | `release_assets` 在 `setup_project` 后即可并行 |
-| 发布视频 | 21—24 | `release_preview` → `package_release` → `release_qa` → `release_video_review` |
-| 发布物料 | 25、31 | `publish_package` → `publish_package_review` |
-| 产品包 | 26—30 | `product_preflight` → `product_annotation` → `product_annotation_review` → `product_package` → `product_package_review` |
-| 交付 | 32—33 | `final_delivery` → `doctor` |
+| 合同 | 6—7 | `story_contract` → `story_contract_review` |
+| 视觉 | 8—16 | `codex_story_images` → `story_images_review` → `prepare_jobs` → `timing` → `video_prompt_review` → `generate_videos` → `video_qa` → `video_review` → `apply_review` |
+| 配乐 | 17—20 | `music_request` → `suno_generate` → `assemble_music` → `music_qa` |
+| 汇合 | 21 | `assemble_final` 同时等待 `apply_review` 与 `music_qa` |
+| 发布资产 | 22 | `release_assets` 在合同审核通过后即可并行 |
+| 发布视频 | 23—26 | `release_preview` → `package_release` → `release_qa` → `release_video_review` |
+| 发布物料 | 27、33 | `publish_package` → `publish_package_review` |
+| 产品包 | 28—32 | `product_preflight` → `product_annotation` → `product_annotation_review` → `product_package` → `product_package_review` |
+| 交付 | 34—35 | `final_delivery` → `doctor` |
 
 ```mermaid
 flowchart LR
     I["输入"] --> SE["素材处理 5 阶段"]
-    SE --> VI["视觉 9 阶段"]
-    SE --> MU["配乐 4 阶段"]
-    SE --> RA["发布资产"]
+    SE --> CT["合同生成 + 独立审核"]
+    CT --> VI["视觉 9 阶段"]
+    CT --> MU["配乐 4 阶段"]
+    CT --> RA["发布资产"]
     VI --> A["横屏合成"]
     MU --> A
     A --> RP["发布视频 4 阶段"]
@@ -59,6 +61,8 @@ flowchart LR
 5. `critical_errors` 为空；
 6. 决策文件与当前 jobs 精确匹配。
 
+V3.5 新任务还必须先通过合同门禁：Luna 生成草案，Sol 在独立上下文审核七个 section，Runtime 重新校验 bundle/review SHA-256 后 crash-safe 写入 `story_contract.lock.json`。任何半写、字段缺失或绑定哈希不匹配都等于未锁定。V3 冻结项目不补造合同；只有 Runtime 根据基线日期、历史阶段和绑定 receipt 判定为真正历史项目时，两个合同阶段才采用 `legacy_passthrough`。
+
 ## 重试原则
 
 - 只隔离失败镜头，不删除旧版本。
@@ -66,3 +70,4 @@ flowchart LR
 - 提示词、图片或连续性状态变化后，旧审核失效。
 - 不允许仅修改 manifest 状态来绕过审核。
 - 长期目标是变更镜头增量审核；当前部分阶段仍存在大范围重读与返工放大。
+- 合同消费者目前按 section projection 做模块族级失效；它能避免品牌变化重做故事图片，但还不是逐镜头依赖图。

@@ -198,9 +198,10 @@ class StoryContractRuntimeTests(unittest.TestCase):
     def test_contract_stages_are_before_all_expensive_branches(self) -> None:
         self.assertLess(STORY_STAGE_SEQUENCE.index("story_contract_review"), STORY_STAGE_SEQUENCE.index("codex_story_images"))
         self.assertEqual(STORY_STAGE_DEPENDENCIES["story_contract"], ("setup_project",))
-        self.assertEqual(STORY_STAGE_DEPENDENCIES["codex_story_images"], ("story_contract_review",))
+        self.assertEqual(STORY_STAGE_DEPENDENCIES["artifact_semantic_plan"], ("story_contract_review",))
+        self.assertEqual(STORY_STAGE_DEPENDENCIES["codex_story_images"], ("artifact_semantic_plan",))
         self.assertEqual(STORY_STAGE_DEPENDENCIES["music_request"], ("story_contract_review",))
-        self.assertEqual(STORY_STAGE_DEPENDENCIES["release_assets"], ("story_contract_review",))
+        self.assertEqual(STORY_STAGE_DEPENDENCIES["release_assets"], ("artifact_semantic_plan",))
 
     def test_contract_generation_uses_luna_and_rejects_spoofed_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

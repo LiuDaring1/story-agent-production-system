@@ -38,6 +38,13 @@ from story_contract_runtime import (
     write_trusted_input_chain,
 )
 from story_contract_consumers import compile_cover_spec
+from artifact_semantic_plan import (
+    artifact_semantic_plan_is_current,
+    load_current_artifact_semantic_plan,
+    plan_binding as artifact_semantic_plan_binding,
+    semantic_plan_path,
+    write_artifact_semantic_plan,
+)
 
 from story_codex_tasks import (
     build_children_story_handoff,
@@ -929,6 +936,7 @@ class StoryAgent:
             ("setup_project", self._has_setup_project, self._stage_setup_project),
             ("story_contract", self._has_story_contract, self._stage_story_contract),
             ("story_contract_review", self._has_story_contract_review, self._stage_story_contract_review),
+            ("artifact_semantic_plan", self._has_artifact_semantic_plan, self._stage_artifact_semantic_plan),
             ("codex_story_images", self._has_story_images, self._stage_codex_story_images),
             ("story_images_review", self._has_story_images_review, self._stage_story_images_review),
             ("prepare_jobs", self._has_jobs_csv, self._stage_prepare_jobs),
@@ -1087,6 +1095,8 @@ class StoryAgent:
                 "你自己的分析、视觉补全和推断一律标记 agent_inference；禁止伪装成高优先级来源。",
                 "角色卡、尺度锚点、风格锚点、布局预览按故事实际需要条件生成；无需预览的类型不要创建占位。",
                 "尺度优先 qualitative_relation；只有可信依据或机器布局需要时才写宽容数值区间及 numeric_basis。",
+                "semantic_artifacts.mappings 必须按语义源中实际出现的 semantic_kind，完整覆盖 demo_subtitles、background_visual、background_subtitles、sales_subtitles、ppt、customer_manuscript、reading_annotation 七类产物；不得缺项或私自留给下游默认补齐。",
+                "标题或道理若用 visual_substitute，必须给出唯一 mutual_exclusion_group；同组 background_subtitles 必须 action=exclude 且 subtitle_policy=hide。Demo 必须按自身 mapping 决定，不借用销售版规则。",
                 "如实际生成预览文件，写入项目 99_项目状态/contracts/previews 下，并在合同记录项目相对 path 和真实 SHA-256。",
                 f"写入 `{paths['contract']}` 和便于人读的 `{paths['summary']}`。不要写合同锁，锁只能由 Runtime 在独立审核通过后生成。",
             ]
@@ -1147,6 +1157,21 @@ class StoryAgent:
             )
         lock = write_contract_lock(self.context.project_dir, bundle=bundle, review=paths["review"])
         return StageResult("done", f"合同独立审核通过并由 Runtime 确定性锁定：{payload.get('score')} 分", lock)
+
+    def _stage_artifact_semantic_plan(self, manifest: dict[str, Any]) -> StageResult:
+        if self._legacy_contract_policy(manifest):
+            return StageResult("done", "V3 冻结项目沿用 story_semantics，不补造语义呈现计划。")
+        source = self._artifact_semantic_source(manifest)
+        if source is None:
+            return StageResult("blocked", "缺少可读的逐行语义源，无法编译 artifact_semantic_plan。")
+        if not self.context.execute:
+            return StageResult("done", "dry-run：将从已锁定合同确定性编译逐产物语义呈现计划。")
+        try:
+            path = write_artifact_semantic_plan(self.context.project_dir, source)
+            load_current_artifact_semantic_plan(self.context.project_dir, source)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return StageResult("blocked", f"逐产物语义呈现计划编译失败：{exc}")
+        return StageResult("done", "逐产物语义呈现计划已确定性编译并绑定当前合同与语义源。", path)
 
     def _stage_source_edit(self, manifest: dict[str, Any]) -> StageResult:
         contract = manifest.get("agent", {}).get("input_contract", {})
@@ -1466,6 +1491,12 @@ class StoryAgent:
         return merged
 
     def _stage_codex_story_images(self, manifest: dict[str, Any]) -> StageResult:
+        if not self._legacy_contract_policy(manifest):
+            semantic_source = self._artifact_semantic_source(manifest)
+            if semantic_source is None or not artifact_semantic_plan_is_current(
+                self.context.project_dir, semantic_source
+            ):
+                return StageResult("blocked", "逐产物语义呈现计划缺失或已过期，禁止开始批量生图。")
         contract_context = self._prepare_contract_consumer(manifest, "storyboard_images")
         if isinstance(contract_context, StageResult):
             return contract_context
@@ -2127,11 +2158,24 @@ class StoryAgent:
             "--subtitle-style",
             "clean",
         ]
+        if not self._legacy_contract_policy(manifest):
+            source = self._artifact_semantic_source(manifest)
+            if source is None:
+                return StageResult("blocked", "缺少语义源，不能验证逐产物语义呈现计划。")
+            try:
+                load_current_artifact_semantic_plan(self.context.project_dir, source)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                return StageResult("blocked", f"逐产物语义呈现计划缺失或过期，禁止最终合成：{exc}")
+            command.extend([
+                "--project-dir", str(self.context.project_dir),
+                "--artifact-semantic-plan", str(self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"),
+                "--subtitle-script", str(source),
+            ])
         model_dir = ROOT / "models" / "whisper"
         if model_dir.exists():
             command.extend(["--whisper-model-dir", str(model_dir)])
         confirmed_subtitles = first_existing(manifest.get("inputs", {}).get("confirmed_subtitles"))
-        if confirmed_subtitles is not None:
+        if confirmed_subtitles is not None and self._legacy_contract_policy(manifest):
             # Keep semantic story_text/storyboard_text as the video timing
             # script.  The optional user-confirmed stream is only the subtitle
             # script, aligned independently by the existing synthesizer.
@@ -2139,6 +2183,12 @@ class StoryAgent:
         return self._workflow(command, "合成背景成片")
 
     def _stage_release_assets(self, manifest: dict[str, Any]) -> StageResult:
+        if not self._legacy_contract_policy(manifest):
+            semantic_source = self._artifact_semantic_source(manifest)
+            if semantic_source is None or not artifact_semantic_plan_is_current(
+                self.context.project_dir, semantic_source
+            ):
+                return StageResult("blocked", "逐产物语义呈现计划缺失或已过期，禁止生成发布视觉素材。")
         contract_context = self._prepare_contract_consumer(manifest, "release_video")
         if isinstance(contract_context, StageResult):
             return contract_context
@@ -2952,6 +3002,7 @@ class StoryAgent:
                 "可以创建或更新视觉圣经和图生视频提示词文件，然后连续生成图片；镜头编号必须逐行对应锁定分镜。",
                 f"必须先写入机器可读分镜计划：`{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}`。每镜包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description；story_text 必须逐行等于锁定分镜。",
                 "机器可读分镜计划的顶层还必须原样记录合同请求清单中的 contract_schema_version、story_contract_sha256、story_contract_dependency_sha256 和 contract_projection，并把逐镜列表放在 shots 字段；contract_projection 不得删减、改写或用模型推断覆盖。",
+                "机器可读分镜计划还必须原样记录当前逐产物语义呈现计划的 artifact_semantic_plan_sha256、artifact_semantic_plan_schema_version、artifact_semantic_plan_dependency_sha256；缺失或旧绑定将被 Runtime 拒绝。",
                 "每个唱歌、关键发言、关键动作或明显受挫的角色都要获得焦点镜头；连续场景要安排建立全景、表演者中近景、反应镜头等景别变化，不能所有角色都和主角挤在同一种双人中景。",
                 "为反复出现的角色固定 appearance_id；生成后续镜头时必须同时引用风格锚点和该角色最近一张已通过图片，禁止只靠文字重新随机生成角色。",
                 "图生视频提示词文件的 CSV 必须包含 `scene,story_text,visual_description,prompt`；`prompt` 要作为后续图生视频 API 和审核页直接使用的最终提示词。图生视频已经有当前图片作为视觉约束，只写具体动作、表情、道具运动、镜头运动和少量禁止项，不要复制文生图视觉圣经、服装细节或画风长描述，也不能用“角色动作自然克制、镜头缓慢推进或轻移”之类通用模板充数。",
@@ -2982,6 +3033,18 @@ class StoryAgent:
                     "", "以下是本轮最终生产指令必须完整遵守的五类合同投影：",
                     "```json", json.dumps(projection, ensure_ascii=False, indent=2, sort_keys=True), "```",
                 ])
+        if not self._legacy_contract_policy(self._manifest()):
+            source = self._artifact_semantic_source(self._manifest())
+            if source is not None:
+                try:
+                    plan_path = self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"
+                    plan = load_current_artifact_semantic_plan(self.context.project_dir, source)
+                    lines.extend([
+                        "", "以下三个逐产物语义计划绑定字段必须原样写入 storyboard plan 顶层：",
+                        "```json", json.dumps(artifact_semantic_plan_binding(plan_path, plan), ensure_ascii=False, indent=2, sort_keys=True), "```",
+                    ])
+                except (OSError, ValueError, KeyError, TypeError):
+                    lines.extend(["", "ERROR: 当前逐产物语义计划无效，禁止继续生成分镜计划。"])
         return "\n".join(lines)
 
     def _missing_story_image_indices(self, story_lines: list[str]) -> list[int]:
@@ -3020,7 +3083,13 @@ class StoryAgent:
                 expected = json.loads(
                     contract_consumer_path(self.context.project_dir, "storyboard_images").read_text(encoding="utf-8")
                 )
-            except (OSError, json.JSONDecodeError):
+                semantic_source = self._artifact_semantic_source(self._manifest())
+                if semantic_source is None:
+                    return False
+                semantic_plan_path = self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"
+                semantic_plan = load_current_artifact_semantic_plan(self.context.project_dir, semantic_source)
+                semantic_binding = artifact_semantic_plan_binding(semantic_plan_path, semantic_plan)
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
                 return False
             if not isinstance(payload, dict) or any(
                 payload.get(field) != expected.get(field)
@@ -3033,6 +3102,8 @@ class StoryAgent:
                 return False
             expected_projection = expected.get("contract_projection")
             if not isinstance(expected_projection, dict) or payload.get("contract_projection") != expected_projection:
+                return False
+            if any(payload.get(field) != value for field, value in semantic_binding.items()):
                 return False
         required = {
             "scene", "story_text", "narrative_function", "shot_size", "focal_character",
@@ -3770,7 +3841,21 @@ class StoryAgent:
         return True
 
     def _has_background_assembly(self, manifest: dict[str, Any]) -> bool:
-        return all((self.context.paths.assembly / name).exists() for name in ("story_no_subs_bgm.mp4", "story_sales_subs_bgm.mp4", "story_demo_voice_bgm.mp4"))
+        if not all((self.context.paths.assembly / name).exists() for name in ("story_no_subs_bgm.mp4", "story_sales_subs_bgm.mp4", "story_demo_voice_bgm.mp4")):
+            return False
+        if self._legacy_contract_policy(manifest):
+            return True
+        source = self._artifact_semantic_source(manifest)
+        receipt = self.context.paths.assembly / "artifact_semantic_plan_manifest.json"
+        if source is None or not receipt.is_file():
+            return False
+        try:
+            plan_path = self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"
+            plan = load_current_artifact_semantic_plan(self.context.project_dir, source)
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            return all(payload.get(field) == value for field, value in artifact_semantic_plan_binding(plan_path, plan).items())
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return False
 
     def _has_release_assets(self, manifest: dict[str, Any]) -> bool:
         theme = self.context.paths.release / "theme_assets"
@@ -3805,17 +3890,53 @@ class StoryAgent:
         return self._review_stage_current("publish_package_review")
 
     def _has_product_preflight(self, manifest: dict[str, Any]) -> bool:
-        return self._consumer_request_current(manifest, "product_package") and (self.context.paths.status / "product_package_work" / "第16步资料包_Codex前置审查.md").exists()
+        work = self.context.paths.status / "product_package_work"
+        return (
+            self._consumer_request_current(manifest, "product_package")
+            and (work / "第16步资料包_Codex前置审查.md").exists()
+            and self._artifact_semantic_receipt_current(manifest, work / "artifact_semantic_plan_product_manifest.json")
+        )
 
     def _has_product_annotation(self, manifest: dict[str, Any]) -> bool:
-        return self._product_annotation() is not None
+        return (
+            self._product_annotation() is not None
+            and self._artifact_semantic_receipt_current(
+                manifest,
+                self.context.paths.status / "product_package_work" / "artifact_semantic_plan_product_manifest.json",
+            )
+        )
 
     def _has_product_annotation_review(self, manifest: dict[str, Any]) -> bool:
         return self._review_stage_current("product_annotation_review")
 
     def _has_product_package(self, manifest: dict[str, Any]) -> bool:
         outputs = manifest.get("outputs", {})
-        return self._consumer_output_current(manifest, "product_package") and first_existing(outputs.get("product_base")) is not None and first_existing(outputs.get("product_advanced")) is not None
+        return (
+            self._consumer_output_current(manifest, "product_package")
+            and first_existing(outputs.get("product_base")) is not None
+            and first_existing(outputs.get("product_advanced")) is not None
+            and self._artifact_semantic_receipt_current(
+                manifest,
+                self.context.paths.status / "product_package_work" / "artifact_semantic_plan_product_manifest.json",
+            )
+        )
+
+    def _artifact_semantic_receipt_current(self, manifest: dict[str, Any], receipt: Path) -> bool:
+        if self._legacy_contract_policy(manifest):
+            return True
+        source = self._artifact_semantic_source(manifest)
+        if source is None or not receipt.is_file():
+            return False
+        try:
+            plan_path = semantic_plan_path(self.context.project_dir)
+            plan = load_current_artifact_semantic_plan(self.context.project_dir, source)
+            payload = json.loads(receipt.read_text(encoding="utf-8"))
+            return all(
+                payload.get(field) == value
+                for field, value in artifact_semantic_plan_binding(plan_path, plan).items()
+            )
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return False
 
     def _has_product_package_review(self, manifest: dict[str, Any]) -> bool:
         return self._review_stage_current("product_package_review")
@@ -3958,6 +4079,29 @@ class StoryAgent:
         except Exception:
             return []
         return [line.strip() for line in text.splitlines() if line.strip()]
+
+    def _artifact_semantic_source(self, manifest: dict[str, Any]) -> Path | None:
+        """Return the auditable, line-oriented source used by the plan compiler."""
+
+        inputs = manifest.get("inputs", {})
+        candidates = (
+            inputs.get("confirmed_subtitles"),
+            inputs.get("storyboard_text"),
+            self.context.paths.inputs / f"{self.context.slug}_storyboard_text.txt",
+            inputs.get("story_text"),
+            self.context.paths.inputs / "story_source.txt",
+        )
+        for candidate in candidates:
+            path = first_existing(candidate)
+            if path is not None and path.suffix.lower() in {".txt", ".md"}:
+                return path
+        return None
+
+    def _has_artifact_semantic_plan(self, manifest: dict[str, Any]) -> bool:
+        if self._legacy_contract_policy(manifest):
+            return True
+        source = self._artifact_semantic_source(manifest)
+        return source is not None and artifact_semantic_plan_is_current(self.context.project_dir, source)
 
     def _expected_story_image_count(self, manifest: dict[str, Any], storyboard: Path | None = None) -> int:
         story_lines = self._story_lines(manifest)

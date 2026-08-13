@@ -241,7 +241,13 @@ class StoryAgentRuntimeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project = root / "故事剪辑：字幕接入"
-            manifest = init_project(project, story_name="字幕接入", slug="subtitle-assembly")
+            # This test exercises the pre-V3.5 confirmed-subtitle compatibility
+            # path.  New required_v1 projects are intentionally covered by the
+            # artifact-semantic-plan tests and may not assemble without a
+            # current locked plan.
+            manifest = as_frozen_v3_legacy(
+                init_project(project, story_name="字幕接入", slug="subtitle-assembly")
+            )
             fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
             subtitles = project_paths(project).inputs / "subtitle-assembly_confirmed_subtitles.txt"
             subtitles.write_text("逐行字幕一。\n逐行字幕二。\n", encoding="utf-8")

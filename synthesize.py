@@ -22,6 +22,8 @@ def main() -> None:
     parser.add_argument("--narration", required=True, type=Path, help="完整旁白录音")
     parser.add_argument("--music", required=True, type=Path, help="背景音乐")
     parser.add_argument("--output-dir", required=True, type=Path, help="输出文件夹")
+    parser.add_argument("--project-dir", type=Path, help="required_v1 项目根目录，用于重新验证合同锁")
+    parser.add_argument("--artifact-semantic-plan", type=Path, help="已锁定合同确定性编译的逐产物语义呈现计划")
     parser.add_argument("--whisper-model", default="base", help="Whisper 模型名，例如 tiny/base/small/medium")
     parser.add_argument("--language", default="zh", help="旁白语言，中文用 zh；自动识别可留空字符串")
     parser.add_argument("--alignment-mode", choices=["whisper", "even"], default="whisper", help="对齐模式")
@@ -65,6 +67,8 @@ def main() -> None:
             keep_workdir=args.keep_workdir,
             whisper_model_dir=args.whisper_model_dir,
             progress_callback=lambda message: print(message, flush=True),
+            project_dir=args.project_dir,
+            artifact_semantic_plan_path=args.artifact_semantic_plan,
         )
     )
 

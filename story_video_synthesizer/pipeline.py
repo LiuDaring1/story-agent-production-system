@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import re
 import shutil
+import json
+import os
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
+
 
 from .align import LineTiming, align_script_to_narration, read_script_lines, save_timings
 from .media import ensure_dir, probe_duration, run_command, sorted_video_files
@@ -36,6 +40,8 @@ class SynthesisConfig:
     keep_workdir: bool = False
     whisper_model_dir: Path | None = None
     progress_callback: Callable[[str], None] | None = None
+    project_dir: Path | None = None
+    artifact_semantic_plan_path: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -47,10 +53,19 @@ class SynthesisResult:
     timings_json: Path
     subtitles_srt: Path
     sales_subtitles_srt: Path
+    semantic_plan_manifest: Path | None
     total_duration: float
 
 
 def synthesize_story(config: SynthesisConfig) -> SynthesisResult:
+    # Lazy import avoids the existing story_project -> package -> pipeline
+    # import cycle while keeping validation on every required_v1 execution.
+    from artifact_semantic_plan import (
+        load_current_artifact_semantic_plan,
+        plan_binding,
+        presentation_windows,
+        select_timings_for_artifact,
+    )
     _progress(config, "检查工具和输入...")
     _validate_tools()
     ensure_dir(config.output_dir)
@@ -89,17 +104,40 @@ def synthesize_story(config: SynthesisConfig) -> SynthesisResult:
         else timings
     )
 
+    semantic_plan = None
+    semantic_plan_manifest = None
+    if config.artifact_semantic_plan_path is not None:
+        if config.project_dir is None:
+            raise ValueError("--artifact-semantic-plan requires --project-dir for current-lock validation")
+        semantic_plan = load_current_artifact_semantic_plan(config.project_dir, config.subtitle_script_path or config.script_path)
+
     _progress(config, "保存时间轴和字幕文件...")
     timings_json = config.output_dir / "timings.json"
     subtitle_timings_json = config.output_dir / "subtitle_timings.json"
     subtitles_srt = config.output_dir / "story_subtitles.srt"
+    semantic_timeline_srt = config.output_dir / "story_semantic_timeline.srt"
     sales_subtitles_srt = config.output_dir / "story_sales_subtitles.srt"
     save_timings(timings, timings_json)
     if subtitle_timings is not timings:
         save_timings(subtitle_timings, subtitle_timings_json)
-    write_srt(subtitle_timings, subtitles_srt)
-    subtitle_cues = build_subtitle_cues(subtitle_timings)
-    sales_timings = _sales_subtitle_timings(subtitle_timings, config)
+    # Preserve the complete, audited semantic cue stream for deterministic
+    # downstream selectors.  The customer-facing background SRT may exclude
+    # title/moral cues because those are rendered as visual cards.
+    write_srt(subtitle_timings, semantic_timeline_srt)
+    background_timings = (
+        select_timings_for_artifact(subtitle_timings, semantic_plan, "background_subtitles")
+        if semantic_plan is not None else subtitle_timings
+    )
+    demo_timings = (
+        select_timings_for_artifact(subtitle_timings, semantic_plan, "demo_subtitles")
+        if semantic_plan is not None else subtitle_timings
+    )
+    write_srt(background_timings, subtitles_srt)
+    subtitle_cues = build_subtitle_cues(background_timings)
+    sales_timings = (
+        select_timings_for_artifact(subtitle_timings, semantic_plan, "sales_subtitles")
+        if semantic_plan is not None else _sales_subtitle_timings(subtitle_timings, config)
+    )
     write_srt(sales_timings, sales_subtitles_srt)
     sales_subtitle_cues = build_subtitle_cues(sales_timings)
 
@@ -113,6 +151,26 @@ def synthesize_story(config: SynthesisConfig) -> SynthesisResult:
     _progress(config, "拼接完整静音视频...")
     silent_video = work_dir / "story_silent.mp4"
     _concat_videos(segment_paths, silent_video, work_dir / "concat.txt")
+    presentation_base = silent_video
+    card_windows: list[dict] = []
+    if semantic_plan is not None:
+        card_windows = presentation_windows(subtitle_timings, semantic_plan)
+        if card_windows:
+            presentation_base = work_dir / "story_semantic_cards.mp4"
+            _overlay_semantic_cards(silent_video, card_windows, presentation_base, work_dir / "semantic_cards", total_duration, config)
+        semantic_plan_manifest = config.output_dir / "artifact_semantic_plan_manifest.json"
+        _write_json_atomic(semantic_plan_manifest, {
+            "version": 1,
+            "consumer": "assembly",
+            **plan_binding(config.artifact_semantic_plan_path, semantic_plan),
+            "selections": {
+                "background_subtitles": [item.index for item in background_timings],
+                "sales_subtitles": [item.index for item in sales_timings],
+                "demo_subtitles": [item.index for item in demo_timings],
+            },
+            "visual_card_windows": card_windows,
+            "source_video_unchanged": True,
+        })
 
     no_subs_bgm = config.output_dir / "story_no_subs_bgm.mp4"
     subs_bgm = config.output_dir / "story_subs_bgm.mp4"
@@ -121,7 +179,7 @@ def synthesize_story(config: SynthesisConfig) -> SynthesisResult:
 
     _progress(config, "生成无字幕 + 背景音乐版...")
     _mux_with_music(
-        video_path=silent_video,
+        video_path=presentation_base,
         music_path=config.music_path,
         output_path=no_subs_bgm,
         total_duration=total_duration,
@@ -130,7 +188,7 @@ def synthesize_story(config: SynthesisConfig) -> SynthesisResult:
     _progress(config, "烧录字幕视频轨...")
     subtitled_video = work_dir / "story_subtitled_silent.mp4"
     _burn_subtitles_only(
-        video_path=silent_video,
+        video_path=presentation_base,
         cues=subtitle_cues,
         work_dir=work_dir,
         output_path=subtitled_video,
@@ -148,7 +206,7 @@ def synthesize_story(config: SynthesisConfig) -> SynthesisResult:
     _progress(config, "生成销售版有字幕 + 背景音乐版...")
     sales_subtitled_video = work_dir / "story_sales_subtitled_silent.mp4"
     _burn_subtitles_only(
-        video_path=silent_video,
+        video_path=presentation_base,
         cues=sales_subtitle_cues,
         work_dir=work_dir / "sales_subtitles",
         output_path=sales_subtitled_video,
@@ -163,8 +221,17 @@ def synthesize_story(config: SynthesisConfig) -> SynthesisResult:
         music_volume=config.music_volume,
     )
     _progress(config, "生成有字幕 + 旁白 + 背景音乐版...")
+    demo_subtitled_video = work_dir / "story_demo_subtitled_silent.mp4"
+    _burn_subtitles_only(
+        video_path=presentation_base,
+        cues=build_subtitle_cues(demo_timings),
+        work_dir=work_dir / "demo_subtitles",
+        output_path=demo_subtitled_video,
+        total_duration=total_duration,
+        config=config,
+    )
     _mux_with_voice_music(
-        video_path=subtitled_video,
+        video_path=demo_subtitled_video,
         narration_path=config.narration_path,
         music_path=config.music_path,
         output_path=demo_voice_bgm,
@@ -184,8 +251,27 @@ def synthesize_story(config: SynthesisConfig) -> SynthesisResult:
         timings_json=timings_json,
         subtitles_srt=subtitles_srt,
         sales_subtitles_srt=sales_subtitles_srt,
+        semantic_plan_manifest=semantic_plan_manifest,
         total_duration=total_duration,
     )
+
+
+def _write_json_atomic(path: Path, payload: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", suffix=".tmp", dir=str(path.parent))
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(payload, file, ensure_ascii=False, indent=2, sort_keys=True)
+            file.write("\n")
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temporary, path)
+    except Exception:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
 
 
 def _sales_subtitle_timings(timings: list[LineTiming], config: SynthesisConfig) -> list[LineTiming]:
@@ -418,6 +504,68 @@ def _mux_with_music(
     )
 
 
+def _overlay_semantic_cards(
+    video_path: Path,
+    windows: list[dict],
+    output_path: Path,
+    card_dir: Path,
+    total_duration: float,
+    config: SynthesisConfig,
+) -> None:
+    """Render reviewed text in code and overlay it on a deterministic card.
+
+    No generated text/logo is used. The source video remains read-only.
+    """
+
+    try:
+        from PIL import Image, ImageDraw, ImageFont
+    except ImportError as exc:
+        raise RuntimeError("没有找到 Pillow，无法渲染确定性语义图卡。") from exc
+    ensure_dir(card_dir)
+    images = []
+    for index, window in enumerate(windows, start=1):
+        image = Image.new("RGBA", (config.width, config.height), (246, 239, 216, 255))
+        draw = ImageDraw.Draw(image)
+        accent = (205, 158, 73, 255) if window["card_kind"] == "title_card" else (103, 145, 91, 255)
+        margin_x, margin_y = int(config.width * .09), int(config.height * .14)
+        draw.rounded_rectangle(
+            (margin_x, margin_y, config.width - margin_x, config.height - margin_y),
+            radius=max(24, config.height // 28), fill=(255, 252, 241, 255), outline=accent,
+            width=max(4, config.height // 180),
+        )
+        font_size = max(44, config.height // (8 if window["card_kind"] == "title_card" else 11))
+        font = _load_subtitle_font(ImageFont, font_size)
+        lines = []
+        for paragraph in str(window["text"]).splitlines():
+            lines.extend(_wrap_subtitle_text(draw, paragraph, font, int(config.width * .72)))
+        line_height = int(font_size * 1.35)
+        y = (config.height - line_height * len(lines)) // 2
+        for line in lines:
+            x = (config.width - _text_width(draw, line, font)) // 2
+            draw.text((x, y), line, font=font, fill=(78, 57, 34, 255))
+            y += line_height
+        card_path = card_dir / f"semantic_card_{index:02d}.png"
+        image.save(card_path)
+        images.append(card_path)
+    args = ["ffmpeg", "-y", "-i", str(video_path)]
+    for image_path in images:
+        args.extend(["-loop", "1", "-i", str(image_path)])
+    current = "[0:v]"
+    filters = []
+    for offset, window in enumerate(windows, start=1):
+        output = "[v]" if offset == len(windows) else f"[card{offset}]"
+        filters.append(
+            f"{current}[{offset}:v]overlay=0:0:enable='between(t,{window['start']:.3f},{window['end']:.3f})'{output}"
+        )
+        current = output
+    args.extend([
+        "-filter_complex", ";".join(filters), "-map", "[v]", "-t", f"{total_duration:.3f}", "-an",
+        "-c:v", "libx264", "-preset", config.x264_preset, "-crf", str(config.x264_crf),
+        "-pix_fmt", "yuv420p", "-movflags", "+faststart", str(output_path),
+    ])
+    run_command(args)
+
+
 def _burn_subtitles_only(
     video_path: Path,
     cues: list[SubtitleCue],
@@ -426,6 +574,10 @@ def _burn_subtitles_only(
     total_duration: float,
     config: SynthesisConfig,
 ) -> None:
+    if not cues:
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(video_path, output_path)
+        return
     subtitle_images = _render_subtitle_images(cues, work_dir / "subtitle_images", config)
     video_chain = _subtitle_overlay_chain(cues, first_image_input=1)
     args = [

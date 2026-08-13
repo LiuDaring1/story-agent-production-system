@@ -31,6 +31,7 @@ from pptx.util import Emu, Pt as PptPt
 
 from story_video_synthesizer.align import LineTiming, align_evenly, read_script_lines
 from story_contract_consumers import BINDING_FIELDS, semantic_line_indices, write_json_atomic
+from artifact_semantic_plan import load_current_artifact_semantic_plan, plan_binding, selected_line_indices
 from story_video_synthesizer.image_video import sorted_image_files
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
 from story_video_synthesizer.subtitles import write_srt
@@ -69,6 +70,19 @@ class KeyingPreset:
     person_x: int | None = None
     person_y: int | None = None
     bottom_margin: int = 0
+
+
+def artifact_semantic_product_selections(
+    script_lines: list[str], semantic_plan: dict[str, Any]
+) -> dict[str, list[int]]:
+    """Compile the minimal deterministic product projection used below."""
+
+    return {
+        "ppt": selected_line_indices(script_lines, semantic_plan, "ppt"),
+        "customer_manuscript": selected_line_indices(script_lines, semantic_plan, "customer_manuscript"),
+        "reading_annotation": selected_line_indices(script_lines, semantic_plan, "reading_annotation"),
+        "demo_subtitles": selected_line_indices(script_lines, semantic_plan, "demo_subtitles"),
+    }
 
 
 def main() -> None:
@@ -120,6 +134,8 @@ def main() -> None:
     parser.add_argument("--music-volume", default=0.22, type=float)
     parser.add_argument("--narration-volume", default=1.0, type=float)
     parser.add_argument("--semantic-contract-spec", type=Path, help="已审核合同编译出的资料包内容选择规格")
+    parser.add_argument("--project-dir", type=Path, help="required_v1 项目根目录，用于重新验证语义计划")
+    parser.add_argument("--artifact-semantic-plan", type=Path, help="逐产物语义呈现计划")
     args = parser.parse_args()
 
     build_product_package(args)
@@ -181,9 +197,22 @@ def build_product_package(args: argparse.Namespace) -> None:
         allow_even=args.allow_even_timings,
     )
     semantic_spec = load_product_semantic_spec(args.semantic_contract_spec) if args.semantic_contract_spec else None
+    semantic_plan = None
+    if args.artifact_semantic_plan:
+        if args.project_dir is None:
+            raise ValueError("--artifact-semantic-plan requires --project-dir")
+        semantic_plan = load_current_artifact_semantic_plan(args.project_dir)
+    semantic_plan_selections = (
+        artifact_semantic_product_selections(script_lines, semantic_plan)
+        if semantic_plan is not None else None
+    )
 
     def selected(artifact: str) -> tuple[list[str], list[Path], list[LineTiming], list[int]]:
-        indices = semantic_line_indices(script_lines, semantic_spec, artifact) if semantic_spec else list(range(len(script_lines)))
+        if semantic_plan is not None:
+            key = "demo_subtitles" if artifact == "demo" else artifact
+            indices = list(semantic_plan_selections[key])
+        else:
+            indices = semantic_line_indices(script_lines, semantic_spec, artifact) if semantic_spec else list(range(len(script_lines)))
         lines = [public_script_lines[index] for index in indices]
         selected_images = [images[index] for index in indices]
         selected_timings = [
@@ -197,7 +226,23 @@ def build_product_package(args: argparse.Namespace) -> None:
     manuscript_lines, _mi, _mt, manuscript_indices = selected("customer_manuscript")
     annotation_lines, _ai, _at, annotation_indices = selected("reading_annotation")
     demo_lines, _di, demo_timings, demo_indices = selected("demo")
-    if semantic_spec is not None:
+    if semantic_plan is not None:
+        write_json_atomic(
+            work_dir / "artifact_semantic_plan_product_manifest.json",
+            {
+                "version": 1,
+                "consumer": "product_package",
+                **plan_binding(args.artifact_semantic_plan, semantic_plan),
+                "source_line_count": len(script_lines),
+                "selections": {
+                    "ppt": ppt_indices,
+                    "customer_manuscript": manuscript_indices,
+                    "reading_annotation": annotation_indices,
+                    "demo_subtitles": demo_indices,
+                },
+            },
+        )
+    elif semantic_spec is not None:
         write_json_atomic(
             work_dir / "product_semantic_selection_manifest.json",
             {
@@ -299,7 +344,11 @@ def build_product_package(args: argparse.Namespace) -> None:
         print(f"朗读标注精修请求：{request_path}")
         return
 
-    manuscript_text = "\n".join(manuscript_lines) if semantic_spec is not None else clean_public_story_text(read_text_document(story_text_path))
+    manuscript_text = (
+        "\n".join(manuscript_lines)
+        if semantic_spec is not None or semantic_plan is not None
+        else clean_public_story_text(read_text_document(story_text_path))
+    )
     render_story_docx(story_name, manuscript_text, story_docx)
     if args.annotation_docx is not None:
         annotation_source = args.annotation_docx.expanduser()

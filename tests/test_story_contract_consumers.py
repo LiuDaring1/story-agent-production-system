@@ -26,6 +26,8 @@ from story_contract_runtime import contract_consumer_path, write_contract_consum
 from story_project import apply_fixed_cover_branding, project_paths
 from tests.test_publish_qa import make_publish_fixture
 from tests.test_story_contract_runtime import _lock_contract, _new_project
+from tests.test_artifact_semantic_plan import _contract as semantic_contract_fixture
+from artifact_semantic_plan import load_current_artifact_semantic_plan, plan_binding, write_artifact_semantic_plan
 
 
 def _context(path: Path, consumer: str, projection: dict) -> dict:
@@ -45,7 +47,10 @@ class StoryContractConsumerTests(unittest.TestCase):
     def test_storyboard_handoff_carries_five_sections_and_plan_is_projection_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, manifest = _new_project(Path(directory))
-            agent, _paths = _lock_contract(project, manifest)
+            agent, _paths = _lock_contract(project, manifest, contract_payload=semantic_contract_fixture(project, manifest, ("title", "story_body")))
+            semantic_source = Path(manifest["inputs"]["story_text"])
+            semantic_path = write_artifact_semantic_plan(project, semantic_source)
+            semantic_binding = plan_binding(semantic_path, load_current_artifact_semantic_plan(project, semantic_source))
             context_path = write_contract_consumer_context(project, "storyboard_images")
             expected = json.loads(context_path.read_text(encoding="utf-8"))
             projection = expected["contract_projection"]
@@ -70,7 +75,7 @@ class StoryContractConsumerTests(unittest.TestCase):
                 "visual_description": "主角出发",
             }
             plan = staging / "generic-contract_storyboard_plan.json"
-            plan.write_text(json.dumps({**{field: expected[field] for field in BINDING_FIELDS}, "contract_projection": projection, "shots": [shot]}, ensure_ascii=False), encoding="utf-8")
+            plan.write_text(json.dumps({**{field: expected[field] for field in BINDING_FIELDS}, **semantic_binding, "contract_projection": projection, "shots": [shot]}, ensure_ascii=False), encoding="utf-8")
             self.assertTrue(agent._storyboard_plan_valid(plan, storyboard))
             changed = json.loads(context_path.read_text(encoding="utf-8"))
             changed["contract_projection"]["visual_style"]["rules"] = [{"value": "changed"}]

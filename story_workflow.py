@@ -21,10 +21,10 @@ from story_video_synthesizer.image_video import (
 from video_provider_adapter import resolve_video_provider
 from story_semantics import SemanticKind, classify_story
 from story_contract_consumers import (
-    compile_product_content_spec,
     compile_release_render_spec,
     release_argument_overrides,
 )
+from artifact_semantic_plan import load_current_artifact_semantic_plan, semantic_plan_path
 
 from story_project import (
     auto_keying,
@@ -306,6 +306,8 @@ def main() -> None:
     assemble.add_argument("--language", default="zh")
     assemble.add_argument("--whisper-model-dir", default=None, type=Path)
     assemble.add_argument("--subtitle-style", choices=["clean", "box"], default="clean")
+    assemble.add_argument("--project-dir", type=Path)
+    assemble.add_argument("--artifact-semantic-plan", type=Path)
 
     release = subparsers.add_parser("package-release", help="背景成片 -> 主账号/宝库号小红书发布视频")
     release.add_argument("--story-name", required=True)
@@ -800,6 +802,10 @@ def main() -> None:
         ]
         if subtitle_script is not None:
             command.extend(["--subtitle-script", subtitle_script])
+        if args.project_dir is not None:
+            command.extend(["--project-dir", args.project_dir])
+        if args.artifact_semantic_plan is not None:
+            command.extend(["--artifact-semantic-plan", args.artifact_semantic_plan])
         if args.whisper_model_dir is not None:
             command.extend(["--whisper-model-dir", args.whisper_model_dir])
         run_script("synthesize.py", *command)
@@ -1834,7 +1840,10 @@ def run_product_package_project(
     demo_bg = first_existing(outputs.get("main_background_image"), paths.release / "theme_assets" / "main_background_16x9.png")
     story_frame_a = first_existing(outputs.get("story_frame_a"), paths.release / "theme_assets" / "story_frame_a.png")
     timings = first_existing(outputs.get("timings_json"), paths.assembly / "timings.json")
-    source_subtitles = first_existing(paths.assembly / "story_subtitles.srt")
+    source_subtitles = first_existing(
+        paths.assembly / "story_semantic_timeline.srt" if story_contract_context is not None else None,
+        paths.assembly / "story_subtitles.srt",
+    )
     # The customer manuscript keeps natural reading paragraphs, while PPTs
     # must stay one-to-one with the generated storyboard images.  Prepared
     # projects therefore use the audited storyboard text for presentation
@@ -1925,11 +1934,13 @@ def run_product_package_project(
         str(release_defaults.get("story_logo_y", 44)),
     ]
     if story_contract_context is not None:
-        product_spec = compile_product_content_spec(
-            story_contract_context,
-            paths.status / "product_package_work" / "product_content.compiled.json",
-        )
-        command.extend(["--semantic-contract-spec", product_spec])
+        # The semantic plan supersedes the older static product selector for
+        # required_v1 projects. Loading revalidates lock, source and recompilation.
+        load_current_artifact_semantic_plan(paths.root)
+        command.extend([
+            "--project-dir", paths.root,
+            "--artifact-semantic-plan", semantic_plan_path(paths.root),
+        ])
     annotation_skill_path = (
         annotation_skill_path_from_config()
     )

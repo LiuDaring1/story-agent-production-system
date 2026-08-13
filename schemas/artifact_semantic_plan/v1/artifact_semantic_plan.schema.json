@@ -1,0 +1,99 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "artifact_semantic_plan.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version", "compiler_version", "story_contract_sha256",
+    "contract_schema_version", "story_contract_dependency_sha256",
+    "contract_projection_sha256", "semantic_source", "artifacts",
+    "visual_cards", "pre_roll_diagnostic"
+  ],
+  "properties": {
+    "schema_version": {"const": "1.0"},
+    "compiler_version": {"const": "1"},
+    "story_contract_sha256": {"$ref": "#/$defs/sha256"},
+    "contract_schema_version": {"type": "string", "minLength": 1},
+    "story_contract_dependency_sha256": {"$ref": "#/$defs/sha256"},
+    "contract_projection_sha256": {"$ref": "#/$defs/sha256"},
+    "semantic_source": {
+      "type": "object", "additionalProperties": false,
+      "required": ["project_relative_path", "sha256", "line_count"],
+      "properties": {
+        "project_relative_path": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"},
+        "line_count": {"type": "integer", "minimum": 1}
+      }
+    },
+    "artifacts": {
+      "type": "object", "additionalProperties": false,
+      "required": ["demo_subtitles", "background_visual", "background_subtitles", "sales_subtitles", "ppt", "customer_manuscript", "reading_annotation"],
+      "properties": {
+        "demo_subtitles": {"$ref": "#/$defs/artifactPlan"},
+        "background_visual": {"$ref": "#/$defs/artifactPlan"},
+        "background_subtitles": {"$ref": "#/$defs/artifactPlan"},
+        "sales_subtitles": {"$ref": "#/$defs/artifactPlan"},
+        "ppt": {"$ref": "#/$defs/artifactPlan"},
+        "customer_manuscript": {"$ref": "#/$defs/artifactPlan"},
+        "reading_annotation": {"$ref": "#/$defs/artifactPlan"}
+      }
+    },
+    "visual_cards": {"type": "array", "items": {"$ref": "#/$defs/visualCard"}},
+    "pre_roll_diagnostic": {
+      "type": "object", "additionalProperties": false,
+      "required": ["suspected", "source_line_numbers", "action"],
+      "properties": {
+        "suspected": {"type": "boolean"},
+        "source_line_numbers": {"type": "array", "items": {"type": "integer", "minimum": 1}},
+        "action": {"const": "record_only_no_auto_trim"}
+      }
+    }
+  },
+  "$defs": {
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "provenance": {
+      "type": "object", "additionalProperties": true,
+      "required": ["source", "source_ref"],
+      "properties": {
+        "source": {"enum": ["task_input", "project_config", "brand_or_global_default", "agent_inference"]},
+        "source_ref": {"type": "string", "minLength": 1},
+        "source_sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "allOf": [{
+        "if": {"properties": {"source": {"enum": ["task_input", "project_config", "brand_or_global_default"]}}},
+        "then": {"required": ["source_sha256"]}
+      }]
+    },
+    "decision": {
+      "type": "object", "additionalProperties": false,
+      "required": ["semantic_kind", "source_line_numbers", "action", "subtitle_policy", "provenance", "source_mapping_index"],
+      "properties": {
+        "semantic_kind": {"type": "string", "minLength": 1},
+        "source_line_numbers": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1}},
+        "action": {"enum": ["include", "exclude", "visual_substitute"]},
+        "subtitle_policy": {"enum": ["show", "hide", "inherit"]},
+        "visual_substitute": {"type": "string", "minLength": 1},
+        "mutual_exclusion_group": {"type": "string", "minLength": 1},
+        "provenance": {"$ref": "#/$defs/provenance"},
+        "source_mapping_index": {"type": "integer", "minimum": 0}
+      }
+    },
+    "artifactPlan": {
+      "type": "object", "additionalProperties": false,
+      "required": ["decisions"],
+      "properties": {"decisions": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/decision"}}}
+    },
+    "visualCard": {
+      "type": "object", "additionalProperties": false,
+      "required": ["semantic_kind", "card_kind", "text", "source_line_numbers", "mutual_exclusion_group", "timing_rule"],
+      "properties": {
+        "semantic_kind": {"enum": ["title", "moral"]},
+        "card_kind": {"enum": ["title_card", "moral_card"]},
+        "text": {"type": "string", "minLength": 1},
+        "source_line_numbers": {"type": "array", "minItems": 1, "items": {"type": "integer", "minimum": 1}},
+        "mutual_exclusion_group": {"type": "string", "minLength": 1},
+        "timing_rule": {"enum": ["until_first_story_body_cue", "semantic_cue_range"]}
+      }
+    }
+  }
+}

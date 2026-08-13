@@ -20,6 +20,11 @@ from story_video_synthesizer.image_video import (
 )
 from video_provider_adapter import resolve_video_provider
 from story_semantics import SemanticKind, classify_story
+from story_contract_consumers import (
+    compile_product_content_spec,
+    compile_release_render_spec,
+    release_argument_overrides,
+)
 
 from story_project import (
     auto_keying,
@@ -134,12 +139,14 @@ def main() -> None:
     release_project = subparsers.add_parser("package-release-project", help="从桌面项目自动生成主账号/宝库号发布视频")
     release_project.add_argument("--project-dir", required=True, type=Path)
     release_project.add_argument("--variant", choices=["auto", "both", "main", "library"], default="auto")
+    release_project.add_argument("--story-contract-context", type=Path)
 
     release_preview = subparsers.add_parser("preview-release-project", help="可选刷新当前发布视频预览帧，不编码完整视频")
     release_preview.add_argument("--project-dir", required=True, type=Path)
     release_preview.add_argument("--variant", choices=["auto", "both", "main", "library"], default="auto")
     release_preview.add_argument("--times", default="1,2,37,92")
     release_preview.add_argument("--person-layouts", default="", help="主账号人物布局候选；留空只预览 keying_preset 当前最终参数，auto 生成候选")
+    release_preview.add_argument("--story-contract-context", type=Path)
 
     layout_handoff = subparsers.add_parser("release-layout-handoff", help="第 12 步后生成 Codex 智能定参候选预览和交接说明")
     layout_handoff.add_argument("--project-dir", required=True, type=Path)
@@ -174,6 +181,7 @@ def main() -> None:
     product_preflight.add_argument("--demo-person-crop-mode", choices=["preset", "full-width"], default="full-width")
     product_preflight.add_argument("--demo-person-vertical-align", choices=["center", "bottom"], default="bottom")
     product_preflight.add_argument("--demo-person-crop-bottom-ratio", default=0.0, type=float)
+    product_preflight.add_argument("--story-contract-context", type=Path)
 
     product_project = subparsers.add_parser("product-package-project", help="从桌面项目自动生成基础版/进阶版资料包")
     product_project.add_argument("--project-dir", required=True, type=Path)
@@ -183,6 +191,7 @@ def main() -> None:
     product_project.add_argument("--demo-person-crop-mode", choices=["preset", "full-width"], default="full-width")
     product_project.add_argument("--demo-person-vertical-align", choices=["center", "bottom"], default="bottom")
     product_project.add_argument("--demo-person-crop-bottom-ratio", default=0.0, type=float)
+    product_project.add_argument("--story-contract-context", type=Path)
 
     normalize = subparsers.add_parser("normalize-images", help="文生图输出 -> 标准 images 目录")
     normalize.add_argument("--source-dir", required=True, type=Path)
@@ -519,9 +528,9 @@ def main() -> None:
         report = doctor_project(args.project_dir)
         print(f"已生成工程体检报告：{report}")
     elif args.command == "package-release-project":
-        run_package_release_project(args.project_dir, args.variant)
+        run_package_release_project(args.project_dir, args.variant, story_contract_context=args.story_contract_context)
     elif args.command == "preview-release-project":
-        run_package_release_project(args.project_dir, args.variant, preview_times=args.times, preview_person_layouts=args.person_layouts)
+        run_package_release_project(args.project_dir, args.variant, preview_times=args.times, preview_person_layouts=args.person_layouts, story_contract_context=args.story_contract_context)
     elif args.command == "release-layout-handoff":
         run_release_layout_handoff(args.project_dir, args.times, args.person_layouts)
     elif args.command == "publish-package-project":
@@ -553,6 +562,7 @@ def main() -> None:
             demo_person_vertical_align=args.demo_person_vertical_align,
             demo_person_crop_bottom_ratio=args.demo_person_crop_bottom_ratio,
             preview_times=args.preview_times,
+            story_contract_context=args.story_contract_context,
         )
     elif args.command == "product-package-project":
         run_product_package_project(
@@ -565,6 +575,7 @@ def main() -> None:
             demo_person_vertical_align=args.demo_person_vertical_align,
             demo_person_crop_bottom_ratio=args.demo_person_crop_bottom_ratio,
             preview_times="",
+            story_contract_context=args.story_contract_context,
         )
     elif args.command == "normalize-images":
         command = [
@@ -1097,6 +1108,7 @@ def run_package_release_project(
     variant: str,
     preview_times: str | None = None,
     preview_person_layouts: str | None = None,
+    story_contract_context: Path | None = None,
 ) -> None:
     paths = project_paths(project_dir)
     is_preview = preview_times is not None
@@ -1162,6 +1174,16 @@ def run_package_release_project(
         paths.assembly / "story_sales_subtitles.srt",
     )
     release_defaults = config.get("release_defaults", {})
+    release_contract_spec: Path | None = None
+    release_contract_args: dict[str, object] = {}
+    if story_contract_context is not None:
+        release_contract_spec = compile_release_render_spec(
+            story_contract_context,
+            paths.status / "contracts" / "consumers" / "release_video.compiled.json",
+        )
+        release_contract_args = release_argument_overrides(
+            json.loads(release_contract_spec.read_text(encoding="utf-8")), "main"
+        )
     brand_assets = config.get("brand_assets", {})
     story_logo = first_existing(brand_assets.get("story_logo"), brand_assets.get("logo"))
     watermark_logo = first_existing(brand_assets.get("watermark_logo"))
@@ -1214,6 +1236,9 @@ def run_package_release_project(
         return b_windows, c_windows
 
     def release_command(selected_variant: str, bg_video: Path, plate_image: Path | None) -> list[object]:
+        effective = dict(release_defaults)
+        if selected_variant == "main":
+            effective.update({key: value for key, value in release_contract_args.items() if key != "safe_regions"})
         command: list[object] = [
             "--story-name",
             story.get("name", ""),
@@ -1226,9 +1251,9 @@ def run_package_release_project(
             "--variant",
             selected_variant,
             "--video-box",
-            release_defaults.get("video_box", "0,416,1080,608"),
+            effective.get("video_box", "0,416,1080,608"),
             "--story-box",
-            release_defaults.get("story_box", "210,270,910,512"),
+            effective.get("story_box", "210,270,910,512"),
             "--story-bleed",
             str(release_defaults.get("story_bleed", 0)),
             "--background-blur",
@@ -1242,11 +1267,11 @@ def run_package_release_project(
             "--output-scale",
             str(release_defaults.get("output_scale", 2)),
             "--person-height",
-            str(release_defaults.get("person_height", 900)),
+            str(effective.get("person_height", 900)),
             "--person-x",
-            str(release_defaults.get("person_x", 1200)),
+            str(effective.get("person_x", 1200)),
             "--person-y",
-            str(release_defaults.get("person_y", 105)),
+            str(effective.get("person_y", 105)),
             "--keyer",
             release_defaults.get("keyer", "colorkey"),
             "--chroma-color",
@@ -1268,18 +1293,20 @@ def run_package_release_project(
             "--tail-notice-text",
             str(release_defaults.get("tail_notice_text", "有需要联系客服，好作品有偿分享！")),
             "--story-logo-width-a",
-            str(release_defaults.get("story_logo_width_a", 150)),
+            str(effective.get("story_logo_width_a", 150)),
             "--story-logo-width-b",
             str(release_defaults.get("story_logo_width_b", 175)),
             "--story-logo-x",
-            str(release_defaults.get("story_logo_x", 42)),
+            str(effective.get("story_logo_x", 42)),
             "--story-logo-y",
-            str(release_defaults.get("story_logo_y", 44)),
+            str(effective.get("story_logo_y", 44)),
             "--subtitle-font-size",
             str(release_defaults.get("subtitle_font_size", 42)),
             "--subtitle-margin-v",
-            str(release_defaults.get("subtitle_margin_v", 72)),
+            str(effective.get("subtitle_margin_v", 72)),
         ]
+        if release_contract_spec is not None:
+            command.extend(["--contract-render-spec", release_contract_spec])
         optional: list[tuple[str, object | None]] = [
             ("--plate-image", plate_image),
             ("--watermark-logo", watermark_logo),
@@ -1779,6 +1806,7 @@ def run_product_package_project(
     demo_person_vertical_align: str,
     demo_person_crop_bottom_ratio: float,
     preview_times: str,
+    story_contract_context: Path | None = None,
 ) -> None:
     paths = project_paths(project_dir)
     manifest = detect_project_assets(paths.root, extract_audio=True)
@@ -1896,6 +1924,12 @@ def run_product_package_project(
         "--demo-logo-y",
         str(release_defaults.get("story_logo_y", 44)),
     ]
+    if story_contract_context is not None:
+        product_spec = compile_product_content_spec(
+            story_contract_context,
+            paths.status / "product_package_work" / "product_content.compiled.json",
+        )
+        command.extend(["--semantic-contract-spec", product_spec])
     annotation_skill_path = (
         annotation_skill_path_from_config()
     )

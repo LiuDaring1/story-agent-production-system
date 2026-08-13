@@ -36,6 +36,7 @@ from story_contract_runtime import (
     write_contract_lock,
     write_trusted_input_chain,
 )
+from story_contract_consumers import compile_cover_spec
 
 from story_codex_tasks import (
     build_children_story_handoff,
@@ -2156,7 +2157,13 @@ class StoryAgent:
         return result
 
     def _stage_release_preview(self, manifest: dict[str, Any]) -> StageResult:
-        result = self._workflow(["preview-release-project", "--project-dir", str(self.context.project_dir)], "生成发布预览")
+        command = ["preview-release-project", "--project-dir", str(self.context.project_dir)]
+        if not self._legacy_contract_policy(manifest):
+            command.extend([
+                "--story-contract-context",
+                str(contract_consumer_path(self.context.project_dir, "release_video")),
+            ])
+        result = self._workflow(command, "生成发布预览")
         if result.status != "done":
             return result
         preview_dir = self.context.paths.status / "release_preview_frames"
@@ -2221,7 +2228,13 @@ class StoryAgent:
     def _stage_package_release(self, manifest: dict[str, Any]) -> StageResult:
         if not self._consumer_request_current(manifest, "release_video"):
             return StageResult("blocked", "release_video 合同请求清单已失效，拒绝渲染发布视频。")
-        result = self._workflow(["package-release-project", "--project-dir", str(self.context.project_dir)], "生成主账号/宝库号发布视频")
+        command = ["package-release-project", "--project-dir", str(self.context.project_dir)]
+        if not self._legacy_contract_policy(manifest):
+            command.extend([
+                "--story-contract-context",
+                str(contract_consumer_path(self.context.project_dir, "release_video")),
+            ])
+        result = self._workflow(command, "生成主账号/宝库号发布视频")
         if result.status == "done":
             self._complete_contract_consumer(manifest, "release_video")
         return result
@@ -2354,7 +2367,13 @@ class StoryAgent:
                 return StageResult("blocked", "Codex CLI 子任务已返回，但主账号/宝库号 4:3 封面没有完整落盘。", handoff)
             if result.status == "done":
                 try:
-                    receipt = apply_fixed_cover_branding(self.context.project_dir)
+                    cover_spec = None
+                    if contract_context is not None:
+                        cover_spec = compile_cover_spec(
+                            contract_context,
+                            self.context.paths.status / "contracts" / "consumers" / "cover.compiled.json",
+                        )
+                    receipt = apply_fixed_cover_branding(self.context.project_dir, contract_spec=cover_spec)
                 except (OSError, ValueError) as exc:
                     return StageResult("blocked", f"封面固定品牌 Logo 定版失败：{exc}", handoff)
                 self._complete_contract_consumer(manifest, "cover")
@@ -2426,7 +2445,10 @@ class StoryAgent:
         contract_context = self._prepare_contract_consumer(manifest, "product_package")
         if isinstance(contract_context, StageResult):
             return contract_context
-        result = self._workflow(["product-package-preflight-project", "--project-dir", str(self.context.project_dir)], "资料包前置审查")
+        command = ["product-package-preflight-project", "--project-dir", str(self.context.project_dir)]
+        if contract_context is not None:
+            command.extend(["--story-contract-context", str(contract_context)])
+        result = self._workflow(command, "资料包前置审查")
         handoff = self.context.paths.status / "product_package_work" / "第16步资料包_Codex前置审查.md"
         if result.status == "done" and contract_context is not None and handoff.exists():
             self._append_contract_handoff(handoff, contract_context, "PPT、文稿、朗读标注、示范视频的产物语义矩阵")
@@ -2457,6 +2479,11 @@ class StoryAgent:
         if annotation is None:
             return StageResult("blocked", "缺少精修朗读标注。")
         command = ["product-package-project", "--project-dir", str(self.context.project_dir)]
+        if not self._legacy_contract_policy(manifest):
+            command.extend([
+                "--story-contract-context",
+                str(contract_consumer_path(self.context.project_dir, "product_package")),
+            ])
         if annotation.suffix.lower() == ".json":
             command.extend(["--annotation-json", str(annotation)])
         else:
@@ -2922,7 +2949,7 @@ class StoryAgent:
                 "这是全自动 Agent 模式，不需要向用户确认分镜。状态机已经写好并锁定分镜文本；必须只读使用该文件，绝对不得改写、合并、删减或重排任何一行。",
                 "可以创建或更新视觉圣经和图生视频提示词文件，然后连续生成图片；镜头编号必须逐行对应锁定分镜。",
                 f"必须先写入机器可读分镜计划：`{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}`。每镜包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description；story_text 必须逐行等于锁定分镜。",
-                "机器可读分镜计划的顶层还必须原样记录合同请求清单中的 contract_schema_version、story_contract_sha256、story_contract_dependency_sha256，并把逐镜列表放在 shots 字段。",
+                "机器可读分镜计划的顶层还必须原样记录合同请求清单中的 contract_schema_version、story_contract_sha256、story_contract_dependency_sha256 和 contract_projection，并把逐镜列表放在 shots 字段；contract_projection 不得删减、改写或用模型推断覆盖。",
                 "每个唱歌、关键发言、关键动作或明显受挫的角色都要获得焦点镜头；连续场景要安排建立全景、表演者中近景、反应镜头等景别变化，不能所有角色都和主角挤在同一种双人中景。",
                 "为反复出现的角色固定 appearance_id；生成后续镜头时必须同时引用风格锚点和该角色最近一张已通过图片，禁止只靠文字重新随机生成角色。",
                 "图生视频提示词文件的 CSV 必须包含 `scene,story_text,visual_description,prompt`；`prompt` 要作为后续图生视频 API 和审核页直接使用的最终提示词。图生视频已经有当前图片作为视觉约束，只写具体动作、表情、道具运动、镜头运动和少量禁止项，不要复制文生图视觉圣经、服装细节或画风长描述，也不能用“角色动作自然克制、镜头缓慢推进或轻移”之类通用模板充数。",
@@ -2942,6 +2969,17 @@ class StoryAgent:
                 "完成后只用简短中文说明生成成功的文件路径，以及任何未能完成的镜头编号。",
             ]
         )
+        context_path = contract_consumer_path(self.context.project_dir, "storyboard_images")
+        if context_path.is_file() and not self._legacy_contract_policy(self._manifest()):
+            try:
+                projection = json.loads(context_path.read_text(encoding="utf-8"))["contract_projection"]
+            except (OSError, KeyError, json.JSONDecodeError):
+                projection = None
+            if isinstance(projection, dict):
+                lines.extend([
+                    "", "以下是本轮最终生产指令必须完整遵守的五类合同投影：",
+                    "```json", json.dumps(projection, ensure_ascii=False, indent=2, sort_keys=True), "```",
+                ])
         return "\n".join(lines)
 
     def _missing_story_image_indices(self, story_lines: list[str]) -> list[int]:
@@ -2990,6 +3028,9 @@ class StoryAgent:
                     "story_contract_dependency_sha256",
                 )
             ):
+                return False
+            expected_projection = expected.get("contract_projection")
+            if not isinstance(expected_projection, dict) or payload.get("contract_projection") != expected_projection:
                 return False
         required = {
             "scene", "story_text", "narrative_function", "shot_size", "focal_character",
@@ -3488,10 +3529,28 @@ class StoryAgent:
         elif consumer == "cover":
             candidates.extend(self.context.paths.publish.glob("*/covers/cover_*"))
             candidates.extend(self.context.paths.publish.glob("*/copy.md"))
+            candidates.extend(self.context.paths.publish.glob("publish_asset_manifest.json"))
         elif consumer == "release_video":
             candidates.extend((self.context.paths.release / "theme_assets").glob("*.png"))
             candidates.extend(self.context.paths.release.glob("*发布视频.mp4"))
+            candidates.extend(self.context.paths.release.glob("release_render_manifest*.json"))
         elif consumer == "product_package":
+            work = self.context.paths.status / "product_package_work"
+            candidates.extend(
+                path
+                for path in (
+                    work / "annotation.json",
+                    work / "朗读标注.docx",
+                    work / "demo_params.json",
+                    work / "第16步资料包_Codex前置审查.md",
+                    work / "product_semantic_selection_manifest.json",
+                    work / "product_content.compiled.json",
+                    work / "story_subtitles_public.srt",
+                    work / "story_subtitles_demo.srt",
+                )
+                if path.exists()
+            )
+            candidates.extend(path for path in (work / "demo_preview", work / "keying_preview") if path.exists())
             for key in ("product_base", "product_advanced"):
                 target = first_existing(self._manifest().get("outputs", {}).get(key))
                 if target is not None:

@@ -2777,7 +2777,7 @@ def qa_publish(project_dir: Path) -> Path:
     return report
 
 
-def apply_fixed_cover_branding(project_dir: Path) -> Path:
+def apply_fixed_cover_branding(project_dir: Path, contract_spec: Path | None = None) -> Path:
     """Overlay the exact configured brand PNG on all covers and hash the operation."""
     paths = project_paths(project_dir)
     config = load_config()
@@ -2795,12 +2795,38 @@ def apply_fixed_cover_branding(project_dir: Path) -> Path:
         raise FileNotFoundError("封面定版缺少文件：" + "、".join(path.name for path in missing))
     receipt = paths.status / "publish_cover_branding.json"
     logo_sha = sha256_file(logo)
+    compiled: dict[str, Any] = {}
+    binding: dict[str, str] = {}
+    if contract_spec is not None:
+        try:
+            compiled = json.loads(contract_spec.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"封面合同编译投影不可读：{contract_spec}") from exc
+        if compiled.get("consumer") != "cover":
+            raise ValueError("封面合同编译投影 consumer 必须为 cover")
+        binding = {
+            field: str(compiled.get(field) or "")
+            for field in ("contract_schema_version", "story_contract_sha256", "story_contract_dependency_sha256")
+        }
+        if not all(binding.values()):
+            raise ValueError("封面合同编译投影缺少合同绑定字段")
+        official = [item for item in compiled.get("official_assets", []) if isinstance(item, dict)]
+        if not any(item.get("sha256") == logo_sha and int(item.get("max_per_frame", 0)) >= 1 for item in official):
+            raise ValueError("配置的封面 Logo 不在已审核官方品牌资产清单中")
     try:
         old_receipt = json.loads(receipt.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         old_receipt = {}
     old_outputs = old_receipt.get("covers") if isinstance(old_receipt.get("covers"), dict) else {}
-    if old_receipt.get("logo_sha256") == logo_sha and all(
+    asset_manifest = paths.publish / "publish_asset_manifest.json"
+    manifest_current = not binding
+    if binding and asset_manifest.is_file():
+        try:
+            previous_manifest = json.loads(asset_manifest.read_text(encoding="utf-8"))
+            manifest_current = all(previous_manifest.get(field) == value for field, value in binding.items())
+        except (OSError, json.JSONDecodeError):
+            manifest_current = False
+    if manifest_current and old_receipt.get("logo_sha256") == logo_sha and all(old_receipt.get(field) == value for field, value in binding.items()) and all(
         isinstance(old_outputs.get(str(path)), dict)
         and old_outputs[str(path)].get("output_sha256") == sha256_file(path)
         for path in covers
@@ -2814,19 +2840,34 @@ def apply_fixed_cover_branding(project_dir: Path) -> Path:
             raise ValueError("配置的品牌 Logo 全透明")
         logo_rgba = logo_rgba.crop(logo_bbox)
     cover_records: dict[str, dict[str, Any]] = {}
+    ratio_names = {"3x4": "3:4", "4x3": "4:3", "16x9": "16:9"}
+    variants = [item for item in compiled.get("variants", []) if isinstance(item, dict)]
     for cover in covers:
         input_sha = sha256_file(cover)
         with Image.open(cover) as source:
             canvas = source.convert("RGBA")
-        max_width = round(canvas.width * 0.27)
-        max_height = round(canvas.height * 0.105)
+        ratio_key = cover.stem.removeprefix("cover_")
+        expected_ratio = ratio_names[ratio_key]
+        if abs(canvas.width / canvas.height - ({"3:4": 3 / 4, "4:3": 4 / 3, "16:9": 16 / 9}[expected_ratio])) > 0.015:
+            raise ValueError(f"封面比例与确定性产物规格不符：{cover.name}")
+        variant = next((item for item in variants if item.get("aspect_ratio") == expected_ratio), None)
+        regions = {
+            str(item.get("role")): item
+            for item in ((variant or {}).get("regions", []))
+            if isinstance(item, dict) and item.get("role")
+        }
+        logo_region = regions.get("logo") or regions.get("brand_logo")
+        max_width = round(canvas.width * (float(logo_region["width"]) if logo_region else 0.27))
+        max_height = round(canvas.height * (float(logo_region["height"]) if logo_region else 0.105))
         scale = min(max_width / logo_rgba.width, max_height / logo_rgba.height)
         logo_resized = logo_rgba.resize(
             (max(1, round(logo_rgba.width * scale)), max(1, round(logo_rgba.height * scale))),
             Image.Resampling.LANCZOS,
         )
-        x = (canvas.width - logo_resized.width) // 2
-        y = round(canvas.height * 0.025)
+        x = round(canvas.width * float(logo_region["x"])) if logo_region else (canvas.width - logo_resized.width) // 2
+        y = round(canvas.height * float(logo_region["y"])) if logo_region else round(canvas.height * 0.025)
+        if x < 0 or y < 0 or x + logo_resized.width > canvas.width or y + logo_resized.height > canvas.height:
+            raise ValueError(f"合同 Logo 区域超出封面画布：{cover.name}")
         canvas.alpha_composite(logo_resized, (x, y))
         temporary = cover.with_name(f".{cover.stem}.branding-{uuid.uuid4().hex}.png")
         canvas.convert("RGB").save(temporary, format="PNG", optimize=True)
@@ -2835,6 +2876,11 @@ def apply_fixed_cover_branding(project_dir: Path) -> Path:
             "input_sha256": input_sha,
             "output_sha256": sha256_file(cover),
             "logo_box": [x, y, logo_resized.width, logo_resized.height],
+            "aspect_ratio": expected_ratio,
+            "variant_id": (variant or {}).get("variant_id"),
+            "title_safe_region": regions.get("title_safe") or regions.get("title"),
+            "person_region": regions.get("person") or regions.get("host"),
+            "layout_constraints": compiled.get("layout_rules", []),
         }
 
     lineage_path = paths.publish / "cover_lineage.json"
@@ -2862,12 +2908,29 @@ def apply_fixed_cover_branding(project_dir: Path) -> Path:
         receipt,
         {
             "version": 1,
+            **binding,
             "logo_path": str(logo),
             "logo_sha256": logo_sha,
             "mode": "deterministic_exact_overlay",
             "covers": cover_records,
         },
     )
+    if contract_spec is not None:
+        save_json(
+            asset_manifest,
+            {
+                "version": 1,
+                "consumer": "cover",
+                **binding,
+                "compiled_spec": str(contract_spec),
+                "compiled_spec_sha256": sha256_file(contract_spec),
+                "official_logo_sha256": logo_sha,
+                "official_logo_count_per_cover": 1,
+                "brand_rules": compiled.get("brand_rules", []),
+                "layout_rules": compiled.get("layout_rules", []),
+                "covers": cover_records,
+            },
+        )
     return receipt
 
 

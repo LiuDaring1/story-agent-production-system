@@ -30,6 +30,7 @@ from pptx.enum.text import MSO_ANCHOR
 from pptx.util import Emu, Pt as PptPt
 
 from story_video_synthesizer.align import LineTiming, align_evenly, read_script_lines
+from story_contract_consumers import BINDING_FIELDS, semantic_line_indices, write_json_atomic
 from story_video_synthesizer.image_video import sorted_image_files
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
 from story_video_synthesizer.subtitles import write_srt
@@ -118,6 +119,7 @@ def main() -> None:
     parser.add_argument("--preview-times", default="0.8,1.5,2.5,37,92", help="示范视频预览抽帧时间点，秒")
     parser.add_argument("--music-volume", default=0.22, type=float)
     parser.add_argument("--narration-volume", default=1.0, type=float)
+    parser.add_argument("--semantic-contract-spec", type=Path, help="已审核合同编译出的资料包内容选择规格")
     args = parser.parse_args()
 
     build_product_package(args)
@@ -178,17 +180,42 @@ def build_product_package(args: argparse.Namespace) -> None:
         narration_path,
         allow_even=args.allow_even_timings,
     )
+    semantic_spec = load_product_semantic_spec(args.semantic_contract_spec) if args.semantic_contract_spec else None
+
+    def selected(artifact: str) -> tuple[list[str], list[Path], list[LineTiming], list[int]]:
+        indices = semantic_line_indices(script_lines, semantic_spec, artifact) if semantic_spec else list(range(len(script_lines)))
+        lines = [public_script_lines[index] for index in indices]
+        selected_images = [images[index] for index in indices]
+        selected_timings = [
+            LineTiming(position + 1, public_script_lines[index], timings[index].source_start, timings[index].source_end,
+                       timings[index].duration, timings[index].timeline_start, timings[index].timeline_end)
+            for position, index in enumerate(indices)
+        ]
+        return lines, selected_images, selected_timings, indices
+
+    ppt_lines, ppt_images, ppt_timings, ppt_indices = selected("ppt")
+    manuscript_lines, _mi, _mt, manuscript_indices = selected("customer_manuscript")
+    annotation_lines, _ai, _at, annotation_indices = selected("reading_annotation")
+    demo_lines, _di, demo_timings, demo_indices = selected("demo")
+    if semantic_spec is not None:
+        write_json_atomic(
+            work_dir / "product_semantic_selection_manifest.json",
+            {
+                "version": 1,
+                "consumer": "product_package",
+                **{field: str(semantic_spec[field]) for field in BINDING_FIELDS},
+                "source_line_count": len(script_lines),
+                "selections": {
+                    "ppt": ppt_indices,
+                    "customer_manuscript": manuscript_indices,
+                    "reading_annotation": annotation_indices,
+                    "demo": demo_indices,
+                },
+            },
+        )
     public_srt_path = work_dir / "story_subtitles_public.srt"
     demo_srt_path = work_dir / "story_subtitles_demo.srt"
-    public_timings = [
-        LineTiming(t.index, public_script_lines[index], t.source_start, t.source_end, t.duration, t.timeline_start, t.timeline_end)
-        for index, t in enumerate(timings[: len(public_script_lines)])
-    ]
-    demo_timings = [
-        LineTiming(t.index, script_lines[index], t.source_start, t.source_end, t.duration, t.timeline_start, t.timeline_end)
-        for index, t in enumerate(timings[: len(script_lines)])
-    ]
-    write_srt(public_timings, public_srt_path)
+    write_srt(ppt_timings, public_srt_path)
     write_srt(demo_timings, demo_srt_path)
 
     story_docx = assets_dir / f"故事文稿：{story_name}.docx"
@@ -252,7 +279,7 @@ def build_product_package(args: argparse.Namespace) -> None:
             background_brightness=background_brightness,
         )
         request_path = work_dir / "朗读标注_需精修.md"
-        write_annotation_request(story_name, public_script_lines, request_path, annotation_skill_path)
+        write_annotation_request(story_name, annotation_lines, request_path, annotation_skill_path)
         handoff = work_dir / "第16步资料包_Codex前置审查.md"
         write_product_preflight_handoff(
             story_name=story_name,
@@ -272,7 +299,8 @@ def build_product_package(args: argparse.Namespace) -> None:
         print(f"朗读标注精修请求：{request_path}")
         return
 
-    render_story_docx(story_name, clean_public_story_text(read_text_document(story_text_path)), story_docx)
+    manuscript_text = "\n".join(manuscript_lines) if semantic_spec is not None else clean_public_story_text(read_text_document(story_text_path))
+    render_story_docx(story_name, manuscript_text, story_docx)
     if args.annotation_docx is not None:
         annotation_source = args.annotation_docx.expanduser()
         if not annotation_source.exists():
@@ -283,14 +311,14 @@ def build_product_package(args: argparse.Namespace) -> None:
         if not annotation_source.exists():
             raise FileNotFoundError(f"朗读标注 JSON 不存在：{annotation_source}")
         blocks = load_annotation_blocks(annotation_source)
-        validate_annotation_coverage(blocks, public_script_lines)
+        validate_annotation_coverage(blocks, annotation_lines)
         render_annotation_blocks_docx(story_name, blocks, annotation_docx)
     elif args.allow_draft_annotation:
         print("[warning] 当前使用规则草稿生成朗读标注，仅用于内部预览；正式资料包请传 --annotation-json 或 --annotation-docx。")
-        render_annotation_docx(story_name, public_script_lines, annotation_docx)
+        render_annotation_docx(story_name, annotation_lines, annotation_docx)
     else:
         request_path = work_dir / "朗读标注_需精修.md"
-        write_annotation_request(story_name, public_script_lines, request_path, annotation_skill_path)
+        write_annotation_request(story_name, annotation_lines, request_path, annotation_skill_path)
         raise RuntimeError(
             "已停止：朗读标注必须先精修，不能再自动套模板生成。"
             f"请按 story-performance-script.skill 精修后传入 --annotation-json 或 --annotation-docx：{request_path}"
@@ -298,9 +326,9 @@ def build_product_package(args: argparse.Namespace) -> None:
     narration_duration = probe_duration(narration_path)
     build_story_ppt(
         story_name,
-        images,
-        public_script_lines,
-        timings,
+        ppt_images,
+        ppt_lines,
+        ppt_timings,
         music_path,
         ppt_with_sub,
         with_subtitles=True,
@@ -308,9 +336,9 @@ def build_product_package(args: argparse.Namespace) -> None:
     )
     build_story_ppt(
         story_name,
-        images,
-        public_script_lines,
-        timings,
+        ppt_images,
+        ppt_lines,
+        ppt_timings,
         music_path,
         ppt_no_sub,
         with_subtitles=False,
@@ -367,6 +395,15 @@ def build_product_package(args: argparse.Namespace) -> None:
         ppt_no_sub=ppt_no_sub,
         a_only_video=a_only_video if a_only_video.exists() else None,
     )
+
+
+def load_product_semantic_spec(path: Path) -> dict:
+    payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    if payload.get("consumer") != "product_package" or not all(str(payload.get(field) or "") for field in BINDING_FIELDS):
+        raise ValueError("资料包语义合同规格无效或缺少绑定字段")
+    if not isinstance(payload.get("mappings"), list):
+        raise ValueError("资料包语义合同规格缺少 mappings")
+    return payload
 
 
 def validate_background_videos(with_sub: Path, no_sub: Path, allow_full_subtitle_bg: bool = False) -> None:

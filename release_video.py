@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import subprocess
 from dataclasses import dataclass, replace
@@ -9,6 +10,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
+from story_contract_consumers import BINDING_FIELDS, release_argument_overrides, write_json_atomic
 
 
 FINAL_WIDTH = 1080
@@ -140,6 +142,7 @@ def main() -> None:
     parser.add_argument("--preview-dir", type=Path, help="只生成发布合成预览帧 PNG，不编码完整视频")
     parser.add_argument("--preview-times", default="1,2,37,92", help="预览帧时间点，秒，用逗号分隔；默认包含开头动作帧以检查手部裁切")
     parser.add_argument("--preview-person-layouts", default="", help="预览人像布局候选；auto 或 height,x,y;label:height,x,y")
+    parser.add_argument("--contract-render-spec", type=Path, help="已审核合同编译出的发布渲染规格")
     args = parser.parse_args()
 
     keying = load_keying_preset(args.keying_preset_json.expanduser()) if args.keying_preset_json else {}
@@ -227,6 +230,9 @@ def main() -> None:
         preset=args.preset,
         output_scale=max(1, args.output_scale),
     )
+    contract_spec = load_release_contract_spec(args.contract_render_spec) if args.contract_render_spec else None
+    if contract_spec is not None and config.variant == "main":
+        config = apply_release_contract_spec(config, contract_spec)
     if args.preview_dir is not None:
         render_release_previews(
             config,
@@ -235,7 +241,43 @@ def main() -> None:
             parse_preview_person_layouts(args.preview_person_layouts, config),
         )
     else:
-        package_release_videos(config)
+        package_release_videos(config, contract_spec=contract_spec)
+
+
+def load_release_contract_spec(path: Path) -> dict:
+    payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    if payload.get("consumer") != "release_video" or not all(str(payload.get(field) or "") for field in BINDING_FIELDS):
+        raise ValueError("发布渲染合同规格无效或缺少绑定字段")
+    return payload
+
+
+def apply_release_contract_spec(config: ReleaseConfig, spec: dict) -> ReleaseConfig:
+    overrides = release_argument_overrides(spec, config.variant)
+    values = {key: value for key, value in overrides.items() if key != "safe_regions"}
+    for key in ("story_box", "b_story_box"):
+        if key in values and isinstance(values[key], str):
+            values[key] = parse_required_box(values[key], f"--{key.replace('_', '-')}", "0,0,1,1")
+    return replace(config, **values)
+
+
+def build_release_render_manifest(config: ReleaseConfig, spec: dict, outputs: list[Path]) -> dict:
+    return {
+        "version": 1,
+        "consumer": "release_video",
+        **{field: str(spec[field]) for field in BINDING_FIELDS},
+        "variant": config.variant,
+        "render_parameters": {
+            "person_region": [config.person_x, config.person_y, config.person_height],
+            "story_media_region": list(config.story_box),
+            "logo_region": [config.story_logo_x, config.story_logo_y, config.story_logo_width_a],
+            "subtitle_margin_v": config.subtitle_margin_v,
+        },
+        "safe_regions": release_argument_overrides(spec, config.variant).get("safe_regions", {}),
+        "outputs": [
+            {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            for path in outputs if path.is_file()
+        ],
+    }
 
 
 def load_keying_preset(path: Path) -> dict:
@@ -478,13 +520,14 @@ def find_transparent_seed(mask: Image.Image, preferred: tuple[int, int], window:
     raise ValueError("故事框窗口中心附近没有可用透明开口")
 
 
-def package_release_videos(config: ReleaseConfig) -> None:
+def package_release_videos(config: ReleaseConfig, contract_spec: dict | None = None) -> None:
     validate_config(config)
     ensure_dir(config.output_dir)
     work_dir = config.output_dir / "_release_work"
     ensure_dir(work_dir)
 
     assets = render_static_assets(config, work_dir)
+    generated: list[Path] = []
     if config.variant in {"both", "main"}:
         main_wide = work_dir / "main_account_16x9.mp4"
         main_vertical = config.output_dir / "主账号发布视频.mp4"
@@ -502,6 +545,7 @@ def package_release_videos(config: ReleaseConfig) -> None:
                 output_scale=config.output_scale,
             )
         print(f"已生成主账号发布视频：{main_vertical}")
+        generated.append(main_vertical)
 
     if config.variant in {"both", "library"}:
         library_output = config.output_dir / "宝库号发布视频.mp4"
@@ -526,6 +570,12 @@ def package_release_videos(config: ReleaseConfig) -> None:
                 output_scale=1,
             )
         print(f"已生成宝库号发布视频：{library_output}")
+        generated.append(library_output)
+    if contract_spec is not None:
+        write_json_atomic(
+            config.output_dir / f"release_render_manifest_{config.variant}.json",
+            build_release_render_manifest(config, contract_spec, generated),
+        )
 
 
 def render_release_previews(

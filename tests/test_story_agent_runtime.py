@@ -78,6 +78,8 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             codex_worker_reasoning_effort="max",
         )
         self.assertEqual(context.codex_route("video_review"), ("commander", "gpt-5.6-sol", "xhigh"))
+        self.assertEqual(context.codex_route("visual_sample_review"), ("commander", "gpt-5.6-sol", "xhigh"))
+        self.assertEqual(context.codex_route("visual_samples"), ("worker", "gpt-5.6-luna", "max"))
         self.assertEqual(context.codex_route("codex_story_images"), ("worker", "gpt-5.6-luna", "max"))
         self.assertEqual(context.codex_route("generate_videos"), ("worker", "gpt-5.6-luna", "max"))
 

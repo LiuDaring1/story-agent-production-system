@@ -45,6 +45,20 @@ from artifact_semantic_plan import (
     semantic_plan_path,
     write_artifact_semantic_plan,
 )
+from visual_sample_gate import (
+    load_current_visual_sample_plan,
+    visual_sample_asset_paths,
+    visual_sample_binding,
+    visual_sample_lock_is_current,
+    visual_sample_machine_issues,
+    visual_sample_paths,
+    visual_sample_plan_is_current,
+    visual_sample_review_payload_issues,
+    write_visual_sample_lock,
+    write_visual_sample_machine_qa,
+    write_visual_sample_plan,
+    write_visual_sample_supplemental_request,
+)
 
 from story_codex_tasks import (
     build_children_story_handoff,
@@ -121,6 +135,7 @@ AGENT_STATE_NAME = "story_agent_state.json"
 NATIVE_VISION_REVIEW_STAGES = frozenset(
     {
         "story_contract_review",
+        "visual_sample_review",
         "story_images_review",
         "video_prompt_review",
         "video_review",
@@ -194,6 +209,7 @@ class AgentContext:
         commander_stages = {
             "source_edit_review",
             "story_contract_review",
+            "visual_sample_review",
             "story_images_review",
             "video_prompt_review",
             "video_review",
@@ -937,6 +953,8 @@ class StoryAgent:
             ("story_contract", self._has_story_contract, self._stage_story_contract),
             ("story_contract_review", self._has_story_contract_review, self._stage_story_contract_review),
             ("artifact_semantic_plan", self._has_artifact_semantic_plan, self._stage_artifact_semantic_plan),
+            ("visual_samples", self._has_visual_samples, self._stage_visual_samples),
+            ("visual_sample_review", self._has_visual_sample_review, self._stage_visual_sample_review),
             ("codex_story_images", self._has_story_images, self._stage_codex_story_images),
             ("story_images_review", self._has_story_images_review, self._stage_story_images_review),
             ("prepare_jobs", self._has_jobs_csv, self._stage_prepare_jobs),
@@ -1172,6 +1190,148 @@ class StoryAgent:
         except (OSError, ValueError, KeyError, TypeError) as exc:
             return StageResult("blocked", f"逐产物语义呈现计划编译失败：{exc}")
         return StageResult("done", "逐产物语义呈现计划已确定性编译并绑定当前合同与语义源。", path)
+
+    def _stage_visual_samples(self, manifest: dict[str, Any]) -> StageResult:
+        if self._legacy_contract_policy(manifest):
+            return StageResult("done", "V3 冻结项目沿用既有视觉控制，不补造 V3.5 条件式小样。")
+        context = self._prepare_contract_consumer(manifest, "storyboard_images")
+        if isinstance(context, StageResult):
+            return context
+        if context is None:
+            return StageResult("blocked", "缺少 storyboard_images 合同投影，无法编译视觉小样。")
+        paths = visual_sample_paths(self.context.project_dir)
+        paths["lock"].unlink(missing_ok=True)
+        if not self.context.execute:
+            return StageResult("done", "dry-run：将优先复用合同预览，并只生成故事实际缺少的视觉小样。")
+        try:
+            plan_path = write_visual_sample_plan(self.context.project_dir, context)
+            plan = load_current_visual_sample_plan(self.context.project_dir, context)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return StageResult("blocked", f"条件式视觉小样计划编译失败：{exc}")
+        missing = [item for item in plan["requirements"] if not isinstance(item.get("asset"), dict)]
+        if missing:
+            paths["assets"].mkdir(parents=True, exist_ok=True)
+            paths["handoff"].parent.mkdir(parents=True, exist_ok=True)
+            projection = json.loads(context.read_text(encoding="utf-8"))["contract_projection"]
+            paths["handoff"].write_text(
+                "\n".join(
+                    [
+                        "# 条件式视觉小样生产任务",
+                        "",
+                        "只生成计划中 fulfillment=supplemental_sample 且 asset=null 的小样；禁止生成正式分镜图片。",
+                        f"- 小样计划：`{plan_path}`",
+                        f"- 合同投影：`{context}`",
+                        f"- 输出目录：`{paths['assets']}`",
+                        "- 必须完整遵守 visual_style、characters、world_scale、story_state。",
+                        "- 不得自行添加合同没有来源的身份标记、器官、配饰、装饰、服装特征或解剖特征。",
+                        "- 不得生成文字、标题、字幕、水印或 Logo。",
+                        "- 每张只验证该 sample_id 的合同约束；不要扩展故事事实。",
+                        "",
+                        "## 当前完整视觉投影",
+                        "```json",
+                        json.dumps(projection, ensure_ascii=False, indent=2, sort_keys=True),
+                        "```",
+                        "",
+                        "## 身份扩展禁令",
+                        "```json",
+                        json.dumps(plan["identity_expansion_policy"], ensure_ascii=False, indent=2, sort_keys=True),
+                        "```",
+                        "",
+                        "## 本轮缺失小样",
+                        "```json",
+                        json.dumps(missing, ensure_ascii=False, indent=2, sort_keys=True),
+                        "```",
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            result = self._codex_task(
+                stage="visual_samples",
+                label="条件式视觉小样生成",
+                handoff=paths["handoff"],
+                prompt=(
+                    "严格执行 handoff。使用 ImageGen 仅补齐其中列出的 supplemental_sample；"
+                    "不要修改合同、计划或正式故事图片。完成前逐文件确认可解码且路径精确。"
+                ),
+            )
+            if result.status != "done":
+                return result
+            try:
+                plan_path = write_visual_sample_plan(self.context.project_dir, context)
+                plan = load_current_visual_sample_plan(self.context.project_dir, context)
+            except (OSError, ValueError, KeyError, TypeError) as exc:
+                return StageResult("retrying", f"小样生成后无法重新绑定计划：{exc}", paths["handoff"])
+        issues = visual_sample_machine_issues(self.context.project_dir, plan)
+        qa = write_visual_sample_machine_qa(self.context.project_dir, plan)
+        if issues:
+            return StageResult("retrying", "视觉小样机器完整性未通过：" + "；".join(issues), qa)
+        reused = sum(1 for item in plan["requirements"] if item["fulfillment"] == "contract_preview")
+        supplemental = len(plan["requirements"]) - reused
+        return StageResult(
+            "done",
+            f"条件式视觉小样已就绪：复用合同预览 {reused} 项，补充生产小样 {supplemental} 项。",
+            qa,
+        )
+
+    def _stage_visual_sample_review(self, manifest: dict[str, Any]) -> StageResult:
+        if self._legacy_contract_policy(manifest):
+            return StageResult("done", "V3 冻结项目不补造 V3.5 视觉小样审核。")
+        context = contract_consumer_path(self.context.project_dir, "storyboard_images")
+        paths = visual_sample_paths(self.context.project_dir)
+        paths["lock"].unlink(missing_ok=True)
+        try:
+            plan = load_current_visual_sample_plan(self.context.project_dir, context)
+            machine_issues = visual_sample_machine_issues(self.context.project_dir, plan)
+            machine_qa = write_visual_sample_machine_qa(self.context.project_dir, plan)
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return StageResult("blocked", f"视觉小样或合同绑定无效：{exc}")
+        if machine_issues:
+            return StageResult("retrying", "视觉小样机器完整性未通过：" + "；".join(machine_issues), machine_qa)
+        assets = visual_sample_asset_paths(self.context.project_dir, plan)
+        bundle = write_review_bundle(
+            paths["bundle"],
+            [paths["plan"], machine_qa, context, contract_paths(self.context.project_dir)["contract"], *assets],
+        )
+        result, payload = self._structured_review(
+            stage="visual_sample_review",
+            label="条件式视觉小样独立审核",
+            bundle=bundle,
+            images=assets,
+            rubric=(
+                "这是批量生图前门禁，审核必须分三层并在 JSON 中分别写 machine_completeness、contract_adherence、product_quality。"
+                "machine_completeness 必须 passed=true 且引用文件/哈希证据；contract_adherence.checks 必须逐项覆盖计划要求的 visual_style、characters、world_scale、story_state；"
+                "product_quality.dimensions 必须逐项覆盖计划要求的儿童吸引力、可爱度（有角色时）、自然身份、构图、色彩、光照和风格适配。"
+                "JSON 还必须写 p0_errors、retry_sample_ids 和逐 sample_id 的 evidence_matrix。"
+                "任何无合同来源的身份标记、器官、配饰、装饰或特征，解剖错误、身份错、尺度矛盾、状态矛盾、儿童不适或不可用构图均是 P0；"
+                "只要 p0_errors 非空就必须 approved=false，不能被总分平均。"
+            ),
+        )
+        special_issues = visual_sample_review_payload_issues(payload, plan) if payload else ["missing review payload"]
+        if result.status == "done" and not special_issues:
+            lock = write_visual_sample_lock(self.context.project_dir)
+            return StageResult("done", f"视觉小样三层审核通过并锁定：{payload.get('score')} 分", lock)
+        if payload is not None:
+            try:
+                request = write_visual_sample_supplemental_request(self.context.project_dir, plan, payload)
+                request_payload = json.loads(request.read_text(encoding="utf-8"))
+                retry_ids = set(request_payload.get("sample_ids", []))
+                quarantine = paths["directory"] / "rejected" / time.strftime("%Y%m%d-%H%M%S")
+                for item in plan["requirements"]:
+                    if item["sample_id"] not in retry_ids or item["fulfillment"] != "supplemental_sample":
+                        continue
+                    source = self.context.project_dir / item["expected_path"]
+                    if source.is_file():
+                        quarantine.mkdir(parents=True, exist_ok=True)
+                        shutil.move(str(source), str(quarantine / source.name))
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                pass
+        message = "视觉小样审核未通过"
+        if special_issues:
+            message += "：" + "；".join(special_issues)
+        if self._can_retry_stage("visual_sample_review", critical=True):
+            return StageResult("retrying", message + "；只重做失败小样，不进入批量生图。", paths["review"])
+        return StageResult("blocked", message, paths["review"])
 
     def _stage_source_edit(self, manifest: dict[str, Any]) -> StageResult:
         contract = manifest.get("agent", {}).get("input_contract", {})
@@ -1497,6 +1657,9 @@ class StoryAgent:
                 self.context.project_dir, semantic_source
             ):
                 return StageResult("blocked", "逐产物语义呈现计划缺失或已过期，禁止开始批量生图。")
+            sample_context = contract_consumer_path(self.context.project_dir, "storyboard_images")
+            if not visual_sample_lock_is_current(self.context.project_dir, sample_context):
+                return StageResult("blocked", "条件式视觉小样尚未通过三层独立审核或锁已失效，禁止开始批量生图。")
         contract_context = self._prepare_contract_consumer(manifest, "storyboard_images")
         if isinstance(contract_context, StageResult):
             return contract_context
@@ -1674,11 +1837,19 @@ class StoryAgent:
                 "若 bundle 包含 visual_continuity_contract.json，必须将其作为逐镜硬约束：按 allowed_states、transitions、story_boundaries 和 state_rules 核对每镜当前状态、事件转折与在场证据；状态越界或违反 required/forbidden 均为 critical_errors，不能用整体印象放行。"
                 "若合同的 storyboard_requirements 指定 required_field，机器可读 storyboard_plan 必须逐镜提供该字段且值必须属于合同 allowed_states；缺失或枚举无效是关键错误。"
                 "审核 JSON 的 evidence_matrix 必须逐镜写明：角色数量、身份/服装、关键物体数量、角色应在场/不应在场及画面证据；不得用“整体正常”代替逐项核对。"
+                "V3.5 required_v1 项目还必须分层写 contract_adherence 和 product_quality，并写 p0_errors。"
+                "product_quality 必须覆盖 child_appeal、composition、color、lighting、style_suitability；有角色时还要覆盖 cuteness、natural_identity。"
+                "无合同来源的身份/器官/装饰、解剖错误、身份错、尺度或状态矛盾、儿童不适、不可用构图均为 P0；P0 非空时无论总分多高都不得通过。"
                 "输出 retry_indices（需要重做的镜头编号整数数组）。角色身份或在场关系错、肢体/五官崩坏、错误文字、漏镜头属于关键错误。"
             ),
         )
         if result.status == "done":
-            return result
+            if self._legacy_contract_policy(manifest):
+                return result
+            quality_issues = self._story_image_quality_review_issues(payload)
+            if not quality_issues:
+                return result
+            result = StageResult("blocked", "故事图片产品质量/P0 门禁未通过：" + "；".join(quality_issues), result.handoff)
         if payload and self._can_retry_stage("story_images_review", critical=True):
             indices = self._review_retry_indices(payload)
             if indices:
@@ -1686,6 +1857,38 @@ class StoryAgent:
                 if moved:
                     return StageResult("retrying", f"图片审核未通过，已保留失败版本并排队重做镜头：{', '.join(map(str, moved))}", result.handoff)
         return result
+
+    def _story_image_quality_review_issues(self, payload: dict[str, Any] | None) -> list[str]:
+        if not isinstance(payload, dict):
+            return ["missing review payload"]
+        issues: list[str] = []
+        p0 = payload.get("p0_errors")
+        if not isinstance(p0, list):
+            issues.append("p0_errors must be an array")
+        elif p0:
+            issues.append("P0 hard gate failed: " + ",".join(str(item) for item in p0))
+        adherence = payload.get("contract_adherence")
+        if not isinstance(adherence, dict) or adherence.get("passed") is not True or not adherence.get("evidence"):
+            issues.append("contract_adherence must pass with evidence")
+        context = contract_consumer_path(self.context.project_dir, "storyboard_images")
+        expected = {"child_appeal", "composition", "color", "lighting", "style_suitability"}
+        try:
+            projection = json.loads(context.read_text(encoding="utf-8"))["contract_projection"]
+            if projection.get("characters", {}).get("mode") == "present":
+                expected.update({"cuteness", "natural_identity"})
+        except (OSError, KeyError, json.JSONDecodeError):
+            issues.append("contract projection unreadable")
+        quality = payload.get("product_quality")
+        actual: set[str] = set()
+        if isinstance(quality, dict) and quality.get("passed") is True:
+            for item in quality.get("dimensions", []):
+                if isinstance(item, dict) and item.get("passed") is True and item.get("evidence"):
+                    actual.add(str(item.get("dimension") or ""))
+        else:
+            issues.append("product_quality must pass")
+        if expected - actual:
+            issues.append("product_quality missing: " + ",".join(sorted(expected - actual)))
+        return issues
 
     def _stage_timing(self, manifest: dict[str, Any]) -> StageResult:
         narration = first_existing(manifest.get("inputs", {}).get("narration"), manifest.get("inputs", {}).get("extracted_narration"))
@@ -3003,6 +3206,9 @@ class StoryAgent:
                 f"必须先写入机器可读分镜计划：`{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}`。每镜包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description；story_text 必须逐行等于锁定分镜。",
                 "机器可读分镜计划的顶层还必须原样记录合同请求清单中的 contract_schema_version、story_contract_sha256、story_contract_dependency_sha256 和 contract_projection，并把逐镜列表放在 shots 字段；contract_projection 不得删减、改写或用模型推断覆盖。",
                 "机器可读分镜计划还必须原样记录当前逐产物语义呈现计划的 artifact_semantic_plan_sha256、artifact_semantic_plan_schema_version、artifact_semantic_plan_dependency_sha256；缺失或旧绑定将被 Runtime 拒绝。",
+                "机器可读分镜计划还必须原样记录 visual_sample_schema_version、visual_sample_plan_sha256、visual_sample_review_bundle_sha256、visual_sample_lock_sha256；旧小样或旧审核绑定将被 Runtime 拒绝。",
+                "每镜必须记录 scale_basis、current_story_state、visual_state_evidence。scale_basis 必须说明是否适用、引用合同 relationship_id 或说明不适用原因；有状态机时必须逐 machine_id 记录当前 state_id 及可见/不可见证据。",
+                "不得丢弃、缩写或覆盖合同角色、风格、尺度、状态约束；不得自行添加合同没有来源的身份标记、器官、配饰、装饰、服装或解剖特征。",
                 "每个唱歌、关键发言、关键动作或明显受挫的角色都要获得焦点镜头；连续场景要安排建立全景、表演者中近景、反应镜头等景别变化，不能所有角色都和主角挤在同一种双人中景。",
                 "为反复出现的角色固定 appearance_id；生成后续镜头时必须同时引用风格锚点和该角色最近一张已通过图片，禁止只靠文字重新随机生成角色。",
                 "图生视频提示词文件的 CSV 必须包含 `scene,story_text,visual_description,prompt`；`prompt` 要作为后续图生视频 API 和审核页直接使用的最终提示词。图生视频已经有当前图片作为视觉约束，只写具体动作、表情、道具运动、镜头运动和少量禁止项，不要复制文生图视觉圣经、服装细节或画风长描述，也不能用“角色动作自然克制、镜头缓慢推进或轻移”之类通用模板充数。",
@@ -3045,6 +3251,31 @@ class StoryAgent:
                     ])
                 except (OSError, ValueError, KeyError, TypeError):
                     lines.extend(["", "ERROR: 当前逐产物语义计划无效，禁止继续生成分镜计划。"])
+            try:
+                context = contract_consumer_path(self.context.project_dir, "storyboard_images")
+                sample_plan = load_current_visual_sample_plan(self.context.project_dir, context)
+                sample_paths = visual_sample_paths(self.context.project_dir)
+                lines.extend(
+                    [
+                        "",
+                        "以下是已通过审核的条件式视觉小样计划、资产与强制绑定。必须作为真实出图参考，不得仅抄字段：",
+                        "```json",
+                        json.dumps(
+                            {
+                                "binding": visual_sample_binding(self.context.project_dir),
+                                "requirements": sample_plan["requirements"],
+                                "identity_expansion_policy": sample_plan["identity_expansion_policy"],
+                                "lock": str(sample_paths["lock"]),
+                            },
+                            ensure_ascii=False,
+                            indent=2,
+                            sort_keys=True,
+                        ),
+                        "```",
+                    ]
+                )
+            except (OSError, ValueError, KeyError, TypeError):
+                lines.extend(["", "ERROR: 当前视觉小样锁无效，禁止生成正式图片。"])
         return "\n".join(lines)
 
     def _missing_story_image_indices(self, story_lines: list[str]) -> list[int]:
@@ -3063,7 +3294,6 @@ class StoryAgent:
         storyboard = staging / f"{self.context.slug}_storyboard_lines.txt"
         return (
             (staging / f"{self.context.slug}_visual_bible.md").exists()
-            and (staging / "images" / f"{self.context.slug}_style_anchor.png").exists()
             and self._storyboard_plan_valid(plan, storyboard)
         )
 
@@ -3089,6 +3319,10 @@ class StoryAgent:
                 semantic_plan_path = self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"
                 semantic_plan = load_current_artifact_semantic_plan(self.context.project_dir, semantic_source)
                 semantic_binding = artifact_semantic_plan_binding(semantic_plan_path, semantic_plan)
+                sample_context = contract_consumer_path(self.context.project_dir, "storyboard_images")
+                if not visual_sample_lock_is_current(self.context.project_dir, sample_context):
+                    return False
+                sample_binding = visual_sample_binding(self.context.project_dir)
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
                 return False
             if not isinstance(payload, dict) or any(
@@ -3105,9 +3339,27 @@ class StoryAgent:
                 return False
             if any(payload.get(field) != value for field, value in semantic_binding.items()):
                 return False
+            if any(payload.get(field) != value for field, value in sample_binding.items()):
+                return False
+            projection = expected_projection
+            scale_rows = projection.get("world_scale", {}).get("relationships", [])
+            scale_ids = {
+                str(item.get("relationship_id")) for item in scale_rows if isinstance(item, dict)
+            }
+            state_rows = projection.get("story_state", {}).get("machines", [])
+            allowed_states = {
+                str(item.get("machine_id")): {
+                    str(state.get("state_id"))
+                    for state in item.get("states", [])
+                    if isinstance(state, dict)
+                }
+                for item in state_rows
+                if isinstance(item, dict)
+            }
         required = {
             "scene", "story_text", "narrative_function", "shot_size", "focal_character",
             "visible_characters", "excluded_characters", "continuity_group", "appearance_ids", "visual_description",
+            "scale_basis", "current_story_state", "visual_state_evidence",
         }
         for index, (row, text) in enumerate(zip(rows, story_lines), start=1):
             if not isinstance(row, dict) or not required.issubset(row):
@@ -3120,6 +3372,27 @@ class StoryAgent:
                 return False
             if not str(row["shot_size"]).strip() or not str(row["focal_character"]).strip():
                 return False
+            if not self._legacy_contract_policy(self._manifest()):
+                scale_basis = row.get("scale_basis")
+                if not isinstance(scale_basis, dict) or not isinstance(scale_basis.get("applicable"), bool):
+                    return False
+                relationship_ids = scale_basis.get("relationship_ids", [])
+                if not isinstance(relationship_ids, list) or any(str(value) not in scale_ids for value in relationship_ids):
+                    return False
+                if scale_basis["applicable"] and (not relationship_ids or not str(scale_basis.get("evidence") or "").strip()):
+                    return False
+                if not scale_basis["applicable"] and not str(scale_basis.get("reason") or "").strip():
+                    return False
+                current_state = row.get("current_story_state")
+                state_evidence = row.get("visual_state_evidence")
+                if not isinstance(current_state, dict) or not isinstance(state_evidence, dict):
+                    return False
+                if set(current_state) != set(allowed_states) or set(state_evidence) != set(allowed_states):
+                    return False
+                if any(str(current_state[key]) not in values for key, values in allowed_states.items()):
+                    return False
+                if any(not str(state_evidence[key]).strip() for key in allowed_states):
+                    return False
         return True
 
     def _visual_continuity_contract_path(self) -> Path | None:
@@ -3965,7 +4238,10 @@ class StoryAgent:
             f"权威分镜已由状态机写入 `{staging_storyboard}`；该文件只读，禁止生产者改写、合并、删减、扩写或重排。",
             f"全自动模式下，必须先把视觉圣经保存到：{staging_images.parent / (self.context.slug + '_visual_bible.md')}。",
             f"必须把逐镜叙事覆盖、焦点角色、景别、在场/不在场角色、连续场景组和 appearance_id 保存到：{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}。",
-            f"必须先生成一张非最终交付的风格/角色锚点图，保存到：{staging_images / (self.context.slug + '_style_anchor.png')}。",
+            "V3.5 required_v1 项目必须读取已审核 visual_sample.lock.json 和 visual_sample_plan.json；优先复用其中合同预览/条件小样，不得另造一套风格锚点。",
+            "visual_style、characters、world_scale、story_state 必须完整进入最终逐镜计划和真实生图指令，不得删减或用模型偏好覆盖。",
+            "不得自行增加合同没有可信来源的身份标记、器官、配饰、装饰、服装特征或解剖特征。",
+            "每镜必须写 scale_basis、current_story_state、visual_state_evidence，并引用合同中的 relationship_id、machine_id、state_id；不适用也要写明原因。",
             "不要出现绵羊姐姐形象、主持人形象、羊、小羊、人偶或任何与品牌相关的角色形象。",
             "用户提供的原文已经按镜头分行；原则上每一行就是一个独立镜头。",
             f"如果标题镜头需要文字，只能使用本集标题“{self.context.story_name}”，不得套用任何历史样例标题。",
@@ -4102,6 +4378,30 @@ class StoryAgent:
             return True
         source = self._artifact_semantic_source(manifest)
         return source is not None and artifact_semantic_plan_is_current(self.context.project_dir, source)
+
+    def _has_visual_samples(self, manifest: dict[str, Any]) -> bool:
+        if self._legacy_contract_policy(manifest):
+            return True
+        context = contract_consumer_path(self.context.project_dir, "storyboard_images")
+        if not visual_sample_plan_is_current(self.context.project_dir, context, require_ready=True):
+            return False
+        try:
+            plan = load_current_visual_sample_plan(self.context.project_dir, context)
+            qa = json.loads(visual_sample_paths(self.context.project_dir)["machine_qa"].read_text(encoding="utf-8"))
+        except (OSError, ValueError, json.JSONDecodeError):
+            return False
+        paths = visual_sample_paths(self.context.project_dir)
+        return (
+            not visual_sample_machine_issues(self.context.project_dir, plan)
+            and qa.get("passed") is True
+            and qa.get("visual_sample_plan_sha256") == file_sha256(paths["plan"])
+        )
+
+    def _has_visual_sample_review(self, manifest: dict[str, Any]) -> bool:
+        if self._legacy_contract_policy(manifest):
+            return True
+        context = contract_consumer_path(self.context.project_dir, "storyboard_images")
+        return visual_sample_lock_is_current(self.context.project_dir, context)
 
     def _expected_story_image_count(self, manifest: dict[str, Any], storyboard: Path | None = None) -> int:
         story_lines = self._story_lines(manifest)

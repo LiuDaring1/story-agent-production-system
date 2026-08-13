@@ -1,0 +1,406 @@
+from __future__ import annotations
+
+import copy
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from PIL import Image
+
+from story_agent import StageResult, StoryAgent
+from story_agent_runtime import file_sha256, write_review_bundle
+from story_contract_runtime import contract_consumer_path, write_contract_consumer_context
+from story_project import project_paths, save_json, write_manifest
+from tests.test_story_agent_runtime import as_frozen_v3_legacy
+from tests.test_story_contract_runtime import _lock_contract, _new_project, _runtime_valid_contract
+from tests.test_story_contracts import valid_contract
+from visual_sample_gate import (
+    P0_CATEGORIES,
+    VISUAL_SAMPLE_SCHEMA_PATH,
+    compile_visual_sample_plan,
+    load_current_visual_sample_plan,
+    validate_visual_sample_plan,
+    visual_sample_binding,
+    visual_sample_lock_is_current,
+    visual_sample_paths,
+    visual_sample_review_payload_issues,
+    visual_sample_schema_parity_issues,
+    write_visual_sample_lock,
+    write_visual_sample_machine_qa,
+    write_visual_sample_plan,
+    write_visual_sample_supplemental_request,
+)
+
+
+def _image(path: Path, color=(220, 190, 120)) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (640, 480), color).save(path)
+    return path
+
+
+def _agent_provenance(value) -> None:
+    if isinstance(value, dict):
+        for key, child in list(value.items()):
+            if key in {"provenance", "mode_provenance"} and isinstance(child, dict):
+                value[key] = {
+                    "source": "agent_inference",
+                    "source_ref": "generic visual fixture inference",
+                    "source_order": 0,
+                }
+            else:
+                _agent_provenance(child)
+    elif isinstance(value, list):
+        for child in value:
+            _agent_provenance(child)
+
+
+def _visual_contract(
+    project: Path,
+    manifest: dict,
+    *,
+    characters: bool = True,
+    scale: bool = True,
+    state: bool = True,
+    preview_kinds=("style_anchor",),
+) -> dict:
+    contract = _runtime_valid_contract(project, manifest)
+    if characters:
+        source = valid_contract(with_characters=True)["contracts"]
+        for section in ("characters", "world_scale", "story_state"):
+            contract["contracts"][section] = copy.deepcopy(source[section])
+        _agent_provenance(contract["contracts"]["characters"])
+        _agent_provenance(contract["contracts"]["world_scale"])
+        _agent_provenance(contract["contracts"]["story_state"])
+        if not scale:
+            contract["contracts"]["world_scale"]["relationships"] = []
+        if not state:
+            contract["contracts"]["story_state"]["machines"] = []
+    else:
+        contract["contracts"]["characters"].update(
+            mode="none", characters=[], no_character_reason="This generic story has no visual character."
+        )
+        contract["contracts"]["world_scale"]["relationships"] = []
+        contract["contracts"]["story_state"]["machines"] = []
+    refs = {
+        "style_anchor": [],
+        "character_sheet": ["protagonist", "guide"],
+        "scale_anchor": ["hero_vs_guide"],
+    }
+    previews = []
+    for kind in preview_kinds:
+        path = _image(project / "99_项目状态" / "story_contract" / "previews" / f"{kind}.png")
+        previews.append(
+            {
+                "preview_id": f"{kind}_fixture",
+                "kind": kind,
+                "need_reason": "Generic conditional visual preview fixture.",
+                "content_refs": refs[kind],
+                "path": str(path.relative_to(project)),
+                "sha256": file_sha256(path),
+                "provenance": {
+                    "source": "agent_inference",
+                    "source_ref": "generic visual preview fixture",
+                    "source_order": 0,
+                },
+            }
+        )
+    contract["preview_assets"] = previews
+    return contract
+
+
+def _fixture(
+    root: Path,
+    *,
+    characters: bool = True,
+    scale: bool = True,
+    state: bool = True,
+    preview_kinds=("style_anchor",),
+):
+    project, manifest = _new_project(root)
+    contract = _visual_contract(
+        project,
+        manifest,
+        characters=characters,
+        scale=scale,
+        state=state,
+        preview_kinds=preview_kinds,
+    )
+    agent, _paths = _lock_contract(project, manifest, contract_payload=contract)
+    context = write_contract_consumer_context(project, "storyboard_images")
+    return project, manifest, agent, context
+
+
+def _ready_plan(project: Path, context: Path) -> dict:
+    plan = compile_visual_sample_plan(project, context)
+    for item in plan["requirements"]:
+        if item["fulfillment"] == "supplemental_sample":
+            _image(project / item["expected_path"], color=(160, 200, 180))
+    write_visual_sample_plan(project, context)
+    return load_current_visual_sample_plan(project, context)
+
+
+def _passing_review(plan: dict, bundle: Path) -> dict:
+    return {
+        "approved": True,
+        "score": 96,
+        "critical_errors": [],
+        "issues": [],
+        "retry_indices": [],
+        "retry_files": [],
+        "retry_sample_ids": [],
+        "retry_instructions": [],
+        "p0_errors": [],
+        "machine_completeness": {"passed": True, "evidence": "machine QA bound in bundle"},
+        "contract_adherence": {
+            "passed": True,
+            "checks": [
+                {"dimension": dimension, "passed": True, "evidence": f"sample verifies {dimension}"}
+                for dimension in plan["review_profile"]["contract_adherence"]
+            ],
+        },
+        "product_quality": {
+            "passed": True,
+            "dimensions": [
+                {"dimension": dimension, "passed": True, "evidence": f"sample verifies {dimension}"}
+                for dimension in plan["review_profile"]["product_quality"]
+            ],
+        },
+        "evidence_matrix": [
+            {"sample_id": item["sample_id"], "evidence": item["expected_path"]}
+            for item in plan["requirements"]
+        ],
+        "artifact_sha256": file_sha256(bundle),
+    }
+
+
+def _lock_samples(project: Path, context: Path) -> dict:
+    plan = _ready_plan(project, context)
+    paths = visual_sample_paths(project)
+    machine = write_visual_sample_machine_qa(project, plan)
+    assets = [project / item["expected_path"] for item in plan["requirements"]]
+    bundle = write_review_bundle(paths["bundle"], [paths["plan"], machine, context, *assets])
+    save_json(paths["review"], _passing_review(plan, bundle))
+    write_visual_sample_lock(project)
+    if not visual_sample_lock_is_current(project, context):
+        raise AssertionError("visual sample fixture lock is not current")
+    return plan
+
+
+class VisualSampleGateTests(unittest.TestCase):
+    def test_schema_parity_determinism_and_conditional_sample_matrix(self) -> None:
+        cases = [
+            (False, False, False, {"style_anchor"}),
+            (True, False, False, {"style_anchor", "character_sheet"}),
+            (True, True, False, {"style_anchor", "character_sheet", "scale_anchor"}),
+            (True, True, True, {"style_anchor", "character_sheet", "scale_anchor", "state_anchor"}),
+        ]
+        self.assertEqual(visual_sample_schema_parity_issues(), [])
+        for characters, scale, state, expected in cases:
+            with self.subTest(characters=characters, scale=scale, state=state), tempfile.TemporaryDirectory() as directory:
+                project, _manifest, _agent, context = _fixture(
+                    Path(directory), characters=characters, scale=scale, state=state
+                )
+                first = compile_visual_sample_plan(project, context)
+                second = compile_visual_sample_plan(project, context)
+                self.assertEqual(first, second)
+                self.assertEqual({item["kind"] for item in first["requirements"]}, expected)
+                self.assertEqual(validate_visual_sample_plan(first), [])
+                tampered = copy.deepcopy(first)
+                tampered["unexpected"] = True
+                self.assertIn("unexpected_fields:unexpected", validate_visual_sample_plan(tampered))
+                try:
+                    import jsonschema
+                except ImportError:
+                    jsonschema = None
+                if jsonschema is not None:
+                    schema = json.loads(VISUAL_SAMPLE_SCHEMA_PATH.read_text(encoding="utf-8"))
+                    jsonschema.Draft202012Validator(schema).validate(first)
+
+    def test_reuses_reviewed_contract_preview_and_supplements_only_missing_kinds(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, _manifest, _agent, context = _fixture(
+                Path(directory), preview_kinds=("style_anchor", "character_sheet", "scale_anchor")
+            )
+            plan = compile_visual_sample_plan(project, context)
+            by_kind = {item["kind"]: item for item in plan["requirements"]}
+            self.assertEqual(by_kind["style_anchor"]["fulfillment"], "contract_preview")
+            self.assertEqual(by_kind["character_sheet"]["fulfillment"], "contract_preview")
+            self.assertEqual(by_kind["scale_anchor"]["fulfillment"], "contract_preview")
+            self.assertEqual(by_kind["state_anchor"]["fulfillment"], "supplemental_sample")
+
+    def test_worker_handoff_contains_full_projection_and_identity_expansion_ban(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest, agent, context = _fixture(Path(directory))
+
+            def fake_task(**_kwargs):
+                handoff = visual_sample_paths(project)["handoff"].read_text(encoding="utf-8")
+                for name in ("visual_style", "characters", "world_scale", "story_state"):
+                    self.assertIn(f'"{name}"', handoff)
+                self.assertIn("不得自行添加合同没有来源的身份标记、器官、配饰、装饰", handoff)
+                plan = compile_visual_sample_plan(project, context)
+                for item in plan["requirements"]:
+                    if not isinstance(item.get("asset"), dict):
+                        _image(project / item["expected_path"])
+                return StageResult("done", "fixture samples created")
+
+            with patch.object(agent, "_codex_task", side_effect=fake_task):
+                result = agent._stage_visual_samples(manifest)
+            self.assertEqual(result.status, "done", result.message)
+            self.assertTrue(agent._has_visual_samples(manifest))
+
+    def test_three_layer_review_p0_is_a_hard_gate_and_batch_never_starts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest, agent, context = _fixture(Path(directory))
+            plan = _ready_plan(project, context)
+            paths = visual_sample_paths(project)
+            bad = _passing_review(plan, paths["plan"])
+            bad.update(score=100, approved=True, p0_errors=["unsupported_identity_feature"])
+            self.assertTrue(any("P0 hard gate" in issue for issue in visual_sample_review_payload_issues(bad, plan)))
+
+            def fake_review(**kwargs):
+                bad["artifact_sha256"] = file_sha256(kwargs["bundle"])
+                save_json(paths["review"], bad)
+                return StageResult("done", "generic score passed", paths["review"]), bad
+
+            with patch.object(agent, "_structured_review", side_effect=fake_review):
+                result = agent._stage_visual_sample_review(manifest)
+            self.assertIn(result.status, {"retrying", "blocked"})
+            self.assertFalse(paths["lock"].exists())
+            with patch.object(agent, "_codex_task") as producer:
+                batch = agent._stage_codex_story_images(manifest)
+            self.assertEqual(batch.status, "blocked")
+            producer.assert_not_called()
+
+    def test_failed_sample_request_replaces_only_named_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, _manifest, _agent, context = _fixture(
+                Path(directory),
+                state=False,
+                preview_kinds=("style_anchor", "character_sheet", "scale_anchor"),
+            )
+            plan = _ready_plan(project, context)
+            paths = visual_sample_paths(project)
+            write_visual_sample_machine_qa(project, plan)
+            write_review_bundle(
+                paths["bundle"],
+                [paths["plan"], paths["machine_qa"], context, *[project / item["expected_path"] for item in plan["requirements"]]],
+            )
+            review = _passing_review(plan, paths["bundle"])
+            review.update(
+                approved=False,
+                score=82,
+                retry_sample_ids=["character_sheet"],
+                p0_errors=["character_identity_mismatch"],
+            )
+            save_json(paths["review"], review)
+            write_visual_sample_supplemental_request(project, plan, review)
+            replacement = compile_visual_sample_plan(project, context)
+            by_kind = {item["kind"]: item for item in replacement["requirements"]}
+            self.assertEqual(by_kind["character_sheet"]["fulfillment"], "supplemental_sample")
+            self.assertEqual(by_kind["style_anchor"]["fulfillment"], "contract_preview")
+            self.assertEqual(by_kind["scale_anchor"]["fulfillment"], "contract_preview")
+
+    def test_review_lock_is_hash_bound_and_sample_tamper_invalidates_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, _manifest, _agent, context = _fixture(Path(directory))
+            plan = _lock_samples(project, context)
+            self.assertTrue(visual_sample_lock_is_current(project, context))
+            target = project / plan["requirements"][-1]["expected_path"]
+            _image(target, color=(10, 20, 30))
+            self.assertFalse(visual_sample_lock_is_current(project, context))
+            with self.assertRaisesRegex(ValueError, "stale or manually modified"):
+                load_current_visual_sample_plan(project, context)
+
+    def test_storyboard_requires_current_sample_binding_scale_state_and_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest, agent, context = _fixture(Path(directory))
+            _lock_samples(project, context)
+            expected = json.loads(context.read_text(encoding="utf-8"))
+            storyboard = Path(directory) / "storyboard.txt"
+            storyboard.write_text("主角出发。\n", encoding="utf-8")
+            semantic_binding = {
+                "artifact_semantic_plan_sha256": "a" * 64,
+                "artifact_semantic_plan_schema_version": "1.0",
+                "artifact_semantic_plan_dependency_sha256": "b" * 64,
+            }
+            sample_binding = visual_sample_binding(project)
+            shot = {
+                "scene": 1, "story_text": "主角出发。", "narrative_function": "setup",
+                "shot_size": "wide", "focal_character": "protagonist",
+                "visible_characters": ["protagonist"], "excluded_characters": [],
+                "continuity_group": "opening", "appearance_ids": ["protagonist_default"],
+                "visual_description": "The protagonist starts the journey.",
+                "scale_basis": {
+                    "applicable": True, "relationship_ids": ["hero_vs_guide"],
+                    "evidence": "The protagonist is visibly much smaller than the guide.",
+                },
+                "current_story_state": {"protagonist_condition": "state_initial"},
+                "visual_state_evidence": {"protagonist_condition": "Initial feature is visible."},
+            }
+            payload = {
+                **{key: expected[key] for key in ("contract_schema_version", "story_contract_sha256", "story_contract_dependency_sha256")},
+                "contract_projection": expected["contract_projection"], **semantic_binding, **sample_binding,
+                "shots": [shot],
+            }
+            plan_path = Path(directory) / "storyboard_plan.json"
+            plan_path.write_text(json.dumps(payload), encoding="utf-8")
+            with patch("story_agent.load_current_artifact_semantic_plan", return_value={}), patch(
+                "story_agent.artifact_semantic_plan_binding", return_value=semantic_binding
+            ):
+                self.assertTrue(agent._storyboard_plan_valid(plan_path, storyboard))
+                payload["shots"][0].pop("visual_state_evidence")
+                plan_path.write_text(json.dumps(payload), encoding="utf-8")
+                self.assertFalse(agent._storyboard_plan_valid(plan_path, storyboard))
+                payload["shots"][0]["visual_state_evidence"] = {
+                    "protagonist_condition": "Initial feature is visible."
+                }
+                payload["visual_sample_plan_sha256"] = "0" * 64
+                plan_path.write_text(json.dumps(payload), encoding="utf-8")
+                self.assertFalse(agent._storyboard_plan_valid(plan_path, storyboard))
+
+    def test_full_story_image_review_uses_product_dimensions_and_p0_gate(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, _manifest, agent, context = _fixture(Path(directory))
+            payload = {
+                "p0_errors": [],
+                "contract_adherence": {"passed": True, "evidence": "per-shot contract evidence"},
+                "product_quality": {
+                    "passed": True,
+                    "dimensions": [
+                        {"dimension": name, "passed": True, "evidence": f"evidence for {name}"}
+                        for name in (
+                            "child_appeal", "composition", "color", "lighting", "style_suitability",
+                            "cuteness", "natural_identity",
+                        )
+                    ],
+                },
+            }
+            self.assertEqual(agent._story_image_quality_review_issues(payload), [])
+            payload["p0_errors"] = ["anatomy_or_organ_error"]
+            payload["score"] = 100
+            self.assertTrue(any("P0 hard gate" in issue for issue in agent._story_image_quality_review_issues(payload)))
+
+    def test_legacy_project_needs_no_visual_samples_or_new_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            manifest["agent"]["story_contract"].pop("policy", None)
+            manifest = as_frozen_v3_legacy(manifest)
+            write_manifest(project_paths(project), manifest)
+            agent = StoryAgent(agent_context_for(project))
+            self.assertTrue(agent._has_visual_samples(manifest))
+            self.assertTrue(agent._has_visual_sample_review(manifest))
+            self.assertEqual(agent._stage_visual_samples(manifest).status, "done")
+            self.assertEqual(agent._stage_visual_sample_review(manifest).status, "done")
+            self.assertFalse(visual_sample_paths(project)["directory"].exists())
+
+
+def agent_context_for(project: Path):
+    from tests.test_story_contract_runtime import _context
+
+    return _context(project)
+
+
+if __name__ == "__main__":
+    unittest.main()

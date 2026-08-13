@@ -73,14 +73,28 @@ class StoryContractConsumerTests(unittest.TestCase):
                 "shot_size": "wide", "focal_character": "主角", "visible_characters": ["主角"],
                 "excluded_characters": [], "continuity_group": "opening", "appearance_ids": [],
                 "visual_description": "主角出发",
+                "scale_basis": {"applicable": False, "relationship_ids": [], "reason": "合同没有尺度关系"},
+                "current_story_state": {}, "visual_state_evidence": {},
             }
             plan = staging / "generic-contract_storyboard_plan.json"
-            plan.write_text(json.dumps({**{field: expected[field] for field in BINDING_FIELDS}, **semantic_binding, "contract_projection": projection, "shots": [shot]}, ensure_ascii=False), encoding="utf-8")
-            self.assertTrue(agent._storyboard_plan_valid(plan, storyboard))
+            sample_binding = {
+                "visual_sample_plan_sha256": "c" * 64,
+                "visual_sample_schema_version": "1.0",
+                "visual_sample_dependency_sha256": "d" * 64,
+                "visual_sample_review_bundle_sha256": "e" * 64,
+            }
+            plan.write_text(json.dumps({**{field: expected[field] for field in BINDING_FIELDS}, **semantic_binding, **sample_binding, "contract_projection": projection, "shots": [shot]}, ensure_ascii=False), encoding="utf-8")
+            with patch("story_agent.visual_sample_lock_is_current", return_value=True), patch(
+                "story_agent.visual_sample_binding", return_value=sample_binding
+            ):
+                self.assertTrue(agent._storyboard_plan_valid(plan, storyboard))
             changed = json.loads(context_path.read_text(encoding="utf-8"))
             changed["contract_projection"]["visual_style"]["rules"] = [{"value": "changed"}]
             context_path.write_text(json.dumps(changed, ensure_ascii=False), encoding="utf-8")
-            self.assertFalse(agent._storyboard_plan_valid(plan, storyboard))
+            with patch("story_agent.visual_sample_lock_is_current", return_value=True), patch(
+                "story_agent.visual_sample_binding", return_value=sample_binding
+            ):
+                self.assertFalse(agent._storyboard_plan_valid(plan, storyboard))
 
     def test_storyagent_music_chain_passes_projection_and_requires_current_plan_binding(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

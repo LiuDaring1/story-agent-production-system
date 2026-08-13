@@ -172,14 +172,34 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
         from story_contract_runtime import contract_consumer_path, write_contract_consumer_context
         expected_path = write_contract_consumer_context(project, "storyboard_images")
         expected = json.loads(expected_path.read_text())
-        shot = {"scene": 1, "story_text": "主角出发。", "narrative_function": "setup", "shot_size": "wide", "focal_character": "主角", "visible_characters": ["主角"], "excluded_characters": [], "continuity_group": "opening", "appearance_ids": [], "visual_description": "主角出发"}
-        payload = {**{key: expected[key] for key in ("contract_schema_version", "story_contract_sha256", "story_contract_dependency_sha256")}, "contract_projection": expected["contract_projection"], **plan_binding(plan_path, semantic), "shots": [shot]}
+        sample_binding = {
+            "visual_sample_schema_version": "1.0",
+            "visual_sample_plan_sha256": "1" * 64,
+            "visual_sample_review_bundle_sha256": "2" * 64,
+            "visual_sample_lock_sha256": "3" * 64,
+        }
+        shot = {
+            "scene": 1, "story_text": "主角出发。", "narrative_function": "setup",
+            "shot_size": "wide", "focal_character": "主角", "visible_characters": ["主角"],
+            "excluded_characters": [], "continuity_group": "opening", "appearance_ids": [],
+            "visual_description": "主角出发",
+            "scale_basis": {"applicable": False, "relationship_ids": [], "reason": "合同没有尺度关系"},
+            "current_story_state": {}, "visual_state_evidence": {},
+        }
+        payload = {
+            **{key: expected[key] for key in ("contract_schema_version", "story_contract_sha256", "story_contract_dependency_sha256")},
+            "contract_projection": expected["contract_projection"], **plan_binding(plan_path, semantic),
+            **sample_binding, "shots": [shot],
+        }
         storyboard_plan = staging / "plan.json"
         storyboard_plan.write_text(json.dumps(payload), encoding="utf-8")
-        self.assertTrue(agent._storyboard_plan_valid(storyboard_plan, storyboard))
-        payload["artifact_semantic_plan_sha256"] = "0" * 64
-        storyboard_plan.write_text(json.dumps(payload), encoding="utf-8")
-        self.assertFalse(agent._storyboard_plan_valid(storyboard_plan, storyboard))
+        with patch("story_agent.visual_sample_lock_is_current", return_value=True), patch(
+            "story_agent.visual_sample_binding", return_value=sample_binding
+        ):
+            self.assertTrue(agent._storyboard_plan_valid(storyboard_plan, storyboard))
+            payload["artifact_semantic_plan_sha256"] = "0" * 64
+            storyboard_plan.write_text(json.dumps(payload), encoding="utf-8")
+            self.assertFalse(agent._storyboard_plan_valid(storyboard_plan, storyboard))
 
     def test_runtime_stage_compiles_and_stale_source_blocks_resume(self) -> None:
         temporary, project, manifest, source, agent = self._fixture()

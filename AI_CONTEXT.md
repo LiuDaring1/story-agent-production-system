@@ -12,7 +12,7 @@ Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_ru
 
 1. [`AGENTS.md`](AGENTS.md)：不可破坏规则。
 2. [`docs/architecture/overall-architecture.md`](docs/architecture/overall-architecture.md)：五层架构和数据流。
-3. [`docs/architecture/stage-dag.md`](docs/architecture/stage-dag.md)：V3.5 的 35 个阶段、依赖和并行边界。
+3. [`docs/architecture/stage-dag.md`](docs/architecture/stage-dag.md)：V3.5 当前的 38 个阶段、依赖和并行边界。
 4. [`docs/architecture/model-routing.md`](docs/architecture/model-routing.md)：Sol/Luna 两角色路由。
 5. [`docs/contracts/review-and-safety.md`](docs/contracts/review-and-safety.md)：审核、哈希、预算和密钥合同。
 6. [`docs/operations/runbook.md`](docs/operations/runbook.md)：提交、启动、恢复、诊断和验证。
@@ -27,10 +27,12 @@ Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_ru
 | 文件 | 责任 |
 | --- | --- |
 | `story_agent.py` | 用户任务、阶段执行、DAG worker、模型路由、恢复与 supervisor |
-| `story_agent_runtime.py` | manifest v2、35 阶段 DAG、资源锁、预算、审核与哈希合同 |
+| `story_agent_runtime.py` | manifest v2、38 阶段 DAG、资源锁、预算、审核与哈希合同 |
 | `story_contracts.py` | Story Production Contract Schema/Python 验证和 provenance 规则 |
 | `story_contract_runtime.py` | 合同生成输入链、审核、锁、消费者 projection/receipt 和只读诊断 |
 | `story_contract_consumers.py` | 六类消费者的最小编译投影和确定性 render/content spec |
+| `artifact_semantic_plan.py` | 从已锁合同确定性编译逐产物语义呈现计划、互斥规则和失效校验 |
+| `visual_sample_gate.py` | 条件式视觉小样计划、三层审核、P0 门禁和确定性小样锁 |
 | `story_workflow.py` | 把阶段翻译为本地脚本、FFmpeg 和产品制作命令 |
 | `story_project.py` | 项目目录、产物检测、机器 QA、交付和内部报告 |
 | `story_semantics.py` | 标题、主持人口播、正文、道理和结尾的语义合同 |
@@ -81,4 +83,5 @@ python3 story_agent.py --help
 - 当前成本字段名以 CNY 表示，但 ToAPIs 模型页按美元报价；在修正前不能把本地估算当作人民币实扣。
 - 优化应先解决可观察性、增量返工、上下文包和真实账单，再比较模型档位。
 - V3.5 Milestone 1 已完成合同前置：新任务在批量生产前必须形成七类合同，由 Luna 起草、Sol 独立审核、Runtime 确定性锁定；V3 冻结项目仅在绑定的历史资格成立时 legacy passthrough。
+- Milestone 2 已完成 2A0 与 2A1 的离线机制：逐产物语义计划之后，系统按故事实际需要复用合同预览或补充风格、角色、尺度、状态小样；小样需通过机器完整性、合同遵守和独立产品质量审核，任何 P0 都会阻断批量生图。真实 ImageGen 质量仍需后续新故事 canary 验证。
 - 当前增量失效只到模块族级，不是逐镜头 dependency graph；质量修正、Port/adapter 正式化、请求账本和新故事实跑仍属于后续 Milestone。

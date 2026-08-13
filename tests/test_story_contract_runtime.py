@@ -199,7 +199,9 @@ class StoryContractRuntimeTests(unittest.TestCase):
         self.assertLess(STORY_STAGE_SEQUENCE.index("story_contract_review"), STORY_STAGE_SEQUENCE.index("codex_story_images"))
         self.assertEqual(STORY_STAGE_DEPENDENCIES["story_contract"], ("setup_project",))
         self.assertEqual(STORY_STAGE_DEPENDENCIES["artifact_semantic_plan"], ("story_contract_review",))
-        self.assertEqual(STORY_STAGE_DEPENDENCIES["codex_story_images"], ("artifact_semantic_plan",))
+        self.assertEqual(STORY_STAGE_DEPENDENCIES["visual_samples"], ("artifact_semantic_plan",))
+        self.assertEqual(STORY_STAGE_DEPENDENCIES["visual_sample_review"], ("visual_samples",))
+        self.assertEqual(STORY_STAGE_DEPENDENCIES["codex_story_images"], ("visual_sample_review",))
         self.assertEqual(STORY_STAGE_DEPENDENCIES["music_request"], ("story_contract_review",))
         self.assertEqual(STORY_STAGE_DEPENDENCIES["release_assets"], ("artifact_semantic_plan",))
 

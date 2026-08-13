@@ -24,7 +24,7 @@ from story_contracts import canonical_json_bytes, load_story_contract
 
 
 VISUAL_SAMPLE_SCHEMA_VERSION = "1.0"
-VISUAL_SAMPLE_COMPILER_VERSION = "m2-2a1.1"
+VISUAL_SAMPLE_COMPILER_VERSION = "m2-2a1.1.1"
 VISUAL_SAMPLE_LOCK_VERSION = 1
 VISUAL_SAMPLE_SCHEMA_PATH = (
     Path(__file__).resolve().parent
@@ -35,6 +35,18 @@ VISUAL_SAMPLE_SCHEMA_PATH = (
 )
 
 SAMPLE_KINDS = ("style_anchor", "character_sheet", "scale_anchor", "state_anchor")
+IDENTITY_POLICY_FIELDS = frozenset(
+    {
+        "mode", "scope", "characters", "blocked_inferences", "allowed_contextual_inferences",
+        "inferred_detail_persistence", "contract_precedence", "production_rule",
+    }
+)
+REVIEW_PROFILE_FIELDS = frozenset(
+    {"machine_completeness", "contract_adherence", "product_quality", "style_contract", "p0_categories"}
+)
+STYLE_CONTRACT_FIELDS = frozenset(
+    {"description", "required_traits", "forbidden_traits", "provenance"}
+)
 P0_CATEGORIES = frozenset(
     {
         "unsupported_identity_feature",
@@ -45,6 +57,19 @@ P0_CATEGORIES = frozenset(
         "unsafe_or_unsuitable_for_children",
         "unusable_composition",
     }
+)
+
+NEUTRAL_PRODUCT_QUALITY_DIMENSIONS = (
+    "audience_fit",
+    "composition",
+    "color",
+    "lighting",
+    "style_suitability",
+)
+CHARACTER_PRODUCT_QUALITY_DIMENSIONS = (
+    "character_design_fit",
+    "identity_coherence",
+    "natural_anatomy",
 )
 
 
@@ -123,6 +148,85 @@ def _sample_requirement(
         "expected_path": _project_relative(target, root),
         "asset": _ready_asset(target, root),
     }
+
+
+def compile_product_quality_profile(projection: Mapping[str, Any]) -> dict[str, Any]:
+    """Compile style-neutral quality dimensions plus verbatim style requirements.
+
+    The style contract, not the presence of a character, determines whether a
+    specific aesthetic such as cute, solemn, historical, or realistic is
+    required.  Required and forbidden traits are deliberately preserved
+    verbatim so this compiler never creates a competing aesthetic rule source.
+    """
+
+    characters = projection.get("characters", {})
+    character_rows = characters.get("characters", []) if isinstance(characters, Mapping) else []
+    dimensions = list(NEUTRAL_PRODUCT_QUALITY_DIMENSIONS)
+    if characters.get("mode") == "present" and character_rows:
+        dimensions.extend(CHARACTER_PRODUCT_QUALITY_DIMENSIONS)
+    scale = projection.get("world_scale", {})
+    if isinstance(scale, Mapping) and scale.get("relationships"):
+        dimensions.append("scale_readability")
+    state = projection.get("story_state", {})
+    if isinstance(state, Mapping) and state.get("machines"):
+        dimensions.append("state_readability")
+    visual_style = projection.get("visual_style", {})
+    style_profile = visual_style.get("style_profile", {}) if isinstance(visual_style, Mapping) else {}
+    return {
+        "dimensions": dimensions,
+        "style_contract": {
+            "description": str(style_profile.get("description") or ""),
+            "required_traits": list(style_profile.get("required_traits", [])),
+            "forbidden_traits": list(style_profile.get("forbidden_traits", [])),
+            "provenance": style_profile.get("provenance"),
+        },
+    }
+
+
+def product_quality_review_issues(
+    quality: Any,
+    profile: Mapping[str, Any],
+) -> list[str]:
+    """Validate that neutral dimensions and every contract style rule were reviewed."""
+
+    issues: list[str] = []
+    if not isinstance(quality, Mapping) or quality.get("passed") is not True:
+        return ["product_quality must pass"]
+    actual_dimensions = {
+        str(item.get("dimension") or "")
+        for item in quality.get("dimensions", [])
+        if isinstance(item, Mapping) and item.get("passed") is True and item.get("evidence")
+    }
+    expected_dimensions = set(profile.get("product_quality", []))
+    if expected_dimensions - actual_dimensions:
+        issues.append(
+            "product_quality missing: " + ",".join(sorted(expected_dimensions - actual_dimensions))
+        )
+
+    expected_style = profile.get("style_contract")
+    actual_style = quality.get("style_contract")
+    if not isinstance(expected_style, Mapping) or not isinstance(actual_style, Mapping):
+        issues.append("product_quality style_contract missing")
+        return issues
+    if (
+        actual_style.get("description") != expected_style.get("description")
+        or actual_style.get("description_fit") is not True
+        or not actual_style.get("description_evidence")
+    ):
+        issues.append("product_quality style description not reviewed")
+    for field, result_field in (("required_traits", "passed"), ("forbidden_traits", "absent")):
+        expected_traits = set(expected_style.get(field, []))
+        actual_traits = {
+            str(item.get("trait") or "")
+            for item in actual_style.get(field, [])
+            if isinstance(item, Mapping) and item.get(result_field) is True and item.get("evidence")
+        }
+        if expected_traits - actual_traits:
+            issues.append(
+                f"product_quality style {field} missing: "
+                + ",".join(sorted(expected_traits - actual_traits))
+            )
+    return issues
 
 
 def compile_visual_sample_plan(project_root: Path | str, context_path: Path | str) -> dict[str, Any]:
@@ -209,6 +313,7 @@ def compile_visual_sample_plan(project_root: Path | str, context_path: Path | st
 
     identity_policy = {
         "mode": "deny_unlisted",
+        "scope": "identity_defining_features_only",
         "characters": [
             {
                 "character_id": str(item.get("character_id", "")),
@@ -220,18 +325,29 @@ def compile_visual_sample_plan(project_root: Path | str, context_path: Path | st
             for item in character_rows
             if isinstance(item, Mapping)
         ],
+        "blocked_inferences": [
+            "identity_defining_special_mark",
+            "fixed_accessory",
+            "emblem",
+            "abnormal_anatomy",
+            "new_cross_shot_identity_anchor",
+        ],
+        "allowed_contextual_inferences": [
+            "normal_human_or_animal_anatomy",
+            "era_and_scene_appropriate_ordinary_clothing",
+            "non_identity_natural_detail",
+        ],
+        "inferred_detail_persistence": "scene_local_unless_contract_promotes",
+        "contract_precedence": "required_and_forbidden_features_are_authoritative",
         "production_rule": (
-            "Do not add an identity mark, organ, accessory, decoration, costume feature, or anatomical feature "
-            "unless it is supported by a contract-declared anchor/required feature with provenance."
+            "Do not invent identity-defining special marks, fixed accessories, emblems, abnormal anatomy, or "
+            "other cross-shot identity anchors. Normal anatomy, era- and scene-appropriate ordinary clothing, "
+            "and non-identity natural details are allowed when they do not violate the contract, but inferred "
+            "ordinary details remain scene-local and must not be promoted into permanent identity anchors. "
+            "Contract-declared required and forbidden features are authoritative."
         ),
     }
-    product_dimensions = ["child_appeal", "composition", "color", "lighting", "style_suitability"]
-    if character_ids:
-        product_dimensions.extend(["cuteness", "natural_identity"])
-    if scale_ids:
-        product_dimensions.append("scale_readability")
-    if state_ids:
-        product_dimensions.append("state_readability")
+    quality_profile = compile_product_quality_profile(projection)
     return {
         "schema_version": VISUAL_SAMPLE_SCHEMA_VERSION,
         "compiler_version": VISUAL_SAMPLE_COMPILER_VERSION,
@@ -245,7 +361,8 @@ def compile_visual_sample_plan(project_root: Path | str, context_path: Path | st
         "review_profile": {
             "machine_completeness": ["declared_file", "sha256", "decodable_image", "usable_dimensions"],
             "contract_adherence": ["visual_style", *(["characters"] if character_ids else []), *(["world_scale"] if scale_ids else []), *(["story_state"] if state_ids else [])],
-            "product_quality": product_dimensions,
+            "product_quality": quality_profile["dimensions"],
+            "style_contract": quality_profile["style_contract"],
             "p0_categories": sorted(P0_CATEGORIES),
         },
         "supplemental_request": supplemental_request,
@@ -314,17 +431,33 @@ def validate_visual_sample_plan(payload: Mapping[str, Any]) -> list[str]:
     policy = payload.get("identity_expansion_policy")
     if (
         not isinstance(policy, Mapping)
-        or set(policy) != {"mode", "characters", "production_rule"}
+        or set(policy) != set(IDENTITY_POLICY_FIELDS)
         or policy.get("mode") != "deny_unlisted"
+        or policy.get("scope") != "identity_defining_features_only"
         or not isinstance(policy.get("characters"), list)
+        or not isinstance(policy.get("blocked_inferences"), list)
+        or not isinstance(policy.get("allowed_contextual_inferences"), list)
+        or policy.get("inferred_detail_persistence") != "scene_local_unless_contract_promotes"
+        or policy.get("contract_precedence") != "required_and_forbidden_features_are_authoritative"
         or not str(policy.get("production_rule") or "").strip()
     ):
         issues.append("identity_expansion_policy")
     profile = payload.get("review_profile")
     if (
         not isinstance(profile, Mapping)
-        or set(profile) != {"machine_completeness", "contract_adherence", "product_quality", "p0_categories"}
+        or set(profile) != set(REVIEW_PROFILE_FIELDS)
         or not all(isinstance(profile.get(field), list) for field in ("machine_completeness", "contract_adherence", "product_quality"))
+        or not isinstance(profile.get("style_contract"), Mapping)
+        or set(profile.get("style_contract", {})) != set(STYLE_CONTRACT_FIELDS)
+        or not str(profile.get("style_contract", {}).get("description") or "").strip()
+        or not isinstance(profile.get("style_contract", {}).get("required_traits"), list)
+        or not isinstance(profile.get("style_contract", {}).get("forbidden_traits"), list)
+        or not all(
+            isinstance(value, str) and value.strip()
+            for field in ("required_traits", "forbidden_traits")
+            for value in profile.get("style_contract", {}).get(field, [])
+        )
+        or not isinstance(profile.get("style_contract", {}).get("provenance"), Mapping)
         or set(profile.get("p0_categories", [])) != set(P0_CATEGORIES)
     ):
         issues.append("review_profile")
@@ -353,6 +486,19 @@ def visual_sample_schema_parity_issues() -> list[str]:
     }
     if required != validator_required:
         issues.append("required_fields")
+    properties = schema.get("properties", {})
+    profile_schema = properties.get("review_profile", {})
+    profile_required = set(profile_schema.get("required", []))
+    if profile_required != set(REVIEW_PROFILE_FIELDS):
+        issues.append("review_profile_fields")
+    style_required = set(
+        profile_schema.get("properties", {}).get("style_contract", {}).get("required", [])
+    )
+    if style_required != set(STYLE_CONTRACT_FIELDS):
+        issues.append("style_contract_fields")
+    identity_required = set(properties.get("identity_expansion_policy", {}).get("required", []))
+    if identity_required != set(IDENTITY_POLICY_FIELDS):
+        issues.append("identity_policy_fields")
     p0_schema = schema.get("properties", {}).get("review_profile", {}).get("properties", {}).get("p0_categories", {})
     p0_values = set(p0_schema.get("items", {}).get("enum", []))
     if (
@@ -519,19 +665,7 @@ def visual_sample_review_payload_issues(payload: Mapping[str, Any], plan: Mappin
                     actual_adherence.add(str(item.get("dimension") or ""))
         if not expected_adherence.issubset(actual_adherence):
             issues.append("contract_adherence missing: " + ",".join(sorted(expected_adherence - actual_adherence)))
-    quality = payload.get("product_quality")
-    expected_quality = set(plan.get("review_profile", {}).get("product_quality", []))
-    actual_quality: set[str] = set()
-    if not isinstance(quality, Mapping) or quality.get("passed") is not True:
-        issues.append("product_quality must pass")
-    else:
-        dimensions = quality.get("dimensions")
-        if isinstance(dimensions, list):
-            for item in dimensions:
-                if isinstance(item, Mapping) and item.get("passed") is True and item.get("evidence"):
-                    actual_quality.add(str(item.get("dimension") or ""))
-        if not expected_quality.issubset(actual_quality):
-            issues.append("product_quality missing: " + ",".join(sorted(expected_quality - actual_quality)))
+    issues.extend(product_quality_review_issues(payload.get("product_quality"), plan.get("review_profile", {})))
     matrix = payload.get("evidence_matrix")
     sample_ids = {str(item.get("sample_id")) for item in plan.get("requirements", []) if isinstance(item, Mapping)}
     covered = {
@@ -595,9 +729,11 @@ def visual_sample_binding(project_root: Path | str) -> dict[str, str]:
 
 
 __all__ = [
+    "CHARACTER_PRODUCT_QUALITY_DIMENSIONS", "NEUTRAL_PRODUCT_QUALITY_DIMENSIONS",
     "P0_CATEGORIES", "SAMPLE_KINDS", "VISUAL_SAMPLE_COMPILER_VERSION",
     "VISUAL_SAMPLE_SCHEMA_PATH", "VISUAL_SAMPLE_SCHEMA_VERSION",
-    "compile_visual_sample_plan", "load_current_visual_sample_plan",
+    "compile_product_quality_profile", "compile_visual_sample_plan", "load_current_visual_sample_plan",
+    "product_quality_review_issues",
     "validate_visual_sample_plan", "visual_sample_asset_paths", "visual_sample_binding",
     "visual_sample_lock_is_current", "visual_sample_machine_issues",
     "visual_sample_paths", "visual_sample_plan_is_current",

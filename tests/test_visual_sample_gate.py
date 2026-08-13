@@ -64,6 +64,9 @@ def _visual_contract(
     scale: bool = True,
     state: bool = True,
     preview_kinds=("style_anchor",),
+    style_description: str | None = None,
+    required_traits: list[str] | None = None,
+    forbidden_traits: list[str] | None = None,
 ) -> dict:
     contract = _runtime_valid_contract(project, manifest)
     if characters:
@@ -83,6 +86,13 @@ def _visual_contract(
         )
         contract["contracts"]["world_scale"]["relationships"] = []
         contract["contracts"]["story_state"]["machines"] = []
+    style_profile = contract["contracts"]["visual_style"]["style_profile"]
+    if style_description is not None:
+        style_profile["description"] = style_description
+    if required_traits is not None:
+        style_profile["required_traits"] = required_traits
+    if forbidden_traits is not None:
+        style_profile["forbidden_traits"] = forbidden_traits
     refs = {
         "style_anchor": [],
         "character_sheet": ["protagonist", "guide"],
@@ -117,6 +127,9 @@ def _fixture(
     scale: bool = True,
     state: bool = True,
     preview_kinds=("style_anchor",),
+    style_description: str | None = None,
+    required_traits: list[str] | None = None,
+    forbidden_traits: list[str] | None = None,
 ):
     project, manifest = _new_project(root)
     contract = _visual_contract(
@@ -126,6 +139,9 @@ def _fixture(
         scale=scale,
         state=state,
         preview_kinds=preview_kinds,
+        style_description=style_description,
+        required_traits=required_traits,
+        forbidden_traits=forbidden_traits,
     )
     agent, _paths = _lock_contract(project, manifest, contract_payload=contract)
     context = write_contract_consumer_context(project, "storyboard_images")
@@ -166,6 +182,19 @@ def _passing_review(plan: dict, bundle: Path) -> dict:
                 {"dimension": dimension, "passed": True, "evidence": f"sample verifies {dimension}"}
                 for dimension in plan["review_profile"]["product_quality"]
             ],
+            "style_contract": {
+                "description": plan["review_profile"]["style_contract"]["description"],
+                "description_fit": True,
+                "description_evidence": "All samples fit the declared style description.",
+                "required_traits": [
+                    {"trait": trait, "passed": True, "evidence": f"sample demonstrates {trait}"}
+                    for trait in plan["review_profile"]["style_contract"]["required_traits"]
+                ],
+                "forbidden_traits": [
+                    {"trait": trait, "absent": True, "evidence": f"sample avoids {trait}"}
+                    for trait in plan["review_profile"]["style_contract"]["forbidden_traits"]
+                ],
+            },
         },
         "evidence_matrix": [
             {"sample_id": item["sample_id"], "evidence": item["expected_path"]}
@@ -238,7 +267,9 @@ class VisualSampleGateTests(unittest.TestCase):
                 handoff = visual_sample_paths(project)["handoff"].read_text(encoding="utf-8")
                 for name in ("visual_style", "characters", "world_scale", "story_state"):
                     self.assertIn(f'"{name}"', handoff)
-                self.assertIn("不得自行添加合同没有来源的身份标记、器官、配饰、装饰", handoff)
+                self.assertIn("不得擅自新增会成为跨镜头身份锚点的特殊标记", handoff)
+                self.assertIn("时代和场景合理的普通服饰", handoff)
+                self.assertIn("不得升级为永久身份锚点", handoff)
                 plan = compile_visual_sample_plan(project, context)
                 for item in plan["requirements"]:
                     if not isinstance(item.get("asset"), dict):
@@ -363,24 +394,101 @@ class VisualSampleGateTests(unittest.TestCase):
     def test_full_story_image_review_uses_product_dimensions_and_p0_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, _manifest, agent, context = _fixture(Path(directory))
-            payload = {
+            plan = _ready_plan(project, context)
+            payload = _passing_review(plan, visual_sample_paths(project)["plan"])
+            payload.update({
                 "p0_errors": [],
                 "contract_adherence": {"passed": True, "evidence": "per-shot contract evidence"},
-                "product_quality": {
-                    "passed": True,
-                    "dimensions": [
-                        {"dimension": name, "passed": True, "evidence": f"evidence for {name}"}
-                        for name in (
-                            "child_appeal", "composition", "color", "lighting", "style_suitability",
-                            "cuteness", "natural_identity",
-                        )
-                    ],
-                },
-            }
+            })
             self.assertEqual(agent._story_image_quality_review_issues(payload), [])
             payload["p0_errors"] = ["anatomy_or_organ_error"]
             payload["score"] = 100
             self.assertTrue(any("P0 hard gate" in issue for issue in agent._story_image_quality_review_issues(payload)))
+
+    def test_quality_profile_is_style_adaptive_for_cute_historical_and_abstract_stories(self) -> None:
+        cases = [
+            {
+                "name": "cute_character",
+                "characters": True,
+                "description": "A cute and welcoming children's animation style.",
+                "required": ["cute rounded character design", "warm playful expression"],
+                "forbidden": ["frightening imagery"],
+                "character_dimensions": True,
+            },
+            {
+                "name": "solemn_historical_character",
+                "characters": True,
+                "description": "A restrained, solemn historical picture-book style.",
+                "required": ["historical atmosphere", "dignified restraint", "realistic proportions"],
+                "forbidden": ["cute chibi treatment"],
+                "character_dimensions": True,
+            },
+            {
+                "name": "abstract_no_character",
+                "characters": False,
+                "description": "An abstract visual poem using calm geometric forms.",
+                "required": ["abstract clarity"],
+                "forbidden": ["invented characters"],
+                "character_dimensions": False,
+            },
+        ]
+        for case in cases:
+            with self.subTest(case=case["name"]), tempfile.TemporaryDirectory() as directory:
+                project, _manifest, _agent, context = _fixture(
+                    Path(directory),
+                    characters=case["characters"],
+                    scale=False,
+                    state=False,
+                    style_description=case["description"],
+                    required_traits=case["required"],
+                    forbidden_traits=case["forbidden"],
+                )
+                plan = compile_visual_sample_plan(project, context)
+                dimensions = set(plan["review_profile"]["product_quality"])
+                self.assertTrue(
+                    {"audience_fit", "composition", "color", "lighting", "style_suitability"}.issubset(dimensions)
+                )
+                self.assertNotIn("cuteness", dimensions)
+                self.assertNotIn("child_appeal", dimensions)
+                self.assertNotIn("natural_identity", dimensions)
+                character_dimensions = {"character_design_fit", "identity_coherence", "natural_anatomy"}
+                self.assertEqual(character_dimensions.issubset(dimensions), case["character_dimensions"])
+                self.assertEqual(plan["review_profile"]["style_contract"]["description"], case["description"])
+                self.assertEqual(plan["review_profile"]["style_contract"]["required_traits"], case["required"])
+                self.assertEqual(plan["review_profile"]["style_contract"]["forbidden_traits"], case["forbidden"])
+
+                plan_path = visual_sample_paths(project)["plan"]
+                save_json(plan_path, plan)
+                review = _passing_review(plan, plan_path)
+                self.assertEqual(visual_sample_review_payload_issues(review, plan), [])
+                self.assertIn("unsafe_or_unsuitable_for_children", plan["review_profile"]["p0_categories"])
+                if case["name"] == "cute_character":
+                    review["product_quality"]["style_contract"]["required_traits"] = []
+                    issues = visual_sample_review_payload_issues(review, plan)
+                    self.assertTrue(any("cute rounded character design" in issue for issue in issues))
+                if case["name"] == "solemn_historical_character":
+                    review["product_quality"]["style_contract"]["required_traits"] = []
+                    issues = visual_sample_review_payload_issues(review, plan)
+                    self.assertTrue(any("historical atmosphere" in issue for issue in issues))
+
+    def test_identity_policy_allows_ordinary_contextual_detail_without_promoting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, _manifest, _agent, context = _fixture(
+                Path(directory),
+                characters=True,
+                scale=False,
+                state=False,
+                style_description="A grounded period village story.",
+                required_traits=["era-appropriate ordinary clothing"],
+                forbidden_traits=["invented emblems"],
+            )
+            policy = compile_visual_sample_plan(project, context)["identity_expansion_policy"]
+            self.assertEqual(policy["scope"], "identity_defining_features_only")
+            self.assertIn("era_and_scene_appropriate_ordinary_clothing", policy["allowed_contextual_inferences"])
+            self.assertIn("fixed_accessory", policy["blocked_inferences"])
+            self.assertIn("emblem", policy["blocked_inferences"])
+            self.assertEqual(policy["inferred_detail_persistence"], "scene_local_unless_contract_promotes")
+            self.assertEqual(policy["contract_precedence"], "required_and_forbidden_features_are_authoritative")
 
     def test_legacy_project_needs_no_visual_samples_or_new_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

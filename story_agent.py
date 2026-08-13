@@ -47,6 +47,7 @@ from artifact_semantic_plan import (
 )
 from visual_sample_gate import (
     load_current_visual_sample_plan,
+    product_quality_review_issues,
     visual_sample_asset_paths,
     visual_sample_binding,
     visual_sample_lock_is_current,
@@ -1223,7 +1224,8 @@ class StoryAgent:
                         f"- 合同投影：`{context}`",
                         f"- 输出目录：`{paths['assets']}`",
                         "- 必须完整遵守 visual_style、characters、world_scale、story_state。",
-                        "- 不得自行添加合同没有来源的身份标记、器官、配饰、装饰、服装特征或解剖特征。",
+                        "- 不得擅自新增会成为跨镜头身份锚点的特殊标记、固定配饰、徽记或异常解剖特征。",
+                        "- 允许不违背合同的正常人体/动物结构、时代和场景合理的普通服饰及非身份性自然细节；这些推断细节不得升级为永久身份锚点。合同 required/forbidden 始终优先。",
                         "- 不得生成文字、标题、字幕、水印或 Logo。",
                         "- 每张只验证该 sample_id 的合同约束；不要扩展故事事实。",
                         "",
@@ -1301,9 +1303,12 @@ class StoryAgent:
             rubric=(
                 "这是批量生图前门禁，审核必须分三层并在 JSON 中分别写 machine_completeness、contract_adherence、product_quality。"
                 "machine_completeness 必须 passed=true 且引用文件/哈希证据；contract_adherence.checks 必须逐项覆盖计划要求的 visual_style、characters、world_scale、story_state；"
-                "product_quality.dimensions 必须逐项覆盖计划要求的儿童吸引力、可爱度（有角色时）、自然身份、构图、色彩、光照和风格适配。"
+                "product_quality.dimensions 必须逐项覆盖计划中的风格中性维度；有角色时覆盖角色设计适配、身份一致与自然解剖，但不得默认要求可爱。"
+                "product_quality.style_contract 必须原样引用并逐条审核计划中 visual_style.style_profile 的 description、required_traits、forbidden_traits：合同要求可爱才审核可爱，要求历史感、庄重或写实就审核相应条款。"
+                "style_contract 输出 description、description_fit=true、description_evidence，并分别用 required_traits[{trait,passed,evidence}] 和 forbidden_traits[{trait,absent,evidence}] 逐条举证。"
                 "JSON 还必须写 p0_errors、retry_sample_ids 和逐 sample_id 的 evidence_matrix。"
-                "任何无合同来源的身份标记、器官、配饰、装饰或特征，解剖错误、身份错、尺度矛盾、状态矛盾、儿童不适或不可用构图均是 P0；"
+                "任何擅自新增的身份定义性特殊标记、固定配饰、徽记、异常解剖特征或跨镜头身份锚点，解剖错误、身份错、尺度矛盾、状态矛盾、儿童不适或不可用构图均是 P0；"
+                "不违背合同的正常结构、时代/场景合理普通服饰和非身份性自然细节不是 P0，但不得被升级为永久身份锚点。"
                 "只要 p0_errors 非空就必须 approved=false，不能被总分平均。"
             ),
         )
@@ -1838,8 +1843,10 @@ class StoryAgent:
                 "若合同的 storyboard_requirements 指定 required_field，机器可读 storyboard_plan 必须逐镜提供该字段且值必须属于合同 allowed_states；缺失或枚举无效是关键错误。"
                 "审核 JSON 的 evidence_matrix 必须逐镜写明：角色数量、身份/服装、关键物体数量、角色应在场/不应在场及画面证据；不得用“整体正常”代替逐项核对。"
                 "V3.5 required_v1 项目还必须分层写 contract_adherence 和 product_quality，并写 p0_errors。"
-                "product_quality 必须覆盖 child_appeal、composition、color、lighting、style_suitability；有角色时还要覆盖 cuteness、natural_identity。"
-                "无合同来源的身份/器官/装饰、解剖错误、身份错、尺度或状态矛盾、儿童不适、不可用构图均为 P0；P0 非空时无论总分多高都不得通过。"
+                "product_quality 必须覆盖 audience_fit、composition、color、lighting、style_suitability；有角色时还要覆盖 character_design_fit、identity_coherence、natural_anatomy。"
+                "product_quality.style_contract 必须原样逐条审核当前视觉小样计划中的风格 description、required_traits、forbidden_traits；只有合同要求可爱时才审核可爱，不能把目标受众适配偷换成可爱度。"
+                "style_contract 输出 description、description_fit=true、description_evidence，并分别用 required_traits[{trait,passed,evidence}] 和 forbidden_traits[{trait,absent,evidence}] 逐条举证。"
+                "擅自新增身份定义性特殊标记、固定配饰、徽记、异常解剖或跨镜头身份锚点，以及身份错、尺度或状态矛盾、儿童不适、不可用构图均为 P0；普通合理服饰和非身份自然细节不自动构成 P0。P0 非空时无论总分多高都不得通过。"
                 "输出 retry_indices（需要重做的镜头编号整数数组）。角色身份或在场关系错、肢体/五官崩坏、错误文字、漏镜头属于关键错误。"
             ),
         )
@@ -1871,23 +1878,12 @@ class StoryAgent:
         if not isinstance(adherence, dict) or adherence.get("passed") is not True or not adherence.get("evidence"):
             issues.append("contract_adherence must pass with evidence")
         context = contract_consumer_path(self.context.project_dir, "storyboard_images")
-        expected = {"child_appeal", "composition", "color", "lighting", "style_suitability"}
         try:
-            projection = json.loads(context.read_text(encoding="utf-8"))["contract_projection"]
-            if projection.get("characters", {}).get("mode") == "present":
-                expected.update({"cuteness", "natural_identity"})
-        except (OSError, KeyError, json.JSONDecodeError):
-            issues.append("contract projection unreadable")
-        quality = payload.get("product_quality")
-        actual: set[str] = set()
-        if isinstance(quality, dict) and quality.get("passed") is True:
-            for item in quality.get("dimensions", []):
-                if isinstance(item, dict) and item.get("passed") is True and item.get("evidence"):
-                    actual.add(str(item.get("dimension") or ""))
+            plan = load_current_visual_sample_plan(self.context.project_dir, context)
+        except (OSError, ValueError, KeyError, TypeError):
+            issues.append("visual sample quality profile unreadable")
         else:
-            issues.append("product_quality must pass")
-        if expected - actual:
-            issues.append("product_quality missing: " + ",".join(sorted(expected - actual)))
+            issues.extend(product_quality_review_issues(payload.get("product_quality"), plan["review_profile"]))
         return issues
 
     def _stage_timing(self, manifest: dict[str, Any]) -> StageResult:
@@ -3208,7 +3204,8 @@ class StoryAgent:
                 "机器可读分镜计划还必须原样记录当前逐产物语义呈现计划的 artifact_semantic_plan_sha256、artifact_semantic_plan_schema_version、artifact_semantic_plan_dependency_sha256；缺失或旧绑定将被 Runtime 拒绝。",
                 "机器可读分镜计划还必须原样记录 visual_sample_schema_version、visual_sample_plan_sha256、visual_sample_review_bundle_sha256、visual_sample_lock_sha256；旧小样或旧审核绑定将被 Runtime 拒绝。",
                 "每镜必须记录 scale_basis、current_story_state、visual_state_evidence。scale_basis 必须说明是否适用、引用合同 relationship_id 或说明不适用原因；有状态机时必须逐 machine_id 记录当前 state_id 及可见/不可见证据。",
-                "不得丢弃、缩写或覆盖合同角色、风格、尺度、状态约束；不得自行添加合同没有来源的身份标记、器官、配饰、装饰、服装或解剖特征。",
+                "不得丢弃、缩写或覆盖合同角色、风格、尺度、状态约束；不得擅自新增会成为跨镜头身份锚点的特殊标记、固定配饰、徽记或异常解剖特征。",
+                "允许不违背合同的正常人体/动物结构、时代和场景合理普通服饰及非身份性自然细节，但推断细节不得升级为永久身份锚点；合同 required/forbidden 始终优先。",
                 "每个唱歌、关键发言、关键动作或明显受挫的角色都要获得焦点镜头；连续场景要安排建立全景、表演者中近景、反应镜头等景别变化，不能所有角色都和主角挤在同一种双人中景。",
                 "为反复出现的角色固定 appearance_id；生成后续镜头时必须同时引用风格锚点和该角色最近一张已通过图片，禁止只靠文字重新随机生成角色。",
                 "图生视频提示词文件的 CSV 必须包含 `scene,story_text,visual_description,prompt`；`prompt` 要作为后续图生视频 API 和审核页直接使用的最终提示词。图生视频已经有当前图片作为视觉约束，只写具体动作、表情、道具运动、镜头运动和少量禁止项，不要复制文生图视觉圣经、服装细节或画风长描述，也不能用“角色动作自然克制、镜头缓慢推进或轻移”之类通用模板充数。",

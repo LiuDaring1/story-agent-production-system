@@ -16,6 +16,7 @@ from story_video_synthesizer.image_video import (
     build_jobs,
     continuity_context_from_row,
     inject_visual_continuity_prompt,
+    validate_image_video_jobs,
     write_job_outputs,
 )
 
@@ -40,7 +41,25 @@ class ImageVideoContinuityTests(unittest.TestCase):
             encoding="utf-8",
         )
         plan = root / "demo_storyboard_plan.json"
-        plan.write_text(json.dumps({"shots": [{"scene": 1, "character_state": state}]}, ensure_ascii=False), encoding="utf-8")
+        plan.write_text(json.dumps({"shots": [{
+            "scene": 1,
+            "character_state": state,
+            "visible_characters": ["character_a"],
+            "scale_basis": {"applicable": False, "reason": "single character"},
+            "current_story_state": {"state_machine": state},
+            "visual_state_evidence": {"state_machine": "visible"},
+            "subject_action": "character_a performs the story action",
+            "environment_motion": "environment moves gently",
+            "camera_motion": "stable natural follow",
+            "entry_state": {"story_state": {"state_machine": state}},
+            "exit_state": {"story_state": {"state_machine": state}},
+            "screen_direction": "left_to_right",
+            "adjacent_handoff": {"from_previous": "", "to_next": "", "allows_direction_change": False},
+            "expected_motion": {
+                "primary": "subject", "subject_level": "moderate",
+                "environment_level": "low", "camera_level": "low", "rationale": "story action",
+            },
+        }]}, ensure_ascii=False), encoding="utf-8")
         return image_dir, storyboard, contract, plan
 
     def test_contract_required_and_forbidden_are_in_final_prompt(self) -> None:
@@ -65,6 +84,7 @@ class ImageVideoContinuityTests(unittest.TestCase):
                         "contract_schema_version": "1.0.0",
                         "story_contract_sha256": "a" * 64,
                         "story_contract_dependency_sha256": "b" * 64,
+                        "contract_projection_sha256": "c" * 64,
                         "contract_projection": {
                             "characters": {"mode": "character_driven", "items": [{"character_id": "hero"}]},
                             "story_state": {"states": [{"state_id": "state_a"}]},
@@ -90,8 +110,16 @@ class ImageVideoContinuityTests(unittest.TestCase):
             self.assertEqual(row["contract_schema_version"], "1.0.0")
             self.assertEqual(row["story_contract_sha256"], "a" * 64)
             self.assertEqual(row["story_contract_dependency_sha256"], "b" * 64)
+            self.assertEqual(row["subject_action"], "character_a performs the story action")
+            self.assertEqual(json.loads(row["expected_motion"])["primary"], "subject")
+            self.assertEqual(json.loads(row["entry_state"])["story_state"]["state_machine"], "state_a")
             self.assertIn("STORY_CONTRACT_V1", row["prompt"])
             self.assertIn('"character_id":"hero"', row["prompt"])
+            self.assertEqual(validate_image_video_jobs(outputs["manifest_csv"]), [])
+            payload = json.loads(plan.read_text(encoding="utf-8"))
+            payload["diagnostic_note"] = "storyboard changed after motion-plan compilation"
+            plan.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+            self.assertIn("当前 storyboard plan 已改变", "；".join(validate_image_video_jobs(outputs["manifest_csv"])))
 
     def test_old_review_csv_cannot_erase_contract_constraints(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -75,6 +75,18 @@ class StoryContractConsumerTests(unittest.TestCase):
                 "visual_description": "主角出发",
                 "scale_basis": {"applicable": False, "relationship_ids": [], "reason": "合同没有尺度关系"},
                 "current_story_state": {}, "visual_state_evidence": {},
+                "subject_action": "主角自然出发",
+                "environment_motion": "环境轻微自然变化",
+                "camera_motion": "稳定跟随",
+                "entry_state": {"story_state": "opening"},
+                "exit_state": {"story_state": "opening"},
+                "screen_direction": "left_to_right",
+                "adjacent_handoff": {"from_previous": "", "to_next": "", "allows_direction_change": False},
+                "expected_motion": {
+                    "primary": "subject", "subject_level": "moderate",
+                    "environment_level": "low", "camera_level": "low",
+                    "rationale": "主角正在出发",
+                },
             }
             plan = staging / "generic-contract_storyboard_plan.json"
             sample_binding = {

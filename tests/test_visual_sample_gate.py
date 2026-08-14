@@ -369,6 +369,18 @@ class VisualSampleGateTests(unittest.TestCase):
                 },
                 "current_story_state": {"protagonist_condition": "state_initial"},
                 "visual_state_evidence": {"protagonist_condition": "Initial feature is visible."},
+                "subject_action": "The protagonist starts the journey naturally.",
+                "environment_motion": "The environment moves gently.",
+                "camera_motion": "A stable, gentle follow.",
+                "entry_state": {"protagonist_condition": "state_initial"},
+                "exit_state": {"protagonist_condition": "state_initial"},
+                "screen_direction": "left_to_right",
+                "adjacent_handoff": {"from_previous": "", "to_next": "", "allows_direction_change": False},
+                "expected_motion": {
+                    "primary": "subject", "subject_level": "moderate",
+                    "environment_level": "low", "camera_level": "low",
+                    "rationale": "The protagonist is beginning the journey.",
+                },
             }
             payload = {
                 **{key: expected[key] for key in ("contract_schema_version", "story_contract_sha256", "story_contract_dependency_sha256")},

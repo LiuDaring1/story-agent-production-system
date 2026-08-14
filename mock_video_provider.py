@@ -5,6 +5,8 @@ import csv
 import subprocess
 from pathlib import Path
 
+from video_motion import write_video_receipt
+
 
 def parse_scenes(value: str) -> set[int]:
     return {int(part.strip()) for part in value.split(",") if part.strip()}
@@ -21,8 +23,11 @@ def main() -> None:
     parser.add_argument("--limit", default=0, type=int)
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--submit-all-first", action="store_true")
+    parser.add_argument("--execution-mode", choices=["production", "test"], default="test")
     parser.add_argument("--max-submit-first", default=20, type=int)
     args, _unknown = parser.parse_known_args()
+    if args.execution_mode == "production" and not args.dry_run:
+        raise SystemExit("mock/ffmpeg-still-frame 仅允许 test 模式，正式生产已阻断")
 
     jobs = args.jobs_csv.expanduser()
     images = args.images_dir.expanduser()
@@ -32,7 +37,10 @@ def main() -> None:
         reader = csv.DictReader(file)
         rows = list(reader)
         fieldnames = list(reader.fieldnames or [])
-    for key in ("task_id", "status", "video_url", "error"):
+    for key in (
+        "task_id", "status", "video_url", "error", "video_source_kind", "video_provider",
+        "video_model", "video_execution_mode", "production_eligible", "video_receipt_path", "video_receipt_sha256",
+    ):
         if key not in fieldnames:
             fieldnames.append(key)
     selected = parse_scenes(args.scenes)
@@ -85,6 +93,17 @@ def main() -> None:
         row["status"] = "downloaded"
         row["video_url"] = target.as_uri()
         row["error"] = ""
+        receipt, receipt_sha = write_video_receipt(
+            jobs, row, target, provider="mock_local", model="ffmpeg-still-frame",
+            source_kind="ffmpeg_still_frame", execution_mode=args.execution_mode,
+            production_eligible=False,
+        )
+        row.update({
+            "video_source_kind": "ffmpeg_still_frame", "video_provider": "mock_local",
+            "video_model": "ffmpeg-still-frame", "video_execution_mode": args.execution_mode,
+            "production_eligible": "false", "video_receipt_path": str(receipt.resolve()),
+            "video_receipt_sha256": receipt_sha,
+        })
         _write_jobs(jobs, fieldnames, rows)
         print(f"MOCK GENERATED scene={row['scene']} target={target}")
     if args.dry_run:

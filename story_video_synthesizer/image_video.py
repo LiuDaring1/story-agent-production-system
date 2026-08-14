@@ -11,6 +11,14 @@ from pathlib import Path
 from typing import Any, Mapping
 from xml.etree import ElementTree
 
+from video_motion import (
+    canonical_json_bytes,
+    compile_motion_plan,
+    file_sha256,
+    inject_motion_prompt,
+    validate_motion_plan,
+)
+
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 
@@ -69,6 +77,11 @@ class ImageVideoJob:
     story_contract_context_path: str = ""
     story_contract_characters: str = ""
     story_contract_state: str = ""
+    motion_plan_path: str = ""
+    motion_plan_sha256: str = ""
+    storyboard_sha256: str = ""
+    motion_shot: str = ""
+    motion_plan_json: str = ""
 
 
 def discover_visual_continuity_paths(
@@ -332,7 +345,28 @@ def inject_visual_continuity_prompt(
 def enforce_prompt_continuity_contract(prompt: str, row: Mapping[str, object]) -> str:
     """Re-apply row hard constraints after a human/reviewer prompt edit."""
 
-    return inject_visual_continuity_prompt(prompt, continuity_context_from_row(row))
+    # Remove the generated motion suffix before rebuilding the complete,
+    # canonical constraint stack.  The continuity injector intentionally
+    # replaces everything after its own marker, so Story Contract clauses
+    # must be deterministically restored before motion is appended again.
+    base = str(prompt or "").split("[VIDEO_MOTION_PLAN_V1]", 1)[0].rstrip()
+    value = inject_visual_continuity_prompt(base, continuity_context_from_row(row))
+    try:
+        characters = json.loads(str(row.get("story_contract_characters") or "{}"))
+        state = json.loads(str(row.get("story_contract_state") or "{}"))
+    except json.JSONDecodeError:
+        characters, state = {}, {}
+    if isinstance(characters, dict) and isinstance(state, dict) and (characters or state):
+        value = _inject_story_contract_prompt(value, characters, state)
+    raw_motion = str(row.get("motion_shot") or "").strip()
+    if raw_motion:
+        try:
+            shot = json.loads(raw_motion)
+        except json.JSONDecodeError:
+            return value
+        if isinstance(shot, dict):
+            value = inject_motion_prompt(value, shot)
+    return value
 
 
 def validate_image_video_jobs(jobs_csv: Path) -> list[str]:
@@ -370,6 +404,8 @@ def validate_image_video_jobs(jobs_csv: Path) -> list[str]:
     scenes: set[int] = set()
     contract_path = ""
     plan_path = ""
+    motion_plan_path = ""
+    motion_plan_sha = ""
     for row in rows:
         raw_scene = str(row.get("scene") or "").strip()
         try:
@@ -382,6 +418,8 @@ def validate_image_video_jobs(jobs_csv: Path) -> list[str]:
         scenes.add(scene)
         contract_path = contract_path or str(row.get("continuity_contract_path") or "").strip()
         plan_path = plan_path or str(row.get("storyboard_plan_path") or "").strip()
+        motion_plan_path = motion_plan_path or str(row.get("motion_plan_path") or "").strip()
+        motion_plan_sha = motion_plan_sha or str(row.get("motion_plan_sha256") or "").strip()
         try:
             context = continuity_context_from_row(row)
         except (TypeError, ValueError):
@@ -389,7 +427,13 @@ def validate_image_video_jobs(jobs_csv: Path) -> list[str]:
         if context is None:
             errors.append(f"第 {scene:02d} 镜缺少视觉连续性状态")
             continue
-        canonical = inject_visual_continuity_prompt(str(row.get("prompt") or ""), context)
+        raw_motion = str(row.get("motion_shot") or "").strip()
+        if raw_motion:
+            try:
+                json.loads(raw_motion)
+            except (json.JSONDecodeError, TypeError):
+                errors.append(f"第 {scene:02d} 镜 motion_shot 不可读")
+        canonical = enforce_prompt_continuity_contract(str(row.get("prompt") or ""), row)
         if str(row.get("prompt") or "") != canonical:
             errors.append(f"第 {scene:02d} 镜最终提示词未包含不可删除的连续性硬约束")
     if scenes and scenes != set(range(1, len(rows) + 1)):
@@ -411,6 +455,38 @@ def validate_image_video_jobs(jobs_csv: Path) -> list[str]:
                     errors.append(f"第 {scene:02d} 镜任务状态与合同/分镜不匹配")
         except VisualContinuityContractError as exc:
             errors.append(str(exc))
+    if motion_plan_path or any(str(row.get("motion_shot") or "").strip() for row in rows):
+        target = Path(motion_plan_path) if motion_plan_path else None
+        if target is None or not target.is_file():
+            errors.append("任务 CSV 绑定的视频动作计划不存在")
+        else:
+            try:
+                payload = json.loads(target.read_text(encoding="utf-8"))
+                errors.extend(validate_motion_plan(payload))
+                if file_sha256(target) != motion_plan_sha:
+                    errors.append("视频动作计划 SHA-256 与任务绑定不匹配")
+                bound_storyboard_sha = str(rows[0].get("storyboard_sha256") or "") if rows else ""
+                if payload.get("storyboard_sha256") != bound_storyboard_sha:
+                    errors.append("视频动作计划 storyboard SHA-256 与任务绑定不匹配")
+                if plan_path and Path(plan_path).is_file() and file_sha256(Path(plan_path)) != bound_storyboard_sha:
+                    errors.append("当前 storyboard plan 已改变，视频动作计划失效")
+                shots = payload.get("shots", [])
+                for row, shot in zip(rows, shots):
+                    raw = json.loads(str(row.get("motion_shot") or "{}"))
+                    if raw != shot:
+                        errors.append(f"第 {row.get('scene')} 镜动作字段与计划不匹配")
+                    for field in ("subject_action", "environment_motion", "camera_motion", "screen_direction"):
+                        if str(row.get(field) or "") != str(shot.get(field) or ""):
+                            errors.append(f"第 {row.get('scene')} 镜 {field} 与动作计划不匹配")
+                    for field in ("entry_state", "exit_state", "adjacent_handoff", "expected_motion", "continuity"):
+                        try:
+                            flattened = json.loads(str(row.get(field) or "{}"))
+                        except json.JSONDecodeError:
+                            flattened = None
+                        if flattened != shot.get(field, {}):
+                            errors.append(f"第 {row.get('scene')} 镜 {field} 与动作计划不匹配")
+            except (OSError, json.JSONDecodeError, TypeError, ValueError) as exc:
+                errors.append(f"视频动作计划不可读：{exc}")
     return errors
 
 
@@ -531,6 +607,47 @@ def build_jobs(
     contract_projection = contract_context.get("contract_projection", {}) if contract_context else {}
     contract_characters = contract_projection.get("characters", {}) if isinstance(contract_projection, dict) else {}
     contract_state = contract_projection.get("story_state", {}) if isinstance(contract_projection, dict) else {}
+    motion_plan: dict[str, Any] = {}
+    motion_plan_text = ""
+    motion_plan_sha = ""
+    storyboard_sha = ""
+    motion_shots: dict[int, dict[str, Any]] = {}
+    if contract_context:
+        if storyboard_plan_path is None or not storyboard_plan_path.is_file():
+            raise VisualContinuityContractError("V3.5 图生视频缺少当前 storyboard plan，无法编译动作计划")
+        try:
+            storyboard_payload = json.loads(storyboard_plan_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise VisualContinuityContractError(f"storyboard plan 不可读：{exc}") from exc
+        if isinstance(storyboard_payload, dict):
+            storyboard_sha = file_sha256(storyboard_plan_path)
+            for field in (
+                "contract_schema_version", "story_contract_sha256",
+                "story_contract_dependency_sha256", "contract_projection_sha256",
+            ):
+                storyboard_payload[field] = str(contract_context.get(field) or storyboard_payload.get(field) or "")
+            storyboard_payload["storyboard_sha256"] = storyboard_sha
+            try:
+                motion_plan = compile_motion_plan(storyboard_payload)
+            except ValueError as exc:
+                raise VisualContinuityContractError(str(exc)) from exc
+            # The storyboard owns performance intent; the reviewed continuity
+            # contract owns the hard state/required/forbidden constraints.
+            # Compile both into one per-shot plan before hashing it.
+            for shot in motion_plan.get("shots", []):
+                continuity = continuity_by_scene.get(int(shot.get("scene") or 0))
+                if continuity is None:
+                    continue
+                shot["continuity"]["story_state"] = continuity.state
+                shot["continuity"]["required"] = list(continuity.required)
+                shot["continuity"]["forbidden"] = list(continuity.forbidden)
+            motion_errors = validate_motion_plan(motion_plan)
+            if motion_errors:
+                raise VisualContinuityContractError("视频动作计划无效：" + "；".join(motion_errors))
+            motion_plan_text = canonical_json_bytes(motion_plan).decode("utf-8")
+            import hashlib
+            motion_plan_sha = hashlib.sha256(motion_plan_text.encode("utf-8")).hexdigest()
+            motion_shots = {int(row["scene"]): row for row in motion_plan["shots"]}
     prompt_overrides = read_flow_video_prompts(
         image_dir,
         slug,
@@ -568,6 +685,7 @@ def build_jobs(
             continuity = None
         if contract_context:
             prompt = _inject_story_contract_prompt(prompt, contract_characters, contract_state)
+            prompt = inject_motion_prompt(prompt, motion_shots[scene])
         jobs.append(
             ImageVideoJob(
                 scene=scene,
@@ -588,6 +706,11 @@ def build_jobs(
                 story_contract_context_path=str(story_contract_context_path.expanduser().resolve()) if story_contract_context_path else "",
                 story_contract_characters=json.dumps(contract_characters, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if contract_characters else "",
                 story_contract_state=json.dumps(contract_state, ensure_ascii=False, sort_keys=True, separators=(",", ":")) if contract_state else "",
+                motion_plan_path=str((output_dir / f"{slug}_video_motion_plan.json").resolve()) if motion_plan else "",
+                motion_plan_sha256=motion_plan_sha,
+                storyboard_sha256=storyboard_sha,
+                motion_shot=json.dumps(motion_shots.get(scene, {}), ensure_ascii=False, sort_keys=True, separators=(",", ":")) if motion_plan else "",
+                motion_plan_json=motion_plan_text,
             )
         )
 
@@ -843,6 +966,11 @@ def write_job_outputs(jobs: list[ImageVideoJob], output_dir: Path, slug: str) ->
     existing_rows = _read_jobs_rows(manifest_csv)
     prompt_review_csv = output_dir / "prompt_review_decisions.csv"
     prompt_review_decisions = _read_prompt_review_decisions(prompt_review_csv)
+    motion_plan_path = output_dir / f"{slug}_video_motion_plan.json"
+    if jobs and jobs[0].motion_plan_json:
+        temporary = motion_plan_path.with_suffix(motion_plan_path.suffix + ".tmp")
+        temporary.write_text(jobs[0].motion_plan_json, encoding="utf-8")
+        temporary.replace(motion_plan_path)
 
     rows: list[dict[str, str]] = []
     for job in jobs:
@@ -882,6 +1010,7 @@ def write_job_outputs(jobs: list[ImageVideoJob], output_dir: Path, slug: str) ->
                 }
             )
         if job.contract_schema_version:
+            motion_shot = json.loads(job.motion_shot or "{}")
             rows[-1].update(
                 {
                     "contract_schema_version": job.contract_schema_version,
@@ -890,8 +1019,20 @@ def write_job_outputs(jobs: list[ImageVideoJob], output_dir: Path, slug: str) ->
                     "story_contract_context_path": job.story_contract_context_path,
                     "story_contract_characters": job.story_contract_characters,
                     "story_contract_state": job.story_contract_state,
+                    "motion_plan_path": job.motion_plan_path,
+                    "motion_plan_sha256": job.motion_plan_sha256,
+                    "storyboard_sha256": job.storyboard_sha256,
+                    "motion_shot": job.motion_shot,
                 }
             )
+            for field in (
+                "subject_action", "environment_motion", "camera_motion", "screen_direction",
+            ):
+                rows[-1][field] = str(motion_shot.get(field) or "")
+            for field in ("entry_state", "exit_state", "adjacent_handoff", "expected_motion", "continuity"):
+                rows[-1][field] = json.dumps(
+                    motion_shot.get(field, {}), ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                )
     prompt_stable = _merge_existing_job_rows(rows, existing_rows)
     _apply_prompt_review_decisions(rows, prompt_review_decisions, prompt_stable=prompt_stable)
 
@@ -999,6 +1140,19 @@ def _copy_continuity_fields(source: Mapping[str, str], target: dict[str, str]) -
         "story_contract_context_path",
         "story_contract_characters",
         "story_contract_state",
+        "motion_plan_path",
+        "motion_plan_sha256",
+        "storyboard_sha256",
+        "motion_shot",
+        "subject_action",
+        "environment_motion",
+        "camera_motion",
+        "entry_state",
+        "exit_state",
+        "screen_direction",
+        "adjacent_handoff",
+        "expected_motion",
+        "continuity",
     ):
         if source.get(field, ""):
             target[field] = source[field]
@@ -1046,6 +1200,19 @@ _REFRESHED_JOB_FIELDS = {
     "story_contract_context_path",
     "story_contract_characters",
     "story_contract_state",
+    "motion_plan_path",
+    "motion_plan_sha256",
+    "storyboard_sha256",
+    "motion_shot",
+    "subject_action",
+    "environment_motion",
+    "camera_motion",
+    "entry_state",
+    "exit_state",
+    "screen_direction",
+    "adjacent_handoff",
+    "expected_motion",
+    "continuity",
     "prompt_review_status",
     "prompt_review_notes",
 }

@@ -19,6 +19,13 @@ from PIL import Image, ImageDraw, ImageFont, ImageStat
 
 from story_video_synthesizer.image_video import IMAGE_EXTENSIONS, sorted_image_files
 from story_video_synthesizer.media import VIDEO_EXTENSIONS, probe_duration
+from video_motion import (
+    file_sha256 as motion_file_sha256,
+    formal_source_issues,
+    motion_evidence_issues,
+    motion_metrics,
+    video_receipt_issues,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -812,7 +819,7 @@ def qa_images(project_dir: Path, image_dir: Path | None = None) -> Path:
     return report
 
 
-def qa_videos(project_dir: Path, videos_dir: Path | None = None) -> Path:
+def qa_videos(project_dir: Path, videos_dir: Path | None = None, *, execution_mode: str = "production") -> Path:
     paths = project_paths(project_dir)
     manifest = init_project(paths.root)
     target = videos_dir.expanduser() if videos_dir else paths.video_jobs / "videos"
@@ -821,20 +828,75 @@ def qa_videos(project_dir: Path, videos_dir: Path | None = None) -> Path:
     videos = sorted([p for p in target.iterdir() if p.suffix.lower() in VIDEO_EXTENSIONS]) if target.exists() else []
     frames_dir = paths.status / "video_review_frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
+    jobs_rows: dict[str, dict[str, str]] = {}
+    jobs_candidates = sorted(paths.video_jobs.glob("*_image_video_jobs.csv"))
+    if jobs_candidates:
+        with jobs_candidates[0].open(encoding="utf-8-sig", newline="") as handle:
+            jobs_rows = {
+                str(row.get("target_video_filename") or "").strip(): row
+                for row in csv.DictReader(handle)
+            }
+    evidence_rows: list[dict[str, Any]] = []
+    retry_indices: list[int] = []
     for index, path in enumerate(videos, start=1):
         duration = safe_duration(path)
         frame_paths = extract_video_review_frames(path, frames_dir / path.stem, duration)
-        issue = []
+        issue: list[str] = []
+        row = jobs_rows.get(path.name, {})
+        try:
+            expected_motion = json.loads(row.get("expected_motion") or "{}")
+            if not expected_motion and row.get("motion_shot"):
+                motion_shot = json.loads(row["motion_shot"])
+                expected_motion = motion_shot.get("expected_motion", {})
+        except json.JSONDecodeError:
+            expected_motion = {}
+            issue.append("expected_motion 无效")
+        metrics: dict[str, Any] = {}
+        if expected_motion:
+            try:
+                metrics = motion_metrics(frame_paths, expected_motion)
+                issue.extend(motion_evidence_issues(metrics, expected_motion))
+            except Exception as exc:
+                issue.append(f"运动证据生成失败：{exc}")
         if duration < 1.0:
             issue.append("时长过短")
         if any(is_dark_frame(frame) for frame in frame_paths):
             issue.append("抽帧疑似黑屏")
+        contract_bound = bool(row.get("story_contract_dependency_sha256"))
+        if row and contract_bound:
+            if not expected_motion:
+                issue.append("缺少逐镜 expected_motion")
+            source_issues = formal_source_issues(row, production_mode=execution_mode == "production")
+            issue.extend(source_issues)
+            if execution_mode == "production":
+                issue.extend(video_receipt_issues(row, path, production_mode=True))
         rows.append({"index": str(index), "file": str(path), "duration": f"{duration:.2f}s", "status": "warning" if issue else "ok", "notes": "；".join(issue)})
+        scene = int(row.get("scene") or index)
+        evidence_rows.append({
+            "scene": scene, "file": str(path), "expected_motion": expected_motion,
+            "metrics": metrics, "issues": issue, "passed": not issue,
+            "video_source_kind": row.get("video_source_kind", ""),
+            "video_provider": row.get("video_provider", ""),
+            "video_execution_mode": row.get("video_execution_mode", ""),
+        })
         if issue:
             issues.append(f"- {path.name}：{'；'.join(issue)}")
+            retry_indices.append(scene)
     report = paths.status / "qa_videos_report.md"
-    write_qa_report(report, "视频片段机器审查", target, rows, issues, expected="时长正常、抽帧非黑屏、无明显坏片")
+    write_qa_report(report, "视频片段机器审查", target, rows, issues, expected="来源可用于正式生产、运动符合逐镜 expected_motion、时长正常且抽帧非黑屏")
+    evidence_path = paths.status / "qa_videos_report.json"
+    payload = {
+        "version": 2,
+        "execution_mode": execution_mode,
+        "jobs_csv": str(jobs_candidates[0]) if jobs_candidates else "",
+        "jobs_sha256": motion_file_sha256(jobs_candidates[0]) if jobs_candidates else "",
+        "passed": not issues,
+        "retry_indices": sorted(set(retry_indices)),
+        "clips": evidence_rows,
+    }
+    evidence_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     manifest["qa"]["videos"] = str(report)
+    manifest["qa"]["videos_json"] = str(evidence_path)
     write_manifest(paths, manifest)
     return report
 

@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://story-agent.local/schemas/video_motion/v1/video_motion_plan.schema.json",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "compiler_version", "contract_schema_version", "story_contract_sha256", "story_contract_dependency_sha256", "contract_projection_sha256", "storyboard_sha256", "shots"],
+  "properties": {
+    "schema_version": {"const": "1.0.0"},
+    "compiler_version": {"const": "1.0.0"},
+    "contract_schema_version": {"type": "string", "minLength": 1},
+    "story_contract_sha256": {"type": "string", "minLength": 1},
+    "story_contract_dependency_sha256": {"type": "string", "minLength": 1},
+    "contract_projection_sha256": {"type": "string"},
+    "storyboard_sha256": {"type": "string", "minLength": 1},
+    "shots": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/shot"}}
+  },
+  "$defs": {
+    "expected_motion": {
+      "type": "object", "additionalProperties": true,
+      "required": ["primary", "subject_level", "environment_level", "camera_level", "rationale"],
+      "properties": {
+        "primary": {"enum": ["subject", "environment", "camera", "quiet"]},
+        "subject_level": {"enum": ["none", "low", "moderate", "high"]},
+        "environment_level": {"enum": ["none", "low", "moderate", "high"]},
+        "camera_level": {"enum": ["none", "low", "moderate", "high"]},
+        "rationale": {"type": "string", "minLength": 1},
+        "subject_region": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number", "minimum": 0, "maximum": 1}}
+      }
+    },
+    "shot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scene", "subject_action", "environment_motion", "camera_motion", "entry_state", "exit_state", "screen_direction", "adjacent_handoff", "expected_motion", "continuity"],
+      "properties": {
+        "scene": {"type": "integer", "minimum": 1},
+        "subject_action": {"type": "string", "minLength": 1},
+        "environment_motion": {"type": "string", "minLength": 1},
+        "camera_motion": {"type": "string", "minLength": 1},
+        "entry_state": {"type": "object"},
+        "exit_state": {"type": "object"},
+        "screen_direction": {"enum": ["left_to_right", "right_to_left", "toward_camera", "away_from_camera", "stationary", "mixed"]},
+        "adjacent_handoff": {"type": "object", "required": ["from_previous", "to_next", "allows_direction_change"], "properties": {"from_previous": {"type": "string"}, "to_next": {"type": "string"}, "allows_direction_change": {"type": "boolean"}}, "additionalProperties": true},
+        "expected_motion": {"$ref": "#/$defs/expected_motion"},
+        "continuity": {"type": "object"}
+      }
+    }
+  }
+}

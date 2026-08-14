@@ -61,6 +61,11 @@ from visual_sample_gate import (
     write_visual_sample_plan,
     write_visual_sample_supplemental_request,
 )
+from video_motion import (
+    formal_source_issues,
+    review_semantic_issues,
+    video_receipt_issues,
+)
 
 from story_codex_tasks import (
     build_children_story_handoff,
@@ -2081,6 +2086,11 @@ class StoryAgent:
             self._visual_continuity_contract_path(),
             contract_consumer_path(self.context.project_dir, "image_video"),
         ]
+        with jobs.open(encoding="utf-8-sig", newline="") as handle:
+            first_job = next(csv.DictReader(handle), {})
+        motion_plan = first_existing(first_job.get("motion_plan_path"))
+        if motion_plan is not None:
+            control_files.append(motion_plan)
         bundle = write_review_bundle(
             review_dir / "video_prompt_bundle.json",
             [snapshot, image_dir, *(path for path in control_files if path is not None and path.exists())],
@@ -2098,10 +2108,13 @@ class StoryAgent:
                 f"当前任务及图片哈希清单：`{bundle}`",
                 f"读取任务 CSV：`{jobs}`",
                 "如果任务 CSV 含 continuity_state/continuity_required/continuity_forbidden，必须逐字段保留并审核；这些字段和最终提示词中的视觉连续性硬约束不可删改，不能以审核 CSV 覆盖。",
+                "逐镜核对 motion_shot 中的 subject_action、environment_motion、camera_motion、entry_state、exit_state、screen_direction、adjacent_handoff、expected_motion；动作职责必须具体且与故事状态一致。",
+                "连续性只锁身份、状态、尺度和故事逻辑，不得用完全静止/几乎不动逃避动作；但 expected_motion.primary=quiet 时允许有意义的低运动，不能强迫无意义的大动作。",
+                "逐相邻镜头检查出入状态、视线和移动方向；无解释方向反转、瞬移或状态跳变不得 approved。",
                 "逐镜头检查动作是否具体、是否符合当前图片和故事、是否过度文学化、是否可能触发眼睛发光/肢体畸变/新增角色。",
                 "每个镜头的 prompt 必须显式锁定起始图的角色数量、物体数量和核心外观，禁止凭空新增/删除/融合物体，禁止改变太阳、月亮等核心物体的实心/空心拓扑。",
                 f"把最终确认 CSV 写入：`{decisions_csv}`",
-                "CSV 必须包含 scene,image_filename,story_text,review_status,prompt,notes；如果任务 CSV 含 continuity_* 字段，也原样写回每镜的机器字段；每个镜头一行，review_status 必须是 approved，必要时直接在 prompt 列给出修正后的最终动作提示。",
+                "CSV 必须包含 scene,image_filename,story_text,review_status,prompt,notes；如果任务 CSV 含 continuity_* 或 motion_* 字段，也原样写回每镜的机器字段，不得覆盖或丢弃动作计划；每个镜头一行，review_status 必须是 approved，必要时直接在 prompt 列给出修正后的最终动作提示。",
                 f"把结构化审核 JSON 写入：`{review_path}`",
                 "JSON 必须包含 approved、score、critical_errors、issues、retry_indices、retry_files、retry_instructions、artifact_sha256。",
                 f"artifact_sha256 必须原样写为：{bundle_sha}",
@@ -2126,7 +2139,31 @@ class StoryAgent:
         return StageResult("done", f"图生视频提示词独立审核通过：{payload.get('score')} 分", review_path)
 
     def _stage_video_qa(self, manifest: dict[str, Any]) -> StageResult:
-        return self._workflow(["qa-videos", "--project-dir", str(self.context.project_dir), "--videos-dir", str(self.context.paths.video_jobs / "videos")], "视频片段 QA")
+        result = self._workflow([
+            "qa-videos", "--project-dir", str(self.context.project_dir),
+            "--videos-dir", str(self.context.paths.video_jobs / "videos"),
+            "--execution-mode", "production",
+        ], "视频片段 QA")
+        if result.status != "done":
+            return result
+        evidence = self.context.paths.status / "qa_videos_report.json"
+        try:
+            payload = json.loads(evidence.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return StageResult("blocked", "视频 QA 未写入有效运动证据 JSON。", evidence)
+        if payload.get("passed") is True:
+            return result
+        indices = sorted({int(value) for value in payload.get("retry_indices", []) if str(value).isdigit()})
+        jobs = self._jobs_csv(manifest)
+        if indices and jobs is not None and self._can_retry_stage("video_qa", critical=True):
+            reasons = {
+                str(row.get("scene")): "；".join(str(item) for item in row.get("issues", []))
+                for row in payload.get("clips", []) if isinstance(row, dict) and row.get("issues")
+            }
+            moved = self._quarantine_story_videos(indices, jobs, reasons)
+            if moved:
+                return StageResult("retrying", f"视频运动/来源 QA 未通过，仅排队重做镜头：{', '.join(map(str, moved))}", evidence)
+        return StageResult("blocked", "视频运动/来源 QA 未通过：" + ", ".join(map(str, indices)), evidence)
 
     def _stage_video_review(self, manifest: dict[str, Any]) -> StageResult:
         frames_dir = self.context.paths.status / "video_review_frames"
@@ -2161,6 +2198,7 @@ class StoryAgent:
             [
                 jobs,
                 qa_report,
+                self.context.paths.status / "qa_videos_report.json",
                 videos_dir,
                 frames_dir,
                 *(path for path in [contract_consumer_path(self.context.project_dir, "image_video")] if path.exists()),
@@ -2173,7 +2211,9 @@ class StoryAgent:
             bundle=bundle,
             images=contact_sheets,
             rubric=(
-                "结合分镜任务和首尾/25%/50%/75%抽帧检查动作崩坏、反物理现象、角色漂移、黑帧、文字水印和镜头连续性。"
+                "结合逐镜 motion_shot、机器运动证据和首尾/25%/50%/75%抽帧检查动作崩坏、反物理现象、角色漂移、黑帧、文字水印和镜头连续性。"
+                "逐镜判断 subject_action、environment_motion、camera_motion 是否自然协同并符合 expected_motion；安静镜头允许合理低运动，不能把运动越多误当越好。"
+                "逐镜输出 per_scene_reviews，并明确 story_state_consistent 与 adjacent_handoff_consistent；检查 entry_state、exit_state、screen_direction、视线和移动方向，无解释瞬移、反转或状态跳变必须失败。"
                 "逐镜头数清四足动物的腿，检查嘴/五官位置、物种与颜色身份、角色应出现/不应出现状态、信息因果是否正确。"
                 "必须把每个镜头的 start/q1/mid/q3/end 与起始分镜图逐一比较，evidence_matrix 中记录五个时点的角色数量、关键物体数量、形状拓扑（如实心/空心）和依据文件名。"
                 "若 bundle 包含 visual_continuity_contract.json，必须按合同逐镜核对状态、story_boundaries、transitions、required/forbidden 规则；状态越界或转折不成立必须列入 critical_errors 并重做，不能只写“角色一致”。"
@@ -2182,6 +2222,16 @@ class StoryAgent:
             ),
         )
         if result.status == "done":
+            try:
+                with jobs.open(encoding="utf-8-sig", newline="") as handle:
+                    expected_scenes = [int(row["scene"]) for row in csv.DictReader(handle)]
+            except (OSError, ValueError, KeyError):
+                expected_scenes = []
+            semantic_issues = review_semantic_issues(
+                payload or {}, expected_scenes=expected_scenes if not self._legacy_contract_policy(manifest) else None,
+            )
+            if semantic_issues:
+                return StageResult("blocked", "视频动作/承接审核结论存在关键冲突：" + "；".join(semantic_issues), result.handoff)
             return result
         rejected_root = self.context.paths.status / "rejected" / "story_videos"
         quality_attempts = 1 + len([path for path in rejected_root.iterdir() if path.is_dir()]) if rejected_root.exists() else 1
@@ -3207,6 +3257,7 @@ class StoryAgent:
                 "机器可读分镜计划还必须原样记录当前逐产物语义呈现计划的 artifact_semantic_plan_sha256、artifact_semantic_plan_schema_version、artifact_semantic_plan_dependency_sha256；缺失或旧绑定将被 Runtime 拒绝。",
                 "机器可读分镜计划还必须原样记录 visual_sample_schema_version、visual_sample_plan_sha256、visual_sample_review_bundle_sha256、visual_sample_lock_sha256；旧小样或旧审核绑定将被 Runtime 拒绝。",
                 "每镜必须记录 scale_basis、current_story_state、visual_state_evidence。scale_basis 必须说明是否适用、引用合同 relationship_id 或说明不适用原因；有状态机时必须逐 machine_id 记录当前 state_id 及可见/不可见证据。",
+                "每镜还必须写机器可读视频动作字段 subject_action、environment_motion、camera_motion、entry_state、exit_state、screen_direction、adjacent_handoff、expected_motion。expected_motion.primary 只能是 subject/environment/camera/quiet，并分别声明 subject/environment/camera 的 none/low/moderate/high 预期和理由；相邻镜头用同一 handoff 标识承接 entry/exit、视线与移动方向。连续性用于稳定身份、状态、尺度和故事逻辑，不能靠完全静止逃避动作。",
                 "不得丢弃、缩写或覆盖合同角色、风格、尺度、状态约束；不得擅自新增会成为跨镜头身份锚点的特殊标记、固定配饰、徽记，或违反合同/角色设定的非意图结构。",
                 "允许不违背合同的正常人体/动物结构、时代和场景合理普通服饰及非身份性自然细节，但推断细节不得升级为永久身份锚点；合同 required/forbidden 始终优先。",
                 "每个唱歌、关键发言、关键动作或明显受挫的角色都要获得焦点镜头；连续场景要安排建立全景、表演者中近景、反应镜头等景别变化，不能所有角色都和主角挤在同一种双人中景。",
@@ -3361,6 +3412,10 @@ class StoryAgent:
             "visible_characters", "excluded_characters", "continuity_group", "appearance_ids", "visual_description",
             "scale_basis", "current_story_state", "visual_state_evidence",
         }
+        motion_required = {
+            "subject_action", "environment_motion", "camera_motion", "entry_state", "exit_state",
+            "screen_direction", "adjacent_handoff", "expected_motion",
+        }
         for index, (row, text) in enumerate(zip(rows, story_lines), start=1):
             if not isinstance(row, dict) or not required.issubset(row):
                 return False
@@ -3373,6 +3428,8 @@ class StoryAgent:
             if not str(row["shot_size"]).strip() or not str(row["focal_character"]).strip():
                 return False
             if not self._legacy_contract_policy(self._manifest()):
+                if not motion_required.issubset(row):
+                    return False
                 scale_basis = row.get("scale_basis")
                 if not isinstance(scale_basis, dict) or not isinstance(scale_basis.get("applicable"), bool):
                     return False
@@ -3392,6 +3449,21 @@ class StoryAgent:
                 if any(str(current_state[key]) not in values for key, values in allowed_states.items()):
                     return False
                 if any(not str(state_evidence[key]).strip() for key in allowed_states):
+                    return False
+                if any(not str(row.get(key) or "").strip() for key in ("subject_action", "environment_motion", "camera_motion")):
+                    return False
+                if row.get("screen_direction") not in {
+                    "left_to_right", "right_to_left", "toward_camera", "away_from_camera", "stationary", "mixed",
+                }:
+                    return False
+                if any(not isinstance(row.get(key), dict) for key in ("entry_state", "exit_state", "adjacent_handoff", "expected_motion")):
+                    return False
+                expected_motion = row["expected_motion"]
+                if expected_motion.get("primary") not in {"subject", "environment", "camera", "quiet"}:
+                    return False
+                if any(expected_motion.get(key) not in {"none", "low", "moderate", "high"} for key in ("subject_level", "environment_level", "camera_level")):
+                    return False
+                if not str(expected_motion.get("rationale") or "").strip():
                     return False
         return True
 
@@ -3676,12 +3748,19 @@ class StoryAgent:
             source = self.context.paths.video_jobs / "videos" / row.get("target_video_filename", "")
             if source.exists():
                 shutil.move(str(source), str(quarantine / source.name))
+            receipt_path = Path(str(row.get("video_receipt_path") or "")) if row.get("video_receipt_path") else None
+            if receipt_path is not None and receipt_path.is_file():
+                shutil.copy2(receipt_path, quarantine / receipt_path.name)
             # Preserve the rejected provider identity before clearing it. More
             # importantly, advance provider_attempt so ToAPIs receives a new
             # client_business_id even if an independent prompt review later
             # normalizes the retry prompt back to the previous wording.
             save_json(quarantine / f"scene_{scene:02d}_rejected_job.json", row)
-            for key in ("task_id", "video_url", "error", "api_response", "query_response"):
+            for key in (
+                "task_id", "video_url", "error", "api_response", "query_response",
+                "video_source_kind", "video_provider", "video_model", "video_execution_mode",
+                "production_eligible", "video_receipt_path", "video_receipt_sha256",
+            ):
                 if key in row:
                     row[key] = ""
             try:
@@ -3701,6 +3780,15 @@ class StoryAgent:
         qa_report = self.context.paths.status / "qa_videos_report.md"
         if qa_report.exists():
             shutil.move(str(qa_report), str(quarantine / qa_report.name))
+        qa_json = self.context.paths.status / "qa_videos_report.json"
+        if qa_json.exists():
+            shutil.move(str(qa_json), str(quarantine / qa_json.name))
+        save_json(quarantine / "retry_manifest.json", {
+            "version": 1,
+            "retry_indices": moved,
+            "retry_instructions": retry_instructions or {},
+            "jobs_csv": str(jobs),
+        })
         frames_dir = self.context.paths.status / "video_review_frames"
         if frames_dir.exists():
             shutil.move(str(frames_dir), str(quarantine / frames_dir.name))
@@ -4024,7 +4112,16 @@ class StoryAgent:
         except Exception:
             return False
         targets = [(row.get("target_video_filename") or "").strip() for row in rows]
-        return bool(targets) and all(name and (videos / name).is_file() and (videos / name).stat().st_size > 0 for name in targets)
+        if not targets or not all(name and (videos / name).is_file() and (videos / name).stat().st_size > 0 for name in targets):
+            return False
+        if self._legacy_contract_policy(manifest):
+            return True
+        for row, name in zip(rows, targets):
+            if formal_source_issues(row, production_mode=True):
+                return False
+            if video_receipt_issues(row, videos / name, production_mode=True):
+                return False
+        return True
 
     def _has_video_prompt_review(self, manifest: dict[str, Any]) -> bool:
         review_dir = self.context.paths.status / "reviews"
@@ -4044,7 +4141,24 @@ class StoryAgent:
         return review_passes(payload, artifact=bundle) and video_prompt_review_matches_current(jobs, snapshot, decisions)
 
     def _has_video_qa(self, manifest: dict[str, Any]) -> bool:
-        return first_existing(manifest.get("qa", {}).get("videos"), self.context.paths.status / "qa_videos_report.md") is not None
+        report = first_existing(manifest.get("qa", {}).get("videos"), self.context.paths.status / "qa_videos_report.md")
+        if report is None:
+            return False
+        if self._legacy_contract_policy(manifest):
+            return True
+        evidence = first_existing(manifest.get("qa", {}).get("videos_json"), self.context.paths.status / "qa_videos_report.json")
+        if evidence is None:
+            return False
+        try:
+            payload = json.loads(evidence.read_text(encoding="utf-8"))
+            jobs = self._jobs_csv(manifest)
+            return (
+                payload.get("passed") is True
+                and jobs is not None
+                and payload.get("jobs_sha256") == file_sha256(jobs)
+            )
+        except (OSError, json.JSONDecodeError):
+            return False
 
     def _has_video_review(self, manifest: dict[str, Any]) -> bool:
         return self._review_stage_current("video_review")
@@ -4242,6 +4356,7 @@ class StoryAgent:
             "visual_style、characters、world_scale、story_state 必须完整进入最终逐镜计划和真实生图指令，不得删减或用模型偏好覆盖。",
             "不得擅自新增合同没有可信来源的身份定义性标记、固定配饰、徽记、非意图结构或永久解剖锚点；允许符合合同和 visual_style 的风格化、拟人化、奇幻结构、夸张比例、普通服饰及非身份自然细节。",
             "每镜必须写 scale_basis、current_story_state、visual_state_evidence，并引用合同中的 relationship_id、machine_id、state_id；不适用也要写明原因。",
+            "每镜必须写 subject_action、environment_motion、camera_motion、entry_state、exit_state、screen_direction、adjacent_handoff、expected_motion；动作计划必须明确该动什么、该保持什么，不能用完全静止代替连续性。",
             "不要出现绵羊姐姐形象、主持人形象、羊、小羊、人偶或任何与品牌相关的角色形象。",
             "用户提供的原文已经按镜头分行；原则上每一行就是一个独立镜头。",
             f"如果标题镜头需要文字，只能使用本集标题“{self.context.story_name}”，不得套用任何历史样例标题。",

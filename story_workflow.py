@@ -103,6 +103,7 @@ def main() -> None:
     qa_video_cmd = subparsers.add_parser("qa-videos", help="机器抽帧审查视频片段并生成 QA 报告")
     qa_video_cmd.add_argument("--project-dir", required=True, type=Path)
     qa_video_cmd.add_argument("--videos-dir", type=Path)
+    qa_video_cmd.add_argument("--execution-mode", choices=["production", "test"], default="production")
 
     qa_music_cmd = subparsers.add_parser("qa-music", help="检查配乐覆盖、响度、削波、静音和分段结构")
     qa_music_cmd.add_argument("--project-dir", required=True, type=Path)
@@ -264,6 +265,7 @@ def main() -> None:
     generate.add_argument("--skip-prompt-review", action="store_true", help="跳过图生视频提示词确认闸门")
     generate.add_argument("--provider", default="", help="覆盖 pipeline_config.json 中的图生视频 provider")
     generate.add_argument("--project-dir", default="", type=Path, help="V3.5 合同锁所属项目目录；合同绑定任务必填")
+    generate.add_argument("--execution-mode", choices=["production", "test"], default="production")
 
     rerun_review = subparsers.add_parser("rerun-review", help="根据审核 CSV 只重跑标记为重做的片段")
     rerun_review.add_argument("--jobs-csv", required=True, type=Path)
@@ -493,7 +495,7 @@ def main() -> None:
         report = qa_images(args.project_dir, args.image_dir)
         print(f"已生成图片 QA：{report}")
     elif args.command == "qa-videos":
-        report = qa_videos(args.project_dir, args.videos_dir)
+        report = qa_videos(args.project_dir, args.videos_dir, execution_mode=args.execution_mode)
         print(f"已生成视频 QA：{report}")
     elif args.command == "qa-music":
         report = qa_music(args.project_dir, args.music, args.narration, args.plan_csv)
@@ -683,6 +685,8 @@ def main() -> None:
             str(args.start_scene),
             "--end-scene",
             str(args.end_scene),
+            "--execution-mode",
+            args.execution_mode,
         ]
         if args.project_dir:
             command.extend(["--project-dir", str(args.project_dir)])

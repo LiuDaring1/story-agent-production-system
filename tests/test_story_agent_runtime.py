@@ -693,12 +693,14 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             jobs.parent.mkdir(parents=True, exist_ok=True)
             jobs.write_text(
                 "scene,target_video_filename,status,task_id,video_url,error,api_response,query_response,prompt\n"
-                "12,12_vri.mp4,downloaded,old-task,https://old.example/video.mp4,,{},{}\u002c兔子离开\n",
+                "12,12_vri.mp4,downloaded,old-task,https://old.example/video.mp4,,{},{}\u002c角色离开\n"
+                "13,13_vri.mp4,downloaded,kept-task,https://keep.example/video.mp4,,{},{}\u002c另一角色等待\n",
                 encoding="utf-8-sig",
             )
             videos = paths.video_jobs / "videos"
             videos.mkdir(parents=True)
             (videos / "12_vri.mp4").write_bytes(b"rejected-video")
+            (videos / "13_vri.mp4").write_bytes(b"approved-video")
 
             moved = StoryAgent(context)._quarantine_story_videos([12], jobs, {"12": "保持森林舞台"})
 
@@ -709,6 +711,11 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(row["task_id"], "")
             self.assertEqual(row["provider_attempt"], "1")
             self.assertIn("保持森林舞台", row["prompt"])
+            with jobs.open(encoding="utf-8-sig", newline="") as file:
+                kept = list(csv.DictReader(file))[1]
+            self.assertEqual(kept["status"], "downloaded")
+            self.assertEqual(kept["task_id"], "kept-task")
+            self.assertTrue((videos / "13_vri.mp4").is_file())
             rejected_jobs = list((paths.status / "rejected" / "story_videos").rglob("scene_12_rejected_job.json"))
             self.assertEqual(len(rejected_jobs), 1)
             self.assertEqual(json.loads(rejected_jobs[0].read_text(encoding="utf-8"))["task_id"], "old-task")

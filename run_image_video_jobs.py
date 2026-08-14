@@ -9,6 +9,7 @@ from urllib.parse import urlparse
 
 from secret_store import read_secret
 from video_provider_adapter import resolve_row_generation_seconds
+from video_motion import video_receipt_issues, write_video_receipt
 
 from story_video_synthesizer.volcengine_video import (
     DEFAULT_BASE_URL,
@@ -188,6 +189,7 @@ def main() -> None:
     parser.add_argument("--submit-delay", default=0.2, type=float, help="批量提交时每次创建任务后的短暂停顿，避免请求过快")
     parser.add_argument("--poll-existing", action="store_true", help="只轮询 CSV 中已有 task_id 的任务")
     parser.add_argument("--dry-run", action="store_true", help="只打印请求体，不调用 API")
+    parser.add_argument("--execution-mode", choices=["production", "test"], default="production", help="正式模式只接受真实 provider 输出；test 模式允许离线 fixture")
     parser.add_argument("--extra-body-json", default="", help="额外请求体 JSON，例如 '{\"watermark\": false}'")
     args = parser.parse_args()
 
@@ -225,6 +227,23 @@ def main() -> None:
     project_dir = args.project_dir.expanduser() if args.project_dir else _discover_project_root(args.jobs_csv)
     if contract_bound and project_dir is None:
         raise ValueError("合同绑定 jobs 无法定位 project_dir，已在付费调用前阻断")
+    provider_label = "toapis" if is_toapis else "qingyun"
+
+    def bind_download(row: dict[str, str], video_path: Path) -> None:
+        receipt, receipt_sha = write_video_receipt(
+            args.jobs_csv, row, video_path, provider=provider_label, model=args.model,
+            source_kind="provider_generated", execution_mode=args.execution_mode,
+            production_eligible=args.execution_mode == "production",
+        )
+        row.update({
+            "video_source_kind": "provider_generated",
+            "video_provider": provider_label,
+            "video_model": args.model,
+            "video_execution_mode": args.execution_mode,
+            "production_eligible": "true" if args.execution_mode == "production" else "false",
+            "video_receipt_path": str(receipt.resolve()),
+            "video_receipt_sha256": receipt_sha,
+        })
     args.videos_dir.expanduser().mkdir(parents=True, exist_ok=True)
     api_key = read_secret(args.api_key_env) or args.api_key.strip()
     client_type = ToAPIsVideoClient if is_toapis else QingyunVideoClient
@@ -263,6 +282,8 @@ def main() -> None:
         for row in selected_rows:
             video_path = args.videos_dir.expanduser() / row["target_video_filename"]
             if video_path.exists() and video_path.stat().st_size > 0:
+                if contract_bound and video_receipt_issues(row, video_path, production_mode=args.execution_mode == "production"):
+                    raise ValueError(f"镜头 {row['scene']} 已有视频缺少当前正式来源 receipt，禁止按文件存在跳过")
                 row["status"] = "downloaded"
                 continue
             if row.get("status", "") in {"downloaded", "approved"}:
@@ -344,6 +365,8 @@ def main() -> None:
         status = row.get("status", "")
         video_path = args.videos_dir.expanduser() / row["target_video_filename"]
         if video_path.exists() and video_path.stat().st_size > 0:
+            if contract_bound and video_receipt_issues(row, video_path, production_mode=args.execution_mode == "production"):
+                raise ValueError(f"镜头 {row['scene']} 已有视频缺少当前正式来源 receipt，禁止按文件存在跳过")
             row["status"] = "downloaded"
             continue
         if status in {"downloaded", "approved"}:
@@ -449,10 +472,12 @@ def main() -> None:
                 print(f"下载视频 {row['scene']}：{video_path.name}", flush=True)
                 client.download(result.video_url, video_path)
                 row["status"] = "downloaded"
+                bind_download(row, video_path)
             elif result.status in SUCCESS_STATUSES:
                 print(f"下载视频 {row['scene']}：{video_path.name}", flush=True)
                 client.download_task_video(task_id, video_path)
                 row["status"] = "downloaded"
+                bind_download(row, video_path)
 
             write_jobs_csv(args.jobs_csv.expanduser(), rows)
             processed += 1

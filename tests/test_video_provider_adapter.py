@@ -262,6 +262,8 @@ class VideoProviderAdapterTests(unittest.TestCase):
                     str(videos),
                     "--provider",
                     "mock_local",
+                    "--execution-mode",
+                    "test",
                 ],
                 cwd=root,
                 text=True,
@@ -273,6 +275,10 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 row = next(csv.DictReader(file))
             self.assertEqual(row["status"], "downloaded")
             self.assertEqual(row["prompt"], "小羊自然地向前走")
+            self.assertEqual(row["video_source_kind"], "ffmpeg_still_frame")
+            self.assertEqual(row["video_execution_mode"], "test")
+            self.assertEqual(row["production_eligible"], "false")
+            self.assertTrue(Path(row["video_receipt_path"]).is_file())
 
     def test_selects_named_adapter_without_business_logic_changes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

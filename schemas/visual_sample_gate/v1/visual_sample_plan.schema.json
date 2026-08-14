@@ -11,7 +11,7 @@
   ],
   "properties": {
     "schema_version": {"const": "1.0"},
-    "compiler_version": {"const": "m2-2a1.1.1"},
+    "compiler_version": {"const": "m2-2a1.1.2"},
     "consumer": {"const": "storyboard_images"},
     "contract_schema_version": {"type": "string", "minLength": 1},
     "story_contract_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},

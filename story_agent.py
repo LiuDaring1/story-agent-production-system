@@ -46,6 +46,7 @@ from artifact_semantic_plan import (
     write_artifact_semantic_plan,
 )
 from visual_sample_gate import (
+    ANATOMICAL_COHERENCE_REVIEW_RULE,
     load_current_visual_sample_plan,
     product_quality_review_issues,
     visual_sample_asset_paths,
@@ -1224,7 +1225,7 @@ class StoryAgent:
                         f"- 合同投影：`{context}`",
                         f"- 输出目录：`{paths['assets']}`",
                         "- 必须完整遵守 visual_style、characters、world_scale、story_state。",
-                        "- 不得擅自新增会成为跨镜头身份锚点的特殊标记、固定配饰、徽记或异常解剖特征。",
+                        "- 不得擅自新增会成为跨镜头身份锚点的特殊标记、固定配饰、徽记，或违反合同/角色设定的非意图结构。",
                         "- 允许不违背合同的正常人体/动物结构、时代和场景合理的普通服饰及非身份性自然细节；这些推断细节不得升级为永久身份锚点。合同 required/forbidden 始终优先。",
                         "- 不得生成文字、标题、字幕、水印或 Logo。",
                         "- 每张只验证该 sample_id 的合同约束；不要扩展故事事实。",
@@ -1303,11 +1304,12 @@ class StoryAgent:
             rubric=(
                 "这是批量生图前门禁，审核必须分三层并在 JSON 中分别写 machine_completeness、contract_adherence、product_quality。"
                 "machine_completeness 必须 passed=true 且引用文件/哈希证据；contract_adherence.checks 必须逐项覆盖计划要求的 visual_style、characters、world_scale、story_state；"
-                "product_quality.dimensions 必须逐项覆盖计划中的风格中性维度；有角色时覆盖角色设计适配、身份一致与自然解剖，但不得默认要求可爱。"
+                "product_quality.dimensions 必须逐项覆盖计划中的风格中性维度；有角色时覆盖 character_design_fit、identity_coherence、anatomical_coherence，但不得默认要求可爱或写实解剖。"
+                f"{ANATOMICAL_COHERENCE_REVIEW_RULE}"
                 "product_quality.style_contract 必须原样引用并逐条审核计划中 visual_style.style_profile 的 description、required_traits、forbidden_traits：合同要求可爱才审核可爱，要求历史感、庄重或写实就审核相应条款。"
                 "style_contract 输出 description、description_fit=true、description_evidence，并分别用 required_traits[{trait,passed,evidence}] 和 forbidden_traits[{trait,absent,evidence}] 逐条举证。"
                 "JSON 还必须写 p0_errors、retry_sample_ids 和逐 sample_id 的 evidence_matrix。"
-                "任何擅自新增的身份定义性特殊标记、固定配饰、徽记、异常解剖特征或跨镜头身份锚点，解剖错误、身份错、尺度矛盾、状态矛盾、儿童不适或不可用构图均是 P0；"
+                "任何擅自新增的身份定义性特殊标记、固定配饰、徽记、违反合同/角色设定的结构，或非意图性的多肢、缺肢、器官错位、结构崩坏及跨镜头身份锚点，均可构成 anatomy_or_organ_error 等 P0；"
                 "不违背合同的正常结构、时代/场景合理普通服饰和非身份性自然细节不是 P0，但不得被升级为永久身份锚点。"
                 "只要 p0_errors 非空就必须 approved=false，不能被总分平均。"
             ),
@@ -1834,7 +1836,7 @@ class StoryAgent:
             bundle=bundle,
             images=contact_sheets,
             rubric=(
-                "逐镜头对照分镜检查角色和服装一致性、故事语义、构图和相邻连续性；逐个数清四足动物的腿，检查五官、嘴和象鼻等解剖位置。"
+                "逐镜头对照分镜检查角色和服装一致性、故事语义、构图和相邻连续性；按当前合同的物种/身份、角色定义、visual_style 和本镜头设计检查肢体、五官、器官及整体结构是否内部一致。"
                 "还要检查物种/颜色身份、该镜头应出现与明确不应出现的角色，以及角色是否提前知道尚未发生的信息。"
                 "逐镜核对 storyboard_plan.json：每个唱歌/关键发言/关键动作/受挫反应角色是否有自己的焦点镜头；连续段是否有建立镜头、表演者中近景和反应镜头，而不是全程同一种双人中景。"
                 "按 appearance_id 逐项比较脸部花纹、服装主色/款式和饰品；虎妈妈等跨镜角色无剧情依据换衣服属于关键连续性错误。"
@@ -1843,10 +1845,11 @@ class StoryAgent:
                 "若合同的 storyboard_requirements 指定 required_field，机器可读 storyboard_plan 必须逐镜提供该字段且值必须属于合同 allowed_states；缺失或枚举无效是关键错误。"
                 "审核 JSON 的 evidence_matrix 必须逐镜写明：角色数量、身份/服装、关键物体数量、角色应在场/不应在场及画面证据；不得用“整体正常”代替逐项核对。"
                 "V3.5 required_v1 项目还必须分层写 contract_adherence 和 product_quality，并写 p0_errors。"
-                "product_quality 必须覆盖 audience_fit、composition、color、lighting、style_suitability；有角色时还要覆盖 character_design_fit、identity_coherence、natural_anatomy。"
+                "product_quality 必须覆盖 audience_fit、composition、color、lighting、style_suitability；有角色时还要覆盖 character_design_fit、identity_coherence、anatomical_coherence。"
+                f"{ANATOMICAL_COHERENCE_REVIEW_RULE}"
                 "product_quality.style_contract 必须原样逐条审核当前视觉小样计划中的风格 description、required_traits、forbidden_traits；只有合同要求可爱时才审核可爱，不能把目标受众适配偷换成可爱度。"
                 "style_contract 输出 description、description_fit=true、description_evidence，并分别用 required_traits[{trait,passed,evidence}] 和 forbidden_traits[{trait,absent,evidence}] 逐条举证。"
-                "擅自新增身份定义性特殊标记、固定配饰、徽记、异常解剖或跨镜头身份锚点，以及身份错、尺度或状态矛盾、儿童不适、不可用构图均为 P0；普通合理服饰和非身份自然细节不自动构成 P0。P0 非空时无论总分多高都不得通过。"
+                "擅自新增身份定义性特殊标记、固定配饰、徽记、违反合同/角色设定的结构，或非意图性的多肢、缺肢、器官错位、结构崩坏及跨镜头身份锚点，均可构成 anatomy_or_organ_error 等 P0；符合合同的非写实结构本身不是 P0。身份错、尺度或状态矛盾、儿童不适、不可用构图仍为 P0；普通合理服饰和非身份自然细节不自动构成 P0。P0 非空时无论总分多高都不得通过。"
                 "输出 retry_indices（需要重做的镜头编号整数数组）。角色身份或在场关系错、肢体/五官崩坏、错误文字、漏镜头属于关键错误。"
             ),
         )
@@ -3204,7 +3207,7 @@ class StoryAgent:
                 "机器可读分镜计划还必须原样记录当前逐产物语义呈现计划的 artifact_semantic_plan_sha256、artifact_semantic_plan_schema_version、artifact_semantic_plan_dependency_sha256；缺失或旧绑定将被 Runtime 拒绝。",
                 "机器可读分镜计划还必须原样记录 visual_sample_schema_version、visual_sample_plan_sha256、visual_sample_review_bundle_sha256、visual_sample_lock_sha256；旧小样或旧审核绑定将被 Runtime 拒绝。",
                 "每镜必须记录 scale_basis、current_story_state、visual_state_evidence。scale_basis 必须说明是否适用、引用合同 relationship_id 或说明不适用原因；有状态机时必须逐 machine_id 记录当前 state_id 及可见/不可见证据。",
-                "不得丢弃、缩写或覆盖合同角色、风格、尺度、状态约束；不得擅自新增会成为跨镜头身份锚点的特殊标记、固定配饰、徽记或异常解剖特征。",
+                "不得丢弃、缩写或覆盖合同角色、风格、尺度、状态约束；不得擅自新增会成为跨镜头身份锚点的特殊标记、固定配饰、徽记，或违反合同/角色设定的非意图结构。",
                 "允许不违背合同的正常人体/动物结构、时代和场景合理普通服饰及非身份性自然细节，但推断细节不得升级为永久身份锚点；合同 required/forbidden 始终优先。",
                 "每个唱歌、关键发言、关键动作或明显受挫的角色都要获得焦点镜头；连续场景要安排建立全景、表演者中近景、反应镜头等景别变化，不能所有角色都和主角挤在同一种双人中景。",
                 "为反复出现的角色固定 appearance_id；生成后续镜头时必须同时引用风格锚点和该角色最近一张已通过图片，禁止只靠文字重新随机生成角色。",
@@ -4237,7 +4240,7 @@ class StoryAgent:
             f"必须把逐镜叙事覆盖、焦点角色、景别、在场/不在场角色、连续场景组和 appearance_id 保存到：{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}。",
             "V3.5 required_v1 项目必须读取已审核 visual_sample.lock.json 和 visual_sample_plan.json；优先复用其中合同预览/条件小样，不得另造一套风格锚点。",
             "visual_style、characters、world_scale、story_state 必须完整进入最终逐镜计划和真实生图指令，不得删减或用模型偏好覆盖。",
-            "不得自行增加合同没有可信来源的身份标记、器官、配饰、装饰、服装特征或解剖特征。",
+            "不得擅自新增合同没有可信来源的身份定义性标记、固定配饰、徽记、非意图结构或永久解剖锚点；允许符合合同和 visual_style 的风格化、拟人化、奇幻结构、夸张比例、普通服饰及非身份自然细节。",
             "每镜必须写 scale_basis、current_story_state、visual_state_evidence，并引用合同中的 relationship_id、machine_id、state_id；不适用也要写明原因。",
             "不要出现绵羊姐姐形象、主持人形象、羊、小羊、人偶或任何与品牌相关的角色形象。",
             "用户提供的原文已经按镜头分行；原则上每一行就是一个独立镜头。",

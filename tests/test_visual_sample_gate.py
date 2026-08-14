@@ -451,7 +451,7 @@ class VisualSampleGateTests(unittest.TestCase):
                 self.assertNotIn("cuteness", dimensions)
                 self.assertNotIn("child_appeal", dimensions)
                 self.assertNotIn("natural_identity", dimensions)
-                character_dimensions = {"character_design_fit", "identity_coherence", "natural_anatomy"}
+                character_dimensions = {"character_design_fit", "identity_coherence", "anatomical_coherence"}
                 self.assertEqual(character_dimensions.issubset(dimensions), case["character_dimensions"])
                 self.assertEqual(plan["review_profile"]["style_contract"]["description"], case["description"])
                 self.assertEqual(plan["review_profile"]["style_contract"]["required_traits"], case["required"])
@@ -470,6 +470,67 @@ class VisualSampleGateTests(unittest.TestCase):
                     review["product_quality"]["style_contract"]["required_traits"] = []
                     issues = visual_sample_review_payload_issues(review, plan)
                     self.assertTrue(any("historical atmosphere" in issue for issue in issues))
+
+    def test_anatomical_coherence_is_contract_and_style_relative(self) -> None:
+        cases = [
+            {
+                "name": "strongly_stylized_character",
+                "description": "A strongly stylized cartoon with deliberately oversized heads and tiny bodies.",
+                "required": ["intentional exaggerated proportions"],
+                "forbidden": ["unintended extra limbs"],
+            },
+            {
+                "name": "anthropomorphic_fantasy_character",
+                "description": "An anthropomorphic fantasy character whose contract-defined wings function as arms.",
+                "required": ["contract-consistent fantastical anatomy"],
+                "forbidden": ["unintended duplicate organs"],
+            },
+        ]
+        for case in cases:
+            with self.subTest(case=case["name"]), tempfile.TemporaryDirectory() as directory:
+                project, _manifest, agent, context = _fixture(
+                    Path(directory),
+                    characters=True,
+                    scale=False,
+                    state=False,
+                    style_description=case["description"],
+                    required_traits=case["required"],
+                    forbidden_traits=case["forbidden"],
+                )
+                plan = _ready_plan(project, context)
+                dimensions = set(plan["review_profile"]["product_quality"])
+                self.assertIn("anatomical_coherence", dimensions)
+                self.assertNotIn("natural_anatomy", dimensions)
+                review = _passing_review(plan, visual_sample_paths(project)["plan"])
+                review["contract_adherence"]["evidence"] = "contract-relative structure verified"
+                self.assertEqual(visual_sample_review_payload_issues(review, plan), [])
+                self.assertEqual(agent._story_image_quality_review_issues(review), [])
+
+    def test_anatomy_p0_rejects_unintended_extra_limbs_and_forbidden_anatomy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, _manifest, agent, context = _fixture(
+                Path(directory),
+                characters=True,
+                scale=False,
+                state=False,
+                style_description="A coherent illustrated character design.",
+                required_traits=["stable contract-defined body plan"],
+                forbidden_traits=["unintended extra limbs", "forbidden horn anatomy"],
+            )
+            plan = _ready_plan(project, context)
+            for defect in ("unintended extra limb", "contract-forbidden horn anatomy"):
+                with self.subTest(defect=defect):
+                    review = _passing_review(plan, visual_sample_paths(project)["plan"])
+                    review.update(
+                        score=100,
+                        approved=True,
+                        p0_errors=["anatomy_or_organ_error"],
+                    )
+                    review["contract_adherence"]["evidence"] = defect
+                    sample_issues = visual_sample_review_payload_issues(review, plan)
+                    story_issues = agent._story_image_quality_review_issues(review)
+                    self.assertTrue(any("P0 hard gate" in issue for issue in sample_issues))
+                    self.assertTrue(any("P0 hard gate" in issue for issue in story_issues))
 
     def test_identity_policy_allows_ordinary_contextual_detail_without_promoting_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

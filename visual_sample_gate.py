@@ -24,7 +24,7 @@ from story_contracts import canonical_json_bytes, load_story_contract
 
 
 VISUAL_SAMPLE_SCHEMA_VERSION = "1.0"
-VISUAL_SAMPLE_COMPILER_VERSION = "m2-2a1.1.1"
+VISUAL_SAMPLE_COMPILER_VERSION = "m2-2a1.1.2"
 VISUAL_SAMPLE_LOCK_VERSION = 1
 VISUAL_SAMPLE_SCHEMA_PATH = (
     Path(__file__).resolve().parent
@@ -69,7 +69,12 @@ NEUTRAL_PRODUCT_QUALITY_DIMENSIONS = (
 CHARACTER_PRODUCT_QUALITY_DIMENSIONS = (
     "character_design_fit",
     "identity_coherence",
-    "natural_anatomy",
+    "anatomical_coherence",
+)
+ANATOMICAL_COHERENCE_REVIEW_RULE = (
+    "anatomical_coherence 的基准是当前 Story Contract 中的角色定义、物种/身份、visual_style "
+    "和本镜头设计：阻断违反合同/角色设定或非意图性的多肢、缺肢、器官错位、结构崩坏；"
+    "符合合同的风格化、拟人化、奇幻结构或故意夸张比例不得仅因不写实而失败。"
 )
 
 
@@ -279,7 +284,10 @@ def compile_visual_sample_plan(project_root: Path | str, context_path: Path | st
             _sample_requirement(
                 root=root,
                 kind="character_sheet",
-                reason="Recurring contract-declared characters need identity and natural-anatomy evidence.",
+                reason=(
+                    "Recurring contract-declared characters need identity and contract/style-consistent "
+                    "anatomical-coherence evidence."
+                ),
                 contract_paths_=["contracts.characters"],
                 refs=character_ids,
                 previews=previews,
@@ -329,20 +337,23 @@ def compile_visual_sample_plan(project_root: Path | str, context_path: Path | st
             "identity_defining_special_mark",
             "fixed_accessory",
             "emblem",
-            "abnormal_anatomy",
+            "non_intentional_or_contract_violating_anatomy",
             "new_cross_shot_identity_anchor",
         ],
         "allowed_contextual_inferences": [
             "normal_human_or_animal_anatomy",
+            "contract_consistent_stylized_or_fantastical_anatomy",
             "era_and_scene_appropriate_ordinary_clothing",
             "non_identity_natural_detail",
         ],
         "inferred_detail_persistence": "scene_local_unless_contract_promotes",
         "contract_precedence": "required_and_forbidden_features_are_authoritative",
         "production_rule": (
-            "Do not invent identity-defining special marks, fixed accessories, emblems, abnormal anatomy, or "
-            "other cross-shot identity anchors. Normal anatomy, era- and scene-appropriate ordinary clothing, "
-            "and non-identity natural details are allowed when they do not violate the contract, but inferred "
+            "Do not invent identity-defining special marks, fixed accessories, emblems, non-intentional or "
+            "contract-violating anatomy, or other cross-shot identity anchors. Contract-consistent stylized, "
+            "anthropomorphic, fantastical, or intentionally exaggerated anatomy is allowed and must not fail "
+            "merely for being unrealistic. Normal anatomy, era- and scene-appropriate ordinary clothing, and "
+            "non-identity natural details are also allowed when they do not violate the contract. Inferred "
             "ordinary details remain scene-local and must not be promoted into permanent identity anchors. "
             "Contract-declared required and forbidden features are authoritative."
         ),
@@ -729,6 +740,7 @@ def visual_sample_binding(project_root: Path | str) -> dict[str, str]:
 
 
 __all__ = [
+    "ANATOMICAL_COHERENCE_REVIEW_RULE",
     "CHARACTER_PRODUCT_QUALITY_DIMENSIONS", "NEUTRAL_PRODUCT_QUALITY_DIMENSIONS",
     "P0_CATEGORIES", "SAMPLE_KINDS", "VISUAL_SAMPLE_COMPILER_VERSION",
     "VISUAL_SAMPLE_SCHEMA_PATH", "VISUAL_SAMPLE_SCHEMA_VERSION",

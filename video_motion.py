@@ -3,14 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import statistics
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from PIL import Image, ImageChops, ImageStat
 
 
-MOTION_PLAN_SCHEMA_VERSION = "1.0.0"
-MOTION_PLAN_COMPILER_VERSION = "1.0.0"
+MOTION_PLAN_SCHEMA_VERSION = "1.1.0"
+MOTION_PLAN_COMPILER_VERSION = "1.1.0"
 MOTION_LEVELS = {"none", "low", "moderate", "high"}
 MOTION_PRIMARIES = {"subject", "environment", "camera", "quiet"}
 SCREEN_DIRECTIONS = {
@@ -125,6 +126,8 @@ def validate_motion_plan(payload: Mapping[str, Any]) -> list[str]:
                 errors.append(f"{prefix} adjacent_handoff 缺少承接标识")
             if not isinstance(handoff.get("allows_direction_change"), bool):
                 errors.append(f"{prefix} adjacent_handoff.allows_direction_change 非法")
+            if not isinstance(handoff.get("allows_state_transition"), bool):
+                errors.append(f"{prefix} adjacent_handoff.allows_state_transition 非法")
     errors.extend(adjacent_handoff_issues(shots))
     return errors
 
@@ -139,7 +142,7 @@ def adjacent_handoff_issues(shots: Sequence[Mapping[str, Any]]) -> list[str]:
             incoming = str(right.get("from_previous") or "")
             if outgoing and incoming and outgoing != incoming:
                 errors.append(f"scene {previous.get('scene')}→{current.get('scene')} adjacent_handoff 不匹配")
-            allows = bool(left.get("allows_direction_change") or right.get("allows_direction_change"))
+            allows = left.get("allows_direction_change") is True or right.get("allows_direction_change") is True
             opposite = {
                 ("left_to_right", "right_to_left"),
                 ("right_to_left", "left_to_right"),
@@ -154,7 +157,7 @@ def adjacent_handoff_issues(shots: Sequence[Mapping[str, Any]]) -> list[str]:
         if isinstance(exit_state, dict) and isinstance(entry_state, dict):
             previous_story = exit_state.get("story_state")
             current_story = entry_state.get("story_state")
-            permits = bool(right.get("allows_state_transition")) if isinstance(right, dict) else False
+            permits = right.get("allows_state_transition") is True if isinstance(right, dict) else False
             if previous_story is not None and current_story is not None and previous_story != current_story and not permits:
                 errors.append(f"scene {previous.get('scene')}→{current.get('scene')} entry/exit story_state 跳变")
     return errors
@@ -214,12 +217,38 @@ def motion_metrics(frame_paths: Sequence[Path], expected_motion: Mapping[str, An
         subject_scores.append(subject_score)
         environment_scores.append(environment_score)
         camera_scores.append(max(0.0, global_score - best))
+    component_key = {
+        "subject": "subject",
+        "environment": "environment",
+        "camera": "camera",
+    }.get(str(expected_motion.get("primary") or ""), "global")
+    component_scores = {
+        "subject": subject_scores,
+        "environment": environment_scores,
+        "camera": camera_scores,
+        "global": global_scores,
+    }[component_key]
+    level_key = f"{component_key}_level" if component_key != "global" else "subject_level"
+    level = str(expected_motion.get(level_key) or "low")
+    activation_thresholds = {"none": 0.0, "low": 0.0015, "moderate": 0.006, "high": 0.012}
+    activation_threshold = activation_thresholds.get(level, 0.0015)
+    pair_count = len(global_scores)
+    active_pair_count = sum(score >= 0.0015 for score in global_scores)
+    motion_pair_count = sum(score >= activation_threshold for score in component_scores)
     return {
         "global_motion": max(global_scores),
         "subject_motion": max(subject_scores),
         "environment_motion": max(environment_scores),
         "camera_translation_evidence": max(camera_scores),
         "pairwise_global_motion": global_scores,
+        "pairwise_subject_motion": subject_scores,
+        "pairwise_environment_motion": environment_scores,
+        "pairwise_camera_translation_evidence": camera_scores,
+        "active_pair_count": active_pair_count,
+        "motion_pair_count": motion_pair_count,
+        "motion_coverage": motion_pair_count / pair_count if pair_count else 0.0,
+        "median_global_motion": statistics.median(global_scores),
+        "median_primary_motion": statistics.median(component_scores),
         "frame_count": len(images),
     }
 
@@ -241,6 +270,20 @@ def motion_evidence_issues(metrics: Mapping[str, Any], expected: Mapping[str, An
         level = str(expected.get(level_key) or "none")
         if float(metrics.get(metric_key, 0.0)) < thresholds.get(level, 0.0):
             issues.append(f"expected_{primary}_motion_not_met")
+        pairwise_key = {
+            "subject": "pairwise_subject_motion",
+            "environment": "pairwise_environment_motion",
+            "camera": "pairwise_camera_translation_evidence",
+        }[str(primary)]
+        pairwise = metrics.get(pairwise_key)
+        if level in {"moderate", "high"}:
+            if not isinstance(pairwise, list) or not pairwise:
+                issues.append(f"expected_{primary}_motion_time_evidence_missing")
+            else:
+                required_coverage = 0.5 if level == "moderate" else 0.75
+                coverage = sum(float(value) >= thresholds[level] for value in pairwise) / len(pairwise)
+                if coverage < required_coverage:
+                    issues.append(f"expected_{primary}_motion_not_sustained")
     if primary != "quiet" and global_motion < 0.003:
         issues.append("near_static_conflicts_with_plan")
     return issues
@@ -280,6 +323,8 @@ def write_video_receipt(
         "execution_mode": execution_mode,
         "production_eligible": bool(production_eligible),
         "provider_attempt": int(str(row.get("provider_attempt") or "0")),
+        "task_id": str(row.get("task_id") or ""),
+        "client_business_id": str(row.get("client_business_id") or ""),
         "story_contract_sha256": str(row.get("story_contract_sha256") or ""),
         "story_contract_dependency_sha256": str(row.get("story_contract_dependency_sha256") or ""),
         "motion_plan_sha256": str(row.get("motion_plan_sha256") or ""),
@@ -302,10 +347,36 @@ def video_receipt_issues(row: Mapping[str, Any], video_path: Path, *, production
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return issues + ["video_receipt_invalid"]
+    if receipt.get("schema_version") != "1.0.0":
+        issues.append("video_receipt_schema_version_mismatch")
     if file_sha256(receipt_path) != str(row.get("video_receipt_sha256") or ""):
         issues.append("video_receipt_hash_mismatch")
     if not video_path.is_file() or receipt.get("video_sha256") != file_sha256(video_path):
         issues.append("video_receipt_video_hash_mismatch")
+    integer_bindings = {"scene": "scene", "provider_attempt": "provider_attempt"}
+    for receipt_key, row_key in integer_bindings.items():
+        try:
+            current = int(str(row.get(row_key) or "0"))
+        except (TypeError, ValueError):
+            issues.append(f"video_receipt_{receipt_key}_mismatch")
+            continue
+        if type(receipt.get(receipt_key)) is not int or receipt.get(receipt_key) != current:
+            issues.append(f"video_receipt_{receipt_key}_mismatch")
+    string_bindings = {
+        "target_video_filename": "target_video_filename",
+        "provider": "video_provider",
+        "model": "video_model",
+        "execution_mode": "video_execution_mode",
+        "source_kind": "video_source_kind",
+        "task_id": "task_id",
+        "client_business_id": "client_business_id",
+    }
+    for receipt_key, row_key in string_bindings.items():
+        if receipt.get(receipt_key) != str(row.get(row_key) or ""):
+            issues.append(f"video_receipt_{receipt_key}_mismatch")
+    row_eligible = str(row.get("production_eligible") or "").strip().lower() == "true"
+    if type(receipt.get("production_eligible")) is not bool or receipt.get("production_eligible") != row_eligible:
+        issues.append("video_receipt_production_eligible_mismatch")
     for key in ("story_contract_sha256", "story_contract_dependency_sha256", "motion_plan_sha256"):
         if receipt.get(key) != str(row.get(key) or ""):
             issues.append(f"video_receipt_{key}_mismatch")
@@ -358,4 +429,9 @@ def schema_python_parity() -> list[str]:
     expected = schema.get("$defs", {}).get("expected_motion", {}).get("properties", {})
     if set(expected.get("primary", {}).get("enum", [])) != MOTION_PRIMARIES:
         errors.append("expected_motion.primary")
+    handoff = shot.get("properties", {}).get("adjacent_handoff", {})
+    if "allows_state_transition" not in handoff.get("required", []):
+        errors.append("adjacent_handoff.allows_state_transition.required")
+    if handoff.get("properties", {}).get("allows_state_transition", {}).get("type") != "boolean":
+        errors.append("adjacent_handoff.allows_state_transition.type")
     return errors

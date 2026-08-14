@@ -5,8 +5,8 @@
   "additionalProperties": false,
   "required": ["schema_version", "compiler_version", "contract_schema_version", "story_contract_sha256", "story_contract_dependency_sha256", "contract_projection_sha256", "storyboard_sha256", "shots"],
   "properties": {
-    "schema_version": {"const": "1.0.0"},
-    "compiler_version": {"const": "1.0.0"},
+    "schema_version": {"const": "1.1.0"},
+    "compiler_version": {"const": "1.1.0"},
     "contract_schema_version": {"type": "string", "minLength": 1},
     "story_contract_sha256": {"type": "string", "minLength": 1},
     "story_contract_dependency_sha256": {"type": "string", "minLength": 1},
@@ -38,7 +38,7 @@
         "entry_state": {"type": "object"},
         "exit_state": {"type": "object"},
         "screen_direction": {"enum": ["left_to_right", "right_to_left", "toward_camera", "away_from_camera", "stationary", "mixed"]},
-        "adjacent_handoff": {"type": "object", "required": ["from_previous", "to_next", "allows_direction_change"], "properties": {"from_previous": {"type": "string"}, "to_next": {"type": "string"}, "allows_direction_change": {"type": "boolean"}}, "additionalProperties": true},
+        "adjacent_handoff": {"type": "object", "required": ["from_previous", "to_next", "allows_direction_change", "allows_state_transition"], "properties": {"from_previous": {"type": "string"}, "to_next": {"type": "string"}, "allows_direction_change": {"type": "boolean"}, "allows_state_transition": {"type": "boolean"}}, "additionalProperties": true},
         "expected_motion": {"$ref": "#/$defs/expected_motion"},
         "continuity": {"type": "object"}
       }

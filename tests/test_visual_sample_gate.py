@@ -375,7 +375,7 @@ class VisualSampleGateTests(unittest.TestCase):
                 "entry_state": {"protagonist_condition": "state_initial"},
                 "exit_state": {"protagonist_condition": "state_initial"},
                 "screen_direction": "left_to_right",
-                "adjacent_handoff": {"from_previous": "", "to_next": "", "allows_direction_change": False},
+                "adjacent_handoff": {"from_previous": "", "to_next": "", "allows_direction_change": False, "allows_state_transition": False},
                 "expected_motion": {
                     "primary": "subject", "subject_level": "moderate",
                     "environment_level": "low", "camera_level": "low",

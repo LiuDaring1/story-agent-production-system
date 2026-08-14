@@ -118,6 +118,8 @@ class VideoMotionQualityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             metrics = motion_metrics(self.frame_set(Path(directory), paint), plan)
         self.assertEqual(motion_evidence_issues(metrics, plan), [])
+        self.assertGreaterEqual(metrics["motion_coverage"], 0.5)
+        self.assertGreaterEqual(metrics["motion_pair_count"], 2)
 
     def test_environment_motion_can_satisfy_plan_with_still_subject(self) -> None:
         def paint(image: Image.Image, index: int) -> None:
@@ -135,6 +137,8 @@ class VideoMotionQualityTests(unittest.TestCase):
             "subject_motion": 0.001,
             "environment_motion": 0.01,
             "camera_translation_evidence": 0.01,
+            "pairwise_global_motion": [0.02, 0.02, 0.02, 0.02],
+            "pairwise_camera_translation_evidence": [0.01, 0.01, 0.01, 0.01],
         }
         plan = expected("camera", "none", "low", "moderate")
         self.assertEqual(motion_evidence_issues(metrics, plan), [])
@@ -146,6 +150,18 @@ class VideoMotionQualityTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             metrics = motion_metrics(self.frame_set(Path(directory), paint), plan)
         self.assertEqual(motion_evidence_issues(metrics, plan), [])
+
+    def test_single_jump_cannot_satisfy_sustained_moderate_subject_motion(self) -> None:
+        metrics = {
+            "global_motion": 0.04,
+            "subject_motion": 0.05,
+            "environment_motion": 0.01,
+            "camera_translation_evidence": 0.0,
+            "pairwise_global_motion": [0.0, 0.0, 0.0, 0.04],
+            "pairwise_subject_motion": [0.0, 0.0, 0.0, 0.05],
+        }
+        plan = expected("subject", "moderate", "none", "none")
+        self.assertIn("expected_subject_motion_not_sustained", motion_evidence_issues(metrics, plan))
 
     def test_large_motion_does_not_override_story_state_failure(self) -> None:
         payload = {"per_scene_reviews": [{"scene": 1, "story_state_consistent": False, "adjacent_handoff_consistent": True}]}
@@ -166,6 +182,16 @@ class VideoMotionQualityTests(unittest.TestCase):
         plan["shots"][1]["entry_state"] = {"story_state": {"state_machine": "state_2"}}
         self.assertIn("story_state 跳变", "；".join(adjacent_handoff_issues(plan["shots"])))
 
+    def test_state_transition_permission_is_a_strict_boolean(self) -> None:
+        payload = storyboard()
+        for invalid in ("false", 1, None):
+            payload["shots"][1]["adjacent_handoff"]["allows_state_transition"] = invalid
+            with self.assertRaisesRegex(ValueError, "allows_state_transition"):
+                compile_motion_plan(payload)
+        payload["shots"][1]["adjacent_handoff"]["allows_state_transition"] = True
+        payload["shots"][1]["entry_state"] = {"story_state": {"state_machine": "state_2"}}
+        self.assertEqual(adjacent_handoff_issues(compile_motion_plan(payload)["shots"]), [])
+
     def test_mock_is_allowed_for_test_but_blocked_for_production(self) -> None:
         row = {"video_source_kind": "mock_provider", "production_eligible": "false"}
         self.assertEqual(formal_source_issues(row, production_mode=False), [])
@@ -180,6 +206,7 @@ class VideoMotionQualityTests(unittest.TestCase):
             video.write_bytes(b"provider-video")
             row = {
                 "scene": "1", "target_video_filename": "01.mp4", "provider_attempt": "0",
+                "task_id": "task-current", "client_business_id": "business-current",
                 "story_contract_sha256": "a" * 64,
                 "story_contract_dependency_sha256": "b" * 64,
                 "motion_plan_sha256": "c" * 64,
@@ -190,11 +217,54 @@ class VideoMotionQualityTests(unittest.TestCase):
             )
             row.update({
                 "video_source_kind": "provider_generated", "production_eligible": "true",
+                "video_provider": "provider", "video_model": "model",
+                "video_execution_mode": "production",
                 "video_receipt_path": str(receipt), "video_receipt_sha256": receipt_sha,
             })
             self.assertEqual(video_receipt_issues(row, video, production_mode=True), [])
             row["video_source_kind"] = "static_fallback"
             self.assertTrue(video_receipt_issues(row, video, production_mode=True))
+
+    def test_receipt_rejects_attempt_and_provider_identity_tampering(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = root / "jobs.csv"
+            jobs.write_text("scene,target_video_filename\n1,01.mp4\n", encoding="utf-8")
+            video = root / "01.mp4"
+            video.write_bytes(b"provider-video")
+            row = {
+                "scene": "1", "target_video_filename": "01.mp4", "provider_attempt": "2",
+                "task_id": "task-current", "client_business_id": "business-current",
+                "story_contract_sha256": "a" * 64,
+                "story_contract_dependency_sha256": "b" * 64,
+                "motion_plan_sha256": "c" * 64,
+            }
+            receipt, receipt_sha = write_video_receipt(
+                jobs, row, video, provider="provider", model="model",
+                source_kind="provider_generated", execution_mode="production", production_eligible=True,
+            )
+            row.update({
+                "video_source_kind": "provider_generated", "production_eligible": "true",
+                "video_provider": "provider", "video_model": "model", "video_execution_mode": "production",
+                "video_receipt_path": str(receipt), "video_receipt_sha256": receipt_sha,
+            })
+            self.assertEqual(video_receipt_issues(row, video, production_mode=True), [])
+            for field, value, expected_issue in (
+                ("provider_attempt", "3", "video_receipt_provider_attempt_mismatch"),
+                ("video_provider", "other", "video_receipt_provider_mismatch"),
+                ("video_model", "other", "video_receipt_model_mismatch"),
+                ("video_execution_mode", "test", "video_receipt_execution_mode_mismatch"),
+                ("task_id", "task-other", "video_receipt_task_id_mismatch"),
+                ("client_business_id", "business-other", "video_receipt_client_business_id_mismatch"),
+                ("scene", "2", "video_receipt_scene_mismatch"),
+                ("target_video_filename", "02.mp4", "video_receipt_target_video_filename_mismatch"),
+            ):
+                original = row[field]
+                row[field] = value
+                self.assertIn(expected_issue, video_receipt_issues(row, video, production_mode=True))
+                row[field] = original
+            video.write_bytes(b"tampered-video")
+            self.assertIn("video_receipt_video_hash_mismatch", video_receipt_issues(row, video, production_mode=True))
 
     def test_real_static_video_fixture_writes_only_its_scene_to_retry_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

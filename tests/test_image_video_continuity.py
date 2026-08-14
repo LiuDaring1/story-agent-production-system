@@ -54,7 +54,7 @@ class ImageVideoContinuityTests(unittest.TestCase):
             "entry_state": {"story_state": {"state_machine": state}},
             "exit_state": {"story_state": {"state_machine": state}},
             "screen_direction": "left_to_right",
-            "adjacent_handoff": {"from_previous": "", "to_next": "", "allows_direction_change": False},
+            "adjacent_handoff": {"from_previous": "", "to_next": "", "allows_direction_change": False, "allows_state_transition": False},
             "expected_motion": {
                 "primary": "subject", "subject_level": "moderate",
                 "environment_level": "low", "camera_level": "low", "rationale": "story action",

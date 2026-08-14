@@ -309,6 +309,8 @@ def main() -> None:
             print(f"批量创建任务 {row['scene']}：{row['image_filename']}", flush=True)
             try:
                 request_extra = row_extra_body(args.jobs_csv, row, extra_body, model=args.model) if is_toapis else extra_body
+                if is_toapis and isinstance(request_extra, dict):
+                    row["client_business_id"] = str(request_extra.get("client_business_id") or "")
                 if contract_bound:
                     assert_request_contract_binding(project_dir, "image_video", row)
                 created = client.create_task(
@@ -424,6 +426,8 @@ def main() -> None:
                     print(f"创建任务 {row['scene']}：{row['image_filename']}", flush=True)
                     assert client is not None
                     request_extra = row_extra_body(args.jobs_csv, row, extra_body, model=args.model) if is_toapis else extra_body
+                    if is_toapis and isinstance(request_extra, dict):
+                        row["client_business_id"] = str(request_extra.get("client_business_id") or "")
                     if contract_bound:
                         assert_request_contract_binding(project_dir, "image_video", row)
                     created = client.create_task(

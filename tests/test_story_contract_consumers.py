@@ -18,10 +18,13 @@ from story_agent_runtime import file_sha256
 from story_contract_consumers import (
     BINDING_FIELDS,
     compile_cover_spec,
+    compile_demo_render_spec,
     compile_product_content_spec,
     compile_release_render_spec,
+    demo_logo_arguments,
     semantic_line_indices,
 )
+from demo_quality import load_demo_brand_spec
 from story_contract_runtime import contract_consumer_path, write_contract_consumer_context
 from story_project import apply_fixed_cover_branding, project_paths
 from tests.test_publish_qa import make_publish_fixture
@@ -44,6 +47,41 @@ def _context(path: Path, consumer: str, projection: dict) -> dict:
 
 
 class StoryContractConsumerTests(unittest.TestCase):
+    def test_demo_spec_uses_one_reviewed_official_logo_and_layout_region(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            logo = root / "official.png"
+            Image.new("RGBA", (300, 100), (250, 180, 30, 255)).save(logo)
+            projection = {
+                "brand": {"assets": [{
+                    "asset_id": "official", "sha256": file_sha256(logo),
+                    "allowed_uses": ["demo", "release_video"], "max_per_frame": 1,
+                }], "rules": []},
+                "release_layout": {"rules": [], "variants": [{
+                    "variant_id": "main", "aspect_ratio": "16:9", "regions": [{
+                        "role": "logo", "x": .02, "y": .03, "width": .12, "height": .08,
+                    }],
+                }]},
+            }
+            context = root / "release.json"
+            _context(context, "release_video", projection)
+            spec_path = compile_demo_render_spec(context, root / "demo.compiled.json", official_logo_path=logo)
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            arguments = demo_logo_arguments(spec, 1920, 1080)
+            self.assertEqual(spec["official_logo_count"], 1)
+            self.assertEqual(arguments["logo_sha256"], file_sha256(logo))
+            self.assertEqual((arguments["logo_x"], arguments["logo_y"]), (38, 32))
+            loaded, loaded_arguments = load_demo_brand_spec(spec_path)
+            self.assertEqual(loaded["contract_projection_sha256"], spec["contract_projection_sha256"])
+            self.assertEqual(loaded_arguments["logo_sha256"], file_sha256(logo))
+            context.write_bytes(context.read_bytes() + b" ")
+            with self.assertRaisesRegex(ValueError, "source contract context is stale"):
+                load_demo_brand_spec(spec_path)
+            other = root / "historical.png"
+            Image.new("RGBA", (300, 100), (0, 0, 0, 255)).save(other)
+            with self.assertRaisesRegex(ValueError, "official asset"):
+                compile_demo_render_spec(context, root / "bad.json", official_logo_path=other)
+
     def test_storyboard_handoff_carries_five_sections_and_plan_is_projection_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, manifest = _new_project(Path(directory))

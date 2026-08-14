@@ -66,6 +66,8 @@ from video_motion import (
     review_semantic_issues,
     video_receipt_issues,
 )
+from keying_quality import keying_preset_lock_issues, lock_keying_preset, refresh_keying_quality_from_preset
+from demo_quality import demo_render_manifest_issues
 
 from story_codex_tasks import (
     build_children_story_handoff,
@@ -2461,6 +2463,11 @@ class StoryAgent:
         return result
 
     def _stage_release_preview(self, manifest: dict[str, Any]) -> StageResult:
+        preset = self.context.paths.release / "keying" / "keying_preset.json"
+        try:
+            refresh_keying_quality_from_preset(preset)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            return StageResult("blocked", f"无法为当前抠像 candidate 生成分区机器证据：{exc}", preset)
         command = ["preview-release-project", "--project-dir", str(self.context.project_dir)]
         if not self._legacy_contract_policy(manifest):
             command.extend([
@@ -2473,15 +2480,22 @@ class StoryAgent:
         preview_dir = self.context.paths.status / "release_preview_frames"
         handoff = preview_dir / "release_preview_feedback_to_codex.md"
         images = self._release_preview_images()
-        preset = self.context.paths.release / "keying" / "keying_preset.json"
         keying_search = self.context.paths.release / "keying" / "keying_search.json"
         keying_candidates = self.context.paths.release / "keying" / "keying_candidates.jpg"
+        keying_machine_qa = self.context.paths.release / "keying" / "keying_machine_qa.json"
+        keying_evidence = self.context.paths.release / "keying" / "evidence"
         if keying_candidates.exists():
             images = [keying_candidates, *images]
+        try:
+            qa_payload = json.loads(keying_machine_qa.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return StageResult("blocked", "抠像机器 QA 缺失或损坏，禁止独立审核。", keying_machine_qa)
+        if qa_payload.get("passed") is not True or qa_payload.get("critical_errors"):
+            return StageResult("blocked", f"抠像机器 QA 未通过：{keying_machine_qa}", keying_machine_qa)
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "release_preview_bundle.json",
             [
-                preset, keying_search, keying_candidates, preview_dir,
+                preset, keying_search, keying_candidates, keying_machine_qa, keying_evidence, preview_dir,
                 *(path for path in [contract_consumer_path(self.context.project_dir, "release_video")] if path.exists()),
             ],
         )
@@ -2491,14 +2505,28 @@ class StoryAgent:
             bundle=bundle,
             images=images,
             rubric=(
-                "先比较 keying_candidates.jpg 中站立帧与大手势帧的 3×3 参数候选，再检查主账号和宝库号预览中的"
-                "抠像边缘、头发和手部、绿色溢出、透明孔洞、人物比例与位置、故事框覆盖、"
+                "先比较 keying_candidates.jpg 中站立帧与大手势帧的 3×3 参数候选，并逐项引用 evidence 下的"
+                "head_hair、左右 shoulder_forearm_hand、garment_outline、适用时的 hem/legs、full_body 和 high_contrast_edges 证据。"
+                "检查发丝自然度、肩膀/手臂/手部边缘、衣服与下摆完整性、绿色溢出、灰黑/亮色 halo、锯齿、透明孔洞、背景透漏，"
+                "以及人物是否像贴纸、人物与背景光感是否割裂。再检查主账号和宝库号预览中的人物比例与位置、故事框覆盖、"
                 "字幕安全区以及 A（人物+故事框）、B（故事框）、C（人物+主题背景）三种构图。人物必须保留拍摄原构图和原始大小，禁止因自动检测框被缩小或切手。"
-                "同时检查 LUT 是否只应用一次、肤色是否自然、画面是否灰暗或过饱和。抠像截断、人物被框遮挡、框体露缝属于关键错误。"
+                "同时检查 LUT 是否只应用一次、肤色是否自然、画面是否灰暗或过饱和，以及模糊背景是否有人眼可见的矩形拼接块。"
+                "抠像截断、主体内部误透明、明显 spill/halo、人物被框遮挡、框体露缝、明显矩形背景块均属于 P0/Critical，不能被总分抵消。"
                 "失败时在 retry_instructions 中明确给出候选 id 或可执行的 keying_preset 参数修订建议。"
             ),
         )
         if result.status == "done":
+            review_path = self.context.paths.status / "reviews" / "release_preview_review.json"
+            try:
+                lock_keying_preset(
+                    preset,
+                    machine_qa_path=keying_machine_qa,
+                    evidence_manifest_path=Path(str(qa_payload["evidence_manifest"])),
+                    review_bundle_path=bundle,
+                    review_path=review_path,
+                )
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+                return StageResult("blocked", f"独立审核虽通过，但抠像 preset 无法确定性锁定：{exc}", review_path)
             return result
         if payload and preset.exists() and self._can_retry_stage("release_preview", critical=True):
             previous_sha = file_sha256(preset)
@@ -2532,6 +2560,11 @@ class StoryAgent:
     def _stage_package_release(self, manifest: dict[str, Any]) -> StageResult:
         if not self._consumer_request_current(manifest, "release_video"):
             return StageResult("blocked", "release_video 合同请求清单已失效，拒绝渲染发布视频。")
+        if not self._legacy_contract_policy(manifest):
+            preset = self.context.paths.release / "keying" / "keying_preset.json"
+            issues = keying_preset_lock_issues(preset)
+            if issues:
+                return StageResult("blocked", "抠像审核锁无效，拒绝渲染全片：" + "；".join(issues), preset)
         command = ["package-release-project", "--project-dir", str(self.context.project_dir)]
         if not self._legacy_contract_policy(manifest):
             command.extend([
@@ -4249,7 +4282,11 @@ class StoryAgent:
         return self._consumer_request_current(manifest, "release_video") and all((theme / name).exists() for name in ("main_release_plate.png", "library_release_plate.png", "main_background_16x9.png", "story_frame_a.png")) and (self.context.paths.release / "keying" / "keying_preset.json").exists()
 
     def _has_release_preview(self, manifest: dict[str, Any]) -> bool:
-        return self._review_stage_current("release_preview")
+        if not self._review_stage_current("release_preview"):
+            return False
+        if self._legacy_contract_policy(manifest):
+            return True
+        return not keying_preset_lock_issues(self.context.paths.release / "keying" / "keying_preset.json")
 
     def _has_release_videos(self, manifest: dict[str, Any]) -> bool:
         return self._consumer_output_current(manifest, "release_video") and (self.context.paths.release / "主账号发布视频.mp4").exists() and (self.context.paths.release / "宝库号发布视频.mp4").exists()
@@ -4278,11 +4315,14 @@ class StoryAgent:
 
     def _has_product_preflight(self, manifest: dict[str, Any]) -> bool:
         work = self.context.paths.status / "product_package_work"
-        return (
+        current = (
             self._consumer_request_current(manifest, "product_package")
             and (work / "第16步资料包_Codex前置审查.md").exists()
             and self._artifact_semantic_receipt_current(manifest, work / "artifact_semantic_plan_product_manifest.json")
         )
+        if not current or self._legacy_contract_policy(manifest):
+            return current
+        return not demo_render_manifest_issues(work / "demo_preview_manifest.json", self.context.project_dir)
 
     def _has_product_annotation(self, manifest: dict[str, Any]) -> bool:
         return (
@@ -4298,7 +4338,7 @@ class StoryAgent:
 
     def _has_product_package(self, manifest: dict[str, Any]) -> bool:
         outputs = manifest.get("outputs", {})
-        return (
+        current = (
             self._consumer_output_current(manifest, "product_package")
             and first_existing(outputs.get("product_base")) is not None
             and first_existing(outputs.get("product_advanced")) is not None
@@ -4306,6 +4346,12 @@ class StoryAgent:
                 manifest,
                 self.context.paths.status / "product_package_work" / "artifact_semantic_plan_product_manifest.json",
             )
+        )
+        if not current or self._legacy_contract_policy(manifest):
+            return current
+        return not demo_render_manifest_issues(
+            self.context.paths.status / "product_package_work" / "demo_render_manifest.json",
+            self.context.project_dir,
         )
 
     def _artifact_semantic_receipt_current(self, manifest: dict[str, Any], receipt: Path) -> bool:

@@ -26,6 +26,7 @@ from video_motion import (
     motion_metrics,
     video_receipt_issues,
 )
+from keying_quality import write_evidence_assets
 
 
 ROOT = Path(__file__).resolve().parent
@@ -1665,6 +1666,17 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
     # Keep a separately named evidence artefact for downstream QA/review.  The
     # candidate renderer itself includes full-resolution and local-zoom panels.
     shutil.copy2(candidate_sheet, candidate_detail_sheet)
+    evidence_dir = output_dir / "evidence" / str(recommended["id"])
+    selected_candidate_file, machine_qa_path, _evidence = write_evidence_assets(
+        standing_frame,
+        gesture_frame,
+        chroma_color=color,
+        similarity=float(recommended["similarity"]),
+        blend=float(recommended["blend"]),
+        output_dir=evidence_dir,
+        candidate_id=str(recommended["id"]),
+        machine_qa_path=output_dir / "keying_machine_qa.json",
+    )
     search_path = output_dir / "keying_search.json"
     save_json(
         search_path,
@@ -1680,6 +1692,10 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
             "recommended_candidate": recommended["id"],
             "candidate_sheet": str(candidate_sheet),
             "candidate_detail_sheet": str(candidate_detail_sheet),
+            "selected_candidate_file": str(selected_candidate_file),
+            "selected_candidate_sha256": sha256_file(selected_candidate_file),
+            "machine_qa": str(machine_qa_path),
+            "evidence_manifest": str(evidence_dir / "evidence_manifest.json"),
             "detected_person_bbox": person_crop,
             "selection_policy": "背景绿幕波动决定候选中心 similarity；默认保守中心候选（blend=0.04），其余候选只供独立视觉审核比较。人物框不改变示范/C镜原始大小和位置，只用于清除表演安全区外的暗绿幕残边，并为A镜人物版式提供安全裁切。站立与大手势双帧由独立视觉审核最终确认。",
             "visual_review_required": True,
@@ -1689,6 +1705,7 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
     # Default for current horizontal 16:9 green-screen shoots: presenter centered
     # in the source, full body visible, then placed in the right-side open area.
     preset = {
+        "preset_version": "story-keying-preset/v2",
         "keyer": "colorkey",
         "chroma_color": color,
         "chroma_similarity": recommended["similarity"],
@@ -1710,6 +1727,9 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
         "keying_candidate": recommended["id"],
         "visual_review_required": True,
         "visual_review_status": "pending",
+        "machine_qa": str(machine_qa_path),
+        "evidence_manifest": str(evidence_dir / "evidence_manifest.json"),
+        "selected_candidate_file": str(selected_candidate_file),
     }
     preset_path = output_dir / "keying_preset.json"
     save_json(preset_path, preset)
@@ -1720,6 +1740,8 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
     manifest["qa"]["keying_candidates"] = str(candidate_sheet)
     manifest["qa"]["keying_candidate_detail"] = str(candidate_detail_sheet)
     manifest["qa"]["keying_search"] = str(search_path)
+    manifest["qa"]["keying_machine_qa"] = str(machine_qa_path)
+    manifest["qa"]["keying_evidence"] = str(evidence_dir / "evidence_manifest.json")
     write_manifest(paths, manifest)
     return preset_path
 

@@ -32,6 +32,8 @@ from pptx.util import Emu, Pt as PptPt
 from story_video_synthesizer.align import LineTiming, align_evenly, read_script_lines
 from story_contract_consumers import BINDING_FIELDS, semantic_line_indices, write_json_atomic
 from artifact_semantic_plan import load_current_artifact_semantic_plan, plan_binding, selected_line_indices
+from demo_quality import load_demo_brand_spec, write_demo_render_manifest
+from keying_quality import blurred_background_issues, file_sha256, keying_preset_lock_issues
 from story_video_synthesizer.image_video import sorted_image_files
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
 from story_video_synthesizer.subtitles import write_srt
@@ -103,6 +105,7 @@ def main() -> None:
     parser.add_argument("--demo-logo-width", default=150, type=int)
     parser.add_argument("--demo-logo-x", default=24, type=int)
     parser.add_argument("--demo-logo-y", default=20, type=int)
+    parser.add_argument("--demo-brand-spec", type=Path, help="审核合同编译出的 Demo 官方 Logo 与布局规格")
     parser.add_argument("--annotation-docx", type=Path, help="人工/模型精修后的朗读标注文档；传入后直接使用，不走自动草稿")
     parser.add_argument("--annotation-json", type=Path, help="按 story-performance-script.skill 精修后的朗读标注 JSON")
     parser.add_argument("--annotation-skill-path", default=Path.home() / "Downloads" / "story-performance-script.skill", type=Path)
@@ -155,6 +158,7 @@ def build_product_package(args: argparse.Namespace) -> None:
     bg_no_sub = args.bg_video_no_sub.expanduser()
     person_path = args.person_greenscreen.expanduser()
     demo_logo = args.demo_logo.expanduser() if args.demo_logo else None
+    demo_brand_spec_path = args.demo_brand_spec.expanduser() if args.demo_brand_spec else None
     annotation_skill_path = args.annotation_skill_path.expanduser()
     output_root = args.output_root.expanduser()
     work_dir = (
@@ -202,6 +206,17 @@ def build_product_package(args: argparse.Namespace) -> None:
         if args.project_dir is None:
             raise ValueError("--artifact-semantic-plan requires --project-dir")
         semantic_plan = load_current_artifact_semantic_plan(args.project_dir)
+    demo_brand_spec: dict[str, Any] | None = None
+    if semantic_plan is not None:
+        if demo_brand_spec_path is None or demo_logo is None:
+            raise ValueError("required_v1 Demo 必须提供审核合同编译出的 --demo-brand-spec 和唯一官方 --demo-logo")
+        demo_brand_spec, logo_args = load_demo_brand_spec(demo_brand_spec_path)
+        if demo_logo.resolve() != Path(logo_args["logo_path"]).resolve():
+            raise ValueError("Demo Logo 与审核合同编译规格不一致")
+        if (args.demo_logo_width, args.demo_logo_x, args.demo_logo_y) != (
+            logo_args["logo_width"], logo_args["logo_x"], logo_args["logo_y"]
+        ):
+            raise ValueError("Demo Logo 的确定性坐标/宽度与审核布局规格不一致")
     semantic_plan_selections = (
         artifact_semantic_product_selections(script_lines, semantic_plan)
         if semantic_plan is not None else None
@@ -295,7 +310,13 @@ def build_product_package(args: argparse.Namespace) -> None:
         print("确认后重新运行，并传入 --keying-preset-json。")
         return
 
-    preset = load_keying_preset(args.keying_preset_json.expanduser())
+    preset_path = args.keying_preset_json.expanduser()
+    if semantic_plan is not None:
+        lock_issues = keying_preset_lock_issues(preset_path)
+        if lock_issues:
+            raise RuntimeError("抠像 preset 未绑定当前机器 QA 与独立审核，拒绝渲染 Demo：" + "；".join(lock_issues))
+    preset = load_keying_preset(preset_path)
+    source_greenscreen_sha256 = file_sha256(person_path)
     if demo_background is None:
         render_background_candidate_sheet(images, work_dir / "demo_background_candidates.jpg")
         raise RuntimeError(
@@ -339,6 +360,20 @@ def build_product_package(args: argparse.Namespace) -> None:
             crop_mode=args.demo_person_crop_mode,
             vertical_align=args.demo_person_vertical_align,
         )
+        if semantic_plan is not None and demo_brand_spec is not None and demo_brand_spec_path is not None:
+            if file_sha256(person_path) != source_greenscreen_sha256:
+                raise RuntimeError("原始绿幕素材在 Demo 预览过程中发生变化，已停止")
+            write_demo_render_manifest(
+                work_dir / "demo_preview_manifest.json",
+                project_dir=args.project_dir,
+                semantic_plan=semantic_plan,
+                demo_brand_spec_path=demo_brand_spec_path,
+                demo_brand_spec=demo_brand_spec,
+                keying_preset_path=preset_path,
+                source_greenscreen=person_path,
+                output_artifacts=[*preview_paths, preview_dir / "demo_background_machine_qa.json"],
+                preview=True,
+            )
         print(f"已生成第 16 步前置审查材料：{handoff}")
         print(f"示范视频预览帧目录：{preview_dir}")
         print(f"朗读标注精修请求：{request_path}")
@@ -417,6 +452,20 @@ def build_product_package(args: argparse.Namespace) -> None:
         logo_y=max(0, args.demo_logo_y),
         background_brightness=background_brightness,
     )
+    if file_sha256(person_path) != source_greenscreen_sha256:
+        raise RuntimeError("原始绿幕素材在 Demo 渲染过程中发生变化，已停止")
+    if semantic_plan is not None and demo_brand_spec is not None and demo_brand_spec_path is not None:
+        write_demo_render_manifest(
+            work_dir / "demo_render_manifest.json",
+            project_dir=args.project_dir,
+            semantic_plan=semantic_plan,
+            demo_brand_spec_path=demo_brand_spec_path,
+            demo_brand_spec=demo_brand_spec,
+            keying_preset_path=preset_path,
+            source_greenscreen=person_path,
+            output_artifacts=[demo_video, demo_video.parent / "_demo_work" / "demo_background_machine_qa.json"],
+            preview=False,
+        )
     if story_frame_a is not None:
         render_a_only_background_video(
             bg_video=bg_no_sub,
@@ -997,6 +1046,7 @@ def render_demo_video(
     ensure_dir(work_dir)
     background = work_dir / "demo_background.png"
     make_blurred_background(background_image, background, width, height, brightness=background_brightness)
+    validate_demo_blurred_background(background)
     subtitle_overlay = work_dir / "demo_subtitle_overlay.mov"
     render_subtitle_overlay(subtitles, subtitle_overlay, duration, width, height)
 
@@ -1096,6 +1146,7 @@ def render_demo_preview_frames(
     duration = probe_duration(person_video)
     background = output_dir / "demo_background.png"
     make_blurred_background(background_image, background, width, height, brightness=background_brightness)
+    validate_demo_blurred_background(background)
     subtitle_overlay = output_dir / "demo_subtitle_overlay.mov"
     render_subtitle_overlay(subtitles, subtitle_overlay, duration, width, height)
     output_paths: list[Path] = []
@@ -1443,6 +1494,26 @@ def make_blurred_background(
         image = ImageEnhance.Contrast(image).enhance(max(0.0, float(contrast)))
     output.parent.mkdir(parents=True, exist_ok=True)
     image.save(output)
+
+
+def validate_demo_blurred_background(path: Path) -> Path:
+    with Image.open(path) as image:
+        issues = blurred_background_issues(image)
+    report = path.with_name("demo_background_machine_qa.json")
+    write_json_atomic(
+        report,
+        {
+            "version": 1,
+            "background_path": str(path),
+            "background_sha256": file_sha256(path),
+            "passed": not issues,
+            "critical_errors": issues,
+            "review_note": "机器检测仅阻断明显低频矩形拼接/亮度色块；最终融合感仍由独立视觉审核判断。",
+        },
+    )
+    if issues:
+        raise RuntimeError("Demo 模糊背景存在明显矩形拼接异常：" + "；".join(issues))
+    return report
 
 
 def make_neutral_background(output: Path, width: int, height: int) -> None:

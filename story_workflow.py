@@ -21,6 +21,8 @@ from story_video_synthesizer.image_video import (
 from video_provider_adapter import resolve_video_provider
 from story_semantics import SemanticKind, classify_story
 from story_contract_consumers import (
+    compile_demo_render_spec,
+    demo_logo_arguments,
     compile_release_render_spec,
     release_argument_overrides,
 )
@@ -1142,6 +1144,13 @@ def run_package_release_project(
             raise RuntimeError("全片渲染前必须完成独立发布预览审核") from exc
         if not review_bundle_is_current(preview_bundle) or not review_passes(review_payload, artifact=preview_bundle):
             raise RuntimeError("发布预览审核未通过，或审核后的択像/布局产物已变更，拒绝渲染全片")
+        if story_contract_context is not None:
+            from keying_quality import keying_preset_lock_issues
+
+            preset_path = paths.release / "keying" / "keying_preset.json"
+            lock_issues = keying_preset_lock_issues(preset_path)
+            if lock_issues:
+                raise RuntimeError("抠像 preset 未绑定当前机器 QA 与独立审核，拒绝渲染全片：" + "；".join(lock_issues))
     config = load_config()
     story = manifest["story"]
     outputs = manifest["outputs"]
@@ -1869,7 +1878,7 @@ def run_product_package_project(
     brand_assets = config.get("brand_assets", {})
     demo_logo = first_existing(brand_assets.get("story_logo"), brand_assets.get("logo"))
     product_defaults = config.get("product_defaults", {})
-    if not bool(product_defaults.get("include_demo_logo", False)):
+    if story_contract_context is None and not bool(product_defaults.get("include_demo_logo", False)):
         demo_logo = None
     release_defaults = config.get("release_defaults", {})
     missing = []
@@ -1945,10 +1954,27 @@ def run_product_package_project(
             "--project-dir", paths.root,
             "--artifact-semantic-plan", semantic_plan_path(paths.root),
         ])
+        if demo_logo is None:
+            raise RuntimeError("required_v1 Demo 必须配置与合同品牌资产哈希一致的官方 Logo")
+        release_context = paths.status / "contracts" / "consumers" / "release_video.json"
+        demo_brand_spec_path = compile_demo_render_spec(
+            release_context,
+            paths.status / "contracts" / "consumers" / "demo.compiled.json",
+            official_logo_path=demo_logo,
+        )
+        demo_brand_spec = json.loads(demo_brand_spec_path.read_text(encoding="utf-8"))
+        logo_args = demo_logo_arguments(demo_brand_spec, 1920, 1080)
+        command.extend([
+            "--demo-brand-spec", demo_brand_spec_path,
+            "--demo-logo", logo_args["logo_path"],
+            "--demo-logo-width", str(logo_args["logo_width"]),
+            "--demo-logo-x", str(logo_args["logo_x"]),
+            "--demo-logo-y", str(logo_args["logo_y"]),
+        ])
     annotation_skill_path = (
         annotation_skill_path_from_config()
     )
-    if demo_logo is not None:
+    if demo_logo is not None and story_contract_context is None:
         command.extend(["--demo-logo", demo_logo])
     if preview_only:
         command.append("--preview-only")

@@ -95,6 +95,84 @@ def compile_release_render_spec(context_path: Path | str, output_path: Path | st
     return write_json_atomic(output_path, payload)
 
 
+def compile_demo_render_spec(
+    context_path: Path | str,
+    output_path: Path | str,
+    *,
+    official_logo_path: Path | str,
+) -> Path:
+    """Compile the minimal deterministic brand/layout input used by Demo.
+
+    The logo is never inferred from a prior project: its bytes must match an
+    official asset in the reviewed brand projection, and the reviewed layout
+    must provide one logo region for a 16:9/main variant.
+    """
+    context = load_consumer_context(context_path, "release_video")
+    projection = context["contract_projection"]
+    brand = projection.get("brand", {})
+    layout = projection.get("release_layout", {})
+    logo_path = Path(official_logo_path).expanduser().resolve()
+    if not logo_path.is_file():
+        raise ValueError(f"Demo official logo missing: {logo_path}")
+    logo_sha = hashlib.sha256(logo_path.read_bytes()).hexdigest()
+    permitted = [
+        item for item in brand.get("assets", [])
+        if isinstance(item, Mapping)
+        and logo_sha == item.get("sha256")
+        and ({"release_video", "demo", "product_package"} & set(item.get("allowed_uses", [])))
+    ]
+    if len(permitted) != 1 or int(permitted[0].get("max_per_frame", 1)) != 1:
+        raise ValueError("Demo logo must match exactly one reviewed official asset with max_per_frame=1")
+    variants = [item for item in layout.get("variants", []) if isinstance(item, Mapping)]
+    selected = next(
+        (item for item in variants if str(item.get("aspect_ratio")) == "16:9" or "main" in str(item.get("variant_id", ""))),
+        None,
+    )
+    if selected is None:
+        raise ValueError("Demo requires a reviewed 16:9/main release_layout variant")
+    logo_regions = [
+        item for item in selected.get("regions", [])
+        if isinstance(item, Mapping) and str(item.get("role")) in {"logo", "brand_logo"}
+    ]
+    if len(logo_regions) != 1:
+        raise ValueError("Demo release_layout must contain exactly one logo region")
+    logo_region = dict(logo_regions[0])
+    payload = {
+        "version": 1,
+        "consumer": "demo",
+        "source_contract_context_path": str(Path(context_path).expanduser().resolve()),
+        "source_contract_context_sha256": hashlib.sha256(Path(context_path).read_bytes()).hexdigest(),
+        **binding(context),
+        "contract_projection_sha256": projection_sha256(context),
+        "official_logo_path": str(logo_path),
+        "official_logo_sha256": logo_sha,
+        "official_logo_count": 1,
+        "official_asset": dict(permitted[0]),
+        "logo_region": logo_region,
+        "brand_rules": brand.get("rules", []),
+        "layout_rules": layout.get("rules", []),
+        "variant_id": selected.get("variant_id"),
+        "aspect_ratio": selected.get("aspect_ratio"),
+    }
+    return write_json_atomic(output_path, payload)
+
+
+def demo_logo_arguments(spec: Mapping[str, Any], width: int, height: int) -> dict[str, Any]:
+    if spec.get("consumer") != "demo" or spec.get("official_logo_count") != 1:
+        raise ValueError("invalid Demo render spec")
+    region = spec.get("logo_region")
+    if not isinstance(region, Mapping):
+        raise ValueError("Demo render spec missing logo_region")
+    x, y, logo_width, _logo_height = pixel_box(region, width, height)
+    return {
+        "logo_path": Path(str(spec["official_logo_path"])),
+        "logo_sha256": str(spec["official_logo_sha256"]),
+        "logo_x": x,
+        "logo_y": y,
+        "logo_width": max(1, logo_width),
+    }
+
+
 def compile_product_content_spec(context_path: Path | str, output_path: Path | str) -> Path:
     context = load_consumer_context(context_path, "product_package")
     semantic = context["contract_projection"].get("semantic_artifacts", {})
@@ -186,7 +264,8 @@ def release_argument_overrides(spec: Mapping[str, Any], variant_hint: str) -> di
 
 __all__ = [
     "BINDING_FIELDS", "binding", "compile_cover_spec", "compile_product_content_spec",
-    "compile_release_render_spec", "load_consumer_context", "pixel_box", "projection_sha256",
+    "compile_demo_render_spec", "compile_release_render_spec", "demo_logo_arguments",
+    "load_consumer_context", "pixel_box", "projection_sha256",
     "regions_for_variant", "release_argument_overrides", "select_semantic_lines",
     "semantic_line_indices", "write_json_atomic",
 ]

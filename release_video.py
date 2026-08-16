@@ -12,6 +12,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
 from story_contract_consumers import BINDING_FIELDS, release_argument_overrides, write_json_atomic
 from artifact_semantic_plan import load_current_artifact_semantic_plan, plan_binding as semantic_plan_binding
+from demo_quality import load_current_final_demo_geometry
 from keying_quality import keying_preset_lock_issues
 from production_keying import (
     person_beauty_filter as shared_person_beauty_filter,
@@ -108,6 +109,7 @@ class ReleaseConfig:
     output_scale: int
     artifact_semantic_plan: Path | None = None
     keying_preset_path: Path | None = None
+    demo_render_manifest: Path | None = None
     age_text: str = "3-6岁"
     usage_text: str = "适用于朗诵比赛、故事表演、少儿口才、技能比拼"
     story_type: str = "儿童故事"
@@ -171,6 +173,7 @@ def main() -> None:
     parser.add_argument("--preview-person-layouts", default="", help="预览人像布局候选；auto 或 height,x,y;label:height,x,y")
     parser.add_argument("--contract-render-spec", type=Path, help="已审核合同编译出的发布渲染规格")
     parser.add_argument("--artifact-semantic-plan", type=Path, help="当前锁定合同编译出的逐产物语义计划")
+    parser.add_argument("--demo-render-manifest", type=Path, help="已审核 final Demo 的实际人物 geometry receipt")
     parser.add_argument("--age-text", default="3-6岁", help="发布信息栏年龄文案")
     parser.add_argument("--usage-text", default="适用于朗诵比赛、故事表演、少儿口才、技能比拼", help="发布信息栏固定用途文案")
     parser.add_argument("--story-type", default="儿童故事", help="发布上条带故事/栏目类型")
@@ -262,6 +265,7 @@ def main() -> None:
         output_scale=max(1, args.output_scale),
         artifact_semantic_plan=args.artifact_semantic_plan.expanduser() if args.artifact_semantic_plan else None,
         keying_preset_path=args.keying_preset_json.expanduser() if args.keying_preset_json else None,
+        demo_render_manifest=args.demo_render_manifest.expanduser() if args.demo_render_manifest else None,
         age_text=args.age_text,
         usage_text=args.usage_text,
         story_type=args.story_type,
@@ -315,16 +319,22 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict) -> dict:
     preset = json.loads(config.keying_preset_path.read_text(encoding="utf-8"))
     demo: dict | None = None
     presenter_a: dict | None = None
+    demo_manifest_sha = "not_applicable:library_variant"
+    approved_demo_geometry_sha = "not_applicable:library_variant"
     if config.variant in {"both", "main"}:
         if config.person_greenscreen is None:
             raise ValueError("required_v1 主账号发布渲染缺少人物源视频")
-        source_width, source_height = probe_video_size(config.person_greenscreen)
-        if config.person_crop is not None:
-            _crop_x, _crop_y, source_width, source_height = config.person_crop
-        demo = approved_demo_geometry(
-            source_width, source_height, WIDE_WIDTH, WIDE_HEIGHT,
-            config.detected_person_bbox if config.person_crop is None else None,
+        if config.demo_render_manifest is None:
+            raise ValueError("required_v1 Release 缺少 final Demo presenter geometry receipt")
+        demo_manifest, demo = load_current_final_demo_geometry(
+            config.demo_render_manifest, project_root,
         )
+        if hashlib.sha256(config.person_greenscreen.read_bytes()).hexdigest() != demo.get("source_greenscreen_sha256"):
+            raise ValueError("required_v1 Release 人物源与 final Demo geometry receipt 不匹配")
+        if hashlib.sha256(config.keying_preset_path.read_bytes()).hexdigest() != demo.get("keying_preset_sha256"):
+            raise ValueError("required_v1 Release keying preset 与 final Demo geometry receipt 不匹配")
+        demo_manifest_sha = hashlib.sha256(config.demo_render_manifest.read_bytes()).hexdigest()
+        approved_demo_geometry_sha = str(demo.get("geometry_sha256") or "")
         regions = release_regions_for_variant(spec, "main", "16:9")
         person_region = regions.get("person") or regions.get("host")
         if not isinstance(person_region, dict):
@@ -339,6 +349,10 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict) -> dict:
         keying_filter_fingerprint=production_keying_fingerprint(preset),
     )
     bindings.update(semantic_plan_binding(config.artifact_semantic_plan, semantic_plan))
+    bindings.update({
+        "demo_render_manifest_sha256": demo_manifest_sha,
+        "approved_demo_geometry_sha256": approved_demo_geometry_sha,
+    })
     official_assets = [item for item in spec.get("official_assets", []) if isinstance(item, dict)]
     logo_binding: dict[str, object] = {"count": 0, "asset_sha256": None, "asset_id": None}
     if config.variant in {"both", "main"} and config.watermark_logo is not None:

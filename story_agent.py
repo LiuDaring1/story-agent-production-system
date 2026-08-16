@@ -4323,6 +4323,7 @@ class StoryAgent:
         if self._legacy_contract_policy(manifest):
             return True
         try:
+            from demo_quality import load_current_final_demo_geometry
             from production_keying import production_keying_fingerprint
             from release_geometry import canonical_sha256, file_sha256 as geometry_file_sha256, release_render_manifest_issues
 
@@ -4335,6 +4336,10 @@ class StoryAgent:
             if source is None:
                 return False
             plan = load_current_artifact_semantic_plan(self.context.project_dir, source)
+            demo_manifest_path = self.context.paths.status / "product_package_work" / "demo_render_manifest.json"
+            _demo_manifest, demo_geometry = load_current_final_demo_geometry(
+                demo_manifest_path, self.context.project_dir,
+            )
             expected = {
                 "story_contract_sha256": str(spec["story_contract_sha256"]),
                 "contract_schema_version": str(spec["contract_schema_version"]),
@@ -4346,6 +4351,8 @@ class StoryAgent:
                 "production_keying_filter_fingerprint": production_keying_fingerprint(preset),
                 "keying_preset_sha256": geometry_file_sha256(preset_path),
                 "keying_lock_sha256": geometry_file_sha256(preset_path.with_name("keying_preset.lock.json")),
+                "demo_render_manifest_sha256": geometry_file_sha256(demo_manifest_path),
+                "approved_demo_geometry_sha256": str(demo_geometry["geometry_sha256"]),
                 **artifact_semantic_plan_binding(plan_path, plan),
             }
             candidates = sorted(self.context.paths.release.glob("release_render_manifest*.json"))

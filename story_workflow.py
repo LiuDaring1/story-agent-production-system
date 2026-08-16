@@ -353,6 +353,7 @@ def main() -> None:
     release.add_argument("--chroma-blend", default=0.08, type=float)
     release.add_argument("--keyer", choices=["chromakey", "colorkey"], default="chromakey")
     release.add_argument("--keying-preset-json", type=Path)
+    release.add_argument("--demo-render-manifest", type=Path)
     release.add_argument("--person-crop", default="")
     release.add_argument("--person-grade", choices=["none", "log-soft", "log-strong"], default="none")
     release.add_argument("--library-watermark-text", default="绵羊姐姐原创故事资源")
@@ -876,6 +877,7 @@ def main() -> None:
             ("--story-logo", args.story_logo),
             ("--subtitle-srt", args.subtitle_srt),
             ("--keying-preset-json", args.keying_preset_json),
+            ("--demo-render-manifest", args.demo_render_manifest),
         ):
             if value is not None:
                 command.extend([flag, value])
@@ -1343,6 +1345,7 @@ def run_package_release_project(
             command.extend([
                 "--contract-render-spec", release_contract_spec,
                 "--artifact-semantic-plan", semantic_plan_path(paths.root),
+                "--demo-render-manifest", paths.status / "product_package_work" / "demo_render_manifest.json",
             ])
         release_subtitle_srt = subtitle_srt
         if release_semantic_plan is not None and subtitle_srt is not None:

@@ -7,7 +7,8 @@ from typing import Any, Mapping, Sequence
 
 
 RELEASE_GEOMETRY_SCHEMA_VERSION = "story-release-geometry/v1"
-RELEASE_GEOMETRY_COMPILER_VERSION = "1.0.0"
+RELEASE_GEOMETRY_COMPILER_VERSION = "1.1.0"
+DEMO_PRESENTER_GEOMETRY_SCHEMA_VERSION = "story-demo-presenter-geometry/v1"
 
 
 def canonical_sha256(value: Any) -> str:
@@ -92,6 +93,182 @@ def approved_demo_geometry(
     }
 
 
+def compile_demo_presenter_geometry(
+    source_width: int,
+    source_height: int,
+    canvas_width: int,
+    canvas_height: int,
+    *,
+    person_crop: Sequence[int] | None,
+    detected_bbox: Sequence[int] | None,
+    person_height_ratio: float,
+    crop_mode: str,
+    crop_bottom_ratio: float,
+    vertical_alignment: str,
+    keying_preset_sha256: str,
+    keying_lock_sha256: str,
+    source_greenscreen_sha256: str,
+    production_keying_filter_fingerprint: str,
+) -> dict[str, Any]:
+    """Compile the presenter transform actually used by the Demo renderer.
+
+    This receipt is deliberately derived from the same crop/scale/placement
+    inputs consumed by FFmpeg.  It is not an aesthetic plan and is never
+    recomputed by Release as a substitute for a reviewed final Demo receipt.
+    """
+    if min(source_width, source_height, canvas_width, canvas_height) <= 0:
+        raise ValueError("Demo presenter source/canvas dimensions must be positive")
+    if crop_mode not in {"source-native", "preset", "full-width"}:
+        raise ValueError("unsupported Demo presenter crop mode")
+    if vertical_alignment not in {"center", "bottom"}:
+        raise ValueError("unsupported Demo presenter vertical alignment")
+    if not 0 < float(person_height_ratio) <= 1:
+        raise ValueError("Demo presenter height ratio must be in (0, 1]")
+    if not 0 <= float(crop_bottom_ratio) <= 0.2:
+        raise ValueError("Demo presenter crop bottom ratio must be in [0, 0.2]")
+
+    source_native = crop_mode == "source-native" or person_crop is None
+    if source_native:
+        geometry = approved_demo_geometry(
+            source_width,
+            source_height,
+            canvas_width,
+            canvas_height,
+            detected_bbox,
+        )
+        # Bottom cropping and vertical-align are not applied on the native
+        # path.  Recording the resolved values prevents a requested-but-unused
+        # option from being mistaken for an actual FFmpeg transform.
+        geometry.update({
+            "crop_mode": "source-native",
+            "crop_bottom_ratio": 0.0,
+            "vertical_alignment": "source_canvas_center",
+            "source_native": True,
+        })
+    else:
+        if person_crop is None or len(person_crop) != 4:
+            raise ValueError("non-native Demo presenter geometry requires person_crop")
+        crop_x, crop_y, crop_width, crop_height = (int(value) for value in person_crop)
+        if crop_mode == "full-width":
+            crop_x = 0
+            crop_width = source_width
+            crop_height = min(crop_height, source_height - crop_y)
+        crop_height = max(1, int(round(crop_height * (1 - float(crop_bottom_ratio)))))
+        if (
+            crop_x < 0 or crop_y < 0 or crop_width <= 0 or crop_height <= 0
+            or crop_x + crop_width > source_width or crop_y + crop_height > source_height
+        ):
+            raise ValueError("Demo presenter crop exceeds source")
+        rendered_height = min(int(canvas_height * float(person_height_ratio)), canvas_height)
+        rendered_width = max(1, round(crop_width * rendered_height / crop_height))
+        x = round((canvas_width - rendered_width) / 2)
+        y = canvas_height - rendered_height if vertical_alignment == "bottom" else round((canvas_height - rendered_height) / 2)
+        geometry = {
+            "source_width": source_width,
+            "source_height": source_height,
+            "source_crop": [crop_x, crop_y, crop_width, crop_height],
+            "rendered_width": rendered_width,
+            "rendered_height": rendered_height,
+            "scale": rendered_height / crop_height,
+            "x": x,
+            "y": y,
+            "crop_mode": crop_mode,
+            "crop_bottom_ratio": float(crop_bottom_ratio),
+            "vertical_alignment": vertical_alignment,
+            "source_native": False,
+        }
+    payload = {
+        "schema_version": DEMO_PRESENTER_GEOMETRY_SCHEMA_VERSION,
+        **geometry,
+        "canvas_width": canvas_width,
+        "canvas_height": canvas_height,
+        "keying_preset_sha256": keying_preset_sha256,
+        "keying_lock_sha256": keying_lock_sha256,
+        "source_greenscreen_sha256": source_greenscreen_sha256,
+        "production_keying_filter_fingerprint": production_keying_filter_fingerprint,
+    }
+    payload["geometry_sha256"] = canonical_sha256(payload)
+    return payload
+
+
+def demo_presenter_geometry_issues(
+    payload: Mapping[str, Any],
+    expected_bindings: Mapping[str, Any] | None = None,
+) -> list[str]:
+    issues: list[str] = []
+    if payload.get("schema_version") != DEMO_PRESENTER_GEOMETRY_SCHEMA_VERSION:
+        issues.append("demo_presenter_geometry_schema_mismatch")
+    for field in (
+        "source_width", "source_height", "canvas_width", "canvas_height",
+        "rendered_width", "rendered_height", "scale", "x", "y",
+        "source_crop", "crop_mode", "crop_bottom_ratio", "vertical_alignment",
+        "source_native", "keying_preset_sha256", "keying_lock_sha256",
+        "source_greenscreen_sha256", "production_keying_filter_fingerprint",
+    ):
+        if field not in payload:
+            issues.append(f"demo_presenter_geometry_field_missing:{field}")
+    if not isinstance(payload.get("source_native"), bool):
+        issues.append("demo_presenter_geometry_source_native_type_invalid")
+    for field in (
+        "source_width", "source_height", "canvas_width", "canvas_height",
+        "rendered_width", "rendered_height",
+    ):
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            issues.append(f"demo_presenter_geometry_dimension_invalid:{field}")
+    for field in ("x", "y"):
+        value = payload.get(field)
+        if isinstance(value, bool) or not isinstance(value, int):
+            issues.append(f"demo_presenter_geometry_position_invalid:{field}")
+    scale = payload.get("scale")
+    if isinstance(scale, bool) or not isinstance(scale, (int, float)) or scale <= 0:
+        issues.append("demo_presenter_geometry_scale_invalid")
+    crop = payload.get("source_crop")
+    if (
+        not isinstance(crop, list)
+        or len(crop) != 4
+        or any(isinstance(value, bool) or not isinstance(value, int) for value in crop)
+        or (len(crop) == 4 and (crop[0] < 0 or crop[1] < 0 or crop[2] <= 0 or crop[3] <= 0))
+    ):
+        issues.append("demo_presenter_geometry_source_crop_invalid")
+    elif (
+        isinstance(payload.get("source_width"), int)
+        and isinstance(payload.get("source_height"), int)
+        and (crop[0] + crop[2] > payload["source_width"] or crop[1] + crop[3] > payload["source_height"])
+    ):
+        issues.append("demo_presenter_geometry_source_crop_out_of_bounds")
+    elif isinstance(scale, (int, float)) and not isinstance(scale, bool) and scale > 0:
+        expected_width = round(crop[2] * scale)
+        expected_height = round(crop[3] * scale)
+        if abs(int(payload.get("rendered_width") or 0) - expected_width) > 1:
+            issues.append("demo_presenter_geometry_rendered_width_inconsistent")
+        if abs(int(payload.get("rendered_height") or 0) - expected_height) > 1:
+            issues.append("demo_presenter_geometry_rendered_height_inconsistent")
+    crop_bottom_ratio = payload.get("crop_bottom_ratio")
+    if (
+        isinstance(crop_bottom_ratio, bool)
+        or not isinstance(crop_bottom_ratio, (int, float))
+        or not 0.0 <= float(crop_bottom_ratio) < 1.0
+    ):
+        issues.append("demo_presenter_geometry_crop_bottom_ratio_invalid")
+    if payload.get("crop_mode") not in {"source-native", "preset", "full-width"}:
+        issues.append("demo_presenter_geometry_crop_mode_invalid")
+    if payload.get("vertical_alignment") not in {"bottom", "center", "source_canvas_center"}:
+        issues.append("demo_presenter_geometry_vertical_alignment_invalid")
+    if expected_bindings is not None:
+        issues.extend(
+            f"demo_presenter_geometry_binding_mismatch:{field}"
+            for field, expected in sorted(expected_bindings.items())
+            if str(payload.get(field) or "") != str(expected or "")
+        )
+    stored_hash = str(payload.get("geometry_sha256") or "")
+    unsigned = dict(payload)
+    unsigned.pop("geometry_sha256", None)
+    if not stored_hash or stored_hash != canonical_sha256(unsigned):
+        issues.append("demo_presenter_geometry_sha256_mismatch")
+    return sorted(set(issues))
+
+
 def release_a_geometry(
     demo: Mapping[str, Any],
     person_region: Mapping[str, Any],
@@ -113,17 +290,20 @@ def release_a_geometry(
     if y < safe["y"] or y + height > safe["y"] + safe["height"]:
         raise ValueError("release person vertical safe region requires scale/vertical change; blocking")
     original_x = int(demo["x"])
-    ideal_x = round(safe["x"] + (safe["width"] - width) / 2)
     minimum_x = safe["x"]
     maximum_x = safe["x"] + safe["width"] - width
-    x = min(max(ideal_x, minimum_x), maximum_x)
+    x = min(max(original_x, minimum_x), maximum_x)
     correction = x - original_x
     return {
         **dict(demo),
         "x": x,
         "scale_changed": False,
         "position_correction": {"x": correction, "y": 0},
-        "correction_reason": "horizontal_contract_placement" if correction else "none",
+        "correction_reason": (
+            "left_overflow_minimal_correction" if correction > 0
+            else "right_overflow_minimal_correction" if correction < 0
+            else "none"
+        ),
         "person_safe_region": safe,
     }
 
@@ -252,7 +432,8 @@ def geometry_manifest_issues(
         "artifact_semantic_plan_schema_version",
         "artifact_semantic_plan_dependency_sha256",
         "production_keying_filter_fingerprint", "keying_preset_sha256",
-        "keying_lock_sha256",
+        "keying_lock_sha256", "demo_render_manifest_sha256",
+        "approved_demo_geometry_sha256",
     }
     if not isinstance(bindings, Mapping):
         issues.append("release_geometry_bindings_missing")
@@ -317,8 +498,10 @@ def release_render_manifest_issues(
 
 
 __all__ = [
+    "DEMO_PRESENTER_GEOMETRY_SCHEMA_VERSION",
     "RELEASE_GEOMETRY_COMPILER_VERSION", "RELEASE_GEOMETRY_SCHEMA_VERSION",
     "approved_demo_geometry", "binding_payload", "canonical_sha256",
+    "compile_demo_presenter_geometry", "demo_presenter_geometry_issues",
     "compile_text_group", "file_sha256", "regions_for_variant",
     "geometry_manifest_issues", "release_a_geometry", "release_render_manifest_issues",
     "text_group_issues",

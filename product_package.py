@@ -38,7 +38,9 @@ from production_keying import (
     person_beauty_filter as shared_person_beauty_filter,
     person_grade_filter as shared_person_grade_filter,
     production_keying_filter_chain,
+    production_keying_fingerprint,
 )
+from release_geometry import compile_demo_presenter_geometry
 from story_video_synthesizer.image_video import sorted_image_files
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
 from story_video_synthesizer.subtitles import write_srt
@@ -329,6 +331,24 @@ def build_product_package(args: argparse.Namespace) -> None:
             f"已生成候选索引供选择：{work_dir / 'demo_background_candidates.jpg'}"
         )
     crop_bottom_ratio = max(0.0, min(0.2, args.demo_person_crop_bottom_ratio))
+    source_width, source_height = probe_video_size(person_path)
+    lock_path = preset_path.with_name("keying_preset.lock.json")
+    presenter_geometry = compile_demo_presenter_geometry(
+        source_width,
+        source_height,
+        args.demo_width,
+        args.demo_height,
+        person_crop=preset.person_crop,
+        detected_bbox=preset.detected_person_bbox,
+        person_height_ratio=preset.person_height_ratio,
+        crop_mode=args.demo_person_crop_mode,
+        crop_bottom_ratio=crop_bottom_ratio,
+        vertical_alignment=args.demo_person_vertical_align,
+        keying_preset_sha256=file_sha256(preset_path),
+        keying_lock_sha256=file_sha256(lock_path),
+        source_greenscreen_sha256=source_greenscreen_sha256,
+        production_keying_filter_fingerprint=production_keying_fingerprint(preset),
+    )
     if args.preview_only:
         preview_dir = work_dir / "demo_preview"
         preview_paths = render_demo_preview_frames(
@@ -348,6 +368,7 @@ def build_product_package(args: argparse.Namespace) -> None:
             logo_x=max(0, args.demo_logo_x),
             logo_y=max(0, args.demo_logo_y),
             background_brightness=background_brightness,
+            presenter_geometry=presenter_geometry,
         )
         request_path = work_dir / "朗读标注_需精修.md"
         write_annotation_request(story_name, annotation_lines, request_path, annotation_skill_path)
@@ -376,6 +397,7 @@ def build_product_package(args: argparse.Namespace) -> None:
                 demo_brand_spec=demo_brand_spec,
                 keying_preset_path=preset_path,
                 source_greenscreen=person_path,
+                presenter_geometry=presenter_geometry,
                 output_artifacts=[*preview_paths, preview_dir / "demo_background_machine_qa.json"],
                 preview=True,
             )
@@ -456,6 +478,7 @@ def build_product_package(args: argparse.Namespace) -> None:
         logo_x=max(0, args.demo_logo_x),
         logo_y=max(0, args.demo_logo_y),
         background_brightness=background_brightness,
+        presenter_geometry=presenter_geometry,
     )
     if file_sha256(person_path) != source_greenscreen_sha256:
         raise RuntimeError("原始绿幕素材在 Demo 渲染过程中发生变化，已停止")
@@ -468,6 +491,7 @@ def build_product_package(args: argparse.Namespace) -> None:
             demo_brand_spec=demo_brand_spec,
             keying_preset_path=preset_path,
             source_greenscreen=person_path,
+            presenter_geometry=presenter_geometry,
             output_artifacts=[demo_video, demo_video.parent / "_demo_work" / "demo_background_machine_qa.json"],
             preview=False,
         )
@@ -1045,6 +1069,7 @@ def render_demo_video(
     logo_x: int = 24,
     logo_y: int = 20,
     background_brightness: float = 1.0,
+    presenter_geometry: dict[str, Any] | None = None,
 ) -> None:
     duration = probe_duration(narration)
     work_dir = output_path.parent / "_demo_work"
@@ -1057,7 +1082,9 @@ def render_demo_video(
 
     crop_filter = demo_crop_filter(person_video, preset, crop_bottom_ratio, crop_mode)
     key_filter = keying_filter_chain("[1:v]", preset, crop_filter)
-    if preserve_native_composition(preset, crop_mode):
+    if presenter_geometry is not None:
+        person_filter, person_x, person_y = demo_person_layout_from_geometry(presenter_geometry)
+    elif preserve_native_composition(preset, crop_mode):
         person_filter, person_x, person_y = source_native_person_layout(person_video, preset, width, height)
     else:
         demo_person_height = min(int(height * preset.person_height_ratio), height)
@@ -1146,6 +1173,7 @@ def render_demo_preview_frames(
     logo_x: int,
     logo_y: int,
     background_brightness: float = 1.0,
+    presenter_geometry: dict[str, Any] | None = None,
 ) -> list[Path]:
     ensure_dir(output_dir)
     duration = probe_duration(person_video)
@@ -1174,6 +1202,7 @@ def render_demo_preview_frames(
             logo_width,
             logo_x,
             logo_y,
+            presenter_geometry=presenter_geometry,
         )
         output_paths.append(output_path)
     return output_paths
@@ -1196,6 +1225,7 @@ def render_demo_preview_frame(
     logo_x: int,
     logo_y: int,
     background_brightness: float = 1.0,
+    presenter_geometry: dict[str, Any] | None = None,
 ) -> None:
     crop_filter = demo_crop_filter(person_video, preset, crop_bottom_ratio, crop_mode)
     # Input-level seeking keeps source timestamps on some QuickTime files.  The
@@ -1203,7 +1233,9 @@ def render_demo_preview_frame(
     # only the background while silently dropping the sought person frame.
     # Normalise both sought video inputs before keying/overlaying them.
     key_filter = keying_filter_chain("[person_source]", preset, crop_filter)
-    if preserve_native_composition(preset, crop_mode):
+    if presenter_geometry is not None:
+        person_filter, person_x, person_y = demo_person_layout_from_geometry(presenter_geometry)
+    elif preserve_native_composition(preset, crop_mode):
         person_filter, person_x, person_y = source_native_person_layout(person_video, preset, width, height)
     else:
         demo_person_height = min(int(height * preset.person_height_ratio), height)
@@ -1241,6 +1273,23 @@ def render_demo_preview_frame(
         video_label = "vlogo"
     command.extend(["-filter_complex", ";".join(filters), "-map", f"[{video_label}]", "-frames:v", "1", str(output_path)])
     run_command(command)
+
+
+def demo_person_layout_from_geometry(geometry: dict[str, Any]) -> tuple[str, int, int]:
+    """Return the exact FFmpeg presenter transform recorded in the Demo receipt."""
+    rendered_width = int(geometry["rendered_width"])
+    rendered_height = int(geometry["rendered_height"])
+    source_crop = [int(value) for value in geometry["source_crop"]]
+    if bool(geometry["source_native"]):
+        crop_x, crop_y, crop_width, crop_height = source_crop
+        person_filter = (
+            f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
+            f"scale={rendered_width}:{rendered_height}"
+        )
+    else:
+        # Non-native paths crop before keying through demo_crop_filter().
+        person_filter = f"scale={rendered_width}:{rendered_height}"
+    return person_filter, int(geometry["x"]), int(geometry["y"])
 
 
 def demo_crop_filter(person_video: Path, preset: KeyingPreset, crop_bottom_ratio: float, crop_mode: str) -> str:

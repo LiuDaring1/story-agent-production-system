@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +17,7 @@ from release_geometry import (
     RELEASE_GEOMETRY_SCHEMA_VERSION,
     approved_demo_geometry,
     canonical_sha256,
+    compile_demo_presenter_geometry,
     compile_text_group,
     geometry_manifest_issues,
     release_a_geometry,
@@ -101,6 +104,8 @@ def _valid_manifest() -> dict:
         "production_keying_filter_fingerprint": "1" * 64,
         "keying_preset_sha256": "2" * 64,
         "keying_lock_sha256": "3" * 64,
+        "demo_render_manifest_sha256": "4" * 64,
+        "approved_demo_geometry_sha256": "5" * 64,
     }
     payload = {
         "schema_version": RELEASE_GEOMETRY_SCHEMA_VERSION,
@@ -114,6 +119,25 @@ def _valid_manifest() -> dict:
 
 
 class ReleaseGeometryTests(unittest.TestCase):
+    @staticmethod
+    def _demo_geometry(config: ReleaseConfig, *, source_native: bool = True) -> dict:
+        assert config.person_greenscreen is not None
+        assert config.keying_preset_path is not None
+        lock = config.keying_preset_path.with_name("keying_preset.lock.json")
+        return compile_demo_presenter_geometry(
+            1920, 1080, 1920, 1080,
+            person_crop=None if source_native else (300, 80, 1200, 950),
+            detected_bbox=(1200, 100, 500, 900) if source_native else None,
+            person_height_ratio=.82,
+            crop_mode="source-native" if source_native else "preset",
+            crop_bottom_ratio=0.04 if not source_native else 0.0,
+            vertical_alignment="bottom" if not source_native else "center",
+            keying_preset_sha256=hashlib.sha256(config.keying_preset_path.read_bytes()).hexdigest(),
+            keying_lock_sha256=hashlib.sha256(lock.read_bytes()).hexdigest(),
+            source_greenscreen_sha256=hashlib.sha256(config.person_greenscreen.read_bytes()).hexdigest(),
+            production_keying_filter_fingerprint="1" * 64,
+        )
+
     def test_independent_review_receives_explicit_abc_and_library_previews(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             status = Path(directory)
@@ -155,6 +179,33 @@ class ReleaseGeometryTests(unittest.TestCase):
         )
         self.assertEqual(release["position_correction"], {"x": 0, "y": 0})
         self.assertEqual(release["correction_reason"], "none")
+
+    def test_safe_off_center_presenter_keeps_exact_horizontal_position(self) -> None:
+        for original_x in (180, 1240):
+            demo = {
+                **approved_demo_geometry(1920, 1080, 1920, 1080, (original_x, 100, 400, 800)),
+                "x": original_x,
+            }
+            release = release_a_geometry(
+                demo, {"x": .05, "y": .05, "width": .90, "height": .90}, 1920, 1080,
+            )
+            self.assertEqual(release["x"], original_x)
+            self.assertEqual(release["position_correction"], {"x": 0, "y": 0})
+            self.assertEqual(release["correction_reason"], "none")
+
+    def test_left_and_right_overflow_receive_only_minimum_horizontal_correction(self) -> None:
+        safe_region = {"x": 100 / 1920, "y": 0.0, "width": 1700 / 1920, "height": 1.0}
+        left = {**approved_demo_geometry(1920, 1080, 1920, 1080, (80, 100, 400, 800)), "x": 80}
+        corrected_left = release_a_geometry(left, safe_region, 1920, 1080)
+        self.assertEqual(corrected_left["x"], 100)
+        self.assertEqual(corrected_left["position_correction"], {"x": 20, "y": 0})
+        self.assertFalse(corrected_left["scale_changed"])
+
+        right = {**approved_demo_geometry(1920, 1080, 1920, 1080, (1420, 100, 400, 800)), "x": 1420}
+        corrected_right = release_a_geometry(right, safe_region, 1920, 1080)
+        self.assertEqual(corrected_right["x"], 1400)
+        self.assertEqual(corrected_right["position_correction"], {"x": -20, "y": 0})
+        self.assertFalse(corrected_right["scale_changed"])
 
     def test_horizontal_overflow_gets_horizontal_correction_only(self) -> None:
         demo = approved_demo_geometry(1920, 1080, 1920, 1080, (1200, 100, 500, 900))
@@ -226,11 +277,26 @@ class ReleaseGeometryTests(unittest.TestCase):
                     stale, expected_bindings=geometry["bindings"], verify_outputs=False,
                 )
             ))
+            for binding_field in (
+                "demo_render_manifest_sha256", "approved_demo_geometry_sha256",
+            ):
+                changed_demo = copy.deepcopy(geometry["bindings"])
+                changed_demo[binding_field] = "9" * 64
+                self.assertIn(
+                    f"release_geometry_binding_mismatch:{binding_field}",
+                    release_render_manifest_issues(
+                        manifest, expected_bindings=changed_demo, verify_outputs=False,
+                    ),
+                )
 
     def test_compiler_records_abc_segments_and_actual_center_region(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = _config(root)
+            demo_manifest = root / "demo_render_manifest.json"
+            demo_manifest.write_text("{}", encoding="utf-8")
+            config = replace(config, demo_render_manifest=demo_manifest)
+            demo_geometry = self._demo_geometry(config)
             plan = {
                 "schema_version": "story-artifact-semantic-plan/v1",
                 "story_contract_dependency_sha256": "f" * 64,
@@ -244,7 +310,7 @@ class ReleaseGeometryTests(unittest.TestCase):
                 }),
                 patch("release_video.keying_preset_lock_issues", return_value=[]),
                 patch("release_video.production_keying_fingerprint", return_value="1" * 64),
-                patch("release_video.probe_video_size", return_value=(1920, 1080)),
+                patch("release_video.load_current_final_demo_geometry", return_value=({}, demo_geometry)),
             ):
                 geometry = compile_release_geometry(config, _spec())
             self.assertEqual(geometry["presenter"]["approved_demo_geometry"]["scale"], 1.0)
@@ -253,6 +319,47 @@ class ReleaseGeometryTests(unittest.TestCase):
             self.assertEqual(geometry["main"]["segments"]["c"]["active_time_ranges"], [[30.0, 40.0]])
             self.assertEqual(geometry["library"]["video_region"], [0, TOP_HEIGHT, FINAL_WIDTH, CENTER_HEIGHT])
             self.assertEqual(geometry_manifest_issues(geometry), [])
+
+    def test_release_inherits_actual_non_native_demo_geometry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            demo_manifest = root / "demo_render_manifest.json"
+            demo_manifest.write_text("{}", encoding="utf-8")
+            config = replace(config, demo_render_manifest=demo_manifest)
+            actual = self._demo_geometry(config, source_native=False)
+            plan = {"schema_version": "story-artifact-semantic-plan/v1", "story_contract_dependency_sha256": "f" * 64}
+            with (
+                patch("release_video.load_current_artifact_semantic_plan", return_value=plan),
+                patch("release_video.semantic_plan_binding", return_value={
+                    "artifact_semantic_plan_sha256": "e" * 64,
+                    "artifact_semantic_plan_schema_version": plan["schema_version"],
+                    "artifact_semantic_plan_dependency_sha256": "f" * 64,
+                }),
+                patch("release_video.keying_preset_lock_issues", return_value=[]),
+                patch("release_video.production_keying_fingerprint", return_value="1" * 64),
+                patch("release_video.load_current_final_demo_geometry", return_value=({}, actual)),
+            ):
+                geometry = compile_release_geometry(config, _spec({
+                    "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0,
+                }))
+            self.assertFalse(geometry["presenter"]["approved_demo_geometry"]["source_native"])
+            self.assertEqual(
+                geometry["presenter"]["approved_demo_geometry"]["source_crop"],
+                actual["source_crop"],
+            )
+            self.assertEqual(geometry["presenter"]["approved_demo_geometry"]["scale"], actual["scale"])
+
+    def test_required_release_without_final_demo_geometry_receipt_blocks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = _config(Path(directory))
+            plan = {"schema_version": "story-artifact-semantic-plan/v1", "story_contract_dependency_sha256": "f" * 64}
+            with (
+                patch("release_video.load_current_artifact_semantic_plan", return_value=plan),
+                patch("release_video.keying_preset_lock_issues", return_value=[]),
+            ):
+                with self.assertRaisesRegex(ValueError, "final Demo presenter geometry receipt"):
+                    compile_release_geometry(config, _spec())
 
     def test_top_strip_has_only_type_and_title_and_long_title_does_not_grow(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

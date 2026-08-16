@@ -26,6 +26,7 @@ from production_keying import (
     production_keying_fingerprint,
 )
 from demo_quality import demo_render_manifest_issues, write_demo_render_manifest
+from release_geometry import compile_demo_presenter_geometry
 from story_agent_runtime import write_review_bundle
 
 
@@ -92,6 +93,24 @@ def _locked_fixture(root: Path) -> tuple[Path, Path, Path, Path, Path]:
         review_bundle_path=bundle, review_path=review,
     )
     return preset, lock, candidate, evidence_asset, source
+
+
+def _demo_geometry(preset: Path, source: Path, *, source_native: bool = True) -> dict:
+    lock = preset.with_name("keying_preset.lock.json")
+    preset_payload = json.loads(preset.read_text(encoding="utf-8"))
+    return compile_demo_presenter_geometry(
+        1920, 1080, 1920, 1080,
+        person_crop=None if source_native else (300, 80, 1200, 950),
+        detected_bbox=(420, 60, 1080, 1000) if source_native else None,
+        person_height_ratio=.82,
+        crop_mode="source-native" if source_native else "preset",
+        crop_bottom_ratio=0.04 if not source_native else 0.0,
+        vertical_alignment="bottom" if not source_native else "center",
+        keying_preset_sha256=file_sha256(preset),
+        keying_lock_sha256=file_sha256(lock),
+        source_greenscreen_sha256=file_sha256(source),
+        production_keying_filter_fingerprint=production_keying_fingerprint(preset_payload),
+    )
 
 
 class KeyingQualityTests(unittest.TestCase):
@@ -290,20 +309,91 @@ class KeyingQualityTests(unittest.TestCase):
             manifest = write_demo_render_manifest(
                 root / "demo_render_manifest.json", project_dir=project, semantic_plan=plan,
                 demo_brand_spec_path=brand_spec, demo_brand_spec=brand, keying_preset_path=preset,
-                source_greenscreen=source, output_artifacts=[output], preview=False,
+                source_greenscreen=source, presenter_geometry=_demo_geometry(preset, source),
+                output_artifacts=[output], preview=False,
             )
-            with patch("demo_quality.load_current_artifact_semantic_plan", return_value=plan):
+            with (
+                patch("demo_quality.load_current_artifact_semantic_plan", return_value=plan),
+                patch("demo_quality.load_demo_brand_spec", return_value=(brand, {})),
+            ):
                 self.assertEqual(demo_render_manifest_issues(manifest, project), [])
             payload = json.loads(manifest.read_text(encoding="utf-8"))
             self.assertEqual(payload["official_logo_count"], 1)
             self.assertEqual(payload["official_logo_sha256"], file_sha256(logo))
             self.assertEqual(payload["artifact_semantic_plan_sha256"], file_sha256(plan_path))
 
+            # Source bytes and the shared production filter are part of the
+            # actual geometry receipt, not merely informational metadata.
+            original_source = source.read_bytes()
+            source.write_bytes(original_source + b"-changed")
+            with (
+                patch("demo_quality.load_current_artifact_semantic_plan", return_value=plan),
+                patch("demo_quality.load_demo_brand_spec", return_value=(brand, {})),
+            ):
+                self.assertIn(
+                    "demo_render_binding_mismatch:source",
+                    demo_render_manifest_issues(manifest, project),
+                )
+            source.write_bytes(original_source)
+            with (
+                patch("demo_quality.load_current_artifact_semantic_plan", return_value=plan),
+                patch("demo_quality.load_demo_brand_spec", return_value=(brand, {})),
+                patch("demo_quality.production_keying_fingerprint", return_value="9" * 64),
+            ):
+                filter_issues = demo_render_manifest_issues(manifest, project)
+            self.assertIn("demo_production_keying_filter_fingerprint_mismatch", filter_issues)
+            self.assertIn(
+                "demo_presenter_geometry_binding_mismatch:production_keying_filter_fingerprint",
+                filter_issues,
+            )
+
             # A changed semantic plan makes the existing Demo receipt stale.
             plan["artifacts"]["demo_subtitles"]["decisions"][0]["subtitle_policy"] = "hide"
             plan_path.write_text(json.dumps(plan), encoding="utf-8")
-            with patch("demo_quality.load_current_artifact_semantic_plan", return_value=plan):
+            with (
+                patch("demo_quality.load_current_artifact_semantic_plan", return_value=plan),
+                patch("demo_quality.load_demo_brand_spec", return_value=(brand, {})),
+            ):
                 self.assertTrue(any("semantic_plan" in issue for issue in demo_render_manifest_issues(manifest, project)))
+
+    def test_demo_geometry_or_manifest_tampering_makes_receipt_stale(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            plan_path = project / "99_项目状态" / "story_contract" / "artifact_semantic_plan.json"
+            plan_path.parent.mkdir(parents=True)
+            plan = {"schema_version": "1.0", "story_contract_dependency_sha256": "b" * 64}
+            plan_path.write_text(json.dumps(plan), encoding="utf-8")
+            preset, _lock, _candidate, _evidence, source = _locked_fixture(root / "keying")
+            logo = root / "logo.png"
+            Image.new("RGBA", (20, 20), (255, 255, 255, 255)).save(logo)
+            spec = root / "spec.json"
+            brand = {
+                "consumer": "demo", "version": 1,
+                "contract_schema_version": "1.0.0", "story_contract_sha256": "a" * 64,
+                "story_contract_dependency_sha256": "b" * 64,
+                "contract_projection_sha256": "c" * 64, "official_logo_path": str(logo),
+            }
+            spec.write_text(json.dumps(brand), encoding="utf-8")
+            output = root / "demo.mp4"
+            output.write_bytes(b"offline")
+            manifest = write_demo_render_manifest(
+                root / "manifest.json", project_dir=project, semantic_plan=plan,
+                demo_brand_spec_path=spec, demo_brand_spec=brand, keying_preset_path=preset,
+                source_greenscreen=source,
+                presenter_geometry=_demo_geometry(preset, source, source_native=False),
+                output_artifacts=[output], preview=False,
+            )
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            payload["presenter_geometry"]["vertical_alignment"] = "center"
+            manifest.write_text(json.dumps(payload), encoding="utf-8")
+            with (
+                patch("demo_quality.load_current_artifact_semantic_plan", return_value=plan),
+                patch("demo_quality.load_demo_brand_spec", return_value=(brand, {})),
+            ):
+                issues = demo_render_manifest_issues(manifest, project, require_final=True)
+            self.assertIn("demo_render_manifest_sha256_mismatch", issues)
+            self.assertIn("demo_presenter_geometry_sha256_mismatch", issues)
 
     def test_bad_preset_file_cannot_write_demo_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -330,7 +420,8 @@ class KeyingQualityTests(unittest.TestCase):
                 write_demo_render_manifest(
                     root / "manifest.json", project_dir=project, semantic_plan=plan,
                     demo_brand_spec_path=spec, demo_brand_spec=brand, keying_preset_path=preset,
-                    source_greenscreen=source, output_artifacts=[output], preview=False,
+                    source_greenscreen=source, presenter_geometry=_demo_geometry(preset, source),
+                    output_artifacts=[output], preview=False,
                 )
 
 

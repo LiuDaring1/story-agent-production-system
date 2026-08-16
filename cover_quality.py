@@ -66,6 +66,28 @@ def cover_relative(account: str, ratio: str, *, creative: bool = False) -> str:
     return f"{account}/covers/{name}"
 
 
+def cover_review_image_paths(publish_dir: Path, *, required_v1: bool) -> list[Path]:
+    """Return original-resolution assets handed to the native vision review.
+
+    Legacy reviews retain their historical six final covers.  Required-v1
+    reviews additionally receive all six pre-branding creative bases so final
+    typography cannot conceal generated text or logo contamination.
+    """
+    final_covers = [
+        publish_dir / cover_relative(account, ratio)
+        for account in ("main", "library")
+        for ratio in ("3x4", "4x3", "16x9")
+    ]
+    if not required_v1:
+        return final_covers
+    creative_bases = [
+        publish_dir / cover_relative(account, ratio, creative=True)
+        for account in ("main", "library")
+        for ratio in ("3x4", "4x3", "16x9")
+    ]
+    return [*final_covers, *creative_bases]
+
+
 def cover_descendants(asset_ids: list[str]) -> list[str]:
     selected = set(asset_ids)
     changed = True
@@ -146,7 +168,7 @@ def cover_review_payload_issues(payload: Any, expected_assets: list[str]) -> lis
     # publish-relative paths so one account cannot impersonate all six assets.
     missing = [asset for asset in expected_assets if asset not in serialized]
     if missing:
-        issues.append("六张原图 evidence_matrix 未逐张覆盖：" + "、".join(missing))
+        issues.append("封面原图 evidence_matrix 未逐张覆盖：" + "、".join(missing))
     return issues
 
 

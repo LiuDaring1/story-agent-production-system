@@ -74,6 +74,7 @@ from keying_quality import (
 )
 from demo_quality import demo_render_manifest_issues
 from cover_quality import (
+    cover_review_image_paths,
     cover_review_payload_issues,
     expand_retry_files as expand_cover_retry_files,
     required_cover_issues,
@@ -2761,13 +2762,12 @@ class StoryAgent:
 
     def _stage_publish_package_review(self, manifest: dict[str, Any]) -> StageResult:
         publish = self.context.paths.publish
-        covers = [
-            publish / account / "covers" / f"cover_{ratio}.png"
-            for account in ("main", "library")
-            for ratio in ("3x4", "4x3", "16x9")
-        ]
+        required_v1 = not self._legacy_contract_policy(manifest)
+        review_images = cover_review_image_paths(publish, required_v1=required_v1)
+        covers = review_images[:6]
+        creative_bases = review_images[6:]
         copy_files = [publish / "main" / "copy.md", publish / "library" / "copy.md"]
-        if not all(path.exists() for path in [*covers, *copy_files]):
+        if not all(path.exists() for path in [*review_images, *copy_files]):
             return StageResult("blocked", "发布物料不完整，无法开始独立审核。")
         qa = self._workflow(["qa-publish", "--project-dir", str(self.context.project_dir)], "发布物料比例、尺寸与文案结构 QA")
         if qa.status != "done":
@@ -2790,7 +2790,7 @@ class StoryAgent:
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "publish_package_bundle.json",
             [
-                *covers, *copy_files, qa_report, qa_json, lineage,
+                *review_images, *copy_files, qa_report, qa_json, lineage,
                 self.context.paths.status / "publish_cover_branding.json",
                 publish / "cover_render_manifest.json",
                 publish / "cover_creative_lineage.json",
@@ -2802,7 +2802,7 @@ class StoryAgent:
             stage="publish_package_review",
             label="发布物料独立审核",
             bundle=bundle,
-            images=[*covers, contact_sheet],
+            images=[*review_images, contact_sheet],
             rubric=(
                 "检查两个账号文案定位、标题准确性、敏感承诺和话题相关性；检查六张封面标题文字、真人一致性、故事角色、"
                 "比例构图和安全区。结合 cover_lineage.json 检查：主账号 4:3 是唯一主母版，主账号另外两比例由它编辑衍生；"
@@ -2811,14 +2811,21 @@ class StoryAgent:
                 "必须对照 publish_cover_branding.json 确认六张封面使用同一个原始 Logo SHA-256 的确定性叠加；生成的花朵/仿写字样不得冒充品牌 Logo。"
                 "必须逐张审核六个实际高分辨率文件（contact sheet 只能辅助总览），evidence_matrix 为六张逐一写结论，"
                 "并使用 main/covers/cover_*.png 或 library/covers/cover_*.png 的发布目录相对路径标识，不能只写同名文件名。"
-                "产品质量使用风格中性的 audience_fit、style_suitability、composition、color、lighting、character_design_fit、identity_coherence、anatomical_coherence；"
+                + (
+                    "还必须逐张查看六张 creative_base_*.png 原始高分辨率底图，不能用成品标题覆盖区域或 contact sheet 代替。"
+                    "evidence_matrix 必须使用 main/covers/creative_base_*.png 与 library/covers/creative_base_*.png 相对路径逐张举证。"
+                    "创意底图出现可读正式标题、AI 假汉字/乱码、年龄/时长/用途文字、官方 Logo、仿 Logo、未授权品牌字样或明显第二品牌标记，"
+                    "必须写入 p0_errors/critical_errors；正常世界场景中的非品牌元素不得仅因形似文字而机械误杀。"
+                    if required_v1 else ""
+                )
+                + "产品质量使用风格中性的 audience_fit、style_suitability、composition、color、lighting、character_design_fit、identity_coherence、anatomical_coherence；"
                 "不得把可爱度作为所有故事默认标准。以下任一项必须列入 p0_errors/critical_errors，不能被总分抵消：标题错误或缺失、底图残留假文字、Logo 缺失/重复/伪造、"
                 "关键角色或真人被裁切、角色身份漂移、母版血缘失效、比例/安全区/受保护区域碰撞。"
                 "失败时输出 retry_files，使用相对发布物料目录的路径；Runtime 会只扩展真正的 lineage 后代。"
             ),
         )
-        if not self._legacy_contract_policy(manifest):
-            expected_assets = [str(path.relative_to(publish)) for path in covers]
+        if required_v1:
+            expected_assets = [str(path.relative_to(publish)) for path in [*covers, *creative_bases]]
             review_issues = cover_review_payload_issues(payload, expected_assets)
             if review_issues:
                 result = StageResult(

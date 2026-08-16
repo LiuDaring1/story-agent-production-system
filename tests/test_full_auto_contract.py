@@ -15,9 +15,10 @@ from tests.test_release_qa import make_vertical_video
 
 
 class FullAutoContractTests(unittest.TestCase):
-    def test_publish_claims_are_reviewed_after_product_package_exists(self) -> None:
-        self.assertLess(STORY_STAGE_SEQUENCE.index("publish_package"), STORY_STAGE_SEQUENCE.index("product_package"))
+    def test_final_demo_is_reviewed_before_release_and_publish_claims(self) -> None:
         self.assertLess(STORY_STAGE_SEQUENCE.index("product_package_review"), STORY_STAGE_SEQUENCE.index("publish_package_review"))
+        self.assertLess(STORY_STAGE_SEQUENCE.index("product_package_review"), STORY_STAGE_SEQUENCE.index("release_preview"))
+        self.assertLess(STORY_STAGE_SEQUENCE.index("release_video_review"), STORY_STAGE_SEQUENCE.index("publish_package"))
 
     def test_video_prompt_review_snapshot_survives_status_writeback_but_rejects_content_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

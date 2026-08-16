@@ -73,6 +73,11 @@ from keying_quality import (
     refresh_keying_quality_from_preset,
 )
 from demo_quality import demo_render_manifest_issues
+from cover_quality import (
+    cover_review_payload_issues,
+    expand_retry_files as expand_cover_retry_files,
+    required_cover_issues,
+)
 
 from story_codex_tasks import (
     build_children_story_handoff,
@@ -2714,15 +2719,28 @@ class StoryAgent:
         handoff = self.context.paths.publish / "publish_package_codex_handoff.md"
         if contract_context is not None and handoff.exists():
             self._append_contract_handoff(handoff, contract_context, "品牌、角色身份与封面布局安全区")
+            payload = json.loads(contract_context.read_text(encoding="utf-8"))
+            with handoff.open("a", encoding="utf-8") as handle:
+                handle.write("\n## required_v1 封面创意底图生产覆盖指令\n\n")
+                handle.write("本节覆盖 handoff 中所有 legacy `cover_*.png`、生图文字和生图 Logo 指令。只生成 `creative_base_*.png` 与 `cover_creative_lineage.json`；正式文字和官方 Logo 由 Runtime 确定性渲染。\n\n")
+                handle.write("以下已审核投影必须完整进入最终 ImageGen handoff，不得丢弃或自行扩展身份锚点：\n\n```json\n")
+                handle.write(json.dumps(payload.get("contract_projection", {}), ensure_ascii=False, sort_keys=True, indent=2))
+                handle.write("\n```\n")
         if handoff.exists():
             result = self._codex_task(
                 stage="publish_package",
                 label="Codex 4:3 封面衍生",
                 handoff=handoff,
-                prompt=build_publish_package_agent_prompt(handoff, self.context.project_dir),
+                prompt=build_publish_package_agent_prompt(
+                    handoff,
+                    self.context.project_dir,
+                    required_v1=contract_context is not None,
+                ),
             )
-            if result.status == "done" and not self._has_publish_package_files():
-                return StageResult("blocked", "Codex CLI 子任务已返回，但主账号/宝库号 4:3 封面没有完整落盘。", handoff)
+            if result.status == "done" and contract_context is not None and not self._has_publish_creative_bases():
+                return StageResult("blocked", "Codex CLI 子任务已返回，但 required_v1 六张无字创意底图或创意血缘没有完整落盘。", handoff)
+            if result.status == "done" and contract_context is None and not self._has_publish_package_files():
+                return StageResult("blocked", "Codex CLI 子任务已返回，但主账号/宝库号封面没有完整落盘。", handoff)
             if result.status == "done":
                 try:
                     cover_spec = None
@@ -2733,9 +2751,11 @@ class StoryAgent:
                         )
                     receipt = apply_fixed_cover_branding(self.context.project_dir, contract_spec=cover_spec)
                 except (OSError, ValueError) as exc:
-                    return StageResult("blocked", f"封面固定品牌 Logo 定版失败：{exc}", handoff)
+                    return StageResult("blocked", f"封面确定性文字/品牌定版失败：{exc}", handoff)
+                if not self._has_publish_package_files():
+                    return StageResult("blocked", "封面确定性定版结束，但六张最终封面或文案不完整。", receipt)
                 self._complete_contract_consumer(manifest, "cover")
-                return StageResult("done", "已生成六张封面并原样叠加固定品牌 Logo。", receipt)
+                return StageResult("done", "已从六张创意底图确定性排版标题、信息与唯一官方 Logo。", receipt)
             return result
         return result
 
@@ -2761,7 +2781,7 @@ class StoryAgent:
                 qa_payload = {}
             retry_files = qa_payload.get("retry_files", [])
             if isinstance(retry_files, list) and self._can_retry_stage("publish_package_review", critical=True):
-                moved = self._quarantine_publish_files([str(item) for item in retry_files])
+                moved = self._quarantine_publish_files(expand_cover_retry_files([str(item) for item in retry_files]))
                 if moved:
                     return StageResult("retrying", f"发布物料机器 QA 未通过，已保留并排队重做 {len(moved)} 个文件。", qa_json)
             return StageResult("blocked", f"发布物料机器 QA 未通过或已达到重做上限：{qa_json}", qa_json)
@@ -2772,6 +2792,9 @@ class StoryAgent:
             [
                 *covers, *copy_files, qa_report, qa_json, lineage,
                 self.context.paths.status / "publish_cover_branding.json",
+                publish / "cover_render_manifest.json",
+                publish / "cover_creative_lineage.json",
+                publish / "publish_asset_manifest.json",
                 *(path for path in [contract_consumer_path(self.context.project_dir, "cover")] if path.exists()),
             ],
         )
@@ -2779,22 +2802,36 @@ class StoryAgent:
             stage="publish_package_review",
             label="发布物料独立审核",
             bundle=bundle,
-            images=[contact_sheet],
+            images=[*covers, contact_sheet],
             rubric=(
                 "检查两个账号文案定位、标题准确性、敏感承诺和话题相关性；检查六张封面标题文字、真人一致性、故事角色、"
                 "比例构图和安全区。结合 cover_lineage.json 检查：主账号 4:3 是唯一主母版，主账号另外两比例由它编辑衍生；"
                 "宝库号 4:3 由主母版移除真人得到，另两比例由宝库号母版衍生。六张必须保持同一故事角色、服装、字体、色彩和装饰语言，不能像六次随机生成，也不能只是机械裁切。"
                 "版式应遵循历史样例的扁平简洁信息层级，标题与时长/年龄集中，底部适用说明克制，不能自创复杂木框、嵌套框或多层装饰。"
                 "必须对照 publish_cover_branding.json 确认六张封面使用同一个原始 Logo SHA-256 的确定性叠加；生成的花朵/仿写字样不得冒充品牌 Logo。"
-                "失败时输出 retry_files，使用相对发布物料目录的路径。"
+                "必须逐张审核六个实际高分辨率文件（contact sheet 只能辅助总览），evidence_matrix 为六张逐一写结论，"
+                "并使用 main/covers/cover_*.png 或 library/covers/cover_*.png 的发布目录相对路径标识，不能只写同名文件名。"
+                "产品质量使用风格中性的 audience_fit、style_suitability、composition、color、lighting、character_design_fit、identity_coherence、anatomical_coherence；"
+                "不得把可爱度作为所有故事默认标准。以下任一项必须列入 p0_errors/critical_errors，不能被总分抵消：标题错误或缺失、底图残留假文字、Logo 缺失/重复/伪造、"
+                "关键角色或真人被裁切、角色身份漂移、母版血缘失效、比例/安全区/受保护区域碰撞。"
+                "失败时输出 retry_files，使用相对发布物料目录的路径；Runtime 会只扩展真正的 lineage 后代。"
             ),
         )
+        if not self._legacy_contract_policy(manifest):
+            expected_assets = [str(path.relative_to(publish)) for path in covers]
+            review_issues = cover_review_payload_issues(payload, expected_assets)
+            if review_issues:
+                result = StageResult(
+                    "blocked",
+                    "发布物料独立审核证据不完整或存在 P0：" + "；".join(review_issues),
+                    result.handoff,
+                )
         if result.status == "done":
             return result
         if payload and self._can_retry_stage("publish_package_review", critical=True):
             retry_files = payload.get("retry_files", [])
             if isinstance(retry_files, list):
-                moved = self._quarantine_publish_files([str(item) for item in retry_files])
+                moved = self._quarantine_publish_files(expand_cover_retry_files([str(item) for item in retry_files]))
                 if moved:
                     return StageResult("retrying", f"发布物料审核未通过，已保留失败版本并排队重做 {len(moved)} 个文件。", result.handoff)
         return result
@@ -4376,7 +4413,22 @@ class StoryAgent:
         return self._review_stage_current("release_video_review")
 
     def _has_publish_package(self, manifest: dict[str, Any]) -> bool:
-        return self._consumer_output_current(manifest, "cover") and self._has_publish_package_files()
+        if not (self._consumer_output_current(manifest, "cover") and self._has_publish_package_files()):
+            return False
+        if self._legacy_contract_policy(manifest):
+            return True
+        try:
+            compiled = json.loads((self.context.paths.status / "contracts" / "consumers" / "cover.compiled.json").read_text(encoding="utf-8"))
+            issues, _ = required_cover_issues(
+                self.context.paths.publish,
+                render_manifest_path=self.context.paths.publish / "cover_render_manifest.json",
+                lineage_path=self.context.paths.publish / "cover_lineage.json",
+                compiled_spec=compiled,
+                expected_title=str(manifest.get("story", {}).get("name") or ""),
+            )
+            return not issues
+        except (OSError, ValueError, TypeError, json.JSONDecodeError):
+            return False
 
     def _has_publish_package_files(self) -> bool:
         publish = self.context.paths.publish
@@ -4387,6 +4439,15 @@ class StoryAgent:
         ]
         required.extend([publish / "main" / "copy.md", publish / "library" / "copy.md"])
         return all(path.exists() for path in required)
+
+    def _has_publish_creative_bases(self) -> bool:
+        publish = self.context.paths.publish
+        required = [
+            publish / account / "covers" / f"creative_base_{ratio}.png"
+            for account in ("main", "library") for ratio in ("3x4", "4x3", "16x9")
+        ]
+        required.extend([publish / "cover_creative_lineage.json", publish / "main" / "copy.md", publish / "library" / "copy.md"])
+        return all(path.is_file() for path in required)
 
     def _has_publish_package_review(self, manifest: dict[str, Any]) -> bool:
         return self._review_stage_current("publish_package_review")

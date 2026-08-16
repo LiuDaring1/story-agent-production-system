@@ -39,7 +39,7 @@ CONTRACT_CONSUMER_SECTIONS: dict[str, tuple[str, ...]] = {
     "storyboard_images": ("semantic_artifacts", "visual_style", "characters", "world_scale", "story_state"),
     "image_video": ("characters", "story_state"),
     "music": ("semantic_artifacts", "story_state"),
-    "cover": ("brand", "characters", "release_layout"),
+    "cover": ("semantic_artifacts", "visual_style", "characters", "brand", "release_layout"),
     "release_video": ("brand", "release_layout"),
     "product_package": ("semantic_artifacts",),
 }

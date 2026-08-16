@@ -70,6 +70,8 @@ def compile_cover_spec(context_path: Path | str, output_path: Path | str) -> Pat
         "contract_projection_sha256": projection_sha256(context),
         "official_assets": [item for item in brand.get("assets", []) if "cover" in item.get("allowed_uses", [])],
         "brand_rules": brand.get("rules", []),
+        "semantic_artifacts": projection.get("semantic_artifacts", {}),
+        "visual_style": projection.get("visual_style", {}),
         "characters": projection.get("characters", {}),
         "layout_rules": layout.get("rules", []),
         "variants": layout.get("variants", []),

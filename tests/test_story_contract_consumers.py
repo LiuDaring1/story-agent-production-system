@@ -27,7 +27,7 @@ from story_contract_consumers import (
 from demo_quality import load_demo_brand_spec
 from story_contract_runtime import contract_consumer_path, write_contract_consumer_context
 from story_project import apply_fixed_cover_branding, project_paths
-from tests.test_publish_qa import make_publish_fixture
+from tests.test_publish_qa import make_publish_fixture, make_required_cover_fixture
 from tests.test_story_contract_runtime import _lock_contract, _new_project
 from tests.test_artifact_semantic_plan import _contract as semantic_contract_fixture
 from artifact_semantic_plan import load_current_artifact_semantic_plan, plan_binding, write_artifact_semantic_plan
@@ -178,29 +178,17 @@ class StoryContractConsumerTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project = root / "故事剪辑：封面合同"
-            make_publish_fixture(project)
-            logo = root / "logo.png"
-            Image.new("RGBA", (240, 80), (255, 0, 0, 220)).save(logo)
-            projection = {
-                "brand": {"assets": [{"sha256": file_sha256(logo), "allowed_uses": ["cover"], "max_per_frame": 1}], "rules": [{"value": "one official logo"}]},
-                "characters": {"mode": "present"},
-                "release_layout": {"rules": [{"value": "keep title safe"}], "variants": [
-                    {"variant_id": ratio.replace(":", "x"), "aspect_ratio": ratio, "regions": [
-                        {"role": "logo", "x": .1, "y": .02, "width": .2, "height": .1},
-                        {"role": "title_safe", "x": .2, "y": .15, "width": .6, "height": .2},
-                        {"role": "person", "x": .05, "y": .4, "width": .3, "height": .5},
-                    ]} for ratio in ("3:4", "4:3", "16:9")
-                ]},
-            }
-            context = root / "cover.json"
-            _context(context, "cover", projection)
-            spec = compile_cover_spec(context, root / "cover.compiled.json")
+            logo, spec = make_required_cover_fixture(project, root)
             with patch("story_project.load_config", return_value={"brand_assets": {"logo": str(logo)}}):
                 apply_fixed_cover_branding(project, contract_spec=spec)
             manifest = json.loads((project_paths(project).publish / "publish_asset_manifest.json").read_text(encoding="utf-8"))
-            self.assertEqual(manifest["official_logo_sha256"], file_sha256(logo))
-            self.assertEqual(manifest["official_logo_count_per_cover"], 1)
-            self.assertTrue(all(item["title_safe_region"] and item["person_region"] for item in manifest["covers"].values()))
+            self.assertEqual(manifest["logo_sha256"], file_sha256(logo))
+            self.assertTrue(all(item["official_logo_count"] == 1 for item in manifest["covers"].values()))
+            self.assertTrue(all(item["title_safe_region"] for item in manifest["covers"].values()))
+            compiled = json.loads(spec.read_text())
+            self.assertIn("semantic_artifacts", compiled)
+            self.assertIn("visual_style", compiled)
+            self.assertIn("characters", compiled)
             for field in BINDING_FIELDS:
                 self.assertEqual(manifest[field], json.loads(spec.read_text())[field])
 

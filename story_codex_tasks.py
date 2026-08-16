@@ -295,30 +295,44 @@ def build_release_preview_agent_prompt(handoff: Path, approval_path: Path) -> st
 """
 
 
-def build_publish_package_agent_prompt(handoff: Path, project_dir: Path) -> str:
+def build_publish_package_agent_prompt(handoff: Path, project_dir: Path, *, required_v1: bool = False) -> str:
+    contract_mode = """
+本项目是 V3.5 required_v1。ImageGen 只生成六张无字、无 Logo 的创意底图，文件名必须为：
+- `main/covers/creative_base_4x3.png`（唯一根母版）
+- `main/covers/creative_base_3x4.png`、`creative_base_16x9.png`（由主账号 4:3 编辑衍生）
+- `library/covers/creative_base_4x3.png`（由主账号 4:3 移除真人并重排）
+- `library/covers/creative_base_3x4.png`、`creative_base_16x9.png`（由宝库号 4:3 编辑衍生）
+创意底图严禁任何可读文字、标题、时长、年龄、资料项、品牌字样、Logo 或仿 Logo；必须为合同标题区、信息区和官方 Logo 区保留干净安全空间。正式文字与唯一官方 Logo 由 Runtime 确定性排版。
+生成 `cover_creative_lineage.json`，六项逐一记录 asset_id（main:4x3 等）、parent_asset_id、generation_mode（root_master/branch_master/edit_derived）、reference_files、creative_base_sha256、parent_sha256。不得先生成六张互不相关图片后伪造血缘。
+读取 handoff 中的 cover 合同投影，把 semantic_artifacts、visual_style、characters、brand tone、required/forbidden 和各比例 composition role 完整用于最终生图指令；不得丢弃、覆盖或自行扩展身份锚点。
+不要生成 `cover_*.png` 最终图；主 Agent 会从创意底图确定性生成它们。
+""" if required_v1 else ""
+    cover_names = "六张 `creative_base_*.png` 无字创意底图" if required_v1 else "六张 `cover_*.png` 最终封面"
+    lineage_name = "cover_creative_lineage.json" if required_v1 else "cover_lineage.json"
     return f"""请使用第 15 步交接中的候选帧和参考素材，生成完整发布物料：
 `{handoff}`
 
 本任务采用全自动 Agent 新交付规范；如果旧 handoff 仍写着“只做 4:3/不做文案”，以本任务为准。
+{contract_mode}
 
 执行原则：
 - 逐项读取候选帧索引、真人参考、故事参考和旧 4:3 设计任务。
 - 生成发布文案：`main/copy.md`、`library/copy.md`。每份包含标题、正文、话题建议；两个账号定位不同，不能机械复制。
-- 封面必须按“母版 → 参考图编辑衍生”顺序完成，禁止六次互不相干的随机生成：
-  1. 用本期真人帧、本期故事代表帧、历史已确认封面样例三张参考图生成主账号 `cover_4x3.png` 母版；样例只约束版式层级，不能带入旧故事人物或标题。
-  2. 把主账号 4:3 母版作为必选参考图，通过图像编辑/扩图分别衍生主账号 `cover_3x4.png`、`cover_16x9.png`；重新排版安全区，但保持同一真人、同一故事角色、同一字体体系、同一色彩和装饰语言。
-  3. 以主账号 4:3 母版为参考图编辑，移除真人并重排空位，得到宝库号 `cover_4x3.png`；不得从文字重新生成另一个版本。
+- 封面必须按“母版 → 参考图编辑衍生”顺序完成，禁止六次互不相干的随机生成。required_v1 使用上方列出的 `creative_base_*.png` 名称；legacy 才使用 `cover_*.png`：
+  1. 用本期真人帧、本期故事代表帧、历史已确认封面样例三张参考图生成主账号 4:3 母版；样例只约束版式层级，不能带入旧故事人物或标题。
+  2. 把主账号 4:3 母版作为必选参考图，通过图像编辑/扩图分别衍生主账号 3:4、16:9；保持同一真人、同一故事角色、同一色彩和装饰语言。
+  3. 以主账号 4:3 母版为参考图编辑，移除真人并重排空位，得到宝库号 4:3；不得从文字重新生成另一个版本。
   4. 再以宝库号 4:3 母版为必选参考图编辑衍生宝库号 3:4、16:9。
-- 两个账号最终仍分别交付 `cover_3x4.png`、`cover_4x3.png`、`cover_16x9.png`，共六张。衍生是重新组织版式，不是机械裁切、拉伸或补边。
-- 把生成血缘写入两个账号 covers 目录共同上级的 `cover_lineage.json`：记录每张图的 parent、parent_sha256、generation_mode（master/edit-derived）、reference_files 和当前 sha256；所有 edit-derived 的 parent 哈希必须与实际文件一致。
-- 六张封面必须使用 Codex 原生生图能力生成或衍生；禁止用 Pillow/HTML/CSS/截图拼接/模板叠字作为最终封面。
+- 两个账号交付 {cover_names}。衍生是重新组织构图，不是机械裁切、拉伸或补边。
+- 把生成血缘写入两个账号 covers 目录共同上级的 `{lineage_name}`；所有衍生项的 parent 哈希必须与实际文件一致。
+- 六张创意底图必须使用 Codex 原生生图能力生成或衍生；禁止用 Pillow/HTML/CSS/截图拼接冒充创意底图。required_v1 的最终文字与 Logo 由 Runtime 确定性渲染。
 - 品牌 Logo 不得由生图模型临摹或改造。六张图的上方中间预留干净安全区，不要自行生成花朵/图标/品牌字样；生产任务返回后主 Agent 会把配置中的原始 Logo PNG 原样叠加并记录哈希。这是唯一允许的确定性后期。
 - 如果还没有参考帧，主账号优先使用第 13 步确认的发布预览帧；宝库号查看候选帧索引并选择故事动作/冲突帧，然后运行：
   `python3 story_workflow.py publish-package-project --project-dir "{project_dir}" --generate-covers --library-frame <编号>`
   之后继续执行新生成的 handoff 和封面任务。
 - 主账号真人一致性优先：三种比例都保持参考帧的脸型、五官比例、发型、服装和姿态，不得换脸或卡通化真人。
 - 版式沿用用户历史样例的平面信息层级：故事类型/标题为上半部主信息；时长、年龄、适用场景集中在同一简洁信息区；不要重新发明复杂木框、嵌套视频框或多层装饰风格。
-- 生成后逐项确认两份文案和六张封面都落在目标路径。
+- 生成后逐项确认两份文案和 {cover_names} 都落在目标路径。
 - 如果当前环境缺少 imagegen 或无法查看候选图，请写 blocker 文件说明封面阻塞，不要假装完成。
 
 完成后用简短中文列出：两份文案、六张封面、是否使用选帧重跑命令、任何需要人工后期的风险。

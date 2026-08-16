@@ -441,7 +441,7 @@ class StoryContractRuntimeTests(unittest.TestCase):
             self.assertNotEqual(status["consumers"]["cover"]["completed_receipt"], "current")
             report = render_job_report(project).read_text(encoding="utf-8")
             self.assertIn("## Story Production Contract", report)
-            self.assertIn("| cover | brand, characters, release_layout | damaged |", report)
+            self.assertIn("| cover | semantic_artifacts, visual_style, characters, brand, release_layout | damaged |", report)
 
     def test_existing_status_cli_exposes_read_only_contract_diagnostics(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -476,8 +476,8 @@ class StoryContractRuntimeTests(unittest.TestCase):
 
     def test_section_changes_invalidate_only_declared_consumer_families(self) -> None:
         expected_stale = {
-            "semantic_artifacts": {"storyboard_images", "music", "product_package"},
-            "visual_style": {"storyboard_images"},
+            "semantic_artifacts": {"storyboard_images", "music", "cover", "product_package"},
+            "visual_style": {"storyboard_images", "cover"},
             "characters": {"storyboard_images", "image_video", "cover"},
             "world_scale": {"storyboard_images"},
             "story_state": {"storyboard_images", "image_video", "music"},

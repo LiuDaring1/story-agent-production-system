@@ -27,6 +27,10 @@ from video_motion import (
     video_receipt_issues,
 )
 from keying_quality import write_evidence_assets
+from cover_quality import (
+    render_required_covers,
+    required_cover_issues,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -2805,8 +2809,32 @@ def qa_publish(project_dir: Path) -> Path:
                                 retry_files.append(relative)
 
     handoff = publish_dir / "publish_package_codex_handoff.md"
-    lineage_required = handoff.is_file() and "cover_lineage.json" in handoff.read_text(encoding="utf-8-sig", errors="ignore")
-    if lineage_required:
+    required_v1 = manifest.get("agent", {}).get("story_contract", {}).get("policy") == "required_v1"
+    lineage_required = required_v1 or (handoff.is_file() and "cover_lineage.json" in handoff.read_text(encoding="utf-8-sig", errors="ignore"))
+    if required_v1:
+        compiled_path = paths.status / "contracts" / "consumers" / "cover.compiled.json"
+        try:
+            compiled = json.loads(compiled_path.read_text(encoding="utf-8"))
+            required_issues, required_retries = required_cover_issues(
+                publish_dir,
+                render_manifest_path=publish_dir / "cover_render_manifest.json",
+                lineage_path=publish_dir / "cover_lineage.json",
+                compiled_spec=compiled,
+                expected_title=str(manifest.get("story", {}).get("name") or ""),
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            required_issues = [f"- required_v1 封面编译投影缺失或损坏：{exc}"]
+            required_retries = [
+                f"{account}/covers/cover_{ratio}.png"
+                for account in ("main", "library") for ratio in ("3x4", "4x3", "16x9")
+            ]
+        issues.extend(required_issues)
+        retry_files.extend(required_retries)
+        for name in ("cover_lineage.json", "cover_render_manifest.json", "publish_asset_manifest.json"):
+            path = publish_dir / name
+            if path.is_file():
+                artifacts[name] = {"path": str(path), "sha256": sha256_file(path)}
+    elif lineage_required:
         lineage_path = publish_dir / "cover_lineage.json"
         lineage_issues, lineage_retries = validate_cover_lineage(publish_dir, lineage_path)
         issues.extend(lineage_issues)
@@ -2873,6 +2901,24 @@ def apply_fixed_cover_branding(project_dir: Path, contract_spec: Path | None = N
     logo = first_existing(brand.get("cover_logo"), brand.get("logo"))
     if logo is None:
         raise FileNotFoundError("封面定版缺少可读的固定品牌 Logo；禁止让生图模型伪造图标")
+    if contract_spec is not None:
+        try:
+            compiled = json.loads(contract_spec.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError(f"封面合同编译投影不可读：{contract_spec}") from exc
+        if compiled.get("consumer") != "cover":
+            raise ValueError("封面合同编译投影 consumer 必须为 cover")
+        manifest = load_manifest(paths) or {}
+        receipt, _render, _lineage = render_required_covers(
+            paths.publish,
+            compiled_spec=compiled,
+            logo_path=logo,
+            story=manifest.get("story", {}),
+        )
+        asset_manifest = paths.publish / "publish_asset_manifest.json"
+        render_payload = json.loads((paths.publish / "cover_render_manifest.json").read_text(encoding="utf-8"))
+        save_json(asset_manifest, render_payload)
+        return receipt
     covers = [
         paths.publish / account / "covers" / f"cover_{ratio}.png"
         for account in ("main", "library")

@@ -2685,6 +2685,28 @@ def qa_product(project_dir: Path) -> Path:
         ("A镜无人物背景视频",),
     )
     artifacts: dict[str, dict[str, str]] = {}
+    product_work = paths.status / "product_package_work"
+    package_manifest = product_work / "product_package_manifest.json"
+    if package_manifest.exists():
+        from product_quality import (
+            annotation_receipt_issues,
+            manuscript_receipt_issues,
+            ppt_render_manifest_issues,
+            product_content_manifest_issues,
+            product_package_manifest_issues,
+        )
+
+        deterministic_checks = {
+            "product_content": product_content_manifest_issues(product_work / "product_content_manifest.json"),
+            "customer_manuscript": manuscript_receipt_issues(product_work / "customer_manuscript_receipt.json"),
+            "reading_annotation": annotation_receipt_issues(product_work / "reading_annotation_receipt.json"),
+            "ppt_with_subtitles": ppt_render_manifest_issues(product_work / "ppt_with_subtitles_render_manifest.json"),
+            "ppt_without_subtitles": ppt_render_manifest_issues(product_work / "ppt_without_subtitles_render_manifest.json"),
+            "product_package": product_package_manifest_issues(package_manifest),
+        }
+        for component, component_issues in deterministic_checks.items():
+            for issue in component_issues:
+                issues.append(f"- {component}：{issue}")
     for label, key, required in (
         ("基础版资料包", "product_base", required_base),
         ("进阶版资料包", "product_advanced", required_advanced),

@@ -348,6 +348,7 @@ def build_product_annotation_agent_prompt(handoff: Path, annotation_json: Path, 
 - 如果示范视频参数需要调整，请写入 `{demo_params}`，字段使用 handoff 示例中的 `demo_person_crop_mode`、`demo_person_vertical_align`、`demo_person_crop_bottom_ratio`。
 - 朗读标注必须按 handoff 引用的 `story-performance-script.skill` 和朗读标注请求从头精修。
 - 优先输出 `{annotation_json}`，必须是 `product_package.py` 可读取的 JSON：数组或包含 `blocks` 的对象；不要使用自动草稿冒充精修。
+- 每个 block 必须包含朗读标注请求中给出的 `source_line_indices`；索引必须原样引用，不得自行重编号、遗漏、重复或扩展正文范围。
 - 标注内容要服务儿童朗读/表演：分段、语气、停顿、重音、动作提示清楚；对外售卖资料不得出现“绵羊姐姐”。
 - 每段重音不能只标人物名词；要覆盖动作推进、情绪、反差、判断和转折。长段落应有足够重音组，避免只有一两个红字的机械标注。
 - `marked_text` 必须逐字忠实于 handoff 中经过审核的客户正文，除主持人身份脱敏外不得润色、增删或替换代词。

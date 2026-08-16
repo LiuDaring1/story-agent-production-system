@@ -2926,6 +2926,11 @@ class StoryAgent:
         contract_context = contract_consumer_path(self.context.project_dir, "product_package")
         if contract_context.exists():
             artifacts.append(contract_context)
+        annotation_receipt = work / "reading_annotation_receipt.json"
+        content_manifest = work / "product_content_manifest.json"
+        for path in (annotation_receipt, content_manifest):
+            if path.exists():
+                artifacts.append(path)
         bundle = write_review_bundle(self.context.paths.status / "reviews" / "product_annotation_bundle.json", artifacts)
         images = self._product_preview_images()
         result, payload = self._structured_review(
@@ -2940,8 +2945,25 @@ class StoryAgent:
                 "长段落的重音必须覆盖动作、情绪、反差和转折，只有一两个重音或只标人物名词必须退回。示范视频应保留原片构图、自然停顿、拟声词和完整句尾。"
                 "示范视频是原主持人的表演参考，允许原声和字幕保留‘我是绵羊姐姐’，但不得叠加额外品牌 Logo；不要把这一点误判为对外文稿泄漏。"
                 "漏掉 consumer_manuscript 中的故事正文、错重音导致语义改变属于关键错误。"
+                "required_v1 审核必须逐 block 写 evidence_matrix，每项必须包含 source_line_indices、original_text、fidelity、emotion_fit、"
+                "pause_emphasis_quality、performance_guidance_quality 和 passed=true/false。"
+                "任何漏字、增字、改写、主持人身份泄漏、占位符、伪造 source_line_indices 或 notes 改变原意均为 P0/Critical，不能被总分抵消。"
             ),
         )
+        if result.status == "done" and not self._legacy_contract_policy(manifest):
+            from product_quality import annotation_review_payload_issues
+
+            evidence_issues = annotation_review_payload_issues(
+                payload or {},
+                annotation_json=annotation,
+                content_manifest=content_manifest,
+            )
+            if evidence_issues:
+                result = StageResult(
+                    "blocked",
+                    "朗读标注独立审核结构证据不完整：" + "；".join(evidence_issues),
+                    result.handoff,
+                )
         if result.status == "done":
             return result
         if payload and self._can_retry_stage("product_annotation_review", critical=True):
@@ -2992,19 +3014,48 @@ class StoryAgent:
             [
                 base, advanced, report, report_json,
                 *(path for path in [contract_consumer_path(self.context.project_dir, "product_package")] if path.exists()),
+                *(path for path in [
+                    self.context.paths.status / "product_package_work" / "product_content_manifest.json",
+                    self.context.paths.status / "product_package_work" / "customer_manuscript_receipt.json",
+                    self.context.paths.status / "product_package_work" / "reading_annotation_receipt.json",
+                    self.context.paths.status / "product_package_work" / "ppt_with_subtitles_render_manifest.json",
+                    self.context.paths.status / "product_package_work" / "ppt_without_subtitles_render_manifest.json",
+                    self.context.paths.status / "product_package_work" / "product_package_manifest.json",
+                ] if path.exists()),
             ],
+        )
+        ppt_evidence = sorted(
+            (self.context.paths.status / "product_package_work" / "ppt_evidence").glob("**/*.png")
         )
         result, payload = self._structured_review(
             stage="product_package_review",
             label="资料包独立审核",
             bundle=bundle,
-            images=[],
+            images=ppt_evidence,
             rubric=(
                 "核对基础版必须包含故事文稿、朗读标注、音乐、示范视频、背景图片；进阶版必须包含故事文稿、朗读标注、音乐、"
                 "示范视频、背景图片、含/无字幕 PPT、含/无字幕背景视频、A镜无人物背景视频。检查文件名、重复/缺失、对外禁用口吻和 QA 报告。"
                 "06_资料包 对外层只能包含基础版与进阶版两个客户目录，内部过程文件必须位于 99_项目状态。缺少任一必备文件属于关键错误。"
+                "逐张检查含字幕/无字幕 PPT 的首张、中间、末张、最长字幕和边界证据；字幕需精确、单行或最多两行、黑条不越界，无字幕版不得残留字幕。"
+                "核对客户文稿与朗读标注只包含各自 semantic plan 选择的正文，标题唯一，无主持人自我介绍、占位符、内部路径或 Agent/Codex 痕迹。"
+                "required_v1 必须写 p0_errors 和 evidence_matrix；每张传入的 PPT 证据必须用相对 ppt_evidence 目录的路径逐项引用。"
+                "缺页、重复页、字幕污染/越界、图片拉伸、旧 BGM、漏/增/改客户正文、伪造 source_line_indices 属于 P0，不得被总分抵消。"
             ),
         )
+        if result.status == "done" and payload and not self._legacy_contract_policy(manifest):
+            from product_quality import product_package_review_payload_issues
+
+            evidence_issues = product_package_review_payload_issues(
+                payload,
+                evidence_root=self.context.paths.status / "product_package_work" / "ppt_evidence",
+                required_evidence=ppt_evidence,
+            )
+            if evidence_issues:
+                return StageResult(
+                    "blocked",
+                    f"资料包独立审核证据不完整：{'; '.join(evidence_issues)}",
+                    result.handoff,
+                )
         if result.status == "done":
             return result
         if payload and self._can_retry_stage("product_package_review", critical=True):
@@ -4480,7 +4531,25 @@ class StoryAgent:
         )
 
     def _has_product_annotation_review(self, manifest: dict[str, Any]) -> bool:
-        return self._review_stage_current("product_annotation_review")
+        current = self._review_stage_current("product_annotation_review")
+        if not current or self._legacy_contract_policy(manifest):
+            return current
+        annotation = self._product_annotation()
+        content_manifest = self.context.paths.status / "product_package_work" / "product_content_manifest.json"
+        review_path = self.context.paths.status / "reviews" / "product_annotation_review_review.json"
+        if annotation is None:
+            return False
+        try:
+            payload = json.loads(review_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        from product_quality import annotation_review_payload_issues
+
+        return not annotation_review_payload_issues(
+            payload,
+            annotation_json=annotation,
+            content_manifest=content_manifest,
+        )
 
     def _has_product_package(self, manifest: dict[str, Any]) -> bool:
         outputs = manifest.get("outputs", {})
@@ -4495,9 +4564,25 @@ class StoryAgent:
         )
         if not current or self._legacy_contract_policy(manifest):
             return current
-        return not demo_render_manifest_issues(
-            self.context.paths.status / "product_package_work" / "demo_render_manifest.json",
-            self.context.project_dir,
+        work = self.context.paths.status / "product_package_work"
+        from product_quality import (
+            annotation_receipt_issues,
+            manuscript_receipt_issues,
+            ppt_render_manifest_issues,
+            product_content_manifest_issues,
+            product_package_manifest_issues,
+        )
+
+        return not any(
+            (
+                demo_render_manifest_issues(work / "demo_render_manifest.json", self.context.project_dir),
+                product_content_manifest_issues(work / "product_content_manifest.json"),
+                manuscript_receipt_issues(work / "customer_manuscript_receipt.json"),
+                annotation_receipt_issues(work / "reading_annotation_receipt.json"),
+                ppt_render_manifest_issues(work / "ppt_with_subtitles_render_manifest.json"),
+                ppt_render_manifest_issues(work / "ppt_without_subtitles_render_manifest.json"),
+                product_package_manifest_issues(work / "product_package_manifest.json"),
+            )
         )
 
     def _artifact_semantic_receipt_current(self, manifest: dict[str, Any], receipt: Path) -> bool:
@@ -4518,7 +4603,27 @@ class StoryAgent:
             return False
 
     def _has_product_package_review(self, manifest: dict[str, Any]) -> bool:
-        return self._review_stage_current("product_package_review")
+        if not self._review_stage_current("product_package_review"):
+            return False
+        if self._legacy_contract_policy(manifest):
+            return True
+        try:
+            from product_quality import product_package_review_payload_issues
+
+            evidence_root = self.context.paths.status / "product_package_work" / "ppt_evidence"
+            evidence = sorted(evidence_root.glob("**/*.png"))
+            review = json.loads(
+                (self.context.paths.status / "reviews" / "product_package_review_review.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            return not product_package_review_payload_issues(
+                review,
+                evidence_root=evidence_root,
+                required_evidence=evidence,
+            )
+        except (OSError, json.JSONDecodeError):
+            return False
 
     def _has_final_delivery(self, manifest: dict[str, Any]) -> bool:
         return (self.context.project_dir / "总交付清单.md").exists() and bool(manifest.get("completed_at"))

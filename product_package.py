@@ -21,7 +21,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn as docx_qn
 from docx.shared import Inches, Pt, RGBColor
 from lxml import etree
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
 from pptx import Presentation
 from pptx.dml.color import RGBColor as PptRGBColor
 from pptx.enum.text import PP_ALIGN
@@ -45,6 +45,13 @@ from story_video_synthesizer.image_video import sorted_image_files
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
 from story_video_synthesizer.subtitles import write_srt
 from story_semantics import SemanticKind, classify_story, lines_for_output
+from product_quality import (
+    compile_product_content_manifest,
+    write_annotation_receipt,
+    write_manuscript_receipt,
+    write_ppt_render_manifest,
+    write_product_package_manifest,
+)
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -248,7 +255,23 @@ def build_product_package(args: argparse.Namespace) -> None:
     manuscript_lines, _mi, _mt, manuscript_indices = selected("customer_manuscript")
     annotation_lines, _ai, _at, annotation_indices = selected("reading_annotation")
     demo_lines, _di, demo_timings, demo_indices = selected("demo")
+    product_content_manifest_path = work_dir / "product_content_manifest.json"
     if semantic_plan is not None:
+        content_manifest = compile_product_content_manifest(
+            semantic_plan_path=args.artifact_semantic_plan.expanduser(),
+            semantic_plan=semantic_plan,
+            source_script=script_path,
+            source_lines=public_script_lines,
+            selections={
+                "ppt": ppt_indices,
+                "customer_manuscript": manuscript_indices,
+                "reading_annotation": annotation_indices,
+                "demo_subtitles": demo_indices,
+            },
+            images=images,
+            timings=timings,
+        )
+        write_json_atomic(product_content_manifest_path, content_manifest)
         write_json_atomic(
             work_dir / "artifact_semantic_plan_product_manifest.json",
             {
@@ -371,7 +394,13 @@ def build_product_package(args: argparse.Namespace) -> None:
             presenter_geometry=presenter_geometry,
         )
         request_path = work_dir / "朗读标注_需精修.md"
-        write_annotation_request(story_name, annotation_lines, request_path, annotation_skill_path)
+        write_annotation_request(
+            story_name,
+            annotation_lines,
+            request_path,
+            annotation_skill_path,
+            source_line_indices=annotation_indices if semantic_plan is not None else None,
+        )
         handoff = work_dir / "第16步资料包_Codex前置审查.md"
         write_product_preflight_handoff(
             story_name=story_name,
@@ -412,7 +441,18 @@ def build_product_package(args: argparse.Namespace) -> None:
         else clean_public_story_text(read_text_document(story_text_path))
     )
     render_story_docx(story_name, manuscript_text, story_docx)
+    if semantic_plan is not None:
+        write_manuscript_receipt(
+            work_dir / "customer_manuscript_receipt.json",
+            manuscript=story_docx,
+            story_name=story_name,
+            selected_indices=manuscript_indices,
+            selected_lines=manuscript_lines,
+            content_manifest=product_content_manifest_path,
+        )
     if args.annotation_docx is not None:
+        if semantic_plan is not None:
+            raise RuntimeError("required_v1 朗读标注必须提供含 source_line_indices 的 --annotation-json；不接受不可验证的 opaque DOCX。")
         annotation_source = args.annotation_docx.expanduser()
         if not annotation_source.exists():
             raise FileNotFoundError(f"朗读标注来源文档不存在：{annotation_source}")
@@ -421,15 +461,46 @@ def build_product_package(args: argparse.Namespace) -> None:
         annotation_source = args.annotation_json.expanduser()
         if not annotation_source.exists():
             raise FileNotFoundError(f"朗读标注 JSON 不存在：{annotation_source}")
-        blocks = load_annotation_blocks(annotation_source)
-        validate_annotation_coverage(blocks, annotation_lines)
+        blocks = load_annotation_blocks(annotation_source, require_source_indices=semantic_plan is not None)
+        validate_annotation_coverage(
+            blocks,
+            annotation_lines,
+            selected_source_indices=annotation_indices if semantic_plan is not None else None,
+        )
         render_annotation_blocks_docx(story_name, blocks, annotation_docx)
+        if semantic_plan is not None:
+            write_annotation_receipt(
+                work_dir / "reading_annotation_receipt.json",
+                annotation_json=annotation_source,
+                annotation_docx=annotation_docx,
+                blocks=[
+                    {
+                        "title": block.title,
+                        "marked_text": block.marked_text,
+                        "emotion": block.emotion,
+                        "notes": block.notes,
+                        "source_line_indices": list(block.source_line_indices),
+                    }
+                    for block in blocks
+                ],
+                selected_indices=annotation_indices,
+                selected_lines=annotation_lines,
+                content_manifest=product_content_manifest_path,
+            )
     elif args.allow_draft_annotation:
+        if semantic_plan is not None:
+            raise RuntimeError("required_v1 禁止把规则草稿作为最终朗读标注。")
         print("[warning] 当前使用规则草稿生成朗读标注，仅用于内部预览；正式资料包请传 --annotation-json 或 --annotation-docx。")
         render_annotation_docx(story_name, annotation_lines, annotation_docx)
     else:
         request_path = work_dir / "朗读标注_需精修.md"
-        write_annotation_request(story_name, annotation_lines, request_path, annotation_skill_path)
+        write_annotation_request(
+            story_name,
+            annotation_lines,
+            request_path,
+            annotation_skill_path,
+            source_line_indices=annotation_indices if semantic_plan is not None else None,
+        )
         raise RuntimeError(
             "已停止：朗读标注必须先精修，不能再自动套模板生成。"
             f"请按 story-performance-script.skill 精修后传入 --annotation-json 或 --annotation-docx：{request_path}"
@@ -455,6 +526,34 @@ def build_product_package(args: argparse.Namespace) -> None:
         with_subtitles=False,
         total_duration=narration_duration,
     )
+    if semantic_plan is not None:
+        ppt_evidence_dir = work_dir / "ppt_evidence"
+        rows_with_sub = build_ppt_manifest_rows(
+            ppt_images, ppt_lines, ppt_timings, ppt_indices, narration_duration, with_subtitles=True
+        )
+        rows_no_sub = build_ppt_manifest_rows(
+            ppt_images, ppt_lines, ppt_timings, ppt_indices, narration_duration, with_subtitles=False
+        )
+        with_evidence = render_ppt_evidence(ppt_evidence_dir / "with_subtitles", rows_with_sub, with_subtitles=True)
+        no_evidence = render_ppt_evidence(ppt_evidence_dir / "without_subtitles", rows_no_sub, with_subtitles=False)
+        write_ppt_render_manifest(
+            work_dir / "ppt_with_subtitles_render_manifest.json",
+            pptx=ppt_with_sub,
+            with_subtitles=True,
+            rows=rows_with_sub,
+            music=music_path,
+            content_manifest=product_content_manifest_path,
+            evidence=with_evidence,
+        )
+        write_ppt_render_manifest(
+            work_dir / "ppt_without_subtitles_render_manifest.json",
+            pptx=ppt_no_sub,
+            with_subtitles=False,
+            rows=rows_no_sub,
+            music=music_path,
+            content_manifest=product_content_manifest_path,
+            evidence=no_evidence,
+        )
 
     render_demo_video(
         person_video=person_path,
@@ -508,7 +607,7 @@ def build_product_package(args: argparse.Namespace) -> None:
             x264_preset=args.demo_preset,
         )
 
-    create_package_dirs(
+    package_result = create_package_dirs(
         story_name=story_name,
         output_root=output_root,
         story_docx=story_docx,
@@ -521,7 +620,30 @@ def build_product_package(args: argparse.Namespace) -> None:
         ppt_with_sub=ppt_with_sub,
         ppt_no_sub=ppt_no_sub,
         a_only_video=a_only_video if a_only_video.exists() else None,
+        backup_root=(work_dir / "package_backups") if semantic_plan is not None else None,
     )
+    if semantic_plan is not None:
+        base_dir, advanced_dir, source_map = package_result
+        dependencies = {
+            "product_content_manifest": product_content_manifest_path,
+            "customer_manuscript_receipt": work_dir / "customer_manuscript_receipt.json",
+            "reading_annotation_receipt": work_dir / "reading_annotation_receipt.json",
+            "annotation_review": args.project_dir / "99_项目状态" / "reviews" / "product_annotation_review_review.json",
+            "ppt_with_subtitles_render_manifest": work_dir / "ppt_with_subtitles_render_manifest.json",
+            "ppt_without_subtitles_render_manifest": work_dir / "ppt_without_subtitles_render_manifest.json",
+            "demo_render_manifest": work_dir / "demo_render_manifest.json",
+            "music": music_path,
+            "background_with_subtitles": bg_with_sub,
+            "background_without_subtitles": bg_no_sub,
+        }
+        write_product_package_manifest(
+            work_dir / "product_package_manifest.json",
+            product_root=output_root,
+            base_dir=base_dir,
+            advanced_dir=advanced_dir,
+            dependencies=dependencies,
+            source_map=source_map,
+        )
 
 
 def load_product_semantic_spec(path: Path) -> dict:
@@ -701,6 +823,7 @@ class AnnotationBlock:
     marked_text: str
     emotion: str
     notes: list[str]
+    source_line_indices: tuple[int, ...] = ()
 
 
 def render_annotation_docx(story_name: str, lines: list[str], output_path: Path) -> None:
@@ -782,7 +905,7 @@ def prevent_table_row_split(row: Any) -> None:
         tr_properties.append(OxmlElement("w:cantSplit"))
 
 
-def load_annotation_blocks(path: Path) -> list[AnnotationBlock]:
+def load_annotation_blocks(path: Path, *, require_source_indices: bool = False) -> list[AnnotationBlock]:
     data = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(data, dict):
         data = data.get("blocks", [])
@@ -802,17 +925,34 @@ def load_annotation_blocks(path: Path) -> list[AnnotationBlock]:
             notes = [str(part).strip() for part in notes_value if str(part).strip()]
         else:
             notes = []
+        raw_indices = item.get("source_line_indices", [])
+        if not isinstance(raw_indices, list) or any(type(value) is not int or value < 0 for value in raw_indices):
+            raise ValueError(f"朗读标注 JSON 第 {index} 项 source_line_indices 必须是非负整数数组")
+        source_line_indices = tuple(raw_indices)
+        if require_source_indices and not source_line_indices:
+            raise ValueError(f"朗读标注 JSON 第 {index} 项缺少 source_line_indices")
         if not title or not marked_text or not emotion or not notes:
             raise ValueError(f"朗读标注 JSON 第 {index} 项缺少 title/marked_text/emotion/notes")
-        blocks.append(AnnotationBlock(title=title, marked_text=marked_text, emotion=emotion, notes=notes))
+        blocks.append(AnnotationBlock(title=title, marked_text=marked_text, emotion=emotion, notes=notes, source_line_indices=source_line_indices))
     validate_annotation_blocks(blocks)
     return blocks
 
 
-def write_annotation_request(story_name: str, lines: list[str], output_path: Path, skill_path: Path) -> None:
-    payload = "\n".join(f"{index}. {line}" for index, line in enumerate(lines, start=1))
+def write_annotation_request(
+    story_name: str,
+    lines: list[str],
+    output_path: Path,
+    skill_path: Path,
+    *,
+    source_line_indices: list[int] | None = None,
+) -> None:
+    indices = source_line_indices if source_line_indices is not None else list(range(len(lines)))
+    if len(indices) != len(lines):
+        raise ValueError("朗读标注精修请求的 source_line_indices 与正文行数不一致")
+    payload = "\n".join(f"source_line_index={index}: {line}" for index, line in zip(indices, lines))
     template = {
         "title": "段落标题",
+        "source_line_indices": [indices[0] if indices else 0],
         "marked_text": "原文，使用 **重音**、/、// 标记",
         "emotion": "情绪基调",
         "notes": ["自然段批注，必须引用本段触发词，例如「矛」或「盾」。"],
@@ -828,7 +968,8 @@ def write_annotation_request(story_name: str, lines: list[str], output_path: Pat
 - marked_text 必须逐字覆盖下方已经清洁的故事台词；主持人自我介绍整句删除，除此之外不得润色、增删、改代词或改句尾。
 - 红字只标真正需要重读的内容词、角色/道具首次出现、关键动作、矛盾转折、道理关键词；不得整句连红。
 - 批注必须基于文本本身，写清楚为什么这样读，如何配合语气、停顿、表情或动作。
-- 输出 JSON 数组，每项字段为 title、marked_text、emotion、notes。
+- 输出 JSON 数组，每项字段为 title、source_line_indices、marked_text、emotion、notes。
+- source_line_indices 必须原样引用下方给出的 source_line_index；不得自行重新编号、遗漏、重复或增加未选择正文。
 
 JSON 单项格式示例：
 ```json
@@ -880,6 +1021,119 @@ def build_story_ppt(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prs.save(output_path)
     embed_ppt_bgm(output_path, music_path)
+
+
+def build_ppt_manifest_rows(
+    images: list[Path],
+    script_lines: list[str],
+    timings: list[LineTiming],
+    source_indices: list[int],
+    total_duration: float,
+    *,
+    with_subtitles: bool,
+) -> list[dict[str, Any]]:
+    durations = ppt_slide_durations(timings, total_duration)
+    rows: list[dict[str, Any]] = []
+    for position, (image, text, timing, source_index, duration) in enumerate(
+        zip(images, script_lines, timings, source_indices, durations), start=1
+    ):
+        clean, font_size, subtitle_bbox = ppt_subtitle_layout(text)
+        rows.append(
+            {
+                "slide_index": position,
+                "source_line_index": source_index,
+                "source_text": text,
+                "source_text_sha256": file_sha256_from_text(text),
+                "image_path": str(image),
+                "image_sha256": file_sha256(image),
+                "timing_start": float(timing.source_start),
+                "timing_end": float(timing.source_start + duration),
+                "duration": float(duration),
+                "subtitle_expected": with_subtitles,
+                "subtitle_text": clean if with_subtitles else "",
+                "subtitle_font_size_pt": font_size if with_subtitles else None,
+                "subtitle_line_count": clean.count("\n") + 1 if with_subtitles else 0,
+                "subtitle_bbox": subtitle_bbox if with_subtitles else [],
+                "subtitle_safe_region": [0.0, 0.0, 1.0, 1.0] if with_subtitles else [],
+                "layout_mode": "full_bleed_with_bottom_subtitle" if with_subtitles else "full_bleed_clean",
+            }
+        )
+    return rows
+
+
+def file_sha256_from_text(text: str) -> str:
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def render_ppt_evidence(output_dir: Path, rows: list[dict[str, Any]], *, with_subtitles: bool) -> list[Path]:
+    """Render deterministic QA evidence from the exact slide inputs/layout contract."""
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    if not rows:
+        return []
+    longest = max(range(len(rows)), key=lambda index: len(str(rows[index].get("subtitle_text") or "")))
+    boundary = min(
+        range(len(rows)),
+        key=lambda index: 1.0 - sum(
+            [float(value) for value in (rows[index].get("subtitle_bbox") or [0, 0, 0, 0])][1::2]
+        ),
+    ) if with_subtitles else 0
+    roles = [
+        ("first", 0),
+        ("middle", len(rows) // 2),
+        ("last", len(rows) - 1),
+        ("longest_subtitle", longest),
+        ("boundary", boundary),
+    ]
+
+    def render_row(index: int) -> Image.Image:
+        row = rows[index]
+        with Image.open(Path(row["image_path"])) as source:
+            image = source.convert("RGB")
+        canvas = Image.new("RGB", (960, 540), "black")
+        fitted = ImageOps.fit(image, canvas.size, method=Image.Resampling.LANCZOS)
+        canvas.paste(fitted)
+        if with_subtitles:
+            draw = ImageDraw.Draw(canvas, "RGBA")
+            bbox_ratio = row.get("subtitle_bbox") or [0.0, 0.0, 0.0, 0.0]
+            y = int(canvas.height * float(bbox_ratio[1]))
+            bottom = int(canvas.height * (float(bbox_ratio[1]) + float(bbox_ratio[3])))
+            draw.rectangle((0, y, canvas.width, canvas.height), fill=(0, 0, 0, 220))
+            font = load_font(int(row.get("subtitle_font_size_pt") or 28))
+            text = str(row.get("subtitle_text") or "")
+            text_bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=0, align="center")
+            text_width = text_bbox[2] - text_bbox[0]
+            text_height = text_bbox[3] - text_bbox[1]
+            x = max(12, (canvas.width - text_width) // 2)
+            text_y = y + max(0, (bottom - y - text_height) // 2) - text_bbox[1]
+            draw.multiline_text(
+                (x, text_y), text, font=font, fill=(255, 255, 255, 255), spacing=0, align="center"
+            )
+        return canvas
+
+    rendered: list[Path] = []
+    for role, index in roles:
+        canvas = render_row(index)
+        path = output_dir / f"{role}_slide_{index + 1:03d}.png"
+        canvas.save(path)
+        rendered.append(path)
+
+    thumbnails: list[Image.Image] = []
+    for index in range(len(rows)):
+        thumbnail = render_row(index).resize((480, 270), Image.Resampling.LANCZOS)
+        draw = ImageDraw.Draw(thumbnail, "RGBA")
+        draw.rectangle((0, 0, 92, 28), fill=(0, 0, 0, 180))
+        draw.text((8, 3), f"slide {index + 1}", font=load_font(18), fill=(255, 255, 255, 255))
+        thumbnails.append(thumbnail)
+    contact = output_dir / "contact_sheet.png"
+    columns = 2
+    sheet = Image.new("RGB", (480 * columns, 270 * ((len(thumbnails) + columns - 1) // columns)), "white")
+    for position, thumbnail in enumerate(thumbnails):
+        sheet.paste(thumbnail, ((position % columns) * 480, (position // columns) * 270))
+    sheet.save(contact)
+    return [*rendered, contact]
 
 
 def ppt_slide_durations(timings: list[LineTiming], total_duration: float | None = None) -> list[float]:
@@ -1712,12 +1966,15 @@ def create_package_dirs(
     ppt_with_sub: Path,
     ppt_no_sub: Path,
     a_only_video: Path | None = None,
-) -> None:
+    backup_root: Path | None = None,
+) -> tuple[Path, Path, dict[str, Path]]:
     base_dir = output_root / f"绵羊故事锦囊：{story_name}（基础版）"
     advanced_dir = output_root / f"绵羊故事锦囊：{story_name}（进阶版）"
     for directory in (base_dir, advanced_dir):
         if directory.exists():
-            backup = directory.with_name(f"{directory.name}_旧版_{time.strftime('%Y%m%d_%H%M%S')}")
+            backup_dir = backup_root if backup_root is not None else directory.parent
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup = backup_dir / f"{directory.name}_旧版_{time.strftime('%Y%m%d_%H%M%S')}"
             shutil.move(str(directory), str(backup))
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -1736,12 +1993,16 @@ def create_package_dirs(
     ]
     if a_only_video is not None:
         advanced_items.append((a_only_video, f"A镜无人物背景视频：{story_name}.mp4"))
+    source_map: dict[str, Path] = {}
     for source, filename in base_items:
         shutil.copy2(source, base_dir / filename)
+        source_map[f"base:{filename}"] = source
     for source, filename in advanced_items:
         shutil.copy2(source, advanced_dir / filename)
+        source_map[f"advanced:{filename}"] = source
     print(f"已生成基础版：{base_dir}")
     print(f"已生成进阶版：{advanced_dir}")
+    return base_dir, advanced_dir, source_map
 
 
 def load_keying_preset(path: Path) -> KeyingPreset:
@@ -2019,7 +2280,12 @@ def validate_annotation_blocks(blocks: list[AnnotationBlock]) -> None:
             raise ValueError(f"朗读标注第 {index} 段解析出现套话，请改写为基于文本的具体指导。")
 
 
-def validate_annotation_coverage(blocks: list[AnnotationBlock], source_lines: list[str]) -> None:
+def validate_annotation_coverage(
+    blocks: list[AnnotationBlock],
+    source_lines: list[str],
+    *,
+    selected_source_indices: list[int] | None = None,
+) -> None:
     def normalized(value: str) -> str:
         return re.sub(r"\s+", "", value.replace("**", "").replace("/", ""))
 
@@ -2027,6 +2293,18 @@ def validate_annotation_coverage(blocks: list[AnnotationBlock], source_lines: li
     actual = normalized("".join(block.marked_text for block in blocks))
     if actual != expected:
         raise ValueError("朗读标注 marked_text 未逐字覆盖客户正文，存在增删、改写、代词或句尾差异。")
+    if selected_source_indices is not None:
+        flattened = [value for block in blocks for value in block.source_line_indices]
+        if flattened != selected_source_indices:
+            raise ValueError("朗读标注 source_line_indices 未按顺序且恰好一次覆盖当前 reading_annotation 选择。")
+        line_by_index = dict(zip(selected_source_indices, source_lines))
+        for position, block in enumerate(blocks, start=1):
+            try:
+                block_source = "".join(line_by_index[value] for value in block.source_line_indices)
+            except KeyError as error:
+                raise ValueError(f"朗读标注第 {position} 段引用了未选择的 source_line_index") from error
+            if normalized(block.marked_text) != normalized(block_source):
+                raise ValueError(f"朗读标注第 {position} 段文本与 source_line_indices 指向的原文不一致。")
 
 
 def infer_segment_title(line: str, index: int) -> str:
@@ -2142,7 +2420,18 @@ def set_cell_border(cell, color: str, size: int) -> None:
 
 
 def fill_ppt_image(slide, image_path: Path, prs: Presentation) -> None:
-    slide.shapes.add_picture(str(image_path), 0, 0, prs.slide_width, prs.slide_height)
+    # Cover the 16:9 canvas without changing the source aspect ratio. Passing
+    # both width and height to python-pptx stretches non-16:9 sources.
+    with Image.open(image_path) as source:
+        source_width, source_height = source.size
+    if source_width <= 0 or source_height <= 0:
+        raise ValueError(f"PPT 图片尺寸无效：{image_path}")
+    scale = max(prs.slide_width / source_width, prs.slide_height / source_height)
+    width = int(round(source_width * scale))
+    height = int(round(source_height * scale))
+    left = (prs.slide_width - width) // 2
+    top = (prs.slide_height - height) // 2
+    slide.shapes.add_picture(str(image_path), left, top, width, height)
 
 
 def overlay_title(slide, story_name: str, prs: Presentation) -> None:
@@ -2171,10 +2460,8 @@ def set_ppt_advance(slide, seconds: float) -> None:
 
 
 def add_ppt_subtitle(slide, text: str, prs: Presentation) -> None:
-    clean, font_size = fit_ppt_subtitle_text(text)
-    line_count = min(PPT_SUBTITLE_MAX_LINES, clean.count("\n") + 1)
-    height_ratio = 0.09 if line_count == 1 else 0.14
-    height = min(int(prs.slide_height * PPT_SUBTITLE_MAX_HEIGHT_RATIO), int(prs.slide_height * height_ratio))
+    clean, font_size, bbox = ppt_subtitle_layout(text)
+    height = min(int(prs.slide_height * PPT_SUBTITLE_MAX_HEIGHT_RATIO), int(prs.slide_height * bbox[3]))
     height = max(1, height)
     box = slide.shapes.add_textbox(0, prs.slide_height - height, prs.slide_width, height)
     box.fill.solid()
@@ -2195,6 +2482,16 @@ def add_ppt_subtitle(slide, text: str, prs: Presentation) -> None:
     run.font.size = PptPt(font_size)
     run.font.bold = True
     run.font.color.rgb = PptRGBColor(255, 255, 255)
+
+
+def ppt_subtitle_layout(text: str) -> tuple[str, int, list[float]]:
+    """Return the subtitle layout contract shared by PPT and QA evidence."""
+
+    clean, font_size = fit_ppt_subtitle_text(text)
+    line_count = min(PPT_SUBTITLE_MAX_LINES, clean.count("\n") + 1)
+    height_ratio = 0.09 if line_count == 1 else 0.14
+    height_ratio = min(PPT_SUBTITLE_MAX_HEIGHT_RATIO, height_ratio)
+    return clean, font_size, [0.0, 1.0 - height_ratio, 1.0, height_ratio]
 
 
 def fit_ppt_subtitle_text(text: str) -> tuple[str, int]:

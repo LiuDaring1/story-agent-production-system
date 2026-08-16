@@ -66,7 +66,12 @@ from video_motion import (
     review_semantic_issues,
     video_receipt_issues,
 )
-from keying_quality import keying_preset_lock_issues, lock_keying_preset, refresh_keying_quality_from_preset
+from keying_quality import (
+    keying_preset_lock_issues,
+    keying_review_images,
+    lock_keying_preset,
+    refresh_keying_quality_from_preset,
+)
 from demo_quality import demo_render_manifest_issues
 
 from story_codex_tasks import (
@@ -2479,19 +2484,22 @@ class StoryAgent:
             return result
         preview_dir = self.context.paths.status / "release_preview_frames"
         handoff = preview_dir / "release_preview_feedback_to_codex.md"
-        images = self._release_preview_images()
+        preview_images = self._release_preview_images()
         keying_search = self.context.paths.release / "keying" / "keying_search.json"
         keying_candidates = self.context.paths.release / "keying" / "keying_candidates.jpg"
         keying_machine_qa = self.context.paths.release / "keying" / "keying_machine_qa.json"
         keying_evidence = self.context.paths.release / "keying" / "evidence"
-        if keying_candidates.exists():
-            images = [keying_candidates, *images]
         try:
             qa_payload = json.loads(keying_machine_qa.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
             return StageResult("blocked", "抠像机器 QA 缺失或损坏，禁止独立审核。", keying_machine_qa)
         if qa_payload.get("passed") is not True or qa_payload.get("critical_errors"):
             return StageResult("blocked", f"抠像机器 QA 未通过：{keying_machine_qa}", keying_machine_qa)
+        evidence_manifest = Path(str(qa_payload.get("evidence_manifest") or ""))
+        try:
+            images = keying_review_images(keying_candidates, evidence_manifest, preview_images)
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+            return StageResult("blocked", f"抠像分区审核图片无法加载：{exc}", evidence_manifest)
         bundle = write_review_bundle(
             self.context.paths.status / "reviews" / "release_preview_bundle.json",
             [

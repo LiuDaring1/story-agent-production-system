@@ -34,6 +34,11 @@ from story_contract_consumers import BINDING_FIELDS, semantic_line_indices, writ
 from artifact_semantic_plan import load_current_artifact_semantic_plan, plan_binding, selected_line_indices
 from demo_quality import load_demo_brand_spec, write_demo_render_manifest
 from keying_quality import blurred_background_issues, file_sha256, keying_preset_lock_issues
+from production_keying import (
+    person_beauty_filter as shared_person_beauty_filter,
+    person_grade_filter as shared_person_grade_filter,
+    production_keying_filter_chain,
+)
 from story_video_synthesizer.image_video import sorted_image_files
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
 from story_video_synthesizer.subtitles import write_srt
@@ -1422,36 +1427,15 @@ def write_product_preflight_handoff(
 
 
 def keying_filter_chain(source: str, preset: KeyingPreset, crop_filter: str = "") -> str:
-    grade = person_grade_filter(preset.person_grade)
-    beauty = person_beauty_filter(preset.person_beauty)
-    beauty_chain = f"{beauty}," if beauty else ""
-    if preset.keyer == "chromakey":
-        return (
-            f"{source}{crop_filter}{beauty_chain}chromakey={preset.chroma_color}:{preset.chroma_similarity}:{preset.chroma_blend},"
-            f"format=rgba{grade}[person_keyed]"
-        )
-    return (
-        f"{source}{crop_filter}{beauty_chain}format=rgba,split[person_orig][person_keysrc];"
-        f"[person_keysrc]colorkey={preset.chroma_color}:{preset.chroma_similarity}:{preset.chroma_blend},"
-        "alphaextract,erosion,dilation[person_mask];"
-        f"[person_orig][person_mask]alphamerge,despill=type=green:mix=0.35{grade}[person_keyed]"
-    )
+    return production_keying_filter_chain(source, preset, crop_filter)
 
 
 def person_grade_filter(value: str) -> str:
-    if value == "natural":
-        return ",eq=contrast=1.05:saturation=1.07:brightness=0.01:gamma=0.99"
-    if value == "log-soft":
-        return ",eq=contrast=1.18:saturation=1.25:brightness=0.03:gamma=0.96"
-    if value == "log-strong":
-        return ",eq=contrast=1.30:saturation=1.35:brightness=0.04:gamma=0.92"
-    return ""
+    return shared_person_grade_filter({"person_grade": value})
 
 
 def person_beauty_filter(value: str) -> str:
-    if value == "light":
-        return "hqdn3d=1.2:1.0:3.0:2.0,unsharp=5:5:0.18:5:5:0.0"
-    return ""
+    return shared_person_beauty_filter({"person_beauty": value})
 
 
 def render_subtitle_overlay(srt_path: Path, output_path: Path, duration: float, width: int, height: int) -> None:

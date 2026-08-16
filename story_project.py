@@ -1667,41 +1667,31 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
     # candidate renderer itself includes full-resolution and local-zoom panels.
     shutil.copy2(candidate_sheet, candidate_detail_sheet)
     evidence_dir = output_dir / "evidence" / str(recommended["id"])
-    selected_candidate_file, machine_qa_path, _evidence = write_evidence_assets(
-        standing_frame,
-        gesture_frame,
-        chroma_color=color,
-        similarity=float(recommended["similarity"]),
-        blend=float(recommended["blend"]),
-        output_dir=evidence_dir,
-        candidate_id=str(recommended["id"]),
-        machine_qa_path=output_dir / "keying_machine_qa.json",
-    )
     search_path = output_dir / "keying_search.json"
-    save_json(
-        search_path,
-        {
-            "version": 1,
-            "source_video": str(video),
-            "source_sha256": sha256_file(video),
-            "chroma_color": color,
-            "green_variation": round(green_variation, 3),
-            "standing_frame": str(standing_frame),
-            "gesture_frame": str(gesture_frame),
-            "candidates": candidates,
-            "recommended_candidate": recommended["id"],
-            "candidate_sheet": str(candidate_sheet),
-            "candidate_detail_sheet": str(candidate_detail_sheet),
-            "selected_candidate_file": str(selected_candidate_file),
-            "selected_candidate_sha256": sha256_file(selected_candidate_file),
-            "machine_qa": str(machine_qa_path),
-            "evidence_manifest": str(evidence_dir / "evidence_manifest.json"),
-            "detected_person_bbox": person_crop,
-            "selection_policy": "背景绿幕波动决定候选中心 similarity；默认保守中心候选（blend=0.04），其余候选只供独立视觉审核比较。人物框不改变示范/C镜原始大小和位置，只用于清除表演安全区外的暗绿幕残边，并为A镜人物版式提供安全裁切。站立与大手势双帧由独立视觉审核最终确认。",
-            "visual_review_required": True,
-            "visual_review_status": "pending",
-        },
-    )
+    machine_qa_path = output_dir / "keying_machine_qa.json"
+    selected_candidate_file = evidence_dir / "selected_candidate.png"
+    evidence_manifest_path = evidence_dir / "evidence_manifest.json"
+    search = {
+        "version": 1,
+        "source_video": str(video),
+        "source_sha256": sha256_file(video),
+        "chroma_color": color,
+        "green_variation": round(green_variation, 3),
+        "standing_frame": str(standing_frame),
+        "gesture_frame": str(gesture_frame),
+        "candidates": candidates,
+        "recommended_candidate": recommended["id"],
+        "candidate_sheet": str(candidate_sheet),
+        "candidate_detail_sheet": str(candidate_detail_sheet),
+        "selected_candidate_file": str(selected_candidate_file),
+        "machine_qa": str(machine_qa_path),
+        "evidence_manifest": str(evidence_manifest_path),
+        "detected_person_bbox": person_crop,
+        "selection_policy": "背景绿幕波动决定候选中心 similarity；默认保守中心候选（blend=0.04），其余候选只供独立视觉审核比较。人物框不改变示范/C镜原始大小和位置，只用于清除表演安全区外的暗绿幕残边，并为A镜人物版式提供安全裁切。站立与大手势双帧由独立视觉审核最终确认。",
+        "visual_review_required": True,
+        "visual_review_status": "pending",
+    }
+    save_json(search_path, search)
     # Default for current horizontal 16:9 green-screen shoots: presenter centered
     # in the source, full body visible, then placed in the right-side open area.
     preset = {
@@ -1733,6 +1723,20 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
     }
     preset_path = output_dir / "keying_preset.json"
     save_json(preset_path, preset)
+    selected_candidate_file, machine_qa_path, _evidence = write_evidence_assets(
+        standing_frame,
+        gesture_frame,
+        chroma_color=color,
+        similarity=float(recommended["similarity"]),
+        blend=float(recommended["blend"]),
+        output_dir=evidence_dir,
+        candidate_id=str(recommended["id"]),
+        machine_qa_path=machine_qa_path,
+        preset=preset,
+        preset_path=preset_path,
+    )
+    search["selected_candidate_sha256"] = sha256_file(selected_candidate_file)
+    save_json(search_path, search)
     sheet = output_dir / "keying_samples.jpg"
     render_contact_sheet(frames, sheet, "绿幕自动采样帧")
     manifest["outputs"]["keying_preset"] = str(preset_path)

@@ -4,6 +4,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from PIL import Image, ImageDraw
@@ -13,8 +14,16 @@ from keying_quality import (
     blurred_background_issues,
     file_sha256,
     keying_preset_lock_issues,
+    keying_review_images,
     lock_keying_preset,
+    representative_evidence_images,
     write_evidence_assets,
+)
+from production_keying import (
+    PRODUCTION_KEYING_FILTER_VERSION,
+    production_keying_contract,
+    production_keying_filter_chain,
+    production_keying_fingerprint,
 )
 from demo_quality import demo_render_manifest_issues, write_demo_render_manifest
 from story_agent_runtime import write_review_bundle
@@ -40,23 +49,38 @@ def _locked_fixture(root: Path) -> tuple[Path, Path, Path, Path, Path]:
     _silhouette().save(candidate)
     evidence_asset = root / "hand.png"
     _silhouette().crop((0, 45, 55, 100)).save(evidence_asset)
-    evidence = root / "evidence_manifest.json"
-    evidence.write_text(json.dumps({"version": 1, "artifacts": [{
-        "role": "left_hand", "path": str(evidence_asset), "sha256": file_sha256(evidence_asset),
-    }]}), encoding="utf-8")
+    search = root / "keying_search.json"
+    search.write_text(json.dumps({"source_video": str(source), "candidates": [{"id": "balanced"}]}), encoding="utf-8")
     qa = root / "keying_machine_qa.json"
+    evidence = root / "evidence_manifest.json"
+    preset = root / "keying_preset.json"
+    preset_payload = {
+        "preset_version": "story-keying-preset/v2", "keying_candidate": "balanced",
+        "keying_search": str(search), "machine_qa": str(qa), "evidence_manifest": str(evidence),
+        "keyer": "colorkey", "chroma_color": "0x00FF00", "chroma_similarity": 0.1,
+        "chroma_blend": 0.0, "person_grade": "natural", "person_beauty": "light",
+        "person_crop": None,
+    }
+    preset.write_text(json.dumps(preset_payload), encoding="utf-8")
+    fingerprint = production_keying_fingerprint(preset_payload)
+    renderer = {
+        "renderer_kind": "production_ffmpeg",
+        "filter_version": PRODUCTION_KEYING_FILTER_VERSION,
+        "filter_fingerprint": fingerprint,
+        "filter_contract": production_keying_contract(preset_payload),
+        "preset_path": str(preset),
+        "preset_sha256": file_sha256(preset),
+    }
+    evidence.write_text(json.dumps({
+        "version": 2, **renderer, "keying_candidate": "balanced", "artifacts": [{
+            "role": "left_hand", "path": str(evidence_asset), "sha256": file_sha256(evidence_asset),
+        }],
+    }), encoding="utf-8")
     qa.write_text(json.dumps({
-        "schema_version": "story-keying-qa/v1", "keying_candidate": "balanced",
+        "schema_version": "story-keying-qa/v1", **renderer, "keying_candidate": "balanced",
         "candidate_file": str(candidate), "candidate_sha256": file_sha256(candidate),
         "evidence_manifest": str(evidence), "evidence_manifest_sha256": file_sha256(evidence),
         "passed": True, "critical_errors": [],
-    }), encoding="utf-8")
-    search = root / "keying_search.json"
-    search.write_text(json.dumps({"source_video": str(source), "candidates": [{"id": "balanced"}]}), encoding="utf-8")
-    preset = root / "keying_preset.json"
-    preset.write_text(json.dumps({
-        "preset_version": "story-keying-preset/v2", "keying_candidate": "balanced",
-        "keying_search": str(search), "machine_qa": str(qa), "evidence_manifest": str(evidence),
     }), encoding="utf-8")
     bundle = write_review_bundle(root / "keying_review_bundle.json", [preset, qa, evidence, evidence_asset])
     review = root / "keying_review_review.json"
@@ -71,6 +95,19 @@ def _locked_fixture(root: Path) -> tuple[Path, Path, Path, Path, Path]:
 
 
 class KeyingQualityTests(unittest.TestCase):
+    def test_demo_release_and_evidence_share_one_production_filter_builder(self) -> None:
+        from product_package import KeyingPreset, keying_filter_chain
+        from release_video import person_key_filters
+
+        preset = KeyingPreset(
+            keyer="colorkey", chroma_color="0x14DC1E", chroma_similarity=.08,
+            chroma_blend=.04, person_grade="natural", person_beauty="light",
+        )
+        release_settings = SimpleNamespace(**preset.__dict__)
+        expected = production_keying_filter_chain("[source]", preset)
+        self.assertEqual(keying_filter_chain("[source]", preset), expected)
+        self.assertEqual(";".join(person_key_filters(release_settings, "[source]")), expected)
+
     def test_clean_edge_passes_and_fine_hair_is_not_rejected(self) -> None:
         clean = _silhouette()
         draw = ImageDraw.Draw(clean)
@@ -151,6 +188,13 @@ class KeyingQualityTests(unittest.TestCase):
             review.write_bytes(review.read_bytes() + b" ")
             self.assertTrue(any("review" in issue for issue in keying_preset_lock_issues(preset)))
 
+    def test_filter_contract_change_invalidates_old_evidence_and_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            preset, _lock, _candidate, _evidence_asset, _source = _locked_fixture(Path(directory))
+            self.assertEqual(keying_preset_lock_issues(preset), [])
+            with patch("production_keying.PRODUCTION_KEYING_FILTER_VERSION", "story-production-keying-filter/v999"):
+                self.assertTrue(any("filter" in issue for issue in keying_preset_lock_issues(preset)))
+
     def test_evidence_generation_does_not_modify_original_input(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -163,11 +207,59 @@ class KeyingQualityTests(unittest.TestCase):
             green.save(gesture)
             source.write_bytes(b"original-user-video")
             before = file_sha256(source)
-            write_evidence_assets(
-                standing, gesture, chroma_color="0x14DC1E", similarity=.08, blend=.04,
-                output_dir=root / "evidence", candidate_id="balanced",
-            )
+            preset_payload = {
+                "keyer": "colorkey", "chroma_color": "0x14DC1E", "chroma_similarity": .08,
+                "chroma_blend": .04, "person_grade": "natural", "person_beauty": "light",
+                "person_crop": None,
+            }
+            preset = root / "keying_preset.json"
+            preset.write_text(json.dumps(preset_payload), encoding="utf-8")
+            with patch("keying_quality.render_production_keyed_foreground", wraps=__import__(
+                "production_keying"
+            ).render_production_keyed_foreground) as renderer:
+                _candidate, _qa, manifest = write_evidence_assets(
+                    standing, gesture, chroma_color="0x14DC1E", similarity=.08, blend=.04,
+                    output_dir=root / "evidence", candidate_id="balanced",
+                    preset=preset_payload, preset_path=preset,
+                )
+            self.assertEqual(renderer.call_count, 2)
+            self.assertEqual(manifest["renderer_kind"], "production_ffmpeg")
+            self.assertEqual(manifest["filter_fingerprint"], production_keying_fingerprint(preset_payload))
             self.assertEqual(file_sha256(source), before)
+
+    def test_representative_evidence_is_explicitly_added_to_review_images(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            roles = [
+                "standing_full_body", "wide_gesture_full_body", "standing_head_hair",
+                "wide_gesture_left_shoulder_forearm_hand", "wide_gesture_right_shoulder_forearm_hand",
+                "standing_garment_outline", "wide_gesture_high_contrast_edges",
+            ]
+            artifacts = []
+            for role in roles:
+                path = root / f"{role}.png"
+                _silhouette().save(path)
+                artifacts.append({"role": role, "path": str(path), "sha256": file_sha256(path)})
+            manifest = root / "evidence_manifest.json"
+            manifest.write_text(json.dumps({"version": 2, "artifacts": artifacts}), encoding="utf-8")
+            candidate = root / "candidates.jpg"
+            _silhouette().convert("RGB").save(candidate)
+            preview = root / "preview.png"
+            _silhouette().save(preview)
+            selected = representative_evidence_images(manifest)
+            images = keying_review_images(candidate, manifest, [preview])
+            self.assertEqual(images[0], candidate)
+            self.assertTrue(all(path in images for path in selected))
+            self.assertEqual(images[-1], preview)
+
+    def test_non_applicable_lower_body_regions_are_not_forced(self) -> None:
+        alpha = Image.new("L", (160, 180), 0)
+        ImageDraw.Draw(alpha).ellipse((50, 10, 110, 85), fill=255)
+        from keying_quality import evidence_regions
+
+        regions = evidence_regions(alpha)
+        self.assertNotIn("hem_lower_outline", regions)
+        self.assertNotIn("legs_feet", regions)
 
     def test_demo_manifest_binds_one_logo_semantic_plan_and_reviewed_keying(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

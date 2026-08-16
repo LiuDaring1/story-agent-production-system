@@ -11,6 +11,12 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
 from story_contract_consumers import BINDING_FIELDS, release_argument_overrides, write_json_atomic
+from production_keying import (
+    person_beauty_filter as shared_person_beauty_filter,
+    person_grade_filter as shared_person_grade_filter,
+    production_keying_filter_chain,
+    production_keying_filter_parts,
+)
 
 
 FINAL_WIDTH = 1080
@@ -739,51 +745,18 @@ def extract_video_frame(video: Path, output_path: Path, timestamp: float) -> Pat
 
 
 def extract_person_frame(config: ReleaseConfig, video: Path, output_path: Path, timestamp: float) -> Path:
-    filters: list[str] = []
+    crop_filter = ""
     if config.person_crop is not None:
         x, y, width, height = config.person_crop
-        filters.append(f"crop={width}:{height}:{x}:{y}")
-    source = "[0:v]"
-    if filters:
-        source = "[person_crop]"
-    grade = person_grade_filter(config)
-    beauty = person_beauty_filter(config)
-    if config.keyer == "chromakey":
-        graph = ",".join(filters + ([beauty] if beauty else []) + [f"chromakey={config.chroma_color}:{config.chroma_similarity}:{config.chroma_blend}", "format=rgba"])
-        if grade:
-            graph += grade
-        run_command(["ffmpeg", "-y", "-ss", f"{timestamp:.3f}", "-i", str(video), "-frames:v", "1", "-vf", graph, "-update", "1", str(output_path)])
-    else:
-        graph_parts: list[str] = []
-        if filters:
-            graph_parts.append(f"[0:v]{','.join(filters)}[person_crop]")
-        beauty_chain = f"{beauty}," if beauty else ""
-        graph_parts.extend(
-            [
-                f"{source}{beauty_chain}format=rgba,split[person_orig][person_keysrc]",
-                f"[person_keysrc]colorkey={config.chroma_color}:{config.chroma_similarity}:{config.chroma_blend},alphaextract,erosion,dilation[person_mask]",
-                f"[person_orig][person_mask]alphamerge,despill=type=green:mix=0.35{grade}[person_keyed]",
-            ]
-        )
-        run_command(
-            [
-                "ffmpeg",
-                "-y",
-                "-ss",
-                f"{timestamp:.3f}",
-                "-i",
-                str(video),
-                "-frames:v",
-                "1",
-                "-filter_complex",
-                ";".join(graph_parts),
-                "-map",
-                "[person_keyed]",
-                "-update",
-                "1",
-                str(output_path),
-            ]
-        )
+        crop_filter = f"crop={width}:{height}:{x}:{y},"
+    graph = production_keying_filter_chain("[0:v]", config, crop_filter)
+    run_command(
+        [
+            "ffmpeg", "-y", "-ss", f"{timestamp:.3f}", "-i", str(video),
+            "-filter_complex", graph, "-map", "[person_keyed]", "-frames:v", "1",
+            "-update", "1", str(output_path),
+        ]
+    )
     return output_path
 
 
@@ -1708,35 +1681,15 @@ def render_main_wide(config: ReleaseConfig, frame_image: Path, output_path: Path
 
 
 def person_key_filters(config: ReleaseConfig, source_label: str) -> list[str]:
-    beauty = person_beauty_filter(config)
-    beauty_chain = f"{beauty}," if beauty else ""
-    if config.keyer == "chromakey":
-        return [
-            f"{source_label}{beauty_chain}chromakey={config.chroma_color}:{config.chroma_similarity}:{config.chroma_blend},"
-            f"format=rgba{person_grade_filter(config)}[person_keyed]"
-        ]
-    return [
-        f"{source_label}{beauty_chain}format=rgba,split[person_orig][person_keysrc]",
-        f"[person_keysrc]colorkey={config.chroma_color}:{config.chroma_similarity}:{config.chroma_blend},"
-        "alphaextract,erosion,dilation[person_mask]",
-        f"[person_orig][person_mask]alphamerge,despill=type=green:mix=0.35{person_grade_filter(config)}[person_keyed]",
-    ]
+    return production_keying_filter_parts(source_label, config)
 
 
 def person_grade_filter(config: ReleaseConfig) -> str:
-    if config.person_grade == "natural":
-        return ",eq=contrast=1.05:saturation=1.07:brightness=0.01:gamma=0.99"
-    if config.person_grade == "log-soft":
-        return ",eq=contrast=1.18:saturation=1.25:brightness=0.03:gamma=0.96"
-    if config.person_grade == "log-strong":
-        return ",eq=contrast=1.30:saturation=1.35:brightness=0.04:gamma=0.92"
-    return ""
+    return shared_person_grade_filter(config)
 
 
 def person_beauty_filter(config: ReleaseConfig) -> str:
-    if config.person_beauty == "light":
-        return "hqdn3d=1.2:1.0:3.0:2.0,unsharp=5:5:0.18:5:5:0.0"
-    return ""
+    return shared_person_beauty_filter(config)
 
 
 def render_subtitle_overlay_video(

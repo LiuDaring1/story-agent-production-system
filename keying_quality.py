@@ -10,6 +10,13 @@ from typing import Any
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageStat
 
+from production_keying import (
+    PRODUCTION_KEYING_FILTER_VERSION,
+    production_keying_contract,
+    production_keying_fingerprint,
+    render_production_keyed_foreground,
+)
+
 
 QA_SCHEMA_VERSION = "story-keying-qa/v1"
 LOCK_SCHEMA_VERSION = "story-keying-preset-lock/v1"
@@ -248,22 +255,31 @@ def write_evidence_assets(
     output_dir: Path,
     candidate_id: str = "",
     machine_qa_path: Path | None = None,
+    preset: dict[str, Any] | None = None,
+    preset_path: Path | None = None,
 ) -> tuple[Path, Path, dict[str, Any]]:
-    try:
-        green = tuple(int(chroma_color[index:index + 2], 16) for index in (2, 4, 6))
-    except Exception:
-        green = (0, 255, 0)
+    settings = dict(preset or {})
+    settings.setdefault("keyer", "colorkey")
+    settings.setdefault("chroma_color", chroma_color)
+    settings.setdefault("chroma_similarity", similarity)
+    settings.setdefault("chroma_blend", blend)
+    settings.setdefault("person_grade", "none")
+    settings.setdefault("person_beauty", "none")
+    settings.setdefault("person_crop", None)
+    preset_sha256 = file_sha256(preset_path) if preset_path is not None else ""
+    render_contract = production_keying_contract(settings)
+    render_fingerprint = production_keying_fingerprint(settings)
     output_dir.mkdir(parents=True, exist_ok=True)
     artifacts: list[dict[str, str]] = []
     qa_by_pose: dict[str, Any] = {}
     candidate_file = output_dir / "selected_candidate.png"
     panels: list[Image.Image] = []
     for pose, source_path in (("standing", standing_frame), ("wide_gesture", gesture_frame)):
-        with Image.open(source_path) as source:
-            rgba = key_to_rgba(source, green, similarity, blend)
         pose_path = output_dir / f"{pose}_foreground.png"
-        rgba.save(pose_path)
-        panels.append(rgba)
+        render_production_keyed_foreground(source_path, pose_path, settings)
+        with Image.open(pose_path) as rendered:
+            rgba = rendered.convert("RGBA")
+        panels.append(rgba.copy())
         qa_by_pose[pose] = analyze_keyed_rgba(rgba)
         artifacts.append({"role": f"{pose}_full_body", "path": str(pose_path), "sha256": file_sha256(pose_path)})
         for region, box in evidence_regions(rgba.getchannel("A")).items():
@@ -276,12 +292,29 @@ def write_evidence_assets(
         canvas.paste(panel, (x, 0), panel)
         x += panel.width
     canvas.save(candidate_file)
-    manifest = write_json_atomic(output_dir / "evidence_manifest.json", {"version": 1, "artifacts": artifacts})
+    manifest_payload = {
+        "version": 2,
+        "renderer_kind": "production_ffmpeg",
+        "filter_version": PRODUCTION_KEYING_FILTER_VERSION,
+        "filter_fingerprint": render_fingerprint,
+        "filter_contract": render_contract,
+        "keying_candidate": candidate_id,
+        "preset_path": str(preset_path) if preset_path is not None else "",
+        "preset_sha256": preset_sha256,
+        "artifacts": artifacts,
+    }
+    manifest = write_json_atomic(output_dir / "evidence_manifest.json", manifest_payload)
     qa_path = write_json_atomic(
         machine_qa_path or output_dir.parent / "keying_machine_qa.json",
         {
             "schema_version": QA_SCHEMA_VERSION,
             "keying_candidate": candidate_id,
+            "renderer_kind": "production_ffmpeg",
+            "filter_version": PRODUCTION_KEYING_FILTER_VERSION,
+            "filter_fingerprint": render_fingerprint,
+            "filter_contract": render_contract,
+            "preset_path": str(preset_path) if preset_path is not None else "",
+            "preset_sha256": preset_sha256,
             "candidate_file": str(candidate_file),
             "candidate_sha256": file_sha256(candidate_file),
             "evidence_manifest": str(manifest),
@@ -292,6 +325,50 @@ def write_evidence_assets(
         },
     )
     return candidate_file, qa_path, json.loads(manifest.read_text(encoding="utf-8"))
+
+
+def representative_evidence_images(evidence_manifest_path: Path) -> list[Path]:
+    """Choose a bounded, deterministic multimodal evidence set."""
+
+    payload = json.loads(evidence_manifest_path.read_text(encoding="utf-8"))
+    artifacts = payload.get("artifacts", [])
+    by_role = {
+        str(item.get("role")): Path(str(item.get("path")))
+        for item in artifacts
+        if isinstance(item, dict) and item.get("role") and item.get("path")
+    }
+    priorities = [
+        "standing_full_body",
+        "wide_gesture_full_body",
+        "standing_head_hair",
+        "wide_gesture_left_shoulder_forearm_hand",
+        "wide_gesture_right_shoulder_forearm_hand",
+        "standing_garment_outline",
+        "standing_hem_lower_outline",
+        "standing_legs_feet",
+        "wide_gesture_high_contrast_edges",
+    ]
+    return [by_role[role] for role in priorities if role in by_role and by_role[role].is_file()]
+
+
+def keying_review_images(
+    candidate_sheet: Path | None,
+    evidence_manifest_path: Path,
+    preview_images: list[Path],
+) -> list[Path]:
+    ordered: list[Path] = []
+    if candidate_sheet is not None and candidate_sheet.is_file():
+        ordered.append(candidate_sheet)
+    ordered.extend(representative_evidence_images(evidence_manifest_path))
+    ordered.extend(path for path in preview_images if path.is_file())
+    result: list[Path] = []
+    seen: set[Path] = set()
+    for path in ordered:
+        resolved = path.resolve()
+        if resolved not in seen:
+            seen.add(resolved)
+            result.append(path)
+    return result
 
 
 def refresh_keying_quality_from_preset(preset_path: Path) -> tuple[Path, Path]:
@@ -315,11 +392,9 @@ def refresh_keying_quality_from_preset(preset_path: Path) -> tuple[Path, Path]:
         output_dir=evidence_dir,
         candidate_id=selected,
         machine_qa_path=preset_path.parent / "keying_machine_qa.json",
+        preset=preset,
+        preset_path=preset_path,
     )
-    preset["machine_qa"] = str(qa_path)
-    preset["evidence_manifest"] = str(evidence_dir / "evidence_manifest.json")
-    preset["selected_candidate_file"] = str(candidate_file)
-    write_json_atomic(preset_path, preset)
     search["selected_candidate_file"] = str(candidate_file)
     search["selected_candidate_sha256"] = file_sha256(candidate_file)
     search["machine_qa"] = str(qa_path)
@@ -346,6 +421,27 @@ def lock_keying_preset(
         raise ValueError("keying machine QA 未通过，不能锁定 preset")
     if qa.get("keying_candidate") != preset.get("keying_candidate"):
         raise ValueError("keying machine QA 未绑定当前 candidate")
+    expected_fingerprint = production_keying_fingerprint(preset)
+    expected_contract = production_keying_contract(preset)
+    if qa.get("renderer_kind") != "production_ffmpeg":
+        raise ValueError("keying machine QA 不是正式生产 FFmpeg chain 的证据")
+    if qa.get("preset_sha256") != file_sha256(preset_path):
+        raise ValueError("keying machine QA 未绑定当前 preset")
+    if qa.get("filter_fingerprint") != expected_fingerprint:
+        raise ValueError("keying machine QA 未绑定当前生产 keying filter")
+    if qa.get("filter_contract") != expected_contract:
+        raise ValueError("keying machine QA 的生产 filter contract 不一致")
+    evidence_payload = json.loads(evidence_manifest_path.read_text(encoding="utf-8"))
+    if evidence_payload.get("renderer_kind") != "production_ffmpeg":
+        raise ValueError("keying evidence 不是正式生产 FFmpeg chain 的证据")
+    if evidence_payload.get("preset_sha256") != file_sha256(preset_path):
+        raise ValueError("keying evidence 未绑定当前 preset")
+    if evidence_payload.get("filter_fingerprint") != expected_fingerprint:
+        raise ValueError("keying evidence 未绑定当前生产 keying filter")
+    if evidence_payload.get("filter_contract") != expected_contract:
+        raise ValueError("keying evidence 的生产 filter contract 不一致")
+    if evidence_payload.get("keying_candidate") != preset.get("keying_candidate"):
+        raise ValueError("keying evidence 未绑定当前 candidate")
     if not review_bundle_is_current(review_bundle_path) or not review_passes(review, artifact=review_bundle_path):
         raise ValueError("keying 独立审核未通过或 bundle 已失效")
     search_path = Path(str(preset.get("keying_search") or preset_path.with_name("keying_search.json"))).expanduser()
@@ -374,6 +470,9 @@ def lock_keying_preset(
         "review_bundle_sha256": file_sha256(review_bundle_path),
         "review_path": str(review_path),
         "review_sha256": file_sha256(review_path),
+        "renderer_kind": "production_ffmpeg",
+        "filter_version": PRODUCTION_KEYING_FILTER_VERSION,
+        "filter_fingerprint": expected_fingerprint,
     }
     return write_json_atomic(target, payload)
 
@@ -389,6 +488,7 @@ def keying_preset_lock_issues(preset_path: Path, lock_path: Path | None = None) 
         "candidate_sha256", "source_video", "source_sha256", "machine_qa_path", "machine_qa_sha256",
         "evidence_manifest_path", "evidence_manifest_sha256", "review_bundle_path", "review_bundle_sha256",
         "review_path", "review_sha256",
+        "renderer_kind", "filter_version", "filter_fingerprint",
     }
     if required - set(lock):
         return ["keying_preset_lock_fields_missing"]
@@ -426,6 +526,30 @@ def keying_preset_lock_issues(preset_path: Path, lock_path: Path | None = None) 
             issues.append("keying_machine_qa_candidate_binding_mismatch")
         if qa.get("evidence_manifest_sha256") != lock.get("evidence_manifest_sha256"):
             issues.append("keying_machine_qa_evidence_binding_mismatch")
+        expected_fingerprint = production_keying_fingerprint(preset)
+        expected_contract = production_keying_contract(preset)
+        if lock.get("renderer_kind") != "production_ffmpeg" or qa.get("renderer_kind") != "production_ffmpeg":
+            issues.append("keying_renderer_not_production_ffmpeg")
+        if lock.get("filter_version") != PRODUCTION_KEYING_FILTER_VERSION:
+            issues.append("keying_filter_version_stale")
+        if lock.get("filter_fingerprint") != expected_fingerprint:
+            issues.append("keying_filter_fingerprint_stale")
+        if qa.get("filter_version") != PRODUCTION_KEYING_FILTER_VERSION or qa.get("filter_fingerprint") != expected_fingerprint:
+            issues.append("keying_machine_qa_filter_stale")
+        if qa.get("filter_contract") != expected_contract:
+            issues.append("keying_machine_qa_filter_contract_mismatch")
+        if qa.get("preset_sha256") != lock.get("preset_sha256"):
+            issues.append("keying_machine_qa_preset_binding_mismatch")
+        if evidence.get("renderer_kind") != "production_ffmpeg":
+            issues.append("keying_evidence_renderer_invalid")
+        if evidence.get("filter_version") != PRODUCTION_KEYING_FILTER_VERSION or evidence.get("filter_fingerprint") != expected_fingerprint:
+            issues.append("keying_evidence_filter_stale")
+        if evidence.get("filter_contract") != expected_contract:
+            issues.append("keying_evidence_filter_contract_mismatch")
+        if evidence.get("preset_sha256") != lock.get("preset_sha256"):
+            issues.append("keying_evidence_preset_binding_mismatch")
+        if evidence.get("keying_candidate") != preset.get("keying_candidate"):
+            issues.append("keying_evidence_candidate_not_current")
         artifacts = evidence.get("artifacts")
         if not isinstance(artifacts, list) or not artifacts:
             issues.append("keying_evidence_manifest_empty")
@@ -448,5 +572,6 @@ def keying_preset_lock_issues(preset_path: Path, lock_path: Path | None = None) 
 __all__ = [
     "LOCK_SCHEMA_VERSION", "QA_SCHEMA_VERSION", "analyze_keyed_rgba", "blurred_background_issues",
     "evidence_regions", "file_sha256", "key_to_rgba", "keying_preset_lock_issues", "lock_keying_preset",
-    "refresh_keying_quality_from_preset", "write_evidence_assets", "write_json_atomic",
+    "keying_review_images", "refresh_keying_quality_from_preset", "representative_evidence_images",
+    "write_evidence_assets", "write_json_atomic",
 ]

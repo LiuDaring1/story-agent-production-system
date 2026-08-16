@@ -235,12 +235,22 @@ class StoryContractConsumerTests(unittest.TestCase):
                 library_watermark_text="", tail_seconds=0, tail_notice_text="", crf=17, preset="medium", output_scale=1,
             )
             compiled = apply_release_contract_spec(base, spec)
-            self.assertEqual((compiled.person_x, compiled.person_y, compiled.person_height), (1152, 108, 864))
+            # Contract person regions are safe regions, not a second
+            # fit-to-box instruction.  Approved Demo/source-native presenter
+            # geometry is compiled later by release_geometry.py.
+            self.assertEqual((compiled.person_x, compiled.person_y, compiled.person_height), (0, 0, 1))
             self.assertEqual(compiled.story_box, (96, 216, 960, 540))
             self.assertEqual((compiled.story_logo_x, compiled.story_logo_y, compiled.story_logo_width_a), (38, 32, 192))
             self.assertEqual(compiled.subtitle_margin_v, 54)
-            manifest = build_release_render_manifest(compiled, spec, [])
+            geometry = {
+                "schema_version": "story-release-geometry/v1",
+                "geometry_sha256": "d" * 64,
+                "bindings": {"compiled_release_spec_sha256": "e" * 64},
+                "presenter": {"a": {"source_native": True, "scale_changed": False}},
+            }
+            manifest = build_release_render_manifest(compiled, spec, [], geometry)
             self.assertIn("title_safe", manifest["safe_regions"])
+            self.assertTrue(manifest["actual_geometry"]["presenter"]["a"]["source_native"])
             for field in BINDING_FIELDS:
                 self.assertEqual(manifest[field], spec[field])
 

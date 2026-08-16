@@ -26,7 +26,7 @@ from story_contract_consumers import (
     compile_release_render_spec,
     release_argument_overrides,
 )
-from artifact_semantic_plan import load_current_artifact_semantic_plan, semantic_plan_path
+from artifact_semantic_plan import load_current_artifact_semantic_plan, semantic_plan_path, selected_line_indices
 
 from story_project import (
     auto_keying,
@@ -1195,6 +1195,7 @@ def run_package_release_project(
     release_defaults = config.get("release_defaults", {})
     release_contract_spec: Path | None = None
     release_contract_args: dict[str, object] = {}
+    release_semantic_plan: dict | None = None
     if story_contract_context is not None:
         release_contract_spec = compile_release_render_spec(
             story_contract_context,
@@ -1203,12 +1204,27 @@ def run_package_release_project(
         release_contract_args = release_argument_overrides(
             json.loads(release_contract_spec.read_text(encoding="utf-8")), "main"
         )
+        # Required-v1 packaging renders all text and brand elements
+        # deterministically.  Historical AI plate assets remain legacy-only.
+        main_plate = None
+        library_plate = None
+        release_semantic_plan = load_current_artifact_semantic_plan(paths.root)
     brand_assets = config.get("brand_assets", {})
     story_logo = first_existing(brand_assets.get("story_logo"), brand_assets.get("logo"))
     watermark_logo = first_existing(brand_assets.get("watermark_logo"))
     if story_logo is not None and watermark_logo is not None and story_logo.resolve() == watermark_logo.resolve():
         watermark_logo = None
     antipiracy_logo = first_existing(brand_assets.get("antipiracy_logo"), brand_assets.get("logo"))
+    if (
+        story_contract_context is not None
+        and antipiracy_logo is not None
+        and story_logo is not None
+        and antipiracy_logo.resolve() == story_logo.resolve()
+    ):
+        # The reviewed official story Logo is already a deterministic brand
+        # element.  Do not reuse it as the moving anti-piracy watermark and
+        # accidentally show the same official mark twice in one frame.
+        antipiracy_logo = None
     keying_preset = first_existing(outputs.get("keying_preset"), paths.release / "keying" / "keying_preset.json")
     if keying_preset is None and greenscreen is not None:
         try:
@@ -1223,7 +1239,6 @@ def run_package_release_project(
     missing: list[str] = []
     if requested_variant in {"both", "main"}:
         for label, value in (
-            ("主账号底板 main_release_plate.png", main_plate),
             ("主账号 16:9 背景图 main_background_16x9.png", bg_image),
             ("A 景透明故事框 story_frame_a.png", frame_a),
             ("无字幕背景视频 story_no_subs_bgm.mp4", main_bg_video),
@@ -1237,14 +1252,14 @@ def run_package_release_project(
     if requested_variant in {"both", "library"}:
         if library_bg_video is None:
             missing.append("宝库号有人声有字幕版本 story_demo_voice_bgm.mp4")
-        if library_plate is None:
+        if library_plate is None and story_contract_context is None:
             missing.append("宝库号底板 library_release_plate.png")
     if missing:
         request = create_theme_asset_request(paths.root)["request"]
         raise FileNotFoundError(
             "发布视频缺少必要素材：" + "、".join(missing) + f"。请先点击 ⑫ 生成/打开发布素材任务书，把复制的指令发给 Codex；Codex 生成素材后，再点 ⑬ 接收并体检发布素材：{request}"
         )
-    qa_theme_assets(paths, strict=True)
+    qa_theme_assets(paths, strict=story_contract_context is None)
 
     def resolve_scene_windows(bg_video: Path) -> tuple[str, str]:
         configured_b = str(release_defaults.get("b_windows", "") or "").strip()
@@ -1325,7 +1340,19 @@ def run_package_release_project(
             str(effective.get("subtitle_margin_v", 72)),
         ]
         if release_contract_spec is not None:
-            command.extend(["--contract-render-spec", release_contract_spec])
+            command.extend([
+                "--contract-render-spec", release_contract_spec,
+                "--artifact-semantic-plan", semantic_plan_path(paths.root),
+            ])
+        release_subtitle_srt = subtitle_srt
+        if release_semantic_plan is not None and subtitle_srt is not None:
+            artifact = "demo_subtitles" if selected_variant == "main" else "background_subtitles"
+            release_subtitle_srt = compile_release_subtitle_srt(
+                subtitle_srt,
+                release_semantic_plan,
+                artifact,
+                paths.status / "release_semantics" / f"{selected_variant}_{artifact}.srt",
+            )
         optional: list[tuple[str, object | None]] = [
             ("--plate-image", plate_image),
             ("--watermark-logo", watermark_logo),
@@ -1344,7 +1371,7 @@ def run_package_release_project(
                     ("--audio-mix", audio_mix),
                     ("--frame-image", frame_a),
                     ("--frame-image-b", frame_b),
-                    ("--subtitle-srt", subtitle_srt),
+                    ("--subtitle-srt", release_subtitle_srt),
                 ]
             )
             b_windows, c_windows = resolve_scene_windows(bg_video)
@@ -1356,7 +1383,7 @@ def run_package_release_project(
             optional.extend(
                 [
                     ("--audio-mix", audio_mix),
-                    ("--subtitle-srt", subtitle_srt),
+                    ("--subtitle-srt", release_subtitle_srt),
                 ]
             )
         if preview_times is not None:
@@ -2146,6 +2173,24 @@ def parse_simple_srt(path: Path) -> list[tuple[float, float, str]]:
         if cue_text:
             cues.append((parse_srt_timestamp(raw_start.strip()), parse_srt_timestamp(raw_end.strip()), cue_text))
     return cues
+
+
+def compile_release_subtitle_srt(source: Path, plan: dict, artifact: str, target: Path) -> Path:
+    """Project the reviewed per-artifact semantics onto an existing timeline."""
+    text = source.read_text(encoding="utf-8-sig", errors="strict")
+    blocks = [block for block in re.split(r"\n\s*\n", text.strip()) if block.strip()]
+    lines: list[str] = []
+    valid_blocks: list[str] = []
+    for block in blocks:
+        parts = [line.strip() for line in block.splitlines() if line.strip()]
+        if len(parts) >= 3 and "-->" in parts[1]:
+            valid_blocks.append(block.strip())
+            lines.append("，".join(parts[2:]).strip())
+    indices = selected_line_indices(lines, plan, artifact)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    selected = [valid_blocks[index] for index in indices]
+    target.write_text("\n\n".join(selected) + ("\n" if selected else ""), encoding="utf-8")
+    return target
 
 
 def parse_srt_timestamp(value: str) -> float:

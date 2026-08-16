@@ -2604,9 +2604,11 @@ class StoryAgent:
             shutil.rmtree(frame_dir)
         frames: list[Path] = []
         tail_sheets: list[Path] = []
+        boundary_sheets: list[Path] = []
         for video in videos:
             duration = self._probe_duration(video)
-            timestamps = [0.5, duration * 0.25, duration * 0.5, duration * 0.75]
+            timestamps = [0.5, 5.0, 10.0, 14.5, duration * 0.25, duration * 0.5, duration * 0.75]
+            timestamps.extend(max(0.0, duration - offset) for offset in (14.5, 10.0, 5.0, 0.5))
             if video.name == "宝库号发布视频.mp4":
                 # The library edition must have at least 30 seconds of a blurred,
                 # watermark-free tail.  Sparse quarter-point sampling cannot prove
@@ -2639,6 +2641,13 @@ class StoryAgent:
                         columns=7,
                     )
                 )
+            video_frames = sorted((frame_dir / video.stem).glob("*.jpg"))
+            if video_frames:
+                boundary_sheets.append(self._make_contact_sheet(
+                    video_frames[:4] + video_frames[-4:],
+                    self.context.paths.status / "reviews" / f"{video.stem}_first_last_15s.jpg",
+                    columns=4,
+                ))
         if not frames:
             return StageResult("blocked", "发布终片无法抽帧，拒绝仅凭文件存在放行。")
         contact_sheet = self._make_contact_sheet(frames, self.context.paths.status / "reviews" / "release_videos_contact_sheet.jpg", columns=5)
@@ -2646,6 +2655,8 @@ class StoryAgent:
             self.context.paths.status / "reviews" / "release_video_bundle.json",
             [
                 *videos, frame_dir,
+                *(path for path in sorted(self.context.paths.release.glob("release_geometry_manifest_*.json")) if path.is_file()),
+                *(path for path in sorted(self.context.paths.release.glob("release_render_manifest_*.json")) if path.is_file()),
                 *(path for path in [contract_consumer_path(self.context.project_dir, "release_video")] if path.exists()),
             ],
         )
@@ -2653,9 +2664,11 @@ class StoryAgent:
             stage="release_video_review",
             label="发布终片独立审核",
             bundle=bundle,
-            images=[contact_sheet, *tail_sheets],
+            images=[contact_sheet, *boundary_sheets, *self._release_preview_images(), *tail_sheets],
             rubric=(
-                "检查主账号和宝库号最终竖版视频抽帧：A/B/C 切换、人物抠像、字幕、标题信息、故事框、Logo、水印、尾部提示、"
+                "检查主账号和宝库号最终竖版视频抽帧：必须逐项引用首15秒、末15秒、A/B/C代表帧、切换帧、最大手势、字幕、Logo、上下确定性条带证据；"
+                "A镜人物必须继承审核通过的Demo/source-native尺度，仅允许合同要求的水平位移，不得二次fit-to-box缩小。"
+                "同时检查人物抠像、字幕、标题信息、故事框、Logo、水印、尾部提示、"
                 "黑帧和安全区。主账号必须是 2160×2880 且不得出现销售联系尾卡；宝库号应为 1080×1440，尾部模糊至少 30 秒且模糊阶段不显示移动水印。"
                 "宝库号接近片尾的连续抽帧包含片尾前 36、31、30、29 秒及最后 0.5 秒；请用这些带时间戳的边界帧核验尾部时长，"
                 "不要根据稀疏整十秒采样推测模糊起点。若片尾前 31 秒的帧已经模糊且无移动水印，即满足至少 30 秒。"
@@ -3567,19 +3580,22 @@ class StoryAgent:
 
     def _release_preview_images(self) -> list[Path]:
         preview_dir = self.context.paths.status / "release_preview_frames"
-        preferred = [
-            preview_dir / "preview_contact_sheet.png",
-            preview_dir / "main_002s_a_h84.png",
-            preview_dir / "main_002s_a_h90.png",
-            preview_dir / "main_002s_c.png",
-            preview_dir / "main_037s_b.png",
-            preview_dir / "library_002s.png",
-            preview_dir / "library_037s.png",
-        ]
-        existing = [path for path in preferred if path.exists()]
-        if existing:
-            return existing[:8]
-        return sorted(path for path in preview_dir.glob("*.png"))[:8] if preview_dir.exists() else []
+        if not preview_dir.exists():
+            return []
+        selected: list[Path] = []
+        contact = preview_dir / "preview_contact_sheet.png"
+        if contact.exists():
+            selected.append(contact)
+        # Explicitly hand the independent reviewer one representative of each
+        # deterministic A/B/C layout plus library and the latest A frame (often
+        # the maximum gesture).  Do not depend on historical h84/h90 names.
+        for pattern in ("main_*_a*.png", "main_*_b.png", "main_*_c.png", "library_*.png"):
+            matches = sorted(preview_dir.glob(pattern))
+            if matches:
+                selected.append(matches[0])
+                if pattern == "main_*_a*.png" and matches[-1] != matches[0]:
+                    selected.append(matches[-1])
+        return list(dict.fromkeys(selected))[:8]
 
     def _make_contact_sheet(self, sources: list[Path], target: Path, *, columns: int = 4) -> Path:
         valid: list[tuple[Path, Image.Image]] = []
@@ -4008,6 +4024,7 @@ class StoryAgent:
         elif consumer == "release_video":
             candidates.extend((self.context.paths.release / "theme_assets").glob("*.png"))
             candidates.extend(self.context.paths.release.glob("*发布视频.mp4"))
+            candidates.extend(self.context.paths.release.glob("release_geometry_manifest*.json"))
             candidates.extend(self.context.paths.release.glob("release_render_manifest*.json"))
         elif consumer == "product_package":
             work = self.context.paths.status / "product_package_work"
@@ -4297,7 +4314,53 @@ class StoryAgent:
         return not keying_preset_lock_issues(self.context.paths.release / "keying" / "keying_preset.json")
 
     def _has_release_videos(self, manifest: dict[str, Any]) -> bool:
-        return self._consumer_output_current(manifest, "release_video") and (self.context.paths.release / "主账号发布视频.mp4").exists() and (self.context.paths.release / "宝库号发布视频.mp4").exists()
+        outputs = (
+            self.context.paths.release / "主账号发布视频.mp4",
+            self.context.paths.release / "宝库号发布视频.mp4",
+        )
+        if not self._consumer_output_current(manifest, "release_video") or not all(path.exists() for path in outputs):
+            return False
+        if self._legacy_contract_policy(manifest):
+            return True
+        try:
+            from production_keying import production_keying_fingerprint
+            from release_geometry import canonical_sha256, file_sha256 as geometry_file_sha256, release_render_manifest_issues
+
+            spec_path = self.context.paths.status / "contracts" / "consumers" / "release_video.compiled.json"
+            preset_path = self.context.paths.release / "keying" / "keying_preset.json"
+            plan_path = semantic_plan_path(self.context.project_dir)
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            preset = json.loads(preset_path.read_text(encoding="utf-8"))
+            source = self._artifact_semantic_source(manifest)
+            if source is None:
+                return False
+            plan = load_current_artifact_semantic_plan(self.context.project_dir, source)
+            expected = {
+                "story_contract_sha256": str(spec["story_contract_sha256"]),
+                "contract_schema_version": str(spec["contract_schema_version"]),
+                "contract_projection_sha256": str(spec["contract_projection_sha256"]),
+                "story_contract_dependency_sha256": str(spec["story_contract_dependency_sha256"]),
+                "release_projection_sha256": str(spec["contract_projection_sha256"]),
+                "release_dependency_sha256": str(spec["story_contract_dependency_sha256"]),
+                "compiled_release_spec_sha256": canonical_sha256(spec),
+                "production_keying_filter_fingerprint": production_keying_fingerprint(preset),
+                "keying_preset_sha256": geometry_file_sha256(preset_path),
+                "keying_lock_sha256": geometry_file_sha256(preset_path.with_name("keying_preset.lock.json")),
+                **artifact_semantic_plan_binding(plan_path, plan),
+            }
+            candidates = sorted(self.context.paths.release.glob("release_render_manifest*.json"))
+            if not candidates:
+                return False
+            return all(
+                not release_render_manifest_issues(
+                    json.loads(path.read_text(encoding="utf-8")),
+                    expected_bindings=expected,
+                    verify_outputs=True,
+                )
+                for path in candidates
+            )
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+            return False
 
     def _has_release_qa(self, manifest: dict[str, Any]) -> bool:
         return self._json_qa_report_passes(self.context.paths.status / "qa_release_report.json")

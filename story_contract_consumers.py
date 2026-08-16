@@ -83,8 +83,10 @@ def compile_release_render_spec(context_path: Path | str, output_path: Path | st
     brand = projection.get("brand", {})
     layout = projection.get("release_layout", {})
     payload = {
-        "version": 1,
+        "version": 2,
         "consumer": "release_video",
+        "source_contract_context_path": str(Path(context_path).expanduser().resolve()),
+        "source_contract_context_sha256": hashlib.sha256(Path(context_path).read_bytes()).hexdigest(),
         **binding(context),
         "contract_projection_sha256": projection_sha256(context),
         "official_assets": [item for item in brand.get("assets", []) if "release_video" in item.get("allowed_uses", [])],
@@ -248,9 +250,12 @@ def release_argument_overrides(spec: Mapping[str, Any], variant_hint: str) -> di
     story = regions.get("story_media") or regions.get("story")
     logo = regions.get("logo") or regions.get("brand_logo")
     subtitle = regions.get("subtitle_safe") or regions.get("subtitle")
+    # The presenter region is a *safe placement region*, not a fit-to-box
+    # instruction.  M2-2C2 compiles the approved Demo/source-native transform
+    # and permits horizontal correction only; applying this region as a target
+    # height would silently shrink the presenter a second time.
     if person:
-        x, y, _width, height = pixel_box(person, 1920, 1080)
-        result.update(person_x=x, person_y=y, person_height=height)
+        result["person_safe_region"] = dict(person)
     if story:
         result["story_box"] = ",".join(str(value) for value in pixel_box(story, 1920, 1080))
     if logo:

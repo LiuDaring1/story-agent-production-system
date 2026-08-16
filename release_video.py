@@ -11,11 +11,27 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
 from story_contract_consumers import BINDING_FIELDS, release_argument_overrides, write_json_atomic
+from artifact_semantic_plan import load_current_artifact_semantic_plan, plan_binding as semantic_plan_binding
+from keying_quality import keying_preset_lock_issues
 from production_keying import (
     person_beauty_filter as shared_person_beauty_filter,
     person_grade_filter as shared_person_grade_filter,
     production_keying_filter_chain,
     production_keying_filter_parts,
+    production_keying_fingerprint,
+)
+from release_geometry import (
+    RELEASE_GEOMETRY_COMPILER_VERSION,
+    RELEASE_GEOMETRY_SCHEMA_VERSION,
+    approved_demo_geometry,
+    binding_payload as release_binding_payload,
+    canonical_sha256,
+    compile_text_group,
+    geometry_manifest_issues,
+    release_render_manifest_issues,
+    regions_for_variant as release_regions_for_variant,
+    release_a_geometry,
+    text_group_issues,
 )
 
 
@@ -90,6 +106,11 @@ class ReleaseConfig:
     crf: int
     preset: str
     output_scale: int
+    artifact_semantic_plan: Path | None = None
+    keying_preset_path: Path | None = None
+    age_text: str = "3-6岁"
+    usage_text: str = "适用于朗诵比赛、故事表演、少儿口才、技能比拼"
+    story_type: str = "儿童故事"
 
 
 def main() -> None:
@@ -149,6 +170,10 @@ def main() -> None:
     parser.add_argument("--preview-times", default="1,2,37,92", help="预览帧时间点，秒，用逗号分隔；默认包含开头动作帧以检查手部裁切")
     parser.add_argument("--preview-person-layouts", default="", help="预览人像布局候选；auto 或 height,x,y;label:height,x,y")
     parser.add_argument("--contract-render-spec", type=Path, help="已审核合同编译出的发布渲染规格")
+    parser.add_argument("--artifact-semantic-plan", type=Path, help="当前锁定合同编译出的逐产物语义计划")
+    parser.add_argument("--age-text", default="3-6岁", help="发布信息栏年龄文案")
+    parser.add_argument("--usage-text", default="适用于朗诵比赛、故事表演、少儿口才、技能比拼", help="发布信息栏固定用途文案")
+    parser.add_argument("--story-type", default="儿童故事", help="发布上条带故事/栏目类型")
     args = parser.parse_args()
 
     keying = load_keying_preset(args.keying_preset_json.expanduser()) if args.keying_preset_json else {}
@@ -235,9 +260,14 @@ def main() -> None:
         crf=args.crf,
         preset=args.preset,
         output_scale=max(1, args.output_scale),
+        artifact_semantic_plan=args.artifact_semantic_plan.expanduser() if args.artifact_semantic_plan else None,
+        keying_preset_path=args.keying_preset_json.expanduser() if args.keying_preset_json else None,
+        age_text=args.age_text,
+        usage_text=args.usage_text,
+        story_type=args.story_type,
     )
     contract_spec = load_release_contract_spec(args.contract_render_spec) if args.contract_render_spec else None
-    if contract_spec is not None and config.variant == "main":
+    if contract_spec is not None and config.variant in {"main", "both"}:
         config = apply_release_contract_spec(config, contract_spec)
     if args.preview_dir is not None:
         render_release_previews(
@@ -245,6 +275,7 @@ def main() -> None:
             args.preview_dir.expanduser(),
             parse_preview_times(args.preview_times),
             parse_preview_person_layouts(args.preview_person_layouts, config),
+            contract_spec=contract_spec,
         )
     else:
         package_release_videos(config, contract_spec=contract_spec)
@@ -259,24 +290,154 @@ def load_release_contract_spec(path: Path) -> dict:
 
 def apply_release_contract_spec(config: ReleaseConfig, spec: dict) -> ReleaseConfig:
     overrides = release_argument_overrides(spec, config.variant)
-    values = {key: value for key, value in overrides.items() if key != "safe_regions"}
+    values = {key: value for key, value in overrides.items() if key not in {"safe_regions", "person_safe_region"}}
     for key in ("story_box", "b_story_box"):
         if key in values and isinstance(values[key], str):
             values[key] = parse_required_box(values[key], f"--{key.replace('_', '-')}", "0,0,1,1")
+    # A and B are two presentations of the same reviewed official mark.  A
+    # contract-derived width must not silently fall back to an unrelated
+    # historical B-scene default.
+    if "story_logo_width_a" in values:
+        values["story_logo_width_b"] = values["story_logo_width_a"]
     return replace(config, **values)
 
 
-def build_release_render_manifest(config: ReleaseConfig, spec: dict, outputs: list[Path]) -> dict:
-    return {
-        "version": 1,
+def compile_release_geometry(config: ReleaseConfig, spec: dict) -> dict:
+    if config.artifact_semantic_plan is None:
+        raise ValueError("required_v1 发布渲染缺少 artifact_semantic_plan")
+    project_root = config.artifact_semantic_plan.resolve().parents[2]
+    semantic_plan = load_current_artifact_semantic_plan(project_root)
+    if config.keying_preset_path is None:
+        raise ValueError("required_v1 发布渲染缺少审核锁定的 keying preset")
+    lock_issues = keying_preset_lock_issues(config.keying_preset_path)
+    if lock_issues:
+        raise ValueError("required_v1 keying preset lock invalid: " + "; ".join(lock_issues))
+    preset = json.loads(config.keying_preset_path.read_text(encoding="utf-8"))
+    demo: dict | None = None
+    presenter_a: dict | None = None
+    if config.variant in {"both", "main"}:
+        if config.person_greenscreen is None:
+            raise ValueError("required_v1 主账号发布渲染缺少人物源视频")
+        source_width, source_height = probe_video_size(config.person_greenscreen)
+        if config.person_crop is not None:
+            _crop_x, _crop_y, source_width, source_height = config.person_crop
+        demo = approved_demo_geometry(
+            source_width, source_height, WIDE_WIDTH, WIDE_HEIGHT,
+            config.detected_person_bbox if config.person_crop is None else None,
+        )
+        regions = release_regions_for_variant(spec, "main", "16:9")
+        person_region = regions.get("person") or regions.get("host")
+        if not isinstance(person_region, dict):
+            raise ValueError("required_v1 release_layout lacks presenter safe region")
+        presenter_a = release_a_geometry(demo, person_region, WIDE_WIDTH, WIDE_HEIGHT)
+    compiled_spec_sha = canonical_sha256(spec)
+    bindings = release_binding_payload(
+        spec,
+        compiled_spec_sha256=compiled_spec_sha,
+        semantic_plan_path=config.artifact_semantic_plan,
+        keying_preset_path=config.keying_preset_path,
+        keying_filter_fingerprint=production_keying_fingerprint(preset),
+    )
+    bindings.update(semantic_plan_binding(config.artifact_semantic_plan, semantic_plan))
+    official_assets = [item for item in spec.get("official_assets", []) if isinstance(item, dict)]
+    logo_binding: dict[str, object] = {"count": 0, "asset_sha256": None, "asset_id": None}
+    if config.variant in {"both", "main"} and config.watermark_logo is not None:
+        raise ValueError("required_v1 主账号只允许一个审核通过的官方 Logo，禁止叠加额外 watermark_logo")
+    logo_region: list[int] | None = None
+    if config.story_logo is not None:
+        logo_sha = hashlib.sha256(config.story_logo.read_bytes()).hexdigest()
+        matches = [
+            item for item in official_assets
+            if str(item.get("sha256") or "") == logo_sha
+            and "release_video" in set(item.get("allowed_uses", []))
+        ]
+        if len(matches) != 1 or int(matches[0].get("max_per_frame", 1)) != 1:
+            raise ValueError("required_v1 发布 Logo 必须匹配唯一审核通过的官方资产且 max_per_frame=1")
+        logo_binding = {"count": 1, "asset_sha256": logo_sha, "asset_id": matches[0].get("asset_id")}
+        with Image.open(config.story_logo) as logo_image:
+            logo_height = max(1, round(logo_image.height * config.story_logo_width_a / max(1, logo_image.width)))
+        logo_region = [config.story_logo_x, config.story_logo_y, config.story_logo_width_a, logo_height]
+    elif official_assets:
+        raise ValueError("required_v1 发布渲染存在官方品牌资产但未提供 story_logo")
+    upper = {"x": 0, "y": 0, "width": FINAL_WIDTH, "height": TOP_HEIGHT}
+    lower = {"x": 0, "y": TOP_HEIGHT + CENTER_HEIGHT, "width": FINAL_WIDTH, "height": BOTTOM_HEIGHT}
+    library_group = compile_text_group(
+        {"x": 0.05, "y": (TOP_HEIGHT + CENTER_HEIGHT) / FINAL_HEIGHT, "width": 0.90, "height": BOTTOM_HEIGHT / FINAL_HEIGHT},
+        FINAL_WIDTH, FINAL_HEIGHT,
+        [
+            {"id": "duration", "text": config.duration_text, "hierarchy": 1},
+            {"id": "age", "text": config.age_text, "hierarchy": 2},
+            {"id": "usage", "text": config.usage_text, "hierarchy": 3},
+        ],
+    )
+    group_issues = text_group_issues(library_group)
+    if group_issues:
+        raise ValueError("required_v1 library text group invalid: " + "; ".join(group_issues))
+    release_overrides = release_argument_overrides(spec, config.variant)
+    safe_regions = release_overrides.get("safe_regions", {})
+    payload = {
+        "schema_version": RELEASE_GEOMETRY_SCHEMA_VERSION,
+        "compiler_version": RELEASE_GEOMETRY_COMPILER_VERSION,
+        "bindings": bindings,
+        "presenter": {
+            "approved_demo_geometry": demo or {"applicable": False, "reason": "library_variant"},
+            "a": presenter_a or {"visible": False, "applicable": False, "reason": "library_variant"},
+            "b": {"visible": False, "story_region": list(config.b_story_box)},
+            "c": ({**demo, "position_correction": {"x": 0, "y": 0}, "scale_changed": False}
+                  if demo is not None else {"visible": False, "applicable": False, "reason": "library_variant"}),
+        },
+        "main": {
+            "upper_strip": {**upper, "content": ["story_type", "story_name"], "renderer": "deterministic_text"},
+            "lower_strip": {**lower, "content": ["duration", "age", "approved_usage"], "renderer": "deterministic_text"},
+            "story_region_a": list(config.story_box),
+            "story_region_b": list(config.b_story_box),
+            "logo_region": logo_region,
+            "subtitle_margin_v": config.subtitle_margin_v,
+            "subtitle_safe_region": safe_regions.get("subtitle_safe") or safe_regions.get("subtitle"),
+            "contract_safe_regions": safe_regions,
+            "segments": {
+                "a": {"active": "default_except_explicit_b_c_windows"},
+                "b": {"active_time_ranges": [list(window) for window in config.b_windows]},
+                "c": {"active_time_ranges": [list(window) for window in config.c_windows]},
+            },
+        },
+        # The deterministic packager always stacks the center video directly
+        # below TOP_HEIGHT.  Historical plate video_box coordinates are not
+        # the actual geometry of required_v1 outputs.
+        "library": {
+            "text_group": library_group,
+            "video_region": [0, TOP_HEIGHT, FINAL_WIDTH, CENTER_HEIGHT],
+        },
+        "contract_layout_rules_sha256": canonical_sha256(spec.get("layout_rules", [])),
+        "semantic_selection": {
+            "main": "demo_subtitles",
+            "library": "background_subtitles",
+        },
+        "official_logo": logo_binding,
+    }
+    payload["geometry_sha256"] = canonical_sha256(payload)
+    issues = geometry_manifest_issues(payload)
+    if issues:
+        raise ValueError("release geometry compilation invalid: " + "; ".join(issues))
+    return payload
+
+
+def build_release_render_manifest(config: ReleaseConfig, spec: dict, outputs: list[Path], geometry: dict) -> dict:
+    payload = {
+        "version": 2,
         "consumer": "release_video",
         **{field: str(spec[field]) for field in BINDING_FIELDS},
+        **geometry["bindings"],
         "variant": config.variant,
-        "render_parameters": {
-            "person_region": [config.person_x, config.person_y, config.person_height],
-            "story_media_region": list(config.story_box),
-            "logo_region": [config.story_logo_x, config.story_logo_y, config.story_logo_width_a],
-            "subtitle_margin_v": config.subtitle_margin_v,
+        "release_geometry_schema_version": geometry["schema_version"],
+        "release_geometry_sha256": geometry["geometry_sha256"],
+        "actual_geometry": geometry,
+        "actual_output_geometry": {
+            "base_canvas": [FINAL_WIDTH, FINAL_HEIGHT],
+            "output_scale": config.output_scale if config.variant in {"both", "main"} else 1,
+            "main_canvas": [FINAL_WIDTH * config.output_scale, FINAL_HEIGHT * config.output_scale],
+            "library_canvas": [FINAL_WIDTH, FINAL_HEIGHT],
+            "center_video_region": [0, TOP_HEIGHT, FINAL_WIDTH, CENTER_HEIGHT],
         },
         "safe_regions": release_argument_overrides(spec, config.variant).get("safe_regions", {}),
         "outputs": [
@@ -284,6 +445,8 @@ def build_release_render_manifest(config: ReleaseConfig, spec: dict, outputs: li
             for path in outputs if path.is_file()
         ],
     }
+    payload["render_manifest_sha256"] = canonical_sha256(payload)
+    return payload
 
 
 def load_keying_preset(path: Path) -> dict:
@@ -532,12 +695,26 @@ def package_release_videos(config: ReleaseConfig, contract_spec: dict | None = N
     work_dir = config.output_dir / "_release_work"
     ensure_dir(work_dir)
 
-    assets = render_static_assets(config, work_dir)
+    geometry = compile_release_geometry(config, contract_spec) if contract_spec is not None else None
+    if contract_spec is not None and config.plate_image is not None:
+        raise ValueError("required_v1 发布视频禁止使用含 AI 文字/Logo 的整张 plate；必须使用确定性条带")
+    if geometry is not None:
+        geometry_path = config.output_dir / f"release_geometry_manifest_{config.variant}.json"
+        write_json_atomic(geometry_path, geometry)
+        persisted = json.loads(geometry_path.read_text(encoding="utf-8"))
+        issues = geometry_manifest_issues(persisted, geometry["bindings"])
+        if issues or persisted != geometry:
+            raise ValueError("release geometry manifest write verification failed: " + "; ".join(issues))
+    assets = render_static_assets(config, work_dir, geometry)
     generated: list[Path] = []
     if config.variant in {"both", "main"}:
         main_wide = work_dir / "main_account_16x9.mp4"
         main_vertical = config.output_dir / "主账号发布视频.mp4"
-        render_main_wide(config, assets["frame"], main_wide)
+        render_main_wide(
+            config, assets["frame"], main_wide,
+            presenter_geometry=(geometry or {}).get("presenter", {}).get("a"),
+            presenter_c_geometry=(geometry or {}).get("presenter", {}).get("c"),
+        )
         if config.plate_image is not None:
             render_plate_package(main_wide, config.plate_image, main_vertical, config, output_scale=config.output_scale)
         else:
@@ -578,10 +755,15 @@ def package_release_videos(config: ReleaseConfig, contract_spec: dict | None = N
         print(f"已生成宝库号发布视频：{library_output}")
         generated.append(library_output)
     if contract_spec is not None:
-        write_json_atomic(
-            config.output_dir / f"release_render_manifest_{config.variant}.json",
-            build_release_render_manifest(config, contract_spec, generated),
+        manifest_path = config.output_dir / f"release_render_manifest_{config.variant}.json"
+        manifest = build_release_render_manifest(config, contract_spec, generated, geometry)
+        write_json_atomic(manifest_path, manifest)
+        persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+        issues = release_render_manifest_issues(
+            persisted, expected_bindings=geometry["bindings"], verify_outputs=True,
         )
+        if issues or persisted != manifest:
+            raise ValueError("release render manifest write verification failed: " + "; ".join(issues))
 
 
 def render_release_previews(
@@ -589,12 +771,16 @@ def render_release_previews(
     preview_dir: Path,
     times: list[float],
     person_layouts: list[tuple[str, ReleaseConfig]] | None = None,
+    contract_spec: dict | None = None,
 ) -> None:
     validate_config(config)
     ensure_dir(preview_dir)
     work_dir = preview_dir / "_work"
     ensure_dir(work_dir)
-    assets = render_static_assets(config, work_dir)
+    geometry = compile_release_geometry(config, contract_spec) if contract_spec is not None else None
+    if geometry is not None:
+        write_json_atomic(preview_dir / f"release_geometry_manifest_{config.variant}.json", geometry)
+    assets = render_static_assets(config, work_dir, geometry)
     if config.variant in {"both", "main"}:
         if config.bg_image is None or config.person_greenscreen is None or config.frame_image is None:
             raise ValueError("主账号预览需要 --bg-image、--person-greenscreen 和 --frame-image")
@@ -604,23 +790,36 @@ def render_release_previews(
             use_c = any(start <= timestamp <= end for start, end in config.c_windows)
             if use_b:
                 output = preview_dir / f"main_{int(round(timestamp)):03d}s_b.png"
-                render_main_preview_frame(config, assets["frame"], output, work_dir, timestamp, "b")
+                render_main_preview_frame(
+                    config, assets["frame"], output, work_dir, timestamp, "b", geometry,
+                    assets["main_top"], assets["main_bottom"],
+                )
                 print(f"已生成主账号预览帧：{output}")
                 continue
             if use_c:
                 output = preview_dir / f"main_{int(round(timestamp)):03d}s_c.png"
-                render_main_preview_frame(config, assets["frame"], output, work_dir, timestamp, "c")
+                render_main_preview_frame(
+                    config, assets["frame"], output, work_dir, timestamp, "c", geometry,
+                    assets["main_top"], assets["main_bottom"],
+                )
                 print(f"已生成主账号预览帧：{output}")
                 continue
             for label, layout_config in layouts:
                 suffix = "" if label == "current" and len(layouts) == 1 else f"_{label}"
                 output = preview_dir / f"main_{int(round(timestamp)):03d}s_a{suffix}.png"
-                render_main_preview_frame(layout_config, assets["frame"], output, work_dir, timestamp, "a")
+                render_main_preview_frame(
+                    layout_config, assets["frame"], output, work_dir, timestamp, "a", geometry,
+                    assets["main_top"], assets["main_bottom"],
+                )
                 print(f"已生成主账号预览帧：{output}")
     if config.variant in {"both", "library"}:
         for timestamp in times:
             output = preview_dir / f"library_{int(round(timestamp)):03d}s.png"
-            render_library_preview_frame(config, assets["library_watermark"], output, work_dir, timestamp)
+            render_library_preview_frame(
+                config, assets["library_watermark"], output, work_dir, timestamp,
+                assets["library_top"] if geometry is not None else None,
+                assets["library_bottom"] if geometry is not None else None,
+            )
             print(f"已生成宝库号预览帧：{output}")
 
 
@@ -631,6 +830,9 @@ def render_main_preview_frame(
     work_dir: Path,
     timestamp: float,
     scene: str,
+    geometry: dict | None = None,
+    top_panel: Path | None = None,
+    bottom_panel: Path | None = None,
 ) -> None:
     assert config.bg_image is not None
     assert config.person_greenscreen is not None
@@ -660,13 +862,25 @@ def render_main_preview_frame(
         person_path = work_dir / f"person_{int(round(timestamp)):03d}.png"
         extract_person_frame(config, config.person_greenscreen, person_path, timestamp)
         person = Image.open(person_path).convert("RGBA")
-        if scene == "c":
+        if scene == "c" and geometry is not None:
+            placement = geometry["presenter"]["c"]
+            crop_x, crop_y, crop_width, crop_height = placement["source_crop"]
+            person = person.crop((crop_x, crop_y, crop_x + crop_width, crop_y + crop_height))
+            person = person.resize((placement["rendered_width"], placement["rendered_height"]), Image.Resampling.LANCZOS)
+            person_x, person_y = placement["x"], placement["y"]
+        elif scene == "c":
             person, person_x, person_y = native_person_preview_layout(
                 person,
                 config.detected_person_bbox if config.person_crop is None else None,
                 WIDE_WIDTH,
                 WIDE_HEIGHT,
             )
+        elif geometry is not None:
+            placement = geometry["presenter"]["a"]
+            crop_x, crop_y, crop_width, crop_height = placement["source_crop"]
+            person = person.crop((crop_x, crop_y, crop_x + crop_width, crop_y + crop_height))
+            person = person.resize((placement["rendered_width"], placement["rendered_height"]), Image.Resampling.LANCZOS)
+            person_x, person_y = placement["x"], placement["y"]
         else:
             if config.detected_person_bbox is not None and config.person_crop is None:
                 x, y, width, height = clamp_box(config.detected_person_bbox, person.width, person.height)
@@ -688,14 +902,32 @@ def render_main_preview_frame(
         logo = logo.resize((logo_width, max(1, round(logo.height * logo_width / max(1, logo.width)))), Image.Resampling.LANCZOS)
         base.alpha_composite(logo, (config.story_logo_x, config.story_logo_y))
     draw_preview_subtitle(base, config, timestamp)
-    output = package_preview_frame(base, config.plate_image, config.video_box) if config.plate_image is not None else base
+    if geometry is not None:
+        if top_panel is None or bottom_panel is None:
+            raise ValueError("required_v1 发布预览缺少确定性上下横条")
+        output = package_deterministic_preview_frame(base, top_panel, bottom_panel)
+    else:
+        output = package_preview_frame(base, config.plate_image, config.video_box) if config.plate_image is not None else base
     output.convert("RGB").save(output_path)
 
 
-def render_library_preview_frame(config: ReleaseConfig, watermark_png: Path, output_path: Path, work_dir: Path, timestamp: float) -> None:
+def render_library_preview_frame(
+    config: ReleaseConfig,
+    watermark_png: Path,
+    output_path: Path,
+    work_dir: Path,
+    timestamp: float,
+    top_panel: Path | None = None,
+    bottom_panel: Path | None = None,
+) -> None:
     frame_path = work_dir / f"library_story_{int(round(timestamp)):03d}.png"
     extract_video_frame(config.bg_video, frame_path, timestamp)
-    x, y, width, height = config.video_box
+    if top_panel is not None or bottom_panel is not None:
+        if top_panel is None or bottom_panel is None:
+            raise ValueError("required_v1 宝库号预览必须同时提供上下横条")
+        x, y, width, height = 0, TOP_HEIGHT, FINAL_WIDTH, CENTER_HEIGHT
+    else:
+        x, y, width, height = config.video_box
     story = scale_crop_image(Image.open(frame_path).convert("RGBA"), width, height)
     watermark = Image.open(watermark_png).convert("RGBA")
     wm_width = max(80, min(config.watermark_width, int(width * 0.28)))
@@ -716,6 +948,9 @@ def render_library_preview_frame(config: ReleaseConfig, watermark_png: Path, out
     if config.plate_image is not None:
         overlay = plate_overlay_image(config.plate_image, config.video_box, FINAL_WIDTH, FINAL_HEIGHT)
         canvas.alpha_composite(overlay)
+    elif top_panel is not None and bottom_panel is not None:
+        canvas.alpha_composite(Image.open(top_panel).convert("RGBA"), (0, 0))
+        canvas.alpha_composite(Image.open(bottom_panel).convert("RGBA"), (0, TOP_HEIGHT + CENTER_HEIGHT))
     canvas.convert("RGB").save(output_path)
 
 
@@ -725,6 +960,24 @@ def package_preview_frame(wide_frame: Image.Image, plate_image: Path, video_box:
     center = scale_crop_image(wide_frame.convert("RGBA"), width, height)
     canvas.alpha_composite(center, (x, y))
     canvas.alpha_composite(plate_overlay_image(plate_image, video_box, FINAL_WIDTH, FINAL_HEIGHT))
+    return canvas
+
+
+def package_deterministic_preview_frame(
+    wide_frame: Image.Image,
+    top_panel: Path,
+    bottom_panel: Path,
+) -> Image.Image:
+    """Mirror render_vertical_package for required_v1 review evidence."""
+    canvas = Image.new("RGBA", (FINAL_WIDTH, FINAL_HEIGHT), (255, 247, 223, 255))
+    center = ImageOps.contain(
+        wide_frame.convert("RGBA"), (FINAL_WIDTH, CENTER_HEIGHT), method=Image.Resampling.LANCZOS,
+    )
+    center_canvas = Image.new("RGBA", (FINAL_WIDTH, CENTER_HEIGHT), (255, 247, 223, 255))
+    center_canvas.alpha_composite(center, ((FINAL_WIDTH - center.width) // 2, (CENTER_HEIGHT - center.height) // 2))
+    canvas.alpha_composite(Image.open(top_panel).convert("RGBA"), (0, 0))
+    canvas.alpha_composite(center_canvas, (0, TOP_HEIGHT))
+    canvas.alpha_composite(Image.open(bottom_panel).convert("RGBA"), (0, TOP_HEIGHT + CENTER_HEIGHT))
     return canvas
 
 
@@ -1358,43 +1611,40 @@ def validate_release_assets(config: ReleaseConfig, *, frame_image: Path | None =
         raise ValueError("发布素材未通过机器完整性检查，已阻止全片渲染：\n" + "\n".join(f"- {issue}" for issue in issues))
 
 
-def render_static_assets(config: ReleaseConfig, work_dir: Path) -> dict[str, Path]:
+def render_static_assets(config: ReleaseConfig, work_dir: Path, geometry: dict | None = None) -> dict[str, Path]:
     frame = config.frame_image or render_default_frame(work_dir / "default_frame.png")
     # Validate the generated default frame too.  This keeps the same preflight
     # gate for hand-supplied and built-in A-scene frames.
     validate_release_assets(config, frame_image=frame)
     main_top = render_top_panel(
         work_dir / "main_top.png",
-        "故事表演",
+        config.story_type,
         config.story_name,
-        config.duration_text,
+        "",
         accent=(67, 143, 62),
     )
     main_bottom = render_bottom_panel(
         work_dir / "main_bottom.png",
-        [
-            "背景视频 + PPT + 配乐",
-            "文稿 + 标注",
-            "示范视频",
-        ],
+        [f"完整版时长：{config.duration_text}", f"适合年龄：{config.age_text}", config.usage_text],
         accent=(67, 143, 62),
     )
     library_top = render_top_panel(
         work_dir / "library_top.png",
-        "儿童故事",
+        config.story_type,
         config.story_name,
-        config.duration_text,
+        "",
         accent=(214, 88, 70),
     )
-    library_bottom = render_bottom_panel(
-        work_dir / "library_bottom.png",
-        [
-            "背景视频 + PPT + 配乐",
-            "文稿 + 标注",
-            "示范视频",
-        ],
-        accent=(214, 88, 70),
-    )
+    if geometry is not None:
+        library_bottom = render_compiled_text_group_panel(
+            work_dir / "library_bottom.png", geometry["library"]["text_group"], accent=(214, 88, 70)
+        )
+    else:
+        library_bottom = render_bottom_panel(
+            work_dir / "library_bottom.png",
+            [f"完整版时长：{config.duration_text}", f"适合年龄：{config.age_text}", config.usage_text],
+            accent=(214, 88, 70),
+        )
     library_watermark = config.antipiracy_logo or render_watermark_png(
         work_dir / "library_watermark.png",
         config.library_watermark_text,
@@ -1414,7 +1664,13 @@ def render_static_assets(config: ReleaseConfig, work_dir: Path) -> dict[str, Pat
     }
 
 
-def render_main_wide(config: ReleaseConfig, frame_image: Path, output_path: Path) -> None:
+def render_main_wide(
+    config: ReleaseConfig,
+    frame_image: Path,
+    output_path: Path,
+    presenter_geometry: dict | None = None,
+    presenter_c_geometry: dict | None = None,
+) -> None:
     assert config.bg_image is not None
     assert config.person_greenscreen is not None
     assert config.audio_mix is not None
@@ -1566,16 +1822,28 @@ def render_main_wide(config: ReleaseConfig, frame_image: Path, output_path: Path
     else:
         filters.append("[person_keyed]null[person_keyed_a]")
     a_subject_filter = ""
-    if config.detected_person_bbox is not None and config.person_crop is None:
-        source_width, source_height = probe_video_size(config.person_greenscreen)
-        crop_x, crop_y, crop_width, crop_height = clamp_box(config.detected_person_bbox, source_width, source_height)
+    if presenter_geometry is not None:
+        crop_x, crop_y, crop_width, crop_height = (int(value) for value in presenter_geometry["source_crop"])
         a_subject_filter = f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
+        a_width = int(presenter_geometry["rendered_width"]) * scale
+        a_height = int(presenter_geometry["rendered_height"]) * scale
+        a_x = int(presenter_geometry["x"]) * scale
+        a_y = int(presenter_geometry["y"]) * scale
+    else:
+        if config.detected_person_bbox is not None and config.person_crop is None:
+            source_width, source_height = probe_video_size(config.person_greenscreen)
+            crop_x, crop_y, crop_width, crop_height = clamp_box(config.detected_person_bbox, source_width, source_height)
+            a_subject_filter = f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
+        a_height = config.person_height * scale
+        a_width = -1
+        a_x = config.person_x * scale
+        a_y = config.person_y * scale
     filters.extend(
         [
             f"[{frame_index}:v]scale={wide_width}:{wide_height},setsar=1,format=rgba[frame]",
             "[withstory][frame]overlay=0:0[framed]",
-            f"[person_keyed_a]{a_subject_filter}scale=-1:{config.person_height * scale},setsar=1,format=rgba[person]",
-            f"[framed][person]overlay=min({config.person_x * scale}\\,W-w):min({config.person_y * scale}\\,H-h):"
+            f"[person_keyed_a]{a_subject_filter}scale={a_width}:{a_height},setsar=1,format=rgba[person]",
+            f"[framed][person]overlay={a_x}:{a_y}:"
             "eof_action=pass:repeatlast=0[withperson]",
         ]
     )
@@ -1607,12 +1875,24 @@ def render_main_wide(config: ReleaseConfig, frame_image: Path, output_path: Path
         filters.append(f"[{current}][{b_current}]blend=all_expr='if({b_expr},B,A)'[ab_scene]")
         current = "ab_scene"
     if has_c:
-        c_person_filter, c_person_x, c_person_y = native_person_filter_layout(
-            config.person_greenscreen,
-            config.detected_person_bbox if config.person_crop is None else None,
-            wide_width,
-            wide_height,
-        )
+        if presenter_c_geometry is not None:
+            crop_x, crop_y, crop_width, crop_height = (
+                int(value) for value in presenter_c_geometry["source_crop"]
+            )
+            c_person_filter = (
+                f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
+                f"scale={int(presenter_c_geometry['rendered_width']) * scale}:"
+                f"{int(presenter_c_geometry['rendered_height']) * scale}"
+            )
+            c_person_x = int(presenter_c_geometry["x"]) * scale
+            c_person_y = int(presenter_c_geometry["y"]) * scale
+        else:
+            c_person_filter, c_person_x, c_person_y = native_person_filter_layout(
+                config.person_greenscreen,
+                config.detected_person_bbox if config.person_crop is None else None,
+                wide_width,
+                wide_height,
+            )
         filters.extend(
             [
                 f"[person_keyed_c]{c_person_filter},setsar=1,format=rgba[person_c]",
@@ -2122,7 +2402,8 @@ def render_top_panel(output_path: Path, label: str, story_name: str, duration_te
     draw.text((FINAL_WIDTH / 2, 68), label, font=load_font(52), anchor="mm", fill=(86, 57, 28, 255), stroke_width=2, stroke_fill=(255, 255, 255, 255))
     title = story_name if story_name.startswith("《") else f"《{story_name}》"
     fit_text(draw, title, (FINAL_WIDTH / 2, 185), max_width=930, max_size=92, min_size=58, fill=accent)
-    draw.text((FINAL_WIDTH / 2, 282), f"时长：{duration_text}", font=load_font(48), anchor="mm", fill=accent, stroke_width=3, stroke_fill=(255, 248, 210, 255))
+    if duration_text:
+        draw.text((FINAL_WIDTH / 2, 282), f"时长：{duration_text}", font=load_font(48), anchor="mm", fill=accent, stroke_width=3, stroke_fill=(255, 248, 210, 255))
     image.save(output_path)
     return output_path
 
@@ -2134,14 +2415,59 @@ def render_bottom_panel(output_path: Path, lines: list[str], accent: tuple[int, 
     draw.rounded_rectangle((margin, 44, FINAL_WIDTH - margin, BOTTOM_HEIGHT - 44), radius=28, fill=(255, 245, 202, 255), outline=(132, 83, 39, 255), width=6)
     draw.line((105, 86, FINAL_WIDTH - 105, 86), fill=(199, 139, 59, 255), width=8)
     font = load_font(54)
+    wrapped_lines: list[list[str]] = [wrap_text(draw, line, font, 790) for line in lines]
+    required_height = sum(len(parts) * 64 + 18 for parts in wrapped_lines)
+    if 150 + required_height > BOTTOM_HEIGHT - 54:
+        raise ValueError("发布下横条文字无法在审核安全区内排版")
     y = 150
-    for line in lines:
+    for line, wrapped in zip(lines, wrapped_lines):
         draw.text((142, y), "•", font=font, fill=accent, anchor="lm")
-        wrapped = wrap_text(draw, line, font, 790)
         for part in wrapped:
             draw.text((190, y), part, font=font, fill=(62, 45, 28, 255), anchor="lm")
             y += 64
         y += 18
+    image.save(output_path)
+    return output_path
+
+
+def render_compiled_text_group_panel(
+    output_path: Path,
+    group: dict,
+    accent: tuple[int, int, int],
+) -> Path:
+    """Render the exact reviewed library text-group geometry.
+
+    Coordinates in the compiled spec are absolute on the 1080x1440 canvas;
+    this asset represents only the deterministic lower strip.
+    """
+    image = Image.new("RGBA", (FINAL_WIDTH, BOTTOM_HEIGHT), (255, 248, 218, 255))
+    draw = ImageDraw.Draw(image)
+    safe = group["safe_area"]
+    local_safe = (
+        int(safe["x"]), int(safe["y"]) - (TOP_HEIGHT + CENTER_HEIGHT),
+        int(safe["x"] + safe["width"]),
+        int(safe["y"] + safe["height"]) - (TOP_HEIGHT + CENTER_HEIGHT),
+    )
+    draw.rounded_rectangle(local_safe, radius=26, fill=(255, 245, 202, 255), outline=(132, 83, 39, 255), width=5)
+    for line in group["lines"]:
+        text = str(line["text"])
+        width = int(line["width"])
+        height = int(line["height"])
+        font_size = min(58 if int(line.get("hierarchy", 2)) == 1 else 48, max(20, round(height * 0.48)))
+        font = load_font(font_size)
+        while font_size > 20:
+            bbox = draw.textbbox((0, 0), text, font=font)
+            if bbox[2] - bbox[0] <= width * 0.92 and bbox[3] - bbox[1] <= height * 0.82:
+                break
+            font_size -= 2
+            font = load_font(font_size)
+        bbox = draw.textbbox((0, 0), text, font=font)
+        if bbox[2] - bbox[0] > width * 0.92 or bbox[3] - bbox[1] > height * 0.82:
+            raise ValueError("宝库号文字组无法在审核安全区内排版")
+        center_x = int(line["x"] + width / 2)
+        center_y = int(line["y"] - (TOP_HEIGHT + CENTER_HEIGHT) + height / 2)
+        fill = accent if int(line.get("hierarchy", 2)) == 1 else (62, 45, 28)
+        draw.text((center_x, center_y), text, font=font, fill=fill, anchor="mm")
     image.save(output_path)
     return output_path
 
@@ -2356,9 +2682,34 @@ def fit_text(
     for size in range(max_size, min_size - 1, -2):
         font = load_font(size)
         bbox = draw.textbbox((0, 0), text, font=font, stroke_width=4)
-        if bbox[2] - bbox[0] <= max_width or size == min_size:
+        if bbox[2] - bbox[0] <= max_width:
             draw.text(xy, text, font=font, anchor="mm", fill=fill, stroke_width=4, stroke_fill=(255, 247, 189, 255))
             return
+    # Two balanced lines are the only deterministic expansion allowed inside
+    # the reviewed strip.  The strip itself never grows to accommodate text.
+    middle = len(text) // 2
+    split_points = sorted(range(1, len(text)), key=lambda index: (abs(index - middle), index))
+    for size in range(max_size, min_size - 1, -2):
+        font = load_font(size)
+        for index in split_points:
+            lines = (text[:index], text[index:])
+            boxes = [draw.textbbox((0, 0), line, font=font, stroke_width=4) for line in lines]
+            if max(box[2] - box[0] for box in boxes) > max_width:
+                continue
+            line_gap = max(6, round(size * 0.12))
+            total_height = sum(box[3] - box[1] for box in boxes) + line_gap
+            if total_height > 150:
+                continue
+            center_x, center_y = xy
+            first_y = center_y - total_height / 2 + (boxes[0][3] - boxes[0][1]) / 2
+            second_y = center_y + total_height / 2 - (boxes[1][3] - boxes[1][1]) / 2
+            for line, line_y in zip(lines, (first_y, second_y)):
+                draw.text(
+                    (center_x, line_y), line, font=font, anchor="mm", fill=fill,
+                    stroke_width=4, stroke_fill=(255, 247, 189, 255),
+                )
+            return
+    raise ValueError("发布上横条标题无法在审核安全区内排版")
 
 
 def wrap_text(draw: ImageDraw.ImageDraw, text: str, font: ImageFont.ImageFont, max_width: int) -> list[str]:

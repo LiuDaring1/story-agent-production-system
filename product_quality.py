@@ -14,10 +14,16 @@ from lxml import etree
 from PIL import Image
 
 from artifact_semantic_plan import plan_binding, selected_line_indices
+from product_text_projection import (
+    PUBLIC_TEXT_TRANSFORM_VERSION,
+    compile_public_story_lines,
+    public_line_list_sha256,
+)
 
 
-PRODUCT_CONTENT_SCHEMA_VERSION = "story-product-content/v1"
-PRODUCT_CONTENT_COMPILER_VERSION = "1.0.0"
+PRODUCT_CONTENT_SCHEMA_VERSION = "story-product-content/v2"
+PRODUCT_CONTENT_COMPILER_VERSION = "2.0.0"
+PRODUCT_TIMING_COMPILER_VERSION = "story-product-timing/v1"
 PPT_RENDER_MANIFEST_VERSION = "story-ppt-render/v1"
 ANNOTATION_RECEIPT_VERSION = "story-reading-annotation/v1"
 PRODUCT_PACKAGE_MANIFEST_VERSION = "story-product-package/v1"
@@ -133,10 +139,23 @@ def compile_product_content_manifest(
     semantic_plan: dict[str, Any],
     source_script: Path,
     source_lines: list[str],
+    raw_source_lines: list[str],
     selections: dict[str, list[int]],
     images: list[Path],
     timings: list[Any],
+    timings_source: Path,
 ) -> dict[str, Any]:
+    if not timings_source.is_file():
+        raise ValueError("required_v1 product content requires a formal timings source")
+    public_lines = compile_public_story_lines(raw_source_lines)
+    if source_lines != public_lines:
+        raise ValueError("public source lines do not match the deterministic public-text projection")
+    try:
+        timings_payload = json.loads(timings_source.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("formal timings source must be valid JSON") from exc
+    if not isinstance(timings_payload, list):
+        raise ValueError("formal timings source must contain a JSON list")
     binding: dict[str, Any] = {
         key: semantic_plan.get(key)
         for key in (*CONTRACT_BINDING_FIELDS, "contract_projection_sha256")
@@ -174,8 +193,19 @@ def compile_product_content_manifest(
         "semantic_source": {
             "path": str(source_script),
             "sha256": file_sha256(source_script),
-            "line_count": len(source_lines),
-            "normalized_sha256": stable_sha256([_normalise_public(line) for line in source_lines]),
+            "line_count": len(raw_source_lines),
+        },
+        "public_text_projection": {
+            "transform_version": PUBLIC_TEXT_TRANSFORM_VERSION,
+            "line_count": len(public_lines),
+            "normalized_line_list_sha256": public_line_list_sha256(public_lines),
+        },
+        "timings_source": {
+            "path": str(timings_source),
+            "sha256": file_sha256(timings_source),
+            "row_count": len(timings_payload),
+            "normalized_rows_sha256": stable_sha256(timings_payload),
+            "compiler_version": PRODUCT_TIMING_COMPILER_VERSION,
         },
         "selections": selection_payload,
     }
@@ -215,13 +245,35 @@ def product_content_manifest_issues(
         issues.append("product_content_semantic_source_stale")
         source_lines: list[str] = []
     else:
-        source_lines = _read_semantic_source(source)
-        if payload.get("semantic_source", {}).get("line_count") != len(source_lines):
+        raw_source_lines = _read_semantic_source(source)
+        if payload.get("semantic_source", {}).get("line_count") != len(raw_source_lines):
             issues.append("product_content_semantic_source_line_count_mismatch")
-        if payload.get("semantic_source", {}).get("normalized_sha256") != stable_sha256(
-            [_normalise_public(line) for line in source_lines]
-        ):
-            issues.append("product_content_semantic_source_normalized_mismatch")
+        source_lines = compile_public_story_lines(raw_source_lines)
+        projection = payload.get("public_text_projection", {})
+        if projection.get("transform_version") != PUBLIC_TEXT_TRANSFORM_VERSION:
+            issues.append("product_content_public_transform_version_stale")
+        if projection.get("line_count") != len(source_lines):
+            issues.append("product_content_public_line_count_mismatch")
+        if projection.get("normalized_line_list_sha256") != public_line_list_sha256(source_lines):
+            issues.append("product_content_public_projection_stale")
+    timing_binding = payload.get("timings_source", {})
+    timing_path = Path(str(timing_binding.get("path") or "")) if isinstance(timing_binding, dict) else Path()
+    if not timing_path.is_file() or timing_binding.get("sha256") != file_sha256(timing_path):
+        issues.append("product_content_timings_source_stale")
+    else:
+        try:
+            timing_rows = json.loads(timing_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            timing_rows = None
+        if not isinstance(timing_rows, list):
+            issues.append("product_content_timings_source_invalid")
+        else:
+            if timing_binding.get("compiler_version") != PRODUCT_TIMING_COMPILER_VERSION:
+                issues.append("product_content_timing_compiler_version_stale")
+            if timing_binding.get("row_count") != len(timing_rows):
+                issues.append("product_content_timing_row_count_stale")
+            if timing_binding.get("normalized_rows_sha256") != stable_sha256(timing_rows):
+                issues.append("product_content_timing_rows_stale")
     try:
         plan_payload = json.loads(plan.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -547,6 +599,8 @@ def ppt_render_manifest_issues(manifest_path: Path) -> list[str]:
     content_manifest = Path(str(payload.get("product_content_manifest_path") or ""))
     if not content_manifest.is_file() or payload.get("product_content_manifest_sha256") != file_sha256(content_manifest):
         issues.append("ppt_content_manifest_stale")
+    elif product_content_manifest_issues(content_manifest):
+        issues.append("ppt_content_manifest_currentness_failed")
     if not pptx.is_file() or payload.get("pptx_sha256") != file_sha256(pptx):
         return [*issues, "pptx_stale"]
     rows = payload.get("slides")
@@ -743,6 +797,7 @@ def write_product_package_manifest(
         content = json.loads(dependencies["product_content_manifest"].read_text(encoding="utf-8"))
         for field in (*CONTRACT_BINDING_FIELDS, *SEMANTIC_BINDING_FIELDS):
             payload[field] = content.get(field)
+        payload["timings_provenance"] = content.get("timings_source")
     except (KeyError, OSError, json.JSONDecodeError):
         pass
     atomic_write_json(output, payload)
@@ -772,6 +827,7 @@ def product_package_manifest_issues(manifest_path: Path) -> list[str]:
         "music",
         "background_with_subtitles",
         "background_without_subtitles",
+        "timings_source",
     }
     if not isinstance(dependencies, dict):
         dependencies = {}
@@ -802,6 +858,10 @@ def product_package_manifest_issues(manifest_path: Path) -> list[str]:
         for field in (*CONTRACT_BINDING_FIELDS, *SEMANTIC_BINDING_FIELDS):
             if payload.get(field) != content_payload.get(field):
                 issues.append(f"product_binding_stale:{field}")
+        if payload.get("timings_provenance") != content_payload.get("timings_source"):
+            issues.append("product_timings_provenance_stale")
+        if product_content_manifest_issues(content_path):
+            issues.append("product_content_currentness_failed")
     except (OSError, json.JSONDecodeError):
         issues.append("product_content_dependency_invalid")
     seen: set[tuple[str, str]] = set()

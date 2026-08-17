@@ -52,6 +52,7 @@ from product_quality import (
     write_ppt_render_manifest,
     write_product_package_manifest,
 )
+from product_text_projection import clean_public_story_text as _clean_public_story_text
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -208,8 +209,11 @@ def build_product_package(args: argparse.Namespace) -> None:
     images = sorted_image_files(images_dir, slug=args.slug or None)
     if not images:
         raise ValueError(f"镜头图片目录为空：{images_dir}")
+    formal_timings_path = args.timings_json.expanduser() if args.timings_json else None
+    if args.artifact_semantic_plan and formal_timings_path is None:
+        raise ValueError("required_v1 正式资料包必须提供 --timings-json；平均时长仅允许 legacy/internal preview")
     timings = load_or_build_timings(
-        args.timings_json.expanduser() if args.timings_json else None,
+        formal_timings_path,
         script_lines,
         narration_path,
         allow_even=args.allow_even_timings,
@@ -262,6 +266,7 @@ def build_product_package(args: argparse.Namespace) -> None:
             semantic_plan=semantic_plan,
             source_script=script_path,
             source_lines=public_script_lines,
+            raw_source_lines=script_lines,
             selections={
                 "ppt": ppt_indices,
                 "customer_manuscript": manuscript_indices,
@@ -270,6 +275,7 @@ def build_product_package(args: argparse.Namespace) -> None:
             },
             images=images,
             timings=timings,
+            timings_source=formal_timings_path,
         )
         write_json_atomic(product_content_manifest_path, content_manifest)
         write_json_atomic(
@@ -635,6 +641,7 @@ def build_product_package(args: argparse.Namespace) -> None:
             "music": music_path,
             "background_with_subtitles": bg_with_sub,
             "background_without_subtitles": bg_no_sub,
+            "timings_source": formal_timings_path,
         }
         write_product_package_manifest(
             work_dir / "product_package_manifest.json",
@@ -2088,16 +2095,8 @@ def split_story_paragraphs(text: str) -> list[str]:
 
 
 def clean_public_story_text(text: str) -> str:
-    # 对外文稿和朗读标注都不保留主持人自我介绍。过去这里只把姓名
-    # 替换成下划线，导致独立审核要求“整句删除”而打包器仍要求逐字
-    # 覆盖占位句，形成无法通过的互斥门槛。
-    text = re.sub(
-        r"(?:大家好\s*[，,。！？!?]?\s*)?我是\s*绵羊姐姐(?:姐姐)?\s*[。！？!?]?\s*",
-        "",
-        text,
-    )
-    text = text.replace("绵羊姐姐", "____")
-    return text.strip()
+    # Compatibility wrapper.  Production and validation share one transform.
+    return _clean_public_story_text(text)
 
 
 def build_annotation_blocks(lines: list[str]) -> list[AnnotationBlock]:

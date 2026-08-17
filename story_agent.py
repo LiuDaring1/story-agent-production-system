@@ -4607,6 +4607,8 @@ class StoryAgent:
             return False
         if self._legacy_contract_policy(manifest):
             return True
+        if not self._has_product_package(manifest):
+            return False
         try:
             from product_quality import product_package_review_payload_issues
 

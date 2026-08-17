@@ -15,6 +15,7 @@ from product_package import (
     render_ppt_evidence,
     render_annotation_blocks_docx,
     render_story_docx,
+    load_or_build_timings,
     validate_annotation_coverage,
 )
 from product_quality import (
@@ -31,7 +32,9 @@ from product_quality import (
     write_manuscript_receipt,
     write_ppt_render_manifest,
     write_product_package_manifest,
+    stable_sha256,
 )
+from product_text_projection import compile_public_story_lines
 from story_agent import AgentContext, StageResult, StoryAgent
 from story_agent_runtime import file_sha256
 from story_project import init_project, project_paths
@@ -56,6 +59,12 @@ class ProductQualityTests(unittest.TestCase):
             Image.new("RGB", (320, 180), (80 + index * 20, 120, 150)).save(path)
             self.images.append(path)
         self.timings = [timing(1, self.lines[0], 0.0), timing(2, self.lines[1], 1.0)]
+        self.timings_source = self.root / "timings.json"
+        self.timings_source.write_text(json.dumps([
+            {"line": line, "source_start": float(index), "source_end": float(index + 1),
+             "duration": 1.0, "timeline_start": float(index), "timeline_end": float(index + 1)}
+            for index, line in enumerate(self.lines)
+        ], ensure_ascii=False), encoding="utf-8")
         self.semantic = {
             "story_contract_sha256": "a" * 64,
             "contract_schema_version": "1.0",
@@ -93,6 +102,7 @@ class ProductQualityTests(unittest.TestCase):
             semantic_plan=self.semantic,
             source_script=self.script,
             source_lines=self.lines,
+            raw_source_lines=self.lines,
             selections={
                 "ppt": [0, 1],
                 "customer_manuscript": [0, 1],
@@ -101,12 +111,13 @@ class ProductQualityTests(unittest.TestCase):
             },
             images=self.images,
             timings=self.timings,
+            timings_source=self.timings_source,
         )
         atomic_write_json(path, payload)
         return path
 
     def make_package_dependencies(self, content: Path) -> dict[str, Path]:
-        dependencies = {"product_content_manifest": content}
+        dependencies = {"product_content_manifest": content, "timings_source": self.timings_source}
         names = (
             "customer_manuscript_receipt",
             "reading_annotation_receipt",
@@ -143,6 +154,78 @@ class ProductQualityTests(unittest.TestCase):
         self.assertTrue(payload["artifact_semantic_plan_sha256"])
         self.assertTrue(payload["artifact_semantic_plan_dependency_sha256"])
         self.assertEqual(payload["contract_projection_sha256"], self.semantic["contract_projection_sha256"])
+
+    def test_public_projection_revalidates_from_raw_presenter_source(self) -> None:
+        raw_lines = ["大家好，我是故事老师。", "第一句。", "第二句。"]
+        public_lines = compile_public_story_lines(raw_lines)
+        self.assertEqual(public_lines, ["", "第一句。", "第二句。"])
+        self.script.write_text("\n".join(raw_lines), encoding="utf-8")
+        self.plan_payload["semantic_source"]["line_count"] = 3
+        for artifact in self.plan_payload["artifacts"].values():
+            artifact["decisions"][0]["source_line_numbers"] = [2, 3]
+        self.plan.write_text(json.dumps(self.plan_payload, ensure_ascii=False), encoding="utf-8")
+        timing_rows = json.loads(self.timings_source.read_text(encoding="utf-8"))
+        timing_rows.insert(0, {
+            "line": raw_lines[0], "source_start": 0.0, "source_end": 1.0,
+            "duration": 1.0, "timeline_start": 0.0, "timeline_end": 1.0,
+        })
+        self.timings_source.write_text(json.dumps(timing_rows, ensure_ascii=False), encoding="utf-8")
+        manifest = self.root / "public-content.json"
+        payload = compile_product_content_manifest(
+            semantic_plan_path=self.plan,
+            semantic_plan=self.semantic,
+            source_script=self.script,
+            source_lines=public_lines,
+            raw_source_lines=raw_lines,
+            selections={name: [1, 2] for name in (
+                "ppt", "customer_manuscript", "reading_annotation", "demo_subtitles"
+            )},
+            images=[self.images[0], *self.images],
+            timings=[timing(1, raw_lines[0], 0.0), *self.timings],
+            timings_source=self.timings_source,
+        )
+        atomic_write_json(manifest, payload)
+        self.assertEqual(product_content_manifest_issues(manifest), [])
+        self.script.write_text("大家好，我是故事老师。\n第一句改了。\n第二句。", encoding="utf-8")
+        self.assertIn("product_content_semantic_source_stale", product_content_manifest_issues(manifest))
+
+    def test_public_transform_version_and_selected_public_text_are_currentness_inputs(self) -> None:
+        manifest = self.make_content_manifest()
+        with patch("product_quality.PUBLIC_TEXT_TRANSFORM_VERSION", "story-public-text/v-next"):
+            self.assertIn(
+                "product_content_public_transform_version_stale",
+                product_content_manifest_issues(manifest),
+            )
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        row = payload["selections"]["customer_manuscript"]["rows"][0]
+        row["text"] = "被替换的公开正文。"
+        row["text_sha256"] = stable_sha256(row["text"])
+        payload["selections"]["customer_manuscript"]["selection_sha256"] = stable_sha256(
+            payload["selections"]["customer_manuscript"]["rows"]
+        )
+        payload.pop("compiled_payload_sha256")
+        payload["compiled_payload_sha256"] = stable_sha256(payload)
+        atomic_write_json(manifest, payload)
+        self.assertIn(
+            "product_content_selection_text_stale:customer_manuscript",
+            product_content_manifest_issues(manifest),
+        )
+
+    def test_required_content_manifest_rejects_missing_formal_timings_source(self) -> None:
+        with self.assertRaisesRegex(ValueError, "formal timings source"):
+            compile_product_content_manifest(
+                semantic_plan_path=self.plan,
+                semantic_plan=self.semantic,
+                source_script=self.script,
+                source_lines=self.lines,
+                raw_source_lines=self.lines,
+                selections={name: [0, 1] for name in (
+                    "ppt", "customer_manuscript", "reading_annotation", "demo_subtitles"
+                )},
+                images=self.images,
+                timings=self.timings,
+                timings_source=self.root / "missing-timings.json",
+            )
 
     def test_content_manifest_hand_edit_is_rejected(self) -> None:
         path = self.make_content_manifest()
@@ -330,6 +413,31 @@ class ProductQualityTests(unittest.TestCase):
         self.images[0].write_bytes(b"changed")
         self.assertTrue(any("source_image_stale" in issue for issue in ppt_render_manifest_issues(manifest)))
 
+    def test_timings_change_stales_content_and_dependent_ppt(self) -> None:
+        content = self.make_content_manifest()
+        music = self.root / "timing-music.mp3"
+        music.write_bytes(b"offline-music-fixture")
+        pptx = self.root / "timing.pptx"
+        build_story_ppt("故事", self.images, self.lines, self.timings, music, pptx, True, 2.0)
+        rows = build_ppt_manifest_rows(self.images, self.lines, self.timings, [0, 1], 2.0, with_subtitles=True)
+        manifest = self.root / "timing-ppt.json"
+        write_ppt_render_manifest(
+            manifest, pptx=pptx, with_subtitles=True, rows=rows, music=music,
+            content_manifest=content,
+        )
+        self.assertEqual(ppt_render_manifest_issues(manifest), [])
+        timing_rows = json.loads(self.timings_source.read_text(encoding="utf-8"))
+        timing_rows[0]["source_end"] = 1.25
+        self.timings_source.write_text(json.dumps(timing_rows, ensure_ascii=False), encoding="utf-8")
+        self.assertIn("product_content_timings_source_stale", product_content_manifest_issues(content))
+        self.assertIn("ppt_content_manifest_currentness_failed", ppt_render_manifest_issues(manifest))
+
+    def test_even_timings_remain_available_only_to_preview_legacy_path(self) -> None:
+        with patch("product_package.align_evenly", return_value=self.timings) as align:
+            result = load_or_build_timings(None, self.lines, self.root / "preview.wav", allow_even=True)
+        self.assertEqual(result, self.timings)
+        align.assert_called_once()
+
     def test_no_subtitle_ppt_has_no_story_text(self) -> None:
         content = self.make_content_manifest()
         music = self.root / "music.mp3"
@@ -409,6 +517,17 @@ class ProductQualityTests(unittest.TestCase):
             source_map=source_map,
         )
         self.assertEqual(product_package_manifest_issues(manifest), [])
+        timing_rows = json.loads(self.timings_source.read_text(encoding="utf-8"))
+        timing_rows[0]["timeline_end"] = 1.5
+        self.timings_source.write_text(json.dumps(timing_rows, ensure_ascii=False), encoding="utf-8")
+        timing_issues = product_package_manifest_issues(manifest)
+        self.assertIn("product_dependency_stale:timings_source", timing_issues)
+        self.assertIn("product_content_currentness_failed", timing_issues)
+        self.timings_source.write_text(json.dumps([
+            {"line": line, "source_start": float(index), "source_end": float(index + 1),
+             "duration": 1.0, "timeline_start": float(index), "timeline_end": float(index + 1)}
+            for index, line in enumerate(self.lines)
+        ], ensure_ascii=False), encoding="utf-8")
         (base / ".DS_Store").write_bytes(b"junk")
         payload = json.loads(manifest.read_text())
         payload["files"].append({"package": "base", "relative_path": "base/.DS_Store", "role": "unknown", "sha256": "x", "source_path": str(dependency), "source_sha256": "x"})
@@ -532,6 +651,31 @@ class ProductQualityTests(unittest.TestCase):
 
         self.assertEqual(result.status, "done")
         self.assertEqual(structured_review.call_args.kwargs["images"], sorted(expected_images))
+
+    def test_product_package_review_cannot_remain_current_when_package_inputs_are_stale(self) -> None:
+        project = self.root / "review-currentness-project"
+        manifest = init_project(project, story_name="通用故事", slug="generic-story")
+        context = AgentContext(
+            project_dir=project,
+            inbox=None,
+            story_name="通用故事",
+            slug="generic-story",
+            execute=False,
+            update_latest_episode=False,
+            codex_mode="handoff",
+            codex_model="",
+            codex_sandbox="workspace-write",
+            codex_approval="never",
+            codex_path="codex",
+            codex_timeout=30,
+        )
+        agent = StoryAgent(context, read_only=True)
+        with (
+            patch.object(agent, "_review_stage_current", return_value=True),
+            patch.object(agent, "_legacy_contract_policy", return_value=False),
+            patch.object(agent, "_has_product_package", return_value=False),
+        ):
+            self.assertFalse(agent._has_product_package_review(manifest))
 
 
 if __name__ == "__main__":

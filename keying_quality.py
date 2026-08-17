@@ -10,16 +10,47 @@ from typing import Any
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageStat
 
-from production_keying import (
-    PRODUCTION_KEYING_FILTER_VERSION,
-    production_keying_contract,
-    production_keying_fingerprint,
-    render_production_keyed_foreground,
-)
+from production_keying import PRODUCTION_KEYING_FILTER_VERSION
+from story_module_ports import KeyerPort, KeyerRequest
+from story_module_registry import build_keyer_registry
 
 
 QA_SCHEMA_VERSION = "story-keying-qa/v1"
 LOCK_SCHEMA_VERSION = "story-keying-preset-lock/v1"
+
+
+def _keyer(port: KeyerPort | None = None) -> KeyerPort:
+    return port or build_keyer_registry().keyer()
+
+
+def production_keying_contract(settings: Any, *, keyer_port: KeyerPort | None = None) -> dict[str, Any]:
+    return _keyer(keyer_port).compile_contract(settings)
+
+
+def production_keying_fingerprint(settings: Any, *, keyer_port: KeyerPort | None = None) -> str:
+    return _keyer(keyer_port).fingerprint(settings)
+
+
+def render_production_keyed_foreground(
+    source_path: Path,
+    output_path: Path,
+    settings: Any,
+    *,
+    keyer_port: KeyerPort | None = None,
+) -> None:
+    port = _keyer(keyer_port)
+    request = KeyerRequest(
+        artifact_id=output_path.stem,
+        source_path=source_path,
+        source_sha256=file_sha256(source_path),
+        settings=settings if isinstance(settings, dict) else vars(settings),
+        output_target=output_path,
+        attempt_id="keying-evidence",
+    )
+    result = port.render(request)
+    if not result.success:
+        message = result.failure.message if result.failure is not None else "unknown keyer failure"
+        raise RuntimeError(message)
 
 
 def file_sha256(path: Path | str) -> str:
@@ -257,6 +288,7 @@ def write_evidence_assets(
     machine_qa_path: Path | None = None,
     preset: dict[str, Any] | None = None,
     preset_path: Path | None = None,
+    keyer_port: KeyerPort | None = None,
 ) -> tuple[Path, Path, dict[str, Any]]:
     settings = dict(preset or {})
     settings.setdefault("keyer", "colorkey")
@@ -267,8 +299,8 @@ def write_evidence_assets(
     settings.setdefault("person_beauty", "none")
     settings.setdefault("person_crop", None)
     preset_sha256 = file_sha256(preset_path) if preset_path is not None else ""
-    render_contract = production_keying_contract(settings)
-    render_fingerprint = production_keying_fingerprint(settings)
+    render_contract = production_keying_contract(settings, keyer_port=keyer_port)
+    render_fingerprint = production_keying_fingerprint(settings, keyer_port=keyer_port)
     output_dir.mkdir(parents=True, exist_ok=True)
     artifacts: list[dict[str, str]] = []
     qa_by_pose: dict[str, Any] = {}
@@ -276,7 +308,17 @@ def write_evidence_assets(
     panels: list[Image.Image] = []
     for pose, source_path in (("standing", standing_frame), ("wide_gesture", gesture_frame)):
         pose_path = output_dir / f"{pose}_foreground.png"
-        render_production_keyed_foreground(source_path, pose_path, settings)
+        if keyer_port is None:
+            # Preserve the historical positional call shape for integrations
+            # that patch this rendering seam.
+            render_production_keyed_foreground(source_path, pose_path, settings)
+        else:
+            render_production_keyed_foreground(
+                source_path,
+                pose_path,
+                settings,
+                keyer_port=keyer_port,
+            )
         with Image.open(pose_path) as rendered:
             rgba = rendered.convert("RGBA")
         panels.append(rgba.copy())

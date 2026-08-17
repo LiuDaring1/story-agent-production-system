@@ -17,10 +17,8 @@ from keying_quality import keying_preset_lock_issues
 from production_keying import (
     person_beauty_filter as shared_person_beauty_filter,
     person_grade_filter as shared_person_grade_filter,
-    production_keying_filter_chain,
-    production_keying_filter_parts,
-    production_keying_fingerprint,
 )
+from story_module_registry import build_keyer_registry
 from release_geometry import (
     RELEASE_GEOMETRY_COMPILER_VERSION,
     RELEASE_GEOMETRY_SCHEMA_VERSION,
@@ -34,6 +32,25 @@ from release_geometry import (
     release_a_geometry,
     text_group_issues,
 )
+
+
+def production_keying_fingerprint(settings):
+    """Compatibility seam backed by the registered production keyer."""
+    return build_keyer_registry().keyer().fingerprint(settings)
+
+
+def production_keying_filter_chain(source_label, settings, crop_filter=""):
+    """Compatibility seam backed by the registered production keyer."""
+    return build_keyer_registry().keyer().filter_chain(
+        source_label,
+        settings,
+        crop_filter,
+    )
+
+
+def production_keying_filter_parts(source_label, settings, crop_filter=""):
+    """Compatibility seam backed by the registered production keyer."""
+    return build_keyer_registry().keyer().filter_parts(source_label, settings, crop_filter)
 
 
 FINAL_WIDTH = 1080

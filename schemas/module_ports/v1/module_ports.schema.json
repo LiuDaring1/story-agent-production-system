@@ -1,0 +1,104 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "story-module-ports/v1",
+  "title": "Story Agent module port payload",
+  "type": "object",
+  "required": ["schema_version", "kind"],
+  "properties": {
+    "schema_version": {"const": "story-module-ports/v1"},
+    "kind": {
+      "enum": ["identity", "capabilities", "failure", "usage_event", "video_request", "video_result", "keyer_request", "keyer_result"]
+    }
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "identity"}}},
+      "then": {
+        "required": ["port_name", "port_version", "adapter_name", "adapter_version"],
+        "properties": {
+          "port_name": {"type": "string"}, "port_version": {"type": "string"},
+          "adapter_name": {"type": "string"}, "adapter_version": {"type": "string"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "capabilities"}}},
+      "then": {
+        "required": ["provider", "model_or_tool", "runner_or_tool", "external", "paid", "deterministic", "supported"],
+        "properties": {
+          "provider": {"type": "string"}, "model_or_tool": {"type": "string"}, "runner_or_tool": {"type": "string"},
+          "external": {"type": "boolean"}, "paid": {"type": "boolean"}, "deterministic": {"type": "boolean"},
+          "supported": {"type": "object"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "failure"}}},
+      "then": {
+        "required": ["code", "message", "retryable", "details"],
+        "properties": {
+          "code": {"enum": ["invalid_input", "unsupported_capability", "configuration_error", "provider_unavailable", "execution_failed", "invalid_output"]},
+          "message": {"type": "string"}, "retryable": {"type": "boolean"}, "details": {"type": "object"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "usage_event"}}},
+      "then": {
+        "required": ["provider", "model_or_tool", "operation", "actual_amount_status"],
+        "properties": {
+          "provider": {"type": "string"}, "model_or_tool": {"type": "string"}, "operation": {"type": "string"},
+          "unit_type": {"type": "string"}, "quantity": {"type": ["number", "null"]}, "currency": {"type": "string"},
+          "estimated_amount": {"type": ["number", "null"]}, "actual_amount_status": {"type": "string"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "video_request"}}},
+      "then": {
+        "required": ["artifact_id", "scene_id", "source_image_path", "source_image_sha256", "prompt", "prompt_sha256", "requested_duration", "requested_ratio", "requested_resolution", "output_target", "attempt_id"],
+        "properties": {
+          "artifact_id": {"type": "string"}, "scene_id": {"type": "string"}, "source_image_path": {"type": "string"},
+          "source_image_sha256": {"type": "string"}, "prompt": {"type": "string"}, "prompt_sha256": {"type": "string"},
+          "requested_duration": {"type": "number"}, "requested_ratio": {"type": "string"}, "requested_resolution": {"type": "string"},
+          "output_target": {"type": "string"}, "attempt_id": {"type": "string"}, "story_contract_sha256": {"type": "string"},
+          "story_contract_dependency_sha256": {"type": "string"}, "motion_plan_sha256": {"type": "string"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "video_result"}}},
+      "then": {
+        "required": ["success", "output_path", "output_sha256", "provider", "model", "request_id", "requested_duration", "produced_duration", "attempt_id", "source_image_sha256", "prompt_sha256", "adapter_version"],
+        "properties": {
+          "success": {"type": "boolean"}, "output_path": {"type": ["string", "null"]}, "output_sha256": {"type": "string"},
+          "provider": {"type": "string"}, "model": {"type": "string"}, "request_id": {"type": "string"},
+          "requested_duration": {"type": "number"}, "produced_duration": {"type": ["number", "null"]}, "attempt_id": {"type": "string"},
+          "source_image_sha256": {"type": "string"}, "prompt_sha256": {"type": "string"}, "adapter_version": {"type": "string"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "keyer_request"}}},
+      "then": {
+        "required": ["artifact_id", "source_path", "source_sha256", "settings", "output_target", "attempt_id"],
+        "properties": {
+          "artifact_id": {"type": "string"}, "source_path": {"type": "string"}, "source_sha256": {"type": "string"},
+          "settings": {"type": "object"}, "output_target": {"type": "string"}, "attempt_id": {"type": "string"},
+          "preset_sha256": {"type": "string"}, "keying_lock_sha256": {"type": "string"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "keyer_result"}}},
+      "then": {
+        "required": ["success", "output_path", "output_sha256", "keyer", "filter_version", "filter_fingerprint", "source_sha256", "preset_sha256", "adapter_version"],
+        "properties": {
+          "success": {"type": "boolean"}, "output_path": {"type": ["string", "null"]}, "output_sha256": {"type": "string"},
+          "keyer": {"type": "string"}, "filter_version": {"type": "string"}, "filter_fingerprint": {"type": "string"},
+          "source_sha256": {"type": "string"}, "preset_sha256": {"type": "string"}, "adapter_version": {"type": "string"}
+        }
+      }
+    }
+  ]
+}

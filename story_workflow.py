@@ -18,7 +18,7 @@ from story_video_synthesizer.image_video import (
     enforce_prompt_continuity_contract,
     validate_image_video_jobs,
 )
-from video_provider_adapter import resolve_video_provider
+from story_module_registry import build_default_registry
 from story_semantics import SemanticKind, classify_story
 from story_contract_consumers import (
     compile_demo_render_spec,
@@ -664,7 +664,12 @@ def main() -> None:
             raise ValueError(
                 "视觉连续性合同/任务校验失败，已在付费调用前阻断：" + "；".join(continuity_errors)
             )
-        provider = resolve_video_provider(load_config(), ROOT, args.provider)
+        # Production provider selection and invocation now pass through the
+        # module Port registry; the concrete adapter still delegates to the
+        # unchanged runner and provider configuration.
+        provider = build_default_registry(
+            load_config(), ROOT, video_provider_override=args.provider
+        ).video_generator()
         images_dir = resolve_generate_images_dir(args.jobs_csv, args.images_dir)
         if not args.skip_prompt_review and not args.dry_run:
             decisions_csv = Path(args.prompt_review_csv).expanduser() if args.prompt_review_csv else args.jobs_csv.expanduser().parent / "prompt_review_decisions.csv"
@@ -716,7 +721,9 @@ def main() -> None:
                 limit=args.limit,
             )
     elif args.command == "rerun-review":
-        provider = resolve_video_provider(load_config(), ROOT, args.provider)
+        provider = build_default_registry(
+            load_config(), ROOT, video_provider_override=args.provider
+        ).video_generator()
         scenes = reset_redo_scenes(args.jobs_csv, args.videos_dir, args.decisions_csv)
         if not scenes:
             print("审核 CSV 中没有标记为重做的片段。")

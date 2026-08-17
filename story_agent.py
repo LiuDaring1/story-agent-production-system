@@ -16,7 +16,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PIL import Image, ImageDraw
-from video_provider_adapter import resolve_row_generation_seconds, resolve_video_provider
+from story_module_registry import ModuleRegistry, build_default_registry
 from story_video_synthesizer.image_video import validate_image_video_jobs
 from story_contract_runtime import (
     CONTRACT_POLICY_LEGACY,
@@ -357,15 +357,27 @@ def classify_command_failure(output: str) -> str:
 
 
 class StoryAgent:
-    def __init__(self, context: AgentContext, *, read_only: bool = False) -> None:
+    def __init__(
+        self,
+        context: AgentContext,
+        *,
+        read_only: bool = False,
+        module_registry: ModuleRegistry | None = None,
+    ) -> None:
         self.context = context
         self.read_only = read_only
+        self._module_registry = module_registry
         if not read_only:
             ensure_project_dirs(context.paths)
         worker_dir = os.environ.get("STORY_AGENT_WORKER_DIR", "").strip()
         self.state_path = Path(worker_dir) / AGENT_STATE_NAME if worker_dir else context.paths.status / AGENT_STATE_NAME
         self.state: dict[str, Any] = self._load_state()
         self._stage_cost_baselines: dict[str, float] = {}
+
+    def _modules(self) -> ModuleRegistry:
+        if self._module_registry is None:
+            self._module_registry = build_default_registry(load_config(), ROOT)
+        return self._module_registry
 
     def run(self, max_steps: int) -> int:
         if self.context.scheduler == "dag" and self.context.execute:
@@ -1920,7 +1932,7 @@ class StoryAgent:
         # current Grok Video 1.5 adapter advertises whole-second, per-second
         # generation bounds; legacy providers retain fixed-duration behavior.
         try:
-            provider = resolve_video_provider(load_config(), ROOT)
+            provider = self._modules().video_generator()
         except Exception:
             provider = None
         if (
@@ -1960,7 +1972,7 @@ class StoryAgent:
         pending = max(0, self._job_count(jobs) - actual)
         config = load_config()
         video_api = config.get("video_api", {}) if isinstance(config.get("video_api"), dict) else {}
-        provider = resolve_video_provider(config, ROOT)
+        provider = self._modules().video_generator()
         estimated_per_clip = provider.estimated_cost_cny_per_clip
         try:
             with jobs.open(encoding="utf-8-sig", newline="") as file:
@@ -1983,15 +1995,7 @@ class StoryAgent:
         def estimate_row_cost(row: dict[str, str]) -> float:
             if provider.estimated_cost_cny_per_second > 0:
                 if provider.model.strip().lower() == "grok-video-1.5":
-                    seconds = float(
-                        resolve_row_generation_seconds(
-                            row,
-                            model=provider.model,
-                            fallback_seconds=provider.default_seconds or 8,
-                            min_seconds=provider.min_seconds,
-                            max_seconds=provider.max_seconds,
-                        )
-                    )
+                    seconds = float(provider.resolve_request_seconds(row, provider.default_seconds or 8))
                 else:
                     raw = row.get("generation_duration") or row.get("duration")
                     seconds = float(raw) if raw not in (None, "") else float(provider.default_seconds or 0)
@@ -2008,17 +2012,12 @@ class StoryAgent:
         from story_project import write_manifest
 
         write_manifest(self.context.paths, manifest)
-        generate_command = [
-            "generate",
-            "--jobs-csv",
-            str(jobs),
-            "--images-dir",
-            str(image_dir),
-            "--videos-dir",
-            str(self.context.paths.video_jobs / "videos"),
-            "--project-dir",
-            str(self.context.project_dir),
-        ]
+        generate_command = provider.build_batch_command(
+            jobs_csv=jobs,
+            images_dir=image_dir,
+            videos_dir=self.context.paths.video_jobs / "videos",
+            project_dir=self.context.project_dir,
+        )
         if bool(video_api.get("submit_all_first", False)):
             generate_command.append("--submit-all-first")
             generate_command.extend(["--max-submit-first", str(int(video_api.get("max_submit_first", 20)))])
@@ -4419,7 +4418,6 @@ class StoryAgent:
             return True
         try:
             from demo_quality import load_current_final_demo_geometry
-            from production_keying import production_keying_fingerprint
             from release_geometry import canonical_sha256, file_sha256 as geometry_file_sha256, release_render_manifest_issues
 
             spec_path = self.context.paths.status / "contracts" / "consumers" / "release_video.compiled.json"
@@ -4443,7 +4441,7 @@ class StoryAgent:
                 "release_projection_sha256": str(spec["contract_projection_sha256"]),
                 "release_dependency_sha256": str(spec["story_contract_dependency_sha256"]),
                 "compiled_release_spec_sha256": canonical_sha256(spec),
-                "production_keying_filter_fingerprint": production_keying_fingerprint(preset),
+                "production_keying_filter_fingerprint": self._modules().keyer().fingerprint(preset),
                 "keying_preset_sha256": geometry_file_sha256(preset_path),
                 "keying_lock_sha256": geometry_file_sha256(preset_path.with_name("keying_preset.lock.json")),
                 "demo_render_manifest_sha256": geometry_file_sha256(demo_manifest_path),
@@ -4946,7 +4944,7 @@ class StoryAgent:
     def _provider_for_stage(self, stage: str) -> str:
         if stage == "generate_videos":
             try:
-                return resolve_video_provider(load_config(), ROOT).name
+                return self._modules().video_generator().identity.adapter_name
             except Exception:
                 return "video_api"
         if stage in {"suno_generate", "assemble_music", "music_qa"}:

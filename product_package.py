@@ -37,9 +37,8 @@ from keying_quality import blurred_background_issues, file_sha256, keying_preset
 from production_keying import (
     person_beauty_filter as shared_person_beauty_filter,
     person_grade_filter as shared_person_grade_filter,
-    production_keying_filter_chain,
-    production_keying_fingerprint,
 )
+from story_module_registry import build_keyer_registry
 from release_geometry import compile_demo_presenter_geometry
 from story_video_synthesizer.image_video import sorted_image_files
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
@@ -56,6 +55,16 @@ from product_text_projection import (
     clean_public_story_text as _clean_public_story_text,
     compile_public_story_lines,
 )
+
+
+def production_keying_fingerprint(settings):
+    """Compatibility seam backed by the registered production keyer."""
+    return build_keyer_registry().keyer().fingerprint(settings)
+
+
+def production_keying_filter_chain(source, settings, crop_filter=""):
+    """Compatibility seam backed by the registered production keyer."""
+    return build_keyer_registry().keyer().filter_chain(source, settings, crop_filter)
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}

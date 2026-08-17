@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -11,7 +12,26 @@ from PIL import Image
 
 from story_agent import StageResult, StoryAgent
 from story_agent_runtime import file_sha256, write_review_bundle
-from story_contract_runtime import contract_consumer_path, write_contract_consumer_context
+from story_contract_consumers import projection_sha256
+from story_contract_runtime import (
+    contract_consumer_path,
+    contract_paths,
+    locked_contract_binding,
+    write_contract_consumer_context,
+)
+from story_module_adapters import ApprovedStoryContractVisualDesignAdapter, MockVisualDesignAdapter
+from story_module_ports import (
+    ModuleCapabilities,
+    ModuleIdentity,
+    VisualDesignPort,
+    VisualDesignRequest,
+    VisualDesignResult,
+)
+from story_module_registry import (
+    MODULE_PROFILE_ENV,
+    MODULE_PROFILE_REQUIRED_ENV,
+    ModuleRegistry,
+)
 from story_project import project_paths, save_json, write_manifest
 from tests.test_story_agent_runtime import as_frozen_v3_legacy
 from tests.test_story_contract_runtime import _lock_contract, _new_project, _runtime_valid_contract
@@ -218,6 +238,90 @@ def _lock_samples(project: Path, context: Path) -> dict:
 
 
 class VisualSampleGateTests(unittest.TestCase):
+    def test_visual_design_port_binding_and_protocol_only_substitution_are_byte_equivalent(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, _manifest, _agent, context_path = _fixture(Path(directory))
+            context = json.loads(context_path.read_text(encoding="utf-8"))
+            binding = locked_contract_binding(project, "storyboard_images")
+            adapter = ApprovedStoryContractVisualDesignAdapter()
+            contract = json.loads(contract_paths(project)["contract"].read_text(encoding="utf-8"))
+            references = tuple(contract.get("preview_assets", []))
+            captured: list[VisualDesignRequest] = []
+
+            class ProtocolFake:
+                identity = ModuleIdentity("visual_design", "fake/v1", "protocol-fake", "protocol-fake/v1")
+                capabilities = ModuleCapabilities(provider="fake", deterministic=True)
+
+                def resolve(self, request: VisualDesignRequest) -> VisualDesignResult:
+                    captured.append(request)
+                    return VisualDesignResult(
+                        True,
+                        request.operation,
+                        context["contract_projection"],
+                        references,
+                        request.projection_sha256,
+                        request.story_contract_sha256,
+                        request.projection_sha256,
+                        request.story_semantics_sha256,
+                        request.attempt_id,
+                        "protocol-fake/v1",
+                    )
+
+            fake = ProtocolFake()
+            self.assertIsInstance(fake, VisualDesignPort)
+            baseline = compile_visual_sample_plan(project, context_path)
+            substituted = compile_visual_sample_plan(project, context_path, fake)
+            self.assertEqual(substituted, baseline)
+            plan_path = write_visual_sample_plan(project, context_path)
+            baseline_bytes = plan_path.read_bytes()
+            write_visual_sample_plan(project, context_path, fake)
+            self.assertEqual(plan_path.read_bytes(), baseline_bytes)
+            self.assertEqual(captured[0].story_contract_sha256, binding["story_contract_sha256"])
+            self.assertEqual(captured[0].projection_sha256, projection_sha256(context))
+            result = adapter.resolve(captured[0])
+            self.assertTrue(result.success)
+            self.assertEqual(result.projection_sha256, projection_sha256(context))
+            self.assertEqual(result.approved_projection, binding["contract_projection"])
+
+    def test_visual_design_consumer_fails_closed_for_stale_contract_review_or_lock(self) -> None:
+        for damaged_name in ("contract", "review", "lock"):
+            with self.subTest(damaged=damaged_name), tempfile.TemporaryDirectory() as directory:
+                project, _manifest, _agent, context = _fixture(Path(directory))
+                paths = contract_paths(project)
+                paths[damaged_name].write_text('{"damaged":true}\n', encoding="utf-8")
+                with self.assertRaisesRegex(ValueError, "visual design port rejected"):
+                    compile_visual_sample_plan(project, context)
+
+    def test_mock_visual_design_reaches_story_agent_consumer_without_second_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest, agent, _context = _fixture(
+                Path(directory), state=False, preview_kinds=("style_anchor", "character_sheet", "scale_anchor")
+            )
+            mock = MockVisualDesignAdapter()
+            registry = ModuleRegistry(profile_name="mock-visual-design")
+            registry.register("visual_design", mock)
+            agent._module_registry = registry
+            before = {path.relative_to(project) for path in project.rglob("*") if path.is_file()}
+            with patch.object(mock, "resolve", wraps=mock.resolve) as resolve:
+                result = agent._stage_visual_samples(manifest)
+            self.assertEqual(result.status, "done", result.message)
+            self.assertEqual(resolve.call_count, 2)
+            after = {path.relative_to(project) for path in project.rglob("*") if path.is_file()}
+            self.assertFalse(any("visual_design_contract" in str(path) for path in after))
+            self.assertFalse(any("visual_contract" in str(path) for path in after - before))
+            self.assertTrue(visual_sample_paths(project)["machine_qa"].is_file())
+
+    def test_missing_required_mock_visual_selection_fails_closed_without_plan(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, _manifest, _agent, context = _fixture(Path(directory))
+            environment = os.environ.copy()
+            environment.pop(MODULE_PROFILE_ENV, None)
+            environment[MODULE_PROFILE_REQUIRED_ENV] = "mock-visual-design"
+            with patch.dict(os.environ, environment, clear=True):
+                with self.assertRaisesRegex(RuntimeError, "refusing production fallback"):
+                    write_visual_sample_plan(project, context)
+            self.assertFalse(visual_sample_paths(project)["plan"].exists())
+
     def test_schema_parity_determinism_and_conditional_sample_matrix(self) -> None:
         cases = [
             (False, False, False, {"style_anchor"}),

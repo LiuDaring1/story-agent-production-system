@@ -16,7 +16,14 @@ from typing import Any, Mapping, Sequence
 from story_contract_consumers import write_json_atomic
 from story_contract_runtime import CONTRACT_POLICY_LEGACY, contract_paths, locked_contract_binding
 from story_contracts import canonical_json_bytes, contract_sha256, load_story_contract
-from story_semantics import SemanticKind, classify_story
+from story_module_ports import (
+    STORY_SEMANTICS_COMPILER_VERSION,
+    STORY_SEMANTIC_KINDS,
+    StorySemanticsPort,
+    StorySemanticsRequest,
+    StorySemanticsResult,
+)
+from story_module_registry import build_story_semantics_registry
 
 
 PLAN_SCHEMA_VERSION = "1.0"
@@ -30,7 +37,7 @@ ARTIFACT_ALIASES = {"demo_subtitles": ("demo_subtitles", "demo")}
 ACTIONS = frozenset({"include", "exclude", "visual_substitute"})
 SUBTITLE_POLICIES = frozenset({"show", "hide", "inherit"})
 PROVENANCE_SOURCES = frozenset({"task_input", "project_config", "brand_or_global_default", "agent_inference"})
-CARD_KINDS = {SemanticKind.TITLE.value: "title_card", SemanticKind.MORAL.value: "moral_card"}
+CARD_KINDS = {"title": "title_card", "moral": "moral_card"}
 
 
 def semantic_plan_path(project_root: Path | str) -> Path:
@@ -44,6 +51,7 @@ def semantic_plan_sha256(path: Path | str) -> str:
 def compile_artifact_semantic_plan(
     project_root: Path | str,
     semantic_source: Path | str,
+    semantics_port: StorySemanticsPort | None = None,
 ) -> dict[str, Any]:
     root = Path(project_root).resolve()
     source = Path(semantic_source).resolve()
@@ -52,10 +60,22 @@ def compile_artifact_semantic_plan(
         raise ValueError("legacy_passthrough projects do not create artifact semantic plans")
     contract = load_story_contract(contract_paths(root)["contract"])
     lines = _source_lines(source)
-    semantics = classify_story(lines)
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    port = semantics_port or build_story_semantics_registry().story_semantics()
+    semantic_result = port.analyze(
+        StorySemanticsRequest(
+            source_path=source,
+            source_sha256=source_sha256,
+            normalized_lines=tuple(lines),
+            story_id=str(contract.get("story", {}).get("story_id") or ""),
+            compiler_version=STORY_SEMANTICS_COMPILER_VERSION,
+            attempt_id="artifact-semantic-plan",
+        )
+    )
+    kind_by_line = _semantic_kind_by_line(semantic_result, source, source_sha256, lines)
     present: dict[str, list[int]] = {}
     for line_number in range(1, len(lines) + 1):
-        present.setdefault(semantics.kind_at(line_number).value, []).append(line_number)
+        present.setdefault(kind_by_line[line_number], []).append(line_number)
 
     section = contract["contracts"]["semantic_artifacts"]
     mappings = section.get("mappings")
@@ -112,8 +132,7 @@ def compile_artifact_semantic_plan(
     cards = _compile_visual_cards(lines, artifacts["background_visual"]["decisions"])
     prefix = []
     for line_number in range(1, len(lines) + 1):
-        kind = semantics.kind_at(line_number)
-        if kind is SemanticKind.STORY_BODY:
+        if kind_by_line[line_number] == "story_body":
             break
         prefix.append(line_number)
 
@@ -135,7 +154,7 @@ def compile_artifact_semantic_plan(
         "contract_projection_sha256": _sha_json(projection),
         "semantic_source": {
             "project_relative_path": _relative(source, root),
-            "sha256": hashlib.sha256(source.read_bytes()).hexdigest(),
+            "sha256": source_sha256,
             "line_count": len(lines),
         },
         "artifacts": artifacts,
@@ -148,8 +167,12 @@ def compile_artifact_semantic_plan(
     }
 
 
-def write_artifact_semantic_plan(project_root: Path | str, semantic_source: Path | str) -> Path:
-    plan = compile_artifact_semantic_plan(project_root, semantic_source)
+def write_artifact_semantic_plan(
+    project_root: Path | str,
+    semantic_source: Path | str,
+    semantics_port: StorySemanticsPort | None = None,
+) -> Path:
+    plan = compile_artifact_semantic_plan(project_root, semantic_source, semantics_port)
     validate_artifact_semantic_plan_or_raise(plan)
     return write_json_atomic(semantic_plan_path(project_root), plan)
 
@@ -157,6 +180,7 @@ def write_artifact_semantic_plan(project_root: Path | str, semantic_source: Path
 def load_current_artifact_semantic_plan(
     project_root: Path | str,
     semantic_source: Path | str | None = None,
+    semantics_port: StorySemanticsPort | None = None,
 ) -> dict[str, Any]:
     root = Path(project_root).resolve()
     path = semantic_plan_path(root)
@@ -167,17 +191,21 @@ def load_current_artifact_semantic_plan(
     validate_artifact_semantic_plan_or_raise(payload)
     recorded = payload["semantic_source"]
     source = Path(semantic_source).resolve() if semantic_source else root / str(recorded["project_relative_path"])
-    expected = compile_artifact_semantic_plan(root, source)
+    expected = compile_artifact_semantic_plan(root, source, semantics_port)
     if canonical_json_bytes(payload) != canonical_json_bytes(expected):
         raise ValueError("artifact semantic plan is stale or was modified")
     return payload
 
 
-def artifact_semantic_plan_is_current(project_root: Path | str, semantic_source: Path | str | None = None) -> bool:
+def artifact_semantic_plan_is_current(
+    project_root: Path | str,
+    semantic_source: Path | str | None = None,
+    semantics_port: StorySemanticsPort | None = None,
+) -> bool:
     try:
-        load_current_artifact_semantic_plan(project_root, semantic_source)
+        load_current_artifact_semantic_plan(project_root, semantic_source, semantics_port)
         return True
-    except (OSError, ValueError, KeyError, TypeError):
+    except (OSError, RuntimeError, ValueError, KeyError, TypeError):
         return False
 
 
@@ -231,11 +259,11 @@ def presentation_windows(timings: Sequence[Any], plan: Mapping[str, Any]) -> lis
         str(decision["semantic_kind"]): decision
         for decision in plan["artifacts"]["background_visual"]["decisions"]
     }
-    body_numbers = visual_decisions.get(SemanticKind.STORY_BODY.value, {}).get("source_line_numbers", [])
+    body_numbers = visual_decisions.get("story_body", {}).get("source_line_numbers", [])
     windows = []
     for card in plan.get("visual_cards", []):
         kind = str(card["semantic_kind"])
-        if kind == SemanticKind.TITLE.value:
+        if kind == "title":
             body = [by_line_number[number] for number in body_numbers if number in by_line_number]
             end = float(body[0].source_start if body else timings[-1].source_end)
             start = 0.0
@@ -314,7 +342,7 @@ def validate_artifact_semantic_plan_or_raise(payload: Mapping[str, Any]) -> None
         kind = card.get("semantic_kind")
         if kind not in CARD_KINDS or card.get("card_kind") != CARD_KINDS[kind]:
             raise ValueError("visual card kind invalid")
-        expected_timing = "until_first_story_body_cue" if kind == SemanticKind.TITLE.value else "semantic_cue_range"
+        expected_timing = "until_first_story_body_cue" if kind == "title" else "semantic_cue_range"
         if card.get("timing_rule") != expected_timing:
             raise ValueError("visual card timing rule invalid")
         if not isinstance(card.get("text"), str) or not card["text"] or not isinstance(card.get("mutual_exclusion_group"), str) or not card["mutual_exclusion_group"]:
@@ -378,7 +406,7 @@ def _compile_visual_cards(lines: Sequence[str], decisions: Sequence[Mapping[str,
             "text": "\n".join(lines[number - 1] for number in line_numbers),
             "source_line_numbers": line_numbers,
             "mutual_exclusion_group": decision["mutual_exclusion_group"],
-            "timing_rule": "until_first_story_body_cue" if kind == SemanticKind.TITLE.value else "semantic_cue_range",
+            "timing_rule": "until_first_story_body_cue" if kind == "title" else "semantic_cue_range",
         })
     return cards
 
@@ -406,6 +434,62 @@ def _source_lines(path: Path) -> list[str]:
     if not lines:
         raise ValueError("semantic source has no non-empty lines")
     return lines
+
+
+def _semantic_kind_by_line(
+    result: StorySemanticsResult,
+    source: Path,
+    source_sha256: str,
+    lines: Sequence[str],
+) -> dict[int, str]:
+    """Validate the formal Port result before Product Policy consumes it."""
+
+    if not result.success:
+        code = result.failure.code.value if result.failure is not None else "invalid_output"
+        message = result.failure.message if result.failure is not None else "semantics adapter returned no result"
+        raise ValueError(f"story semantics port failed ({code}): {message}")
+    if result.source_path.resolve() != source or result.source_sha256 != source_sha256:
+        raise ValueError("story semantics result source binding is stale")
+    if result.compiler_version != STORY_SEMANTICS_COMPILER_VERSION or not result.adapter_version:
+        raise ValueError("story semantics result compiler/adapter binding is invalid")
+    if len(result.lines) != len(lines):
+        raise ValueError("story semantics result line count does not match source")
+    kinds: dict[int, str] = {}
+    for expected_number, (source_text, row) in enumerate(zip(lines, result.lines), start=1):
+        if not isinstance(row, Mapping):
+            raise ValueError("story semantics result contains a non-object line")
+        line_number = row.get("line_number")
+        kind = str(row.get("semantic_kind") or "")
+        if line_number != expected_number or row.get("text") != source_text:
+            raise ValueError("story semantics result changed source line identity or text")
+        if kind not in STORY_SEMANTIC_KINDS:
+            raise ValueError(f"story semantics result contains an unknown kind: {kind or '<empty>'}")
+        kinds[expected_number] = kind
+
+    expected_segments: list[dict[str, Any]] = []
+    for line_number, kind in kinds.items():
+        if expected_segments and expected_segments[-1]["kind"] == kind:
+            expected_segments[-1]["end_line"] = line_number
+            expected_segments[-1]["line_numbers"].append(line_number)
+        else:
+            expected_segments.append(
+                {"kind": kind, "start_line": line_number, "end_line": line_number, "line_numbers": [line_number]}
+            )
+    actual_segments = []
+    for segment in result.segments:
+        if not isinstance(segment, Mapping):
+            raise ValueError("story semantics result contains a non-object segment")
+        actual_segments.append(
+            {
+                "kind": segment.get("kind"),
+                "start_line": segment.get("start_line"),
+                "end_line": segment.get("end_line"),
+                "line_numbers": list(segment.get("line_numbers", [])),
+            }
+        )
+    if actual_segments != expected_segments:
+        raise ValueError("story semantics result boundaries do not match per-line kinds")
+    return kinds
 
 
 def _validate_provenance(value: Any, path: str) -> None:

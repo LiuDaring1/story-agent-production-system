@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "story-semantics-port/v1",
+  "title": "Story semantics port payload",
+  "type": "object",
+  "required": ["schema_version", "kind"],
+  "properties": {
+    "schema_version": {"const": "story-semantics-port/v1"},
+    "kind": {"enum": ["semantics_request", "semantics_result"]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "semantics_request"}}},
+      "then": {
+        "required": ["source_path", "source_sha256", "normalized_lines", "story_id", "compiler_version", "attempt_id"],
+        "properties": {
+          "source_path": {"type": "string"},
+          "source_sha256": {"type": "string"},
+          "normalized_lines": {"type": "array", "items": {"type": "string"}},
+          "story_id": {"type": "string"},
+          "compiler_version": {"type": "string"},
+          "attempt_id": {"type": "string"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "semantics_result"}}},
+      "then": {
+        "required": ["success", "source_path", "source_sha256", "title", "lines", "segments", "output_line_numbers", "adapter_version", "compiler_version", "usage_events", "failure"],
+        "properties": {
+          "success": {"type": "boolean"},
+          "source_path": {"type": "string"},
+          "source_sha256": {"type": "string"},
+          "title": {"type": "string"},
+          "lines": {"type": "array", "items": {"type": "object"}},
+          "segments": {"type": "array", "items": {"type": "object"}},
+          "output_line_numbers": {
+            "type": "object",
+            "additionalProperties": {"type": "array", "items": {"type": "integer"}}
+          },
+          "adapter_version": {"type": "string"},
+          "compiler_version": {"type": "string"},
+          "usage_events": {"type": "array", "items": {"type": "object"}},
+          "failure": {"type": ["object", "null"]}
+        }
+      }
+    }
+  ]
+}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import tempfile
 import unittest
 from contextlib import ExitStack
@@ -23,6 +24,16 @@ from artifact_semantic_plan import (
 from story_video_synthesizer.align import LineTiming
 from story_video_synthesizer.pipeline import SynthesisConfig, synthesize_story
 from product_package import artifact_semantic_product_selections
+from story_module_adapters import MockStorySemanticsAdapter
+from story_module_ports import (
+    STORY_SEMANTICS_COMPILER_VERSION,
+    ModuleCapabilities,
+    ModuleIdentity,
+    StorySemanticsPort,
+    StorySemanticsRequest,
+    StorySemanticsResult,
+)
+from story_module_registry import MODULE_PROFILE_ENV, MODULE_PROFILE_REQUIRED_ENV, ModuleRegistry
 from tests.test_story_contract_runtime import _lock_contract, _new_project, _runtime_valid_contract
 
 
@@ -66,6 +77,33 @@ def _contract(project: Path, manifest: dict, kinds=("title", "story_body", "mora
     return contract
 
 
+def _protocol_result(request: StorySemanticsRequest, kinds: tuple[str, ...], adapter: str) -> StorySemanticsResult:
+    lines = tuple(
+        {"line_number": index, "text": text, "semantic_kind": kind}
+        for index, (text, kind) in enumerate(zip(request.normalized_lines, kinds), start=1)
+    )
+    segments = []
+    for index, kind in enumerate(kinds, start=1):
+        if segments and segments[-1]["kind"] == kind:
+            segments[-1]["end_line"] = index
+            segments[-1]["line_numbers"].append(index)
+        else:
+            segments.append(
+                {"kind": kind, "start_line": index, "end_line": index, "line_numbers": [index]}
+            )
+    return StorySemanticsResult(
+        True,
+        request.source_path,
+        request.source_sha256,
+        next((row["text"] for row in lines if row["semantic_kind"] == "title"), ""),
+        lines,
+        tuple(segments),
+        {},
+        adapter,
+        STORY_SEMANTICS_COMPILER_VERSION,
+    )
+
+
 class ArtifactSemanticPlanTests(unittest.TestCase):
     def _fixture(self, text="通用测试故事\n一天，主角出发。\n这个故事告诉我们，要认真观察。\n"):
         temporary = tempfile.TemporaryDirectory()
@@ -97,6 +135,63 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
         if jsonschema is not None:
             schema = json.loads(Path("schemas/artifact_semantic_plan/v1/artifact_semantic_plan.schema.json").read_text())
             jsonschema.Draft202012Validator(schema).validate(first)
+
+    def test_compiler_consumes_minimal_protocol_fake_without_product_policy_changes(self) -> None:
+        temporary, project, _manifest, source, _agent = self._fixture(
+            "通用测试故事\n主角说：“我是森林里的姐姐。”\n这个故事告诉我们，要认真观察。\n"
+        )
+        self.addCleanup(temporary.cleanup)
+
+        class ProtocolFake:
+            identity = ModuleIdentity("story_semantics", "fake/v1", "protocol-fake", "protocol-fake/v1")
+            capabilities = ModuleCapabilities(provider="fake", deterministic=True)
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def analyze(self, request: StorySemanticsRequest) -> StorySemanticsResult:
+                self.calls += 1
+                return _protocol_result(request, ("title", "story_body", "moral"), "protocol-fake/v1")
+
+        fake = ProtocolFake()
+        self.assertIsInstance(fake, StorySemanticsPort)
+        baseline = compile_artifact_semantic_plan(project, source)
+        substituted = compile_artifact_semantic_plan(project, source, fake)
+        self.assertEqual(substituted, baseline)
+        self.assertEqual(fake.calls, 1)
+        self.assertEqual(
+            substituted["artifacts"]["background_subtitles"]["decisions"][1]["source_line_numbers"],
+            [2],
+        )
+
+    def test_mock_profile_reaches_story_agent_stage_and_writes_only_existing_plan(self) -> None:
+        temporary, project, manifest, source, agent = self._fixture()
+        self.addCleanup(temporary.cleanup)
+        mock = MockStorySemanticsAdapter(kinds=("title", "story_body", "moral"))
+        registry = ModuleRegistry(profile_name="mock-semantics")
+        registry.register("story_semantics", mock)
+        agent._module_registry = registry
+        before = {path.relative_to(project) for path in project.rglob("*") if path.is_file()}
+        with patch.object(mock, "analyze", wraps=mock.analyze) as analyze:
+            result = agent._stage_artifact_semantic_plan(manifest)
+        self.assertEqual(result.status, "done")
+        self.assertEqual(analyze.call_count, 2)
+        after = {path.relative_to(project) for path in project.rglob("*") if path.is_file()}
+        self.assertEqual(after - before, {semantic_plan_path(project).relative_to(project)})
+        self.assertFalse(any("semantic_manifest" in str(path) for path in after))
+        source.write_text(source.read_text() + "又一天，主角继续观察。\n", encoding="utf-8")
+        self.assertFalse(artifact_semantic_plan_is_current(project, source, mock))
+
+    def test_missing_required_mock_selection_fails_closed_without_writing_plan(self) -> None:
+        temporary, project, _manifest, source, _agent = self._fixture()
+        self.addCleanup(temporary.cleanup)
+        environment = os.environ.copy()
+        environment.pop(MODULE_PROFILE_ENV, None)
+        environment[MODULE_PROFILE_REQUIRED_ENV] = "mock-semantics"
+        with patch.dict(os.environ, environment, clear=True):
+            with self.assertRaisesRegex(RuntimeError, "refusing production fallback"):
+                write_artifact_semantic_plan(project, source)
+        self.assertFalse(semantic_plan_path(project).exists())
 
     def test_stale_or_modified_plan_is_rejected(self) -> None:
         temporary, project, _manifest, source, _agent = self._fixture()

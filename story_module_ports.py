@@ -9,6 +9,12 @@ from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 MODULE_PORT_SCHEMA_VERSION = "story-module-ports/v1"
 VIDEO_GENERATOR_PORT_VERSION = "story-video-generator-port/v1"
 KEYER_PORT_VERSION = "story-keyer-port/v1"
+STORY_SEMANTICS_PORT_VERSION = "story-semantics-port/v1"
+VISUAL_DESIGN_PORT_VERSION = "story-visual-design-port/v1"
+STORY_SEMANTICS_COMPILER_VERSION = "story-semantics-classifier/v1"
+STORY_SEMANTIC_KINDS = frozenset(
+    {"title", "host_intro", "story_announcement", "story_body", "moral", "outro"}
+)
 
 
 class ModuleFailureCode(str, Enum):
@@ -122,6 +128,59 @@ class KeyerResult:
     failure: ModuleFailure | None = None
 
 
+@dataclass(frozen=True)
+class StorySemanticsRequest:
+    source_path: Path
+    source_sha256: str
+    normalized_lines: tuple[str, ...]
+    story_id: str
+    compiler_version: str
+    attempt_id: str
+
+
+@dataclass(frozen=True)
+class StorySemanticsResult:
+    success: bool
+    source_path: Path
+    source_sha256: str
+    title: str
+    lines: tuple[Mapping[str, Any], ...]
+    segments: tuple[Mapping[str, Any], ...]
+    output_line_numbers: Mapping[str, tuple[int, ...]]
+    adapter_version: str
+    compiler_version: str
+    usage_events: tuple[ModuleUsageEvent, ...] = ()
+    failure: ModuleFailure | None = None
+
+
+@dataclass(frozen=True)
+class VisualDesignRequest:
+    project_root: Path
+    consumer: str
+    operation: str
+    story_contract_sha256: str
+    projection_sha256: str
+    story_semantics_sha256: str
+    current_artifact_references: tuple[Mapping[str, Any], ...]
+    attempt_id: str
+
+
+@dataclass(frozen=True)
+class VisualDesignResult:
+    success: bool
+    operation: str
+    approved_projection: Mapping[str, Any]
+    artifact_references: tuple[Mapping[str, Any], ...]
+    output_sha256: str
+    story_contract_sha256: str
+    projection_sha256: str
+    story_semantics_sha256: str
+    attempt_id: str
+    adapter_version: str
+    usage_events: tuple[ModuleUsageEvent, ...] = ()
+    failure: ModuleFailure | None = None
+
+
 @runtime_checkable
 class VideoGeneratorPort(Protocol):
     identity: ModuleIdentity
@@ -157,6 +216,22 @@ class KeyerPort(Protocol):
     def fingerprint(self, settings: Any) -> str: ...
 
     def render(self, request: KeyerRequest) -> KeyerResult: ...
+
+
+@runtime_checkable
+class StorySemanticsPort(Protocol):
+    identity: ModuleIdentity
+    capabilities: ModuleCapabilities
+
+    def analyze(self, request: StorySemanticsRequest) -> StorySemanticsResult: ...
+
+
+@runtime_checkable
+class VisualDesignPort(Protocol):
+    identity: ModuleIdentity
+    capabilities: ModuleCapabilities
+
+    def resolve(self, request: VisualDesignRequest) -> VisualDesignResult: ...
 
 
 def module_payload(kind: str, value: Any) -> dict[str, Any]:
@@ -264,6 +339,150 @@ def validate_module_payload(payload: Mapping[str, Any]) -> list[str]:
     return issues
 
 
+def story_semantics_payload(kind: str, value: Any) -> dict[str, Any]:
+    return _versioned_payload(STORY_SEMANTICS_PORT_VERSION, kind, value)
+
+
+def visual_design_payload(kind: str, value: Any) -> dict[str, Any]:
+    return _versioned_payload(VISUAL_DESIGN_PORT_VERSION, kind, value)
+
+
+def validate_story_semantics_payload(payload: Mapping[str, Any]) -> list[str]:
+    return _validate_front_half_payload(
+        payload,
+        schema_version=STORY_SEMANTICS_PORT_VERSION,
+        required_by_kind={
+            "semantics_request": (
+                "source_path", "source_sha256", "normalized_lines", "story_id", "compiler_version", "attempt_id",
+            ),
+            "semantics_result": (
+                "success", "source_path", "source_sha256", "title", "lines", "segments",
+                "output_line_numbers", "adapter_version", "compiler_version", "usage_events", "failure",
+            ),
+        },
+        string_fields={
+            "semantics_request": ("source_path", "source_sha256", "story_id", "compiler_version", "attempt_id"),
+            "semantics_result": (
+                "source_path", "source_sha256", "title", "adapter_version", "compiler_version",
+            ),
+        },
+        array_fields={
+            "semantics_request": ("normalized_lines",),
+            "semantics_result": ("lines", "segments", "usage_events"),
+        },
+        array_item_types={
+            "semantics_request": {"normalized_lines": str},
+            "semantics_result": {"lines": Mapping, "segments": Mapping, "usage_events": Mapping},
+        },
+        object_fields={"semantics_result": ("output_line_numbers",)},
+        object_array_value_fields={"semantics_result": ("output_line_numbers",)},
+        boolean_fields={"semantics_result": ("success",)},
+        nullable_object_fields={"semantics_result": ("failure",)},
+    )
+
+
+def validate_visual_design_payload(payload: Mapping[str, Any]) -> list[str]:
+    return _validate_front_half_payload(
+        payload,
+        schema_version=VISUAL_DESIGN_PORT_VERSION,
+        required_by_kind={
+            "visual_design_request": (
+                "project_root", "consumer", "operation", "story_contract_sha256", "projection_sha256",
+                "story_semantics_sha256", "current_artifact_references", "attempt_id",
+            ),
+            "visual_design_result": (
+                "success", "operation", "approved_projection", "artifact_references", "output_sha256",
+                "story_contract_sha256", "projection_sha256", "story_semantics_sha256", "attempt_id",
+                "adapter_version", "usage_events", "failure",
+            ),
+        },
+        string_fields={
+            "visual_design_request": (
+                "project_root", "consumer", "operation", "story_contract_sha256", "projection_sha256",
+                "story_semantics_sha256", "attempt_id",
+            ),
+            "visual_design_result": (
+                "operation", "output_sha256", "story_contract_sha256", "projection_sha256",
+                "story_semantics_sha256", "attempt_id", "adapter_version",
+            ),
+        },
+        array_fields={
+            "visual_design_request": ("current_artifact_references",),
+            "visual_design_result": ("artifact_references", "usage_events"),
+        },
+        array_item_types={
+            "visual_design_request": {"current_artifact_references": Mapping},
+            "visual_design_result": {"artifact_references": Mapping, "usage_events": Mapping},
+        },
+        object_fields={"visual_design_result": ("approved_projection",)},
+        object_array_value_fields={},
+        boolean_fields={"visual_design_result": ("success",)},
+        nullable_object_fields={"visual_design_result": ("failure",)},
+    )
+
+
+def _versioned_payload(schema_version: str, kind: str, value: Any) -> dict[str, Any]:
+    payload = _json_value(asdict(value))
+    payload["kind"] = kind
+    payload["schema_version"] = schema_version
+    return payload
+
+
+def _validate_front_half_payload(
+    payload: Mapping[str, Any],
+    *,
+    schema_version: str,
+    required_by_kind: Mapping[str, Sequence[str]],
+    string_fields: Mapping[str, Sequence[str]],
+    array_fields: Mapping[str, Sequence[str]],
+    array_item_types: Mapping[str, Mapping[str, type]],
+    object_fields: Mapping[str, Sequence[str]],
+    object_array_value_fields: Mapping[str, Sequence[str]],
+    boolean_fields: Mapping[str, Sequence[str]],
+    nullable_object_fields: Mapping[str, Sequence[str]],
+) -> list[str]:
+    if not isinstance(payload, Mapping):
+        return ["payload_not_object"]
+    issues: list[str] = []
+    kind = str(payload.get("kind") or "")
+    if payload.get("schema_version") != schema_version:
+        issues.append("schema_version")
+    if kind not in required_by_kind:
+        return issues + ["kind"]
+    for field_name in required_by_kind[kind]:
+        if field_name not in payload:
+            issues.append(f"missing:{field_name}")
+    for field_name in string_fields.get(kind, ()):
+        if field_name in payload and not isinstance(payload[field_name], str):
+            issues.append(f"type:{field_name}")
+    for field_name in array_fields.get(kind, ()):
+        if field_name in payload and not isinstance(payload[field_name], list):
+            issues.append(f"type:{field_name}")
+        elif field_name in payload:
+            expected = array_item_types.get(kind, {}).get(field_name)
+            if expected is not None and any(not isinstance(item, expected) for item in payload[field_name]):
+                issues.append(f"items:{field_name}")
+    for field_name in object_fields.get(kind, ()):
+        if field_name in payload and not isinstance(payload[field_name], Mapping):
+            issues.append(f"type:{field_name}")
+    for field_name in object_array_value_fields.get(kind, ()):
+        value = payload.get(field_name)
+        if isinstance(value, Mapping) and any(
+            not isinstance(items, list)
+            or any(isinstance(item, bool) or not isinstance(item, int) for item in items)
+            for items in value.values()
+        ):
+            issues.append(f"values:{field_name}")
+    for field_name in boolean_fields.get(kind, ()):
+        if field_name in payload and type(payload[field_name]) is not bool:
+            issues.append(f"type:{field_name}")
+    for field_name in nullable_object_fields.get(kind, ()):
+        value = payload.get(field_name)
+        if value is not None and not isinstance(value, Mapping):
+            issues.append(f"type:{field_name}")
+    return issues
+
+
 def _json_value(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -279,8 +498,13 @@ def _json_value(value: Any) -> Any:
 
 
 __all__ = [
-    "KEYER_PORT_VERSION", "MODULE_PORT_SCHEMA_VERSION", "VIDEO_GENERATOR_PORT_VERSION",
+    "KEYER_PORT_VERSION", "MODULE_PORT_SCHEMA_VERSION", "STORY_SEMANTICS_COMPILER_VERSION",
+    "STORY_SEMANTIC_KINDS",
+    "STORY_SEMANTICS_PORT_VERSION", "VIDEO_GENERATOR_PORT_VERSION", "VISUAL_DESIGN_PORT_VERSION",
     "KeyerPort", "KeyerRequest", "KeyerResult", "ModuleCapabilities", "ModuleFailure",
-    "ModuleFailureCode", "ModuleIdentity", "ModuleUsageEvent", "VideoGeneratorPort",
-    "VideoGeneratorRequest", "VideoGeneratorResult", "module_payload", "validate_module_payload",
+    "ModuleFailureCode", "ModuleIdentity", "ModuleUsageEvent", "StorySemanticsPort",
+    "StorySemanticsRequest", "StorySemanticsResult", "VideoGeneratorPort", "VideoGeneratorRequest",
+    "VideoGeneratorResult", "VisualDesignPort", "VisualDesignRequest", "VisualDesignResult",
+    "module_payload", "story_semantics_payload", "validate_module_payload",
+    "validate_story_semantics_payload", "validate_visual_design_payload", "visual_design_payload",
 ]

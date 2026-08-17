@@ -8,6 +8,7 @@ independent review with a crash-safe lock before batch image generation.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,11 +17,10 @@ from PIL import Image
 
 from story_agent_runtime import file_sha256, review_bundle_is_current, review_passes
 from story_contract_consumers import load_consumer_context, projection_sha256, write_json_atomic
-from story_contract_runtime import (
-    contract_consumer_context_is_current,
-    contract_paths,
-)
-from story_contracts import canonical_json_bytes, load_story_contract
+from story_contract_runtime import contract_consumer_context_is_current
+from story_contracts import canonical_json_bytes
+from story_module_ports import VisualDesignPort, VisualDesignRequest, VisualDesignResult
+from story_module_registry import build_visual_design_registry
 
 
 VISUAL_SAMPLE_SCHEMA_VERSION = "1.0"
@@ -234,13 +234,57 @@ def product_quality_review_issues(
     return issues
 
 
-def compile_visual_sample_plan(project_root: Path | str, context_path: Path | str) -> dict[str, Any]:
+def _approved_visual_projection(
+    root: Path,
+    context: Mapping[str, Any],
+    visual_design_port: VisualDesignPort,
+) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]]:
+    expected_projection = context["contract_projection"]
+    expected_projection_sha = projection_sha256(context)
+    request = VisualDesignRequest(
+        project_root=root,
+        consumer="storyboard_images",
+        operation="approved_projection",
+        story_contract_sha256=str(context["story_contract_sha256"]),
+        projection_sha256=expected_projection_sha,
+        story_semantics_sha256="",
+        current_artifact_references=(),
+        attempt_id="visual-sample-plan",
+    )
+    result: VisualDesignResult = visual_design_port.resolve(request)
+    if not result.success:
+        message = result.failure.message if result.failure is not None else "unknown failure"
+        raise ValueError(f"visual design port rejected current projection: {message}")
+    actual_projection_sha = hashlib.sha256(canonical_json_bytes(result.approved_projection)).hexdigest()
+    if (
+        result.operation != request.operation
+        or result.story_contract_sha256 != request.story_contract_sha256
+        or result.projection_sha256 != request.projection_sha256
+        or result.output_sha256 != request.projection_sha256
+        or result.story_semantics_sha256 != request.story_semantics_sha256
+        or result.attempt_id != request.attempt_id
+        or actual_projection_sha != request.projection_sha256
+        or canonical_json_bytes(result.approved_projection) != canonical_json_bytes(expected_projection)
+    ):
+        raise ValueError("visual design port returned a stale or mismatched projection binding")
+    if not isinstance(result.artifact_references, tuple) or any(
+        not isinstance(item, Mapping) for item in result.artifact_references
+    ):
+        raise ValueError("visual design port returned invalid artifact references")
+    return result.approved_projection, list(result.artifact_references)
+
+
+def compile_visual_sample_plan(
+    project_root: Path | str,
+    context_path: Path | str,
+    visual_design_port: VisualDesignPort | None = None,
+) -> dict[str, Any]:
     """Compile only story-applicable samples from the current reviewed contract."""
 
     root = Path(project_root)
     context = load_consumer_context(context_path, "storyboard_images")
-    contract = load_story_contract(contract_paths(root)["contract"])
-    projection = context["contract_projection"]
+    port = visual_design_port or build_visual_design_registry().visual_design()
+    projection, previews = _approved_visual_projection(root, context, port)
     characters = projection.get("characters", {})
     character_rows = characters.get("characters", []) if isinstance(characters, Mapping) else []
     character_ids = [str(item["character_id"]) for item in character_rows if isinstance(item, Mapping)]
@@ -250,7 +294,6 @@ def compile_visual_sample_plan(project_root: Path | str, context_path: Path | st
     state = projection.get("story_state", {})
     state_rows = state.get("machines", []) if isinstance(state, Mapping) else []
     state_ids = [str(item["machine_id"]) for item in state_rows if isinstance(item, Mapping)]
-    previews = [item for item in contract.get("preview_assets", []) if isinstance(item, Mapping)]
     request_path = visual_sample_paths(root)["supplemental_request"]
     forced: set[str] = set()
     supplemental_request: dict[str, Any] | None = None
@@ -522,16 +565,24 @@ def visual_sample_schema_parity_issues() -> list[str]:
     return issues
 
 
-def write_visual_sample_plan(project_root: Path | str, context_path: Path | str) -> Path:
+def write_visual_sample_plan(
+    project_root: Path | str,
+    context_path: Path | str,
+    visual_design_port: VisualDesignPort | None = None,
+) -> Path:
     paths = visual_sample_paths(project_root)
-    payload = compile_visual_sample_plan(project_root, context_path)
+    payload = compile_visual_sample_plan(project_root, context_path, visual_design_port)
     issues = validate_visual_sample_plan(payload)
     if issues:
         raise ValueError("invalid visual sample plan: " + ", ".join(issues))
     return write_json_atomic(paths["plan"], payload)
 
 
-def load_current_visual_sample_plan(project_root: Path | str, context_path: Path | str) -> dict[str, Any]:
+def load_current_visual_sample_plan(
+    project_root: Path | str,
+    context_path: Path | str,
+    visual_design_port: VisualDesignPort | None = None,
+) -> dict[str, Any]:
     root = Path(project_root)
     paths = visual_sample_paths(root)
     if not contract_consumer_context_is_current(root, "storyboard_images", Path(context_path)):
@@ -543,7 +594,7 @@ def load_current_visual_sample_plan(project_root: Path | str, context_path: Path
     issues = validate_visual_sample_plan(payload)
     if issues:
         raise ValueError("visual sample plan is invalid: " + ", ".join(issues))
-    expected = compile_visual_sample_plan(root, context_path)
+    expected = compile_visual_sample_plan(root, context_path, visual_design_port)
     if canonical_json_bytes(payload) != canonical_json_bytes(expected):
         raise ValueError("visual sample plan is stale or manually modified")
     return payload

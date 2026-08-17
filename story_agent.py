@@ -1227,8 +1227,9 @@ class StoryAgent:
         if not self.context.execute:
             return StageResult("done", "dry-run：将从已锁定合同确定性编译逐产物语义呈现计划。")
         try:
-            path = write_artifact_semantic_plan(self.context.project_dir, source)
-            load_current_artifact_semantic_plan(self.context.project_dir, source)
+            semantics_port = self._modules().story_semantics()
+            path = write_artifact_semantic_plan(self.context.project_dir, source, semantics_port)
+            load_current_artifact_semantic_plan(self.context.project_dir, source, semantics_port)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             return StageResult("blocked", f"逐产物语义呈现计划编译失败：{exc}")
         return StageResult("done", "逐产物语义呈现计划已确定性编译并绑定当前合同与语义源。", path)
@@ -1246,8 +1247,9 @@ class StoryAgent:
         if not self.context.execute:
             return StageResult("done", "dry-run：将优先复用合同预览，并只生成故事实际缺少的视觉小样。")
         try:
-            plan_path = write_visual_sample_plan(self.context.project_dir, context)
-            plan = load_current_visual_sample_plan(self.context.project_dir, context)
+            visual_design_port = self._modules().visual_design()
+            plan_path = write_visual_sample_plan(self.context.project_dir, context, visual_design_port)
+            plan = load_current_visual_sample_plan(self.context.project_dir, context, visual_design_port)
         except (OSError, ValueError, KeyError, TypeError) as exc:
             return StageResult("blocked", f"条件式视觉小样计划编译失败：{exc}")
         missing = [item for item in plan["requirements"] if not isinstance(item.get("asset"), dict)]
@@ -1301,8 +1303,8 @@ class StoryAgent:
             if result.status != "done":
                 return result
             try:
-                plan_path = write_visual_sample_plan(self.context.project_dir, context)
-                plan = load_current_visual_sample_plan(self.context.project_dir, context)
+                plan_path = write_visual_sample_plan(self.context.project_dir, context, visual_design_port)
+                plan = load_current_visual_sample_plan(self.context.project_dir, context, visual_design_port)
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 return StageResult("retrying", f"小样生成后无法重新绑定计划：{exc}", paths["handoff"])
         issues = visual_sample_machine_issues(self.context.project_dir, plan)

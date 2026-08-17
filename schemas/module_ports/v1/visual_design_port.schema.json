@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "story-visual-design-port/v1",
+  "title": "Story visual design port payload",
+  "type": "object",
+  "required": ["schema_version", "kind"],
+  "properties": {
+    "schema_version": {"const": "story-visual-design-port/v1"},
+    "kind": {"enum": ["visual_design_request", "visual_design_result"]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "visual_design_request"}}},
+      "then": {
+        "required": ["project_root", "consumer", "operation", "story_contract_sha256", "projection_sha256", "story_semantics_sha256", "current_artifact_references", "attempt_id"],
+        "properties": {
+          "project_root": {"type": "string"},
+          "consumer": {"type": "string"},
+          "operation": {"type": "string"},
+          "story_contract_sha256": {"type": "string"},
+          "projection_sha256": {"type": "string"},
+          "story_semantics_sha256": {"type": "string"},
+          "current_artifact_references": {"type": "array", "items": {"type": "object"}},
+          "attempt_id": {"type": "string"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "visual_design_result"}}},
+      "then": {
+        "required": ["success", "operation", "approved_projection", "artifact_references", "output_sha256", "story_contract_sha256", "projection_sha256", "story_semantics_sha256", "attempt_id", "adapter_version", "usage_events", "failure"],
+        "properties": {
+          "success": {"type": "boolean"},
+          "operation": {"type": "string"},
+          "approved_projection": {"type": "object"},
+          "artifact_references": {"type": "array", "items": {"type": "object"}},
+          "output_sha256": {"type": "string"},
+          "story_contract_sha256": {"type": "string"},
+          "projection_sha256": {"type": "string"},
+          "story_semantics_sha256": {"type": "string"},
+          "attempt_id": {"type": "string"},
+          "adapter_version": {"type": "string"},
+          "usage_events": {"type": "array", "items": {"type": "object"}},
+          "failure": {"type": ["object", "null"]}
+        }
+      }
+    }
+  ]
+}

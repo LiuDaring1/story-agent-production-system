@@ -7,12 +7,22 @@ from pathlib import Path
 from typing import Any
 
 from story_module_adapters import (
+    ApprovedStoryContractVisualDesignAdapter,
+    ExistingStorySemanticsAdapter,
     ExistingVideoGeneratorAdapter,
     MockKeyerAdapter,
+    MockStorySemanticsAdapter,
     MockVideoGeneratorAdapter,
+    MockVisualDesignAdapter,
     ProductionKeyerAdapter,
 )
-from story_module_ports import KeyerPort, VideoGeneratorPort, module_payload
+from story_module_ports import (
+    KeyerPort,
+    StorySemanticsPort,
+    VideoGeneratorPort,
+    VisualDesignPort,
+    module_payload,
+)
 from video_provider_adapter import resolve_video_provider
 
 
@@ -21,7 +31,9 @@ MODULE_PROFILE_ENV = "STORY_MODULE_PROFILE"
 MODULE_PROFILE_REQUIRED_ENV = "STORY_MODULE_PROFILE_REQUIRED"
 PRODUCTION_PROFILE = "production-default"
 MODULE_PROFILE_ALIASES = {"default": PRODUCTION_PROFILE, "production": PRODUCTION_PROFILE}
-ALLOWED_MODULE_PROFILES = frozenset({PRODUCTION_PROFILE, "mock-video", "mock-keyer"})
+ALLOWED_MODULE_PROFILES = frozenset(
+    {PRODUCTION_PROFILE, "mock-video", "mock-keyer", "mock-semantics", "mock-visual-design"}
+)
 
 
 class ModuleRegistry:
@@ -48,6 +60,12 @@ class ModuleRegistry:
 
     def keyer(self) -> KeyerPort:
         return self.get("keyer")  # type: ignore[return-value]
+
+    def story_semantics(self) -> StorySemanticsPort:
+        return self.get("story_semantics")  # type: ignore[return-value]
+
+    def visual_design(self) -> VisualDesignPort:
+        return self.get("visual_design")  # type: ignore[return-value]
 
     def describe(self, port_name: str) -> dict[str, Any]:
         adapter = self.get(port_name)
@@ -79,6 +97,8 @@ def build_default_registry(
     provider = resolve_video_provider(config or load_pipeline_config(root), root, video_provider_override)
     registry.register("video_generator", ExistingVideoGeneratorAdapter(provider))
     registry.register("keyer", ProductionKeyerAdapter())
+    registry.register("story_semantics", ExistingStorySemanticsAdapter())
+    registry.register("visual_design", ApprovedStoryContractVisualDesignAdapter())
     return registry
 
 
@@ -122,6 +142,14 @@ def build_registry_for_profile(
         provider = resolve_video_provider(config or load_pipeline_config(root), root, video_provider_override)
         registry.register("video_generator", ExistingVideoGeneratorAdapter(provider))
     registry.register("keyer", MockKeyerAdapter() if selected == "mock-keyer" else ProductionKeyerAdapter())
+    registry.register(
+        "story_semantics",
+        MockStorySemanticsAdapter() if selected == "mock-semantics" else ExistingStorySemanticsAdapter(),
+    )
+    registry.register(
+        "visual_design",
+        MockVisualDesignAdapter() if selected == "mock-visual-design" else ApprovedStoryContractVisualDesignAdapter(),
+    )
     return registry
 
 
@@ -134,13 +162,39 @@ def build_keyer_registry(profile: str = "") -> ModuleRegistry:
     return registry
 
 
+def build_story_semantics_registry(profile: str = "") -> ModuleRegistry:
+    """Build the local-only semantics registry without reading provider config."""
+
+    selected = resolve_module_profile(profile)
+    registry = ModuleRegistry(profile_name=selected)
+    registry.register(
+        "story_semantics",
+        MockStorySemanticsAdapter() if selected == "mock-semantics" else ExistingStorySemanticsAdapter(),
+    )
+    return registry
+
+
+def build_visual_design_registry(profile: str = "") -> ModuleRegistry:
+    """Build the local-only visual-design registry without reading provider config."""
+
+    selected = resolve_module_profile(profile)
+    registry = ModuleRegistry(profile_name=selected)
+    registry.register(
+        "visual_design",
+        MockVisualDesignAdapter() if selected == "mock-visual-design" else ApprovedStoryContractVisualDesignAdapter(),
+    )
+    return registry
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Story Agent module port diagnostics (read-only)")
     parser.add_argument("--profile", default="", help="Allowlisted adapter selection profile")
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("list", help="List selected module adapters and capabilities")
     describe = sub.add_parser("describe", help="Describe one selected module adapter")
-    describe.add_argument("port_name", choices=["video_generator", "keyer"])
+    describe.add_argument(
+        "port_name", choices=["video_generator", "keyer", "story_semantics", "visual_design"]
+    )
     args = parser.parse_args()
     registry = build_registry_for_profile(args.profile)
     payload = registry.list_descriptions() if args.command == "list" else registry.describe(args.port_name)

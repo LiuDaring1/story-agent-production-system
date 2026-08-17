@@ -4,6 +4,7 @@ import csv
 import hashlib
 import sys
 import shutil
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -17,7 +18,11 @@ from production_keying import (
 )
 from story_module_ports import (
     KEYER_PORT_VERSION,
+    STORY_SEMANTICS_COMPILER_VERSION,
+    STORY_SEMANTICS_PORT_VERSION,
+    STORY_SEMANTIC_KINDS,
     VIDEO_GENERATOR_PORT_VERSION,
+    VISUAL_DESIGN_PORT_VERSION,
     KeyerRequest,
     KeyerResult,
     ModuleCapabilities,
@@ -25,19 +30,364 @@ from story_module_ports import (
     ModuleFailureCode,
     ModuleIdentity,
     ModuleUsageEvent,
+    StorySemanticsRequest,
+    StorySemanticsResult,
     VideoGeneratorRequest,
     VideoGeneratorResult,
+    VisualDesignRequest,
+    VisualDesignResult,
 )
+from story_contracts import StoryContractValidationError, canonical_json_bytes, load_story_contract
+from story_semantics import StoryOutput, classify_story, lines_for_output
 from video_provider_adapter import VideoProviderAdapter, resolve_row_generation_seconds
 
 
 VIDEO_ADAPTER_VERSION = "story-existing-video-adapter/v1"
 KEYER_ADAPTER_VERSION = "story-production-ffmpeg-keyer/v1"
 VIDEO_BATCH_INVOCATION_VERSION = "story-video-batch-invocation/v1"
+STORY_SEMANTICS_ADAPTER_VERSION = "story-existing-semantics-adapter/v1"
+VISUAL_DESIGN_ADAPTER_VERSION = "story-approved-contract-visual-design-adapter/v1"
 
 
 def file_sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def json_sha256(value: Any) -> str:
+    return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
+
+
+def _valid_sha256(value: str) -> bool:
+    return len(value) == 64 and all(character in "0123456789abcdef" for character in value.lower())
+
+
+class ExistingStorySemanticsAdapter:
+    """Thin deterministic adapter around the existing story_semantics module."""
+
+    identity = ModuleIdentity(
+        "story_semantics", STORY_SEMANTICS_PORT_VERSION, "story-semantics", STORY_SEMANTICS_ADAPTER_VERSION
+    )
+    capabilities = ModuleCapabilities(
+        provider="local",
+        model_or_tool="story_semantics.py",
+        runner_or_tool="in-process",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={
+            "classify_full_story": True,
+            "semantic_kind_by_source_line": True,
+            "lines_for_output": True,
+            "source_sha256_binding": True,
+        },
+    )
+
+    def analyze(self, request: StorySemanticsRequest) -> StorySemanticsResult:
+        issue = self._input_issue(request)
+        if issue:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, issue)
+        try:
+            semantics = classify_story(request.normalized_lines)
+            payload = semantics.to_dict()
+            line_payload = tuple(
+                {
+                    **line,
+                    "semantic_kind": (
+                        semantics.kind_at(int(line["line_number"])).value
+                        if semantics.kind_at(int(line["line_number"])) is not None
+                        else ""
+                    ),
+                }
+                for line in payload["lines"]
+            )
+            outputs = {
+                output.value: tuple(line.line_number for line in lines_for_output(semantics, output))
+                for output in StoryOutput
+            }
+        except Exception as exc:
+            return self._failure(request, ModuleFailureCode.EXECUTION_FAILED, str(exc))
+        return StorySemanticsResult(
+            True,
+            request.source_path,
+            request.source_sha256,
+            semantics.title or "",
+            line_payload,
+            tuple(payload["segments"]),
+            outputs,
+            STORY_SEMANTICS_ADAPTER_VERSION,
+            STORY_SEMANTICS_COMPILER_VERSION,
+            usage_events=(
+                ModuleUsageEvent(
+                    "local", "story_semantics.py", "story_semantics_analysis", actual_amount_status="not_applicable"
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _input_issue(request: StorySemanticsRequest) -> str:
+        if not isinstance(request.source_path, Path) or not request.source_path.is_file():
+            return "semantic source is missing"
+        if not isinstance(request.source_sha256, str) or not _valid_sha256(request.source_sha256):
+            return "semantic source hash is missing or stale"
+        try:
+            if file_sha256(request.source_path) != request.source_sha256:
+                return "semantic source hash is missing or stale"
+        except OSError:
+            return "semantic source is unreadable"
+        if (
+            not isinstance(request.normalized_lines, tuple)
+            or not request.normalized_lines
+            or any(not isinstance(line, str) for line in request.normalized_lines)
+        ):
+            return "normalized semantic lines are missing or invalid"
+        if not isinstance(request.compiler_version, str) or request.compiler_version != STORY_SEMANTICS_COMPILER_VERSION:
+            return "semantic compiler version binding is unsupported"
+        if not isinstance(request.attempt_id, str) or not request.attempt_id.strip():
+            return "semantic attempt id is missing"
+        return ""
+
+    @staticmethod
+    def _failure(
+        request: StorySemanticsRequest, code: ModuleFailureCode, message: str
+    ) -> StorySemanticsResult:
+        return StorySemanticsResult(
+            False,
+            request.source_path,
+            request.source_sha256,
+            "",
+            (),
+            (),
+            {},
+            STORY_SEMANTICS_ADAPTER_VERSION,
+            STORY_SEMANTICS_COMPILER_VERSION,
+            failure=ModuleFailure(code, message),
+        )
+
+
+class MockStorySemanticsAdapter(ExistingStorySemanticsAdapter):
+    """Deterministic fixture adapter; it is not an alternative classifier."""
+
+    identity = ModuleIdentity(
+        "story_semantics", STORY_SEMANTICS_PORT_VERSION, "mock-semantics", "story-mock-semantics/v1"
+    )
+    capabilities = ModuleCapabilities(
+        provider="mock",
+        model_or_tool="known-semantic-fixture",
+        runner_or_tool="in-process",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={"known_fixture": True, "network": False},
+    )
+
+    def __init__(
+        self,
+        *,
+        kinds: Sequence[str] = (),
+        output_line_numbers: Mapping[str, Sequence[int]] | None = None,
+        mode: str = "success",
+    ) -> None:
+        self.kinds = tuple(str(kind) for kind in kinds)
+        self.output_line_numbers = {
+            str(output): tuple(int(number) for number in numbers)
+            for output, numbers in (output_line_numbers or {}).items()
+        }
+        self.mode = mode
+
+    def analyze(self, request: StorySemanticsRequest) -> StorySemanticsResult:
+        issue = self._input_issue(request)
+        if issue:
+            return replace(
+                self._failure(request, ModuleFailureCode.INVALID_INPUT, issue),
+                adapter_version="story-mock-semantics/v1",
+            )
+        if self.mode == "failure":
+            return replace(
+                self._failure(request, ModuleFailureCode.EXECUTION_FAILED, "mock execution failure"),
+                adapter_version="story-mock-semantics/v1",
+            )
+        if not self.kinds:
+            return replace(super().analyze(request), adapter_version="story-mock-semantics/v1")
+        if len(self.kinds) != len(request.normalized_lines) or any(
+            kind not in STORY_SEMANTIC_KINDS for kind in self.kinds
+        ):
+            return replace(
+                self._failure(request, ModuleFailureCode.INVALID_INPUT, "mock fixture does not match source lines"),
+                adapter_version="story-mock-semantics/v1",
+            )
+        lines = tuple(
+            {"line_number": index, "text": text, "semantic_kind": kind}
+            for index, (text, kind) in enumerate(zip(request.normalized_lines, self.kinds), start=1)
+        )
+        segments: list[dict[str, Any]] = []
+        for index, kind in enumerate(self.kinds, start=1):
+            if segments and segments[-1]["kind"] == kind:
+                segments[-1]["end_line"] = index
+                segments[-1]["line_numbers"].append(index)
+                segments[-1]["text"] += "\n" + request.normalized_lines[index - 1]
+            else:
+                segments.append(
+                    {
+                        "kind": kind,
+                        "start_line": index,
+                        "end_line": index,
+                        "line_numbers": [index],
+                        "text": request.normalized_lines[index - 1],
+                    }
+                )
+        title = next((line["text"] for line in lines if line["semantic_kind"] == "title"), "")
+        return StorySemanticsResult(
+            True,
+            request.source_path,
+            request.source_sha256,
+            title,
+            lines,
+            tuple(segments),
+            self.output_line_numbers,
+            "story-mock-semantics/v1",
+            STORY_SEMANTICS_COMPILER_VERSION,
+        )
+
+
+class ApprovedStoryContractVisualDesignAdapter:
+    """Resolve only the current reviewed-and-locked Story Contract projection."""
+
+    identity = ModuleIdentity(
+        "visual_design", VISUAL_DESIGN_PORT_VERSION, "approved-story-contract", VISUAL_DESIGN_ADAPTER_VERSION
+    )
+    capabilities = ModuleCapabilities(
+        provider="local",
+        model_or_tool="story-production-contract",
+        runner_or_tool="story_contract_runtime.py",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={
+            "approved_projection": True,
+            "review_lock_required": True,
+            "preview_asset_references": True,
+            "writes_visual_contract": False,
+        },
+    )
+
+    def resolve(self, request: VisualDesignRequest) -> VisualDesignResult:
+        issue = self._input_issue(request)
+        if issue:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, issue)
+        try:
+            # Keep this import local: story_project's keying helpers import the
+            # registry during startup, while story_contract_runtime imports
+            # story_project for persistence.  The Port itself remains a thin
+            # caller of the existing reviewed-lock fact source.
+            from story_contract_runtime import CONTRACT_POLICY_LEGACY, contract_paths, locked_contract_binding
+
+            binding = locked_contract_binding(request.project_root, request.consumer)
+            projection = binding["contract_projection"]
+            projection_sha = json_sha256(projection)
+            if binding.get("mode") != CONTRACT_POLICY_LEGACY:
+                if binding["story_contract_sha256"] != request.story_contract_sha256:
+                    raise ValueError("story contract binding is stale")
+                if projection_sha != request.projection_sha256:
+                    raise ValueError("visual projection binding is stale")
+                contract = load_story_contract(contract_paths(request.project_root)["contract"])
+                references = tuple(
+                    dict(item) for item in contract.get("preview_assets", []) if isinstance(item, Mapping)
+                )
+            else:
+                if request.story_contract_sha256 or request.projection_sha256 != projection_sha:
+                    raise ValueError("legacy visual projection binding is stale")
+                references = ()
+        except (OSError, ValueError, KeyError, TypeError, StoryContractValidationError) as exc:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, str(exc))
+        return VisualDesignResult(
+            True,
+            request.operation,
+            projection,
+            references,
+            projection_sha,
+            str(binding["story_contract_sha256"]),
+            projection_sha,
+            request.story_semantics_sha256,
+            request.attempt_id,
+            VISUAL_DESIGN_ADAPTER_VERSION,
+            usage_events=(
+                ModuleUsageEvent(
+                    "local", "story_contract_runtime.py", "approved_visual_projection", actual_amount_status="not_applicable"
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _input_issue(request: VisualDesignRequest) -> str:
+        if not isinstance(request.project_root, Path) or not request.project_root.is_dir():
+            return "visual design project root is missing"
+        if not isinstance(request.consumer, str) or request.consumer != "storyboard_images":
+            return "visual design consumer is unsupported"
+        if not isinstance(request.operation, str) or request.operation != "approved_projection":
+            return "visual design operation is unsupported"
+        if not isinstance(request.story_contract_sha256, str) or (
+            request.story_contract_sha256 and not _valid_sha256(request.story_contract_sha256)
+        ):
+            return "story contract hash is invalid"
+        if not isinstance(request.projection_sha256, str) or not _valid_sha256(request.projection_sha256):
+            return "visual projection hash is invalid"
+        if not isinstance(request.story_semantics_sha256, str) or (
+            request.story_semantics_sha256 and not _valid_sha256(request.story_semantics_sha256)
+        ):
+            return "story semantics binding is invalid"
+        if not isinstance(request.current_artifact_references, tuple) or any(
+            not isinstance(reference, Mapping) for reference in request.current_artifact_references
+        ):
+            return "visual artifact references are invalid"
+        if not isinstance(request.attempt_id, str) or not request.attempt_id.strip():
+            return "visual design attempt id is missing"
+        return ""
+
+    @staticmethod
+    def _failure(
+        request: VisualDesignRequest, code: ModuleFailureCode, message: str
+    ) -> VisualDesignResult:
+        return VisualDesignResult(
+            False,
+            request.operation,
+            {},
+            (),
+            "",
+            request.story_contract_sha256,
+            request.projection_sha256,
+            request.story_semantics_sha256,
+            request.attempt_id,
+            VISUAL_DESIGN_ADAPTER_VERSION,
+            failure=ModuleFailure(code, message),
+        )
+
+
+class MockVisualDesignAdapter(ApprovedStoryContractVisualDesignAdapter):
+    """Offline substitution that still resolves the sole approved contract fact source."""
+
+    identity = ModuleIdentity(
+        "visual_design", VISUAL_DESIGN_PORT_VERSION, "mock-visual-design", "story-mock-visual-design/v1"
+    )
+    capabilities = ModuleCapabilities(
+        provider="mock",
+        model_or_tool="approved-projection-fixture",
+        runner_or_tool="in-process",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={"approved_projection_passthrough": True, "network": False, "writes_visual_contract": False},
+    )
+
+    def __init__(self, mode: str = "success") -> None:
+        self.mode = mode
+
+    def resolve(self, request: VisualDesignRequest) -> VisualDesignResult:
+        if self.mode == "failure":
+            return replace(
+                self._failure(request, ModuleFailureCode.EXECUTION_FAILED, "mock execution failure"),
+                adapter_version="story-mock-visual-design/v1",
+            )
+        return replace(super().resolve(request), adapter_version="story-mock-visual-design/v1")
 
 
 class ExistingVideoGeneratorAdapter:
@@ -325,7 +675,9 @@ class MockKeyerAdapter(ProductionKeyerAdapter):
 
 
 __all__ = [
+    "ApprovedStoryContractVisualDesignAdapter", "ExistingStorySemanticsAdapter",
     "ExistingVideoGeneratorAdapter", "KEYER_ADAPTER_VERSION", "MockKeyerAdapter",
-    "MockVideoGeneratorAdapter", "ProductionKeyerAdapter", "VIDEO_ADAPTER_VERSION",
-    "VIDEO_BATCH_INVOCATION_VERSION",
+    "MockStorySemanticsAdapter", "MockVideoGeneratorAdapter", "MockVisualDesignAdapter",
+    "ProductionKeyerAdapter", "STORY_SEMANTICS_ADAPTER_VERSION", "VIDEO_ADAPTER_VERSION",
+    "VIDEO_BATCH_INVOCATION_VERSION", "VISUAL_DESIGN_ADAPTER_VERSION",
 ]

@@ -16,7 +16,12 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PIL import Image, ImageDraw
-from story_module_registry import ModuleRegistry, build_default_registry
+from story_module_registry import (
+    MODULE_PROFILE_ENV,
+    MODULE_PROFILE_REQUIRED_ENV,
+    ModuleRegistry,
+    build_registry_for_profile,
+)
 from story_video_synthesizer.image_video import validate_image_video_jobs
 from story_contract_runtime import (
     CONTRACT_POLICY_LEGACY,
@@ -376,8 +381,12 @@ class StoryAgent:
 
     def _modules(self) -> ModuleRegistry:
         if self._module_registry is None:
-            self._module_registry = build_default_registry(load_config(), ROOT)
+            self._module_registry = build_registry_for_profile("", load_config(), ROOT)
         return self._module_registry
+
+    def _module_subprocess_env(self) -> dict[str, str]:
+        profile = self._modules().selection_profile()
+        return {MODULE_PROFILE_ENV: profile, MODULE_PROFILE_REQUIRED_ENV: profile}
 
     def run(self, max_steps: int) -> int:
         if self.context.scheduler == "dag" and self.context.execute:
@@ -675,6 +684,7 @@ class StoryAgent:
             env["STORY_AGENT_PROJECT_ROOT"] = str(self.context.project_dir.expanduser().resolve())
             env["STORY_AGENT_WORKER_DIR"] = str(work_dir)
             env["STORY_AGENT_RUN_EPOCH"] = str(run_epoch)
+            env.update(self._module_subprocess_env())
             with log_file.open("w", encoding="utf-8") as worker_log:
                 process = subprocess.Popen(
                     command,
@@ -1935,20 +1945,18 @@ class StoryAgent:
             provider = self._modules().video_generator()
         except Exception:
             provider = None
-        if (
-            provider is not None
-            and provider.model.strip().lower() == "grok-video-1.5"
-            and provider.min_seconds is not None
-            and provider.max_seconds is not None
-        ):
+        supported = provider.capabilities.supported if provider is not None else {}
+        min_seconds = supported.get("min_duration")
+        max_seconds = supported.get("max_duration")
+        if provider is not None and min_seconds is not None and max_seconds is not None:
             command.extend(
                 [
                     "--duration-mode",
                     "adaptive-seconds",
                     "--min-generation-seconds",
-                    str(int(provider.min_seconds)),
+                    str(int(min_seconds)),
                     "--max-generation-seconds",
-                    str(int(provider.max_seconds)),
+                    str(int(max_seconds)),
                 ]
             )
         return self._workflow(command, "写入旁白时长")
@@ -1973,7 +1981,9 @@ class StoryAgent:
         config = load_config()
         video_api = config.get("video_api", {}) if isinstance(config.get("video_api"), dict) else {}
         provider = self._modules().video_generator()
-        estimated_per_clip = provider.estimated_cost_cny_per_clip
+        supported = provider.capabilities.supported
+        default_seconds = supported.get("default_duration") or 0
+        estimated_per_clip = provider.estimate_cost(float(default_seconds or 0))
         try:
             with jobs.open(encoding="utf-8-sig", newline="") as file:
                 job_rows = list(csv.DictReader(file))
@@ -1993,16 +2003,10 @@ class StoryAgent:
         ]
 
         def estimate_row_cost(row: dict[str, str]) -> float:
-            if provider.estimated_cost_cny_per_second > 0:
-                if provider.model.strip().lower() == "grok-video-1.5":
-                    seconds = float(provider.resolve_request_seconds(row, provider.default_seconds or 8))
-                else:
-                    raw = row.get("generation_duration") or row.get("duration")
-                    seconds = float(raw) if raw not in (None, "") else float(provider.default_seconds or 0)
-                return provider.estimate_cost(seconds)
-            return provider.estimate_cost()
+            seconds = float(provider.resolve_request_seconds(row, default_seconds or 0))
+            return provider.estimate_cost(seconds)
 
-        estimated_rows = pending_rows or [{"duration": str(provider.default_seconds or 0)} for _ in range(pending)]
+        estimated_rows = pending_rows or [{"duration": str(default_seconds or 0)} for _ in range(pending)]
         estimate = round(sum(estimate_row_cost(row) for row in estimated_rows), 2)
         ledger = BudgetLedger(manifest)
         try:
@@ -2012,12 +2016,14 @@ class StoryAgent:
         from story_project import write_manifest
 
         write_manifest(self.context.paths, manifest)
-        generate_command = provider.build_batch_command(
-            jobs_csv=jobs,
-            images_dir=image_dir,
-            videos_dir=self.context.paths.video_jobs / "videos",
-            project_dir=self.context.project_dir,
-        )
+        generate_command = [
+            "generate",
+            "--jobs-csv", str(jobs),
+            "--images-dir", str(image_dir),
+            "--videos-dir", str(self.context.paths.video_jobs / "videos"),
+            "--project-dir", str(self.context.project_dir),
+            "--execution-mode", "test" if self._modules().selection_profile() == "mock-video" else "production",
+        ]
         if bool(video_api.get("submit_all_first", False)):
             generate_command.append("--submit-all-first")
             generate_command.extend(["--max-submit-first", str(int(video_api.get("max_submit_first", 20)))])
@@ -2045,7 +2051,7 @@ class StoryAgent:
             ledger.settle(
                 reservation,
                 actual_cost,
-                provider=provider.name,
+                provider=provider.capabilities.provider or provider.identity.adapter_name,
             )
         else:
             ledger.release(reservation, reason=result.message)
@@ -3070,17 +3076,40 @@ class StoryAgent:
         return self._workflow(["doctor-project", "--project-dir", str(self.context.project_dir)], "生成工程体检报告")
 
     def _workflow(self, args: list[str], label: str) -> StageResult:
-        command = [sys.executable, str(ROOT / "story_workflow.py"), *args]
-        return self._run_command(command, label, log_name=args[0])
+        profile = self._modules().selection_profile()
+        command = [sys.executable, str(ROOT / "story_workflow.py"), "--module-profile", profile, *args]
+        return self._run_command(
+            command,
+            label,
+            log_name=args[0],
+            env_overrides=self._module_subprocess_env(),
+        )
 
-    def _run_command(self, command: list[str], label: str, *, log_name: str) -> StageResult:
+    def _run_command(
+        self,
+        command: list[str],
+        label: str,
+        *,
+        log_name: str,
+        env_overrides: dict[str, str] | None = None,
+    ) -> StageResult:
         if not self.context.execute:
             return StageResult("done", "dry-run: " + " ".join(str(part) for part in command))
         started = time.time()
         log_dir = self.context.paths.status / "agent_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{int(started)}_{log_name}.log"
-        process = subprocess.Popen(command, cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        env = os.environ.copy()
+        if env_overrides:
+            env.update(env_overrides)
+        process = subprocess.Popen(
+            command,
+            cwd=str(ROOT),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         stdout = ""
         stderr = ""
         while True:

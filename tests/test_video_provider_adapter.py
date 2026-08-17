@@ -8,7 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from PIL import Image
 
@@ -215,19 +215,18 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 "scene,target_video_filename,status\n1,01.mp4,todo\n",
                 encoding="utf-8-sig",
             )
-            with patch("story_workflow.run_script") as runner:
-                with self.assertRaisesRegex(RuntimeError, "没有减少待处理任务"):
-                    run_generate_until_complete(
-                        [],
-                        runner=root / "mock_video_provider.py",
-                        jobs_csv=jobs,
-                        videos_dir=videos,
-                        start_scene=1,
-                        end_scene=9999,
-                        scenes="",
-                        limit=0,
-                    )
-            runner.assert_called_once()
+            invoke = Mock()
+            with self.assertRaisesRegex(RuntimeError, "没有减少待处理任务"):
+                run_generate_until_complete(
+                    invoke,
+                    jobs_csv=jobs,
+                    videos_dir=videos,
+                    start_scene=1,
+                    end_scene=9999,
+                    scenes="",
+                    limit=0,
+                )
+            invoke.assert_called_once()
 
     def test_mock_provider_runs_through_real_workflow_without_paid_api(self) -> None:
         root = Path(__file__).resolve().parents[1]

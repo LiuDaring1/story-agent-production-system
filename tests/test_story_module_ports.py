@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
 import json
+import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from PIL import Image, ImageChops
 
@@ -33,8 +38,16 @@ from story_module_ports import (
     module_payload,
     validate_module_payload,
 )
-from story_module_registry import ModuleRegistry, build_default_registry, load_pipeline_config
-from story_agent import StoryAgent
+from story_module_registry import (
+    MODULE_PROFILE_ENV,
+    MODULE_PROFILE_REQUIRED_ENV,
+    ModuleRegistry,
+    build_default_registry,
+    build_registry_for_profile,
+    load_pipeline_config,
+)
+from story_agent import AgentContext, StoryAgent
+from story_project import init_project
 from video_provider_adapter import VideoProviderAdapter, resolve_row_generation_seconds, resolve_video_provider
 
 
@@ -145,13 +158,13 @@ class StoryModulePortTests(unittest.TestCase):
         port = build_default_registry(config, ROOT).video_generator()
         self.assertEqual(port.identity.adapter_name, legacy.name)
         self.assertEqual(port.provider_config, legacy)
-        self.assertEqual(port.model, legacy.model)
-        self.assertEqual(port.runner, legacy.runner)
+        self.assertEqual(port.capabilities.model_or_tool, legacy.model)
+        self.assertEqual(port.capabilities.runner_or_tool, str(legacy.runner))
         self.assertEqual(port.provider_config.base_url, legacy.base_url)
         self.assertEqual(port.provider_config.api_key_env, legacy.api_key_env)
-        self.assertEqual(port.default_seconds, legacy.default_seconds)
-        self.assertEqual(port.min_seconds, legacy.min_seconds)
-        self.assertEqual(port.max_seconds, legacy.max_seconds)
+        self.assertEqual(port.capabilities.supported["default_duration"], legacy.default_seconds)
+        self.assertEqual(port.capabilities.supported["min_duration"], legacy.min_seconds)
+        self.assertEqual(port.capabilities.supported["max_duration"], legacy.max_seconds)
         self.assertEqual(port.capabilities.supported["resolution"], legacy.default_resolution)
         self.assertEqual(port.capabilities.supported["ratio"], legacy.default_ratio)
         self.assertEqual(port.estimate_cost(9), legacy.estimate_cost(9))
@@ -161,6 +174,93 @@ class StoryModulePortTests(unittest.TestCase):
             port.resolve_request_seconds(row, 8),
             resolve_row_generation_seconds(row, model=legacy.model, fallback_seconds=8, min_seconds=legacy.min_seconds, max_seconds=legacy.max_seconds),
         )
+
+    def test_story_agent_workflow_subprocess_uses_formal_mock_port_without_concrete_attrs(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            init_project(project, story_name="adapter fixture", slug="adapter-fixture")
+            images, videos = root / "images", root / "videos"
+            images.mkdir()
+            Image.new("RGB", (32, 18), (30, 80, 120)).save(images / "01.png")
+            jobs = root / "jobs.csv"
+            jobs.write_text(
+                "scene,image_filename,story_text,prompt,target_video_filename,status\n"
+                "1,01.png,body,character_a moves,01.mp4,todo\n",
+                encoding="utf-8-sig",
+            )
+            registry = build_registry_for_profile("mock-video")
+            port = registry.video_generator()
+            for leaked in ("name", "model", "runner", "default_seconds", "estimated_cost_cny_per_clip"):
+                self.assertFalse(hasattr(port, leaked), leaked)
+            context = AgentContext(
+                project, None, "adapter fixture", "adapter-fixture", True, False,
+                "cli", "", "workspace-write", "never", "codex", 30,
+            )
+            result = StoryAgent(context, module_registry=registry)._workflow(
+                [
+                    "generate", "--jobs-csv", str(jobs), "--images-dir", str(images),
+                    "--videos-dir", str(videos), "--skip-prompt-review", "--execution-mode", "test",
+                ],
+                "mock video integration",
+            )
+            self.assertEqual(result.status, "done", result.message)
+            self.assertEqual((videos / "01.mp4").read_bytes(), b"STORY_MODULE_MOCK_VIDEO\n")
+            with jobs.open(encoding="utf-8-sig", newline="") as file:
+                row = next(csv.DictReader(file))
+            self.assertEqual(row["provider"], "mock")
+            self.assertEqual(row["production_eligible"], "false")
+
+    def test_missing_required_subprocess_selection_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = root / "jobs.csv"
+            images, videos = root / "images", root / "videos"
+            images.mkdir()
+            jobs.write_text(
+                "scene,image_filename,prompt,target_video_filename,status\n1,01.png,move,01.mp4,todo\n",
+                encoding="utf-8-sig",
+            )
+            env = os.environ.copy()
+            env.pop(MODULE_PROFILE_ENV, None)
+            env[MODULE_PROFILE_REQUIRED_ENV] = "mock-video"
+            process = subprocess.run(
+                [
+                    sys.executable, str(ROOT / "story_workflow.py"), "generate",
+                    "--jobs-csv", str(jobs), "--images-dir", str(images), "--videos-dir", str(videos),
+                    "--skip-prompt-review", "--execution-mode", "test",
+                ],
+                cwd=ROOT,
+                env=env,
+                text=True,
+                capture_output=True,
+            )
+            self.assertNotEqual(process.returncode, 0)
+            self.assertIn("refusing production fallback", process.stderr + process.stdout)
+            self.assertFalse((videos / "01.mp4").exists())
+
+    def test_mock_keyer_selection_reaches_evidence_demo_and_release_consumers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, output = root / "source.png", root / "evidence.png"
+            Image.new("RGBA", (8, 8), (1, 2, 3, 255)).save(source)
+            env = {MODULE_PROFILE_ENV: "mock-keyer", MODULE_PROFILE_REQUIRED_ENV: "mock-keyer"}
+            with patch.dict(os.environ, env, clear=False):
+                from keying_quality import render_production_keyed_foreground as render_evidence
+                from product_package import production_keying_filter_chain as demo_filter
+                from release_video import production_keying_filter_chain as release_filter
+
+                render_evidence(source, output, {})
+                self.assertEqual(output.read_bytes(), source.read_bytes())
+                self.assertIn("null[person_keyed]", demo_filter("[0:v]", {}))
+                self.assertIn("null[person_keyed]", release_filter("[0:v]", {}))
+                self.assertNotIn("colorkey", demo_filter("[0:v]", {}))
+
+    def test_default_profile_preserves_production_adapter_parity(self) -> None:
+        registry = build_registry_for_profile("production-default", load_pipeline_config(ROOT), ROOT)
+        self.assertIsInstance(registry.video_generator(), ExistingVideoGeneratorAdapter)
+        self.assertIsInstance(registry.keyer(), ProductionKeyerAdapter)
+        self.assertEqual(registry.keyer().capabilities.runner_or_tool, "production_keying.py")
 
     def test_legacy_video_duration_behavior_is_unchanged(self) -> None:
         provider = VideoProviderAdapter("legacy", ROOT / "run_image_video_jobs.py", "grok-video-3", "", "", 1.2)

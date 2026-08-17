@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, field
 from enum import Enum
 from pathlib import Path
-from typing import Any, Mapping, Protocol, runtime_checkable
+from typing import Any, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 
 MODULE_PORT_SCHEMA_VERSION = "story-module-ports/v1"
@@ -131,11 +131,14 @@ class VideoGeneratorPort(Protocol):
 
     def runner_args(self) -> list[str]: ...
 
-    def resolve_request_seconds(self, row: Mapping[str, Any], fallback_seconds: str | int | float) -> str: ...
+    def invoke_batch(
+        self,
+        arguments: Sequence[str],
+        *,
+        executor: Callable[[Sequence[str]], None],
+    ) -> None: ...
 
-    def build_batch_command(
-        self, *, jobs_csv: Path, images_dir: Path, videos_dir: Path, project_dir: Path
-    ) -> list[str]: ...
+    def resolve_request_seconds(self, row: Mapping[str, Any], fallback_seconds: str | int | float) -> str: ...
 
     def generate(self, request: VideoGeneratorRequest) -> VideoGeneratorResult: ...
 

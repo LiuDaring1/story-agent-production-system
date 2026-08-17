@@ -10,6 +10,7 @@ import sys
 import time
 from datetime import datetime
 from pathlib import Path
+from typing import Callable, Sequence
 
 from PIL import Image, ImageDraw, ImageFont
 from analyze_storyboard_pacing import analyze_storyboard_pacing
@@ -18,7 +19,11 @@ from story_video_synthesizer.image_video import (
     enforce_prompt_continuity_contract,
     validate_image_video_jobs,
 )
-from story_module_registry import build_default_registry
+from story_module_registry import (
+    build_registry_for_profile,
+    export_module_profile,
+    resolve_module_profile,
+)
 from story_semantics import SemanticKind, classify_story
 from story_contract_consumers import (
     compile_demo_render_spec,
@@ -61,6 +66,11 @@ ROOT = Path(__file__).resolve().parent
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="儿童故事图片到成片的统一流程入口")
+    parser.add_argument(
+        "--module-profile",
+        default="",
+        help="允许列表中的模块适配器配置；子进程会校验并继承该选择",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init = subparsers.add_parser("init-project", help="初始化桌面故事项目和 project_manifest.json")
@@ -275,6 +285,7 @@ def main() -> None:
     rerun_review.add_argument("--videos-dir", required=True, type=Path)
     rerun_review.add_argument("--decisions-csv", required=True, type=Path)
     rerun_review.add_argument("--provider", default="", help="覆盖 pipeline_config.json 中的图生视频 provider")
+    rerun_review.add_argument("--execution-mode", choices=["production", "test"], default="production")
 
     review = subparsers.add_parser("apply-review", help="根据审核 CSV 整理最终 clips")
     review.add_argument("--jobs-csv", required=True, type=Path)
@@ -442,6 +453,8 @@ def main() -> None:
     product.add_argument("--narration-volume", default=1.0, type=float)
 
     args = parser.parse_args()
+    module_profile = resolve_module_profile(args.module_profile)
+    export_module_profile(module_profile)
     if args.command == "init-project":
         manifest = init_project(args.project_dir, story_name=args.story_name, slug=args.slug, episode=args.episode)
         print(f"已初始化项目：{args.project_dir.expanduser()}")
@@ -667,8 +680,8 @@ def main() -> None:
         # Production provider selection and invocation now pass through the
         # module Port registry; the concrete adapter still delegates to the
         # unchanged runner and provider configuration.
-        provider = build_default_registry(
-            load_config(), ROOT, video_provider_override=args.provider
+        provider = build_registry_for_profile(
+            module_profile, load_config(), ROOT, video_provider_override=args.provider
         ).video_generator()
         images_dir = resolve_generate_images_dir(args.jobs_csv, args.images_dir)
         if not args.skip_prompt_review and not args.dry_run:
@@ -682,7 +695,6 @@ def main() -> None:
                 limit=args.limit,
             )
         command = [
-            *provider.runner_args(),
             "--jobs-csv",
             args.jobs_csv,
             "--images-dir",
@@ -708,11 +720,10 @@ def main() -> None:
             command.append("--submit-all-first")
             command.extend(["--max-submit-first", str(args.max_submit_first)])
         if args.dry_run:
-            run_script(str(provider.runner), *command)
+            provider.invoke_batch(command, executor=run_module_command)
         else:
             run_generate_until_complete(
-                command,
-                runner=provider.runner,
+                lambda: provider.invoke_batch(command, executor=run_module_command),
                 jobs_csv=args.jobs_csv,
                 videos_dir=args.videos_dir,
                 start_scene=args.start_scene,
@@ -721,26 +732,29 @@ def main() -> None:
                 limit=args.limit,
             )
     elif args.command == "rerun-review":
-        provider = build_default_registry(
-            load_config(), ROOT, video_provider_override=args.provider
+        provider = build_registry_for_profile(
+            module_profile, load_config(), ROOT, video_provider_override=args.provider
         ).video_generator()
         scenes = reset_redo_scenes(args.jobs_csv, args.videos_dir, args.decisions_csv)
         if not scenes:
             print("审核 CSV 中没有标记为重做的片段。")
             return
         print("需要重跑：" + ", ".join(f"{scene:02d}" for scene in scenes))
-        run_script(
-            str(provider.runner),
-            *provider.runner_args(),
-            "--jobs-csv",
-            args.jobs_csv,
-            "--images-dir",
-            args.images_dir,
-            "--videos-dir",
-            args.videos_dir,
-            "--scenes",
-            ",".join(str(scene) for scene in scenes),
-            "--submit-all-first",
+        provider.invoke_batch(
+            [
+                "--jobs-csv",
+                args.jobs_csv,
+                "--images-dir",
+                args.images_dir,
+                "--videos-dir",
+                args.videos_dir,
+                "--scenes",
+                ",".join(str(scene) for scene in scenes),
+                "--submit-all-first",
+                "--execution-mode",
+                args.execution_mode,
+            ],
+            executor=run_module_command,
         )
     elif args.command == "apply-review":
         command = [
@@ -1080,6 +1094,16 @@ def run_script(script_name: str, *args) -> None:
     command = [sys.executable, str(script)] + [str(arg) for arg in args]
     print("运行：", " ".join(command), flush=True)
     result = subprocess.run(command)
+    if result.returncode != 0:
+        raise SystemExit(result.returncode)
+
+
+def run_module_command(command: Sequence[str]) -> None:
+    """Execute an adapter-owned command without knowing its runner or provider."""
+
+    normalized = [str(part) for part in command]
+    print("运行模块：", " ".join(normalized), flush=True)
+    result = subprocess.run(normalized)
     if result.returncode != 0:
         raise SystemExit(result.returncode)
 
@@ -2287,9 +2311,8 @@ def resolve_generate_images_dir(jobs_csv: Path, images_dir: Path) -> Path:
 
 
 def run_generate_until_complete(
-    command: list[object],
+    invoke: Callable[[], None],
     *,
-    runner: Path,
     jobs_csv: Path,
     videos_dir: Path,
     start_scene: int,
@@ -2312,7 +2335,7 @@ def run_generate_until_complete(
             return
         if round_index > 1:
             print(f"继续自动接续图生视频：第 {round_index} 轮，剩余 {pending_before} 条。")
-        run_script(str(runner), *command)
+        invoke()
         pending_after = count_pending_generate_rows(
             jobs_csv,
             videos_dir,

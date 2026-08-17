@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import csv
 import hashlib
+import sys
 import shutil
 from pathlib import Path
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from production_keying import (
     PRODUCTION_KEYING_FILTER_VERSION,
@@ -31,6 +33,7 @@ from video_provider_adapter import VideoProviderAdapter, resolve_row_generation_
 
 VIDEO_ADAPTER_VERSION = "story-existing-video-adapter/v1"
 KEYER_ADAPTER_VERSION = "story-production-ffmpeg-keyer/v1"
+VIDEO_BATCH_INVOCATION_VERSION = "story-video-batch-invocation/v1"
 
 
 def file_sha256(path: Path) -> str:
@@ -69,63 +72,38 @@ class ExistingVideoGeneratorAdapter:
                 "default_duration": provider.default_seconds,
                 "resolution": provider.default_resolution,
                 "ratio": provider.default_ratio,
+                "invocation_version": VIDEO_BATCH_INVOCATION_VERSION,
             },
         )
 
     def estimate_cost(self, seconds: float | None = None) -> float:
         return self.provider_config.estimate_cost(seconds)
 
-    # Read-only compatibility properties let the existing Runtime keep its
-    # exact duration/cost behavior while provider selection moves behind the
-    # Port.  They deliberately do not duplicate provider configuration.
-    @property
-    def name(self) -> str:
-        return self.provider_config.name
-
-    @property
-    def model(self) -> str:
-        return self.provider_config.model
-
-    @property
-    def runner(self) -> Path:
-        return self.provider_config.runner
-
-    @property
-    def default_seconds(self) -> float | None:
-        return self.provider_config.default_seconds
-
-    @property
-    def min_seconds(self) -> float | None:
-        return self.provider_config.min_seconds
-
-    @property
-    def max_seconds(self) -> float | None:
-        return self.provider_config.max_seconds
-
-    @property
-    def estimated_cost_cny_per_clip(self) -> float:
-        return self.provider_config.estimated_cost_cny_per_clip
-
-    @property
-    def estimated_cost_cny_per_second(self) -> float:
-        return self.provider_config.estimated_cost_cny_per_second
-
     def runner_args(self) -> list[str]:
         return self.provider_config.runner_args()
+
+    def invoke_batch(
+        self,
+        arguments: Sequence[str],
+        *,
+        executor: Callable[[Sequence[str]], None],
+    ) -> None:
+        """Invoke the unchanged batch runner behind the formal Port seam."""
+
+        executor(
+            [
+                sys.executable,
+                str(self.provider_config.runner),
+                *self.provider_config.runner_args(),
+                *(str(value) for value in arguments),
+            ]
+        )
 
     def resolve_request_seconds(self, row: Mapping[str, Any], fallback_seconds: str | int | float) -> str:
         return resolve_row_generation_seconds(
             dict(row), model=self.provider_config.model, fallback_seconds=fallback_seconds,
             min_seconds=self.provider_config.min_seconds, max_seconds=self.provider_config.max_seconds,
         )
-
-    def build_batch_command(
-        self, *, jobs_csv: Path, images_dir: Path, videos_dir: Path, project_dir: Path
-    ) -> list[str]:
-        return [
-            "generate", "--jobs-csv", str(jobs_csv), "--images-dir", str(images_dir),
-            "--videos-dir", str(videos_dir), "--project-dir", str(project_dir),
-        ]
 
     def generate(self, request: VideoGeneratorRequest) -> VideoGeneratorResult:
         if self._executor is None:
@@ -196,7 +174,15 @@ class MockVideoGeneratorAdapter:
     identity = ModuleIdentity("video_generator", VIDEO_GENERATOR_PORT_VERSION, "mock-video", "story-mock-video/v1")
     capabilities = ModuleCapabilities(
         provider="mock", model_or_tool="deterministic-fixture", runner_or_tool="in-process",
-        deterministic=True, supported={"image_to_video": True, "first_frame_image_count": 1},
+        deterministic=True,
+        supported={
+            "image_to_video": True,
+            "first_frame_image_count": 1,
+            "default_duration": 1,
+            "min_duration": 1,
+            "max_duration": 15,
+            "invocation_version": VIDEO_BATCH_INVOCATION_VERSION,
+        },
     )
 
     def __init__(self, mode: str = "success") -> None:
@@ -208,11 +194,71 @@ class MockVideoGeneratorAdapter:
     def runner_args(self) -> list[str]:
         return []
 
+    @staticmethod
+    def _option(arguments: Sequence[str], name: str, default: str = "") -> str:
+        values = [str(value) for value in arguments]
+        try:
+            return values[values.index(name) + 1]
+        except (ValueError, IndexError):
+            return default
+
+    def invoke_batch(
+        self,
+        arguments: Sequence[str],
+        *,
+        executor: Callable[[Sequence[str]], None],
+    ) -> None:
+        """Produce deterministic offline fixtures without touching a runner/network."""
+
+        del executor
+        if self._option(arguments, "--execution-mode", "production") != "test":
+            raise RuntimeError("mock-video is test-only and cannot run in production mode")
+        jobs_csv = Path(self._option(arguments, "--jobs-csv")).expanduser()
+        videos_dir = Path(self._option(arguments, "--videos-dir")).expanduser()
+        if not jobs_csv.is_file() or not str(videos_dir):
+            raise ValueError("mock-video invocation requires current jobs and videos paths")
+        with jobs_csv.open(encoding="utf-8-sig", newline="") as file:
+            reader = csv.DictReader(file)
+            rows = list(reader)
+            fieldnames = list(reader.fieldnames or [])
+        selected = {
+            int(value.strip())
+            for value in self._option(arguments, "--scenes").split(",")
+            if value.strip().isdigit()
+        }
+        start = int(self._option(arguments, "--start-scene", "1"))
+        end = int(self._option(arguments, "--end-scene", "9999"))
+        limit = int(self._option(arguments, "--limit", "0"))
+        candidates = [
+            row for row in rows
+            if (int(row.get("scene") or 0) in selected if selected else start <= int(row.get("scene") or 0) <= end)
+        ]
+        if limit:
+            candidates = candidates[:limit]
+        videos_dir.mkdir(parents=True, exist_ok=True)
+        for name in ("status", "provider", "model", "execution_mode", "source_kind", "production_eligible"):
+            if name not in fieldnames:
+                fieldnames.append(name)
+        for row in candidates:
+            target = str(row.get("target_video_filename") or "").strip()
+            if not target:
+                continue
+            (videos_dir / target).write_bytes(b"STORY_MODULE_MOCK_VIDEO\n")
+            row.update(
+                status="downloaded",
+                provider="mock",
+                model="deterministic-fixture",
+                execution_mode="test",
+                source_kind="mock_provider",
+                production_eligible="false",
+            )
+        with jobs_csv.open("w", encoding="utf-8-sig", newline="") as file:
+            writer = csv.DictWriter(file, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+
     def resolve_request_seconds(self, row: Mapping[str, Any], fallback_seconds: str | int | float) -> str:
         return str(fallback_seconds)
-
-    def build_batch_command(self, *, jobs_csv: Path, images_dir: Path, videos_dir: Path, project_dir: Path) -> list[str]:
-        return ["mock-generate", str(jobs_csv), str(images_dir), str(videos_dir), str(project_dir)]
 
     def generate(self, request: VideoGeneratorRequest) -> VideoGeneratorResult:
         failure_code = {
@@ -246,6 +292,25 @@ class MockKeyerAdapter(ProductionKeyerAdapter):
     def __init__(self, mode: str = "success") -> None:
         self.mode = mode
 
+    def compile_contract(self, settings: Any) -> dict[str, Any]:
+        payload = dict(settings) if isinstance(settings, Mapping) else dict(vars(settings))
+        return {
+            "filter_version": "story-mock-filter/v1",
+            "keyer": "mock",
+            "settings": payload,
+        }
+
+    def filter_chain(self, source: str, settings: Any, crop_filter: str = "") -> str:
+        del settings
+        return f"{source}{crop_filter}null[person_keyed]"
+
+    def filter_parts(self, source: str, settings: Any, crop_filter: str = "") -> list[str]:
+        return [self.filter_chain(source, settings, crop_filter)]
+
+    def fingerprint(self, settings: Any) -> str:
+        serialized = repr(sorted(self.compile_contract(settings)["settings"].items())).encode("utf-8")
+        return hashlib.sha256(b"story-mock-keyer/v1\0" + serialized).hexdigest()
+
     def render(self, request: KeyerRequest) -> KeyerResult:
         if not request.source_path.is_file() or file_sha256(request.source_path) != request.source_sha256:
             return self._failure(request, ModuleFailureCode.INVALID_INPUT, "mock invalid input")
@@ -262,4 +327,5 @@ class MockKeyerAdapter(ProductionKeyerAdapter):
 __all__ = [
     "ExistingVideoGeneratorAdapter", "KEYER_ADAPTER_VERSION", "MockKeyerAdapter",
     "MockVideoGeneratorAdapter", "ProductionKeyerAdapter", "VIDEO_ADAPTER_VERSION",
+    "VIDEO_BATCH_INVOCATION_VERSION",
 ]

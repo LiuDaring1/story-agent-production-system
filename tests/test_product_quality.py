@@ -191,6 +191,17 @@ class ProductQualityTests(unittest.TestCase):
 
     def test_public_transform_version_and_selected_public_text_are_currentness_inputs(self) -> None:
         manifest = self.make_content_manifest()
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        payload["public_text_projection"]["transform_version"] = "story-public-text/v1"
+        payload.pop("compiled_payload_sha256")
+        payload["compiled_payload_sha256"] = stable_sha256(payload)
+        atomic_write_json(manifest, payload)
+        self.assertIn(
+            "product_content_public_transform_version_stale",
+            product_content_manifest_issues(manifest),
+        )
+
+        manifest = self.make_content_manifest()
         with patch("product_quality.PUBLIC_TEXT_TRANSFORM_VERSION", "story-public-text/v-next"):
             self.assertIn(
                 "product_content_public_transform_version_stale",

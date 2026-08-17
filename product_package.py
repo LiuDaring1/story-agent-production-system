@@ -52,7 +52,10 @@ from product_quality import (
     write_ppt_render_manifest,
     write_product_package_manifest,
 )
-from product_text_projection import clean_public_story_text as _clean_public_story_text
+from product_text_projection import (
+    clean_public_story_text as _clean_public_story_text,
+    compile_public_story_lines,
+)
 
 
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -205,7 +208,7 @@ def build_product_package(args: argparse.Namespace) -> None:
     ensure_dir(assets_dir)
 
     script_lines = read_script_lines(script_path)
-    public_script_lines = [clean_public_story_text(line) for line in script_lines]
+    public_script_lines = compile_public_story_lines(script_lines)
     images = sorted_image_files(images_dir, slug=args.slug or None)
     if not images:
         raise ValueError(f"镜头图片目录为空：{images_dir}")
@@ -2520,7 +2523,10 @@ def fit_ppt_subtitle_text(text: str) -> tuple[str, int]:
 
 
 def clean_ppt_subtitle_text(text: str) -> str:
-    clean = clean_public_story_text(text).strip()
+    # The caller already receives rows from the complete semantic-aware public
+    # projection.  Reclassifying an isolated story-dialogue row here could
+    # mistake legitimate first-person dialogue for a host introduction.
+    clean = text.strip()
     clean = re.sub(r"[，。！？；：、,.!?;:“”\"'‘’《》〈〉（）()【】\[\]———…·]", " ", clean)
     clean = re.sub(r"\s+", " ", clean)
     return clean.strip()

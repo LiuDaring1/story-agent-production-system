@@ -19,11 +19,12 @@ flowchart TB
 
     V --> AS["横屏最终合成"]
     MU --> AS
-    AS --> R["竖屏发布视频链"]
+    AS --> PROD["故事锦囊、客户资料包与最终 Demo"]
+    RA --> PROD
+    PROD --> R["继承已审核 Demo geometry 的竖屏发布视频链"]
     RA --> R
 
     R --> PUB["封面与发布文案"]
-    R --> PROD["故事锦囊与客户资料包"]
     PUB --> FINAL["最终交付与 Doctor"]
     PROD --> FINAL
 
@@ -63,6 +64,12 @@ FFmpeg、文件复制、哈希、CSV、JSON、LibreOffice 和测试属于确定�
 ## 合同层
 
 新任务在高成本分支前形成七节 Story Production Contract。它不是另一个人工表单：Runtime 编译可信输入链，Luna 起草，Sol 独立审核，Runtime 原子锁定。下游只消费所需 projection；分镜和音乐通过结构化 Agent 指令消费，图生视频、封面、发布视频和资料包的可确定部分进入底层 jobs/render/content spec。合同变化目前按模块族失效，逐镜头图属于后续 Runtime 里程碑。
+
+## V3.5 Milestone 2 质量链
+
+Milestone 2 在同一合同事实源上补强生产质量，而没有建立平行规则系统：逐产物语义计划与条件式视觉小样先阻断错误批量扩散；视频 jobs 携带逐镜动作、承接和来源 receipt；keying QA 与正式渲染共享同一生产滤镜指纹；Demo、Release、封面和产品包分别写入可复验的 geometry/render/lineage/content manifest。能确定性执行的 Logo、坐标、安全区、文本选择和来源 currentness 由代码控制，审美、动作自然度与融合感继续由独立多模态审核负责。
+
+这些能力目前通过离线 fixture 和模拟供应商验证工程机制。它们不等于真实 ImageGen、Grok、Suno 或新人物素材已经达到产品验收标准；真实供应商 canary、完整新故事生产和用户验收仍未完成。
 
 ## 项目目录角色
 

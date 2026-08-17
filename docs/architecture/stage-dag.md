@@ -13,9 +13,9 @@
 | 配乐 | 20—23 | `music_request` → `suno_generate` → `assemble_music` → `music_qa` |
 | 汇合 | 24 | `assemble_final` 同时等待 `apply_review` 与 `music_qa` |
 | 发布资产 | 25 | `release_assets` 在合同审核通过后即可并行 |
-| 发布视频 | 26—29 | `release_preview` → `package_release` → `release_qa` → `release_video_review` |
-| 发布物料 | 30、36 | `publish_package` → `publish_package_review` |
-| 产品包 | 31—35 | `product_preflight` → `product_annotation` → `product_annotation_review` → `product_package` → `product_package_review` |
+| 产品与 Demo | 26—30 | `product_preflight` → `product_annotation` → `product_annotation_review` → `product_package` → `product_package_review` |
+| 发布视频 | 31—34 | `release_preview` → `package_release` → `release_qa` → `release_video_review` |
+| 发布物料 | 35—36 | `publish_package` → `publish_package_review` |
 | 交付 | 37—38 | `final_delivery` → `doctor` |
 
 ```mermaid
@@ -29,10 +29,11 @@ flowchart LR
     CT --> RA["发布资产"]
     VI --> A["横屏合成"]
     MU --> A
-    A --> RP["发布视频 4 阶段"]
+    A --> PROD["产品包与最终 Demo 5 阶段"]
+    RA --> PROD
+    PROD --> RP["发布视频 4 阶段"]
     RA --> RP
     RP --> PUB["发布物料 2 阶段"]
-    RP --> PROD["产品包 5 阶段"]
     PUB --> FD["最终交付"]
     PROD --> FD
     FD --> DR["Doctor"]
@@ -67,6 +68,8 @@ flowchart LR
 V3.5 新任务还必须先通过合同门禁：Luna 生成草案，Sol 在独立上下文审核七个 section，Runtime 重新校验 bundle/review SHA-256 后 crash-safe 写入 `story_contract.lock.json`。任何半写、字段缺失或绑定哈希不匹配都等于未锁定。V3 冻结项目不补造合同；只有 Runtime 根据基线日期、历史阶段和绑定 receipt 判定为真正历史项目时，两个合同阶段才采用 `legacy_passthrough`。
 
 锁定合同通过后，Runtime 先确定性编译 `artifact_semantic_plan`，再按合同实际内容建立条件式视觉小样计划。小样优先复用合同审核中已有的预览；只有缺少所需证据时才补生成风格、角色、尺度或状态小样。`visual_sample_review` 同时检查机器完整性、合同遵守和产品质量，P0 不可被高总分抵消。小样锁、语义计划或合同 projection 变化后，旧 storyboard plan 不再 current；小样未通过时不会进入批量 ImageGen。
+
+`product_package_review` 必须早于 `release_preview`。原因不是排版偏好，而是 required_v1 发布渲染要继承最终 Demo 中已经审核、哈希绑定的 presenter geometry receipt；Release 只能对超出安全区的水平位置做最小修正，不能重新推算或覆盖 Demo 已批准的人物尺度、裁切与垂直位置。
 
 ## 重试原则
 

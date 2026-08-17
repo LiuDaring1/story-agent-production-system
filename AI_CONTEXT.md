@@ -21,6 +21,7 @@ Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_ru
 9. [`docs/baselines/V3_FEEDBACK_REGISTER_XIAOBIHU.md`](docs/baselines/V3_FEEDBACK_REGISTER_XIAOBIHU.md)：用户终验问题、模块归因和根因。
 10. [`docs/roadmaps/V3.5_QUALITY_AND_MODULARIZATION.md`](docs/roadmaps/V3.5_QUALITY_AND_MODULARIZATION.md)：V3.5 范围与非目标。
 11. [`docs/contracts/story-production-contract.md`](docs/contracts/story-production-contract.md)：合同前置、七类合同、锁和消费者失效语义。
+12. [`docs/roadmaps/V3.5_M2_CLOSEOUT_2026-08-17.md`](docs/roadmaps/V3.5_M2_CLOSEOUT_2026-08-17.md)：Milestone 2 的 16 个实现提交、证据边界和当前安全点。
 
 ## 核心代码地图
 
@@ -38,9 +39,12 @@ Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_ru
 | `story_semantics.py` | 标题、主持人口播、正文、道理和结尾的语义合同 |
 | `video_provider_adapter.py` | 视频供应商、模型能力、时长与成本接口 |
 | `run_image_video_jobs.py` | 视频任务提交、轮询、下载和逐镜时长 |
-| `release_video.py` | 竖屏布局、抠像、画框完整性、尾帧和发布渲染 |
-| `product_package.py` | 故事锦囊、PPT、示范视频、朗读标注和客户资料包 |
-| `publish_package.py` | 六张封面、文案和发布物料 |
+| `video_motion.py` | 逐镜动作计划、上下文相关运动 QA、provider receipt 与局部返工证据 |
+| `production_keying.py` / `keying_quality.py` | 正式 keying 滤镜事实源、分区证据、机器 QA 与 preset 锁 |
+| `release_geometry.py` / `release_video.py` | Demo geometry 继承、竖屏布局、画框完整性、尾帧和发布渲染 |
+| `cover_quality.py` | 六张封面血缘、确定性标题/Logo、安全区和 creative base 审核合同 |
+| `product_text_projection.py` / `product_quality.py` / `product_package.py` | public-text 投影、PPT/文稿/标注 currentness、示范视频和客户资料包 |
+| `publish_package.py` | 文案和发布物料兼容入口 |
 
 ## 外部能力
 
@@ -79,9 +83,10 @@ python3 story_agent.py --help
 
 - 《小壁虎借尾巴》已经冻结为正式 V3 基线：工程交付和内部 QA 完成，用户产品验收不通过，现有产物不重做。
 - 最大缺口不是“审核没运行”，而是合同本身未先接受产品意图审核；高分审核无法发现错误画风、奇怪身份标记、尺度、版式和用户审美问题。
-- V3.5 同时修真实质量、安装模块接口、改进 Runtime；继续使用 Codex + GPT 体系，不在第一阶段接 DeepSeek 或多供应商自动路由。
+- V3.5 继续使用 Codex + GPT、ImageGen、Grok、Suno 和 FFmpeg；当前没有接 DeepSeek、去 Codex 或做多供应商自动路由。
 - 当前成本字段名以 CNY 表示，但 ToAPIs 模型页按美元报价；在修正前不能把本地估算当作人民币实扣。
 - 优化应先解决可观察性、增量返工、上下文包和真实账单，再比较模型档位。
 - V3.5 Milestone 1 已完成合同前置：新任务在批量生产前必须形成七类合同，由 Luna 起草、Sol 独立审核、Runtime 确定性锁定；V3 冻结项目仅在绑定的历史资格成立时 legacy passthrough。
-- Milestone 2 已完成 2A0、2A1、2A1.1 与 2A1.2 的离线机制：逐产物语义计划之后，系统按故事实际需要复用合同预览或补充风格、角色、尺度、状态小样；小样需通过机器完整性、合同遵守和独立产品质量审核，任何 P0 都会阻断批量生图。质量维度保持风格中性，具体审美逐条来自已审核 `visual_style.style_profile`，不再把有角色或儿童受众自动等同于可爱；角色结构审核采用合同/风格一致的 `anatomical_coherence`，不把非写实本身当成错误。真实 ImageGen 质量仍需后续新故事 canary 验证。
-- 当前增量失效只到模块族级，不是逐镜头 dependency graph；质量修正、Port/adapter 正式化、请求账本和新故事实跑仍属于后续 Milestone。
+- Milestone 2 已完成工程实现：2A 语义计划、条件式视觉小样与风格自适应审核；2B 逐镜动作计划、上下文运动门禁、正式 provider provenance 与单镜返工；2C 生产同链 keying 证据、Demo Logo/字幕/geometry receipt、Release 最小水平修正和确定性布局；2D 封面血缘与品牌排版、creative base 原图审核，以及 PPT/客户文稿/朗读标注/资料包的语义与来源 currentness。
+- M2 的完成口径是“通用质量机制、离线 fixture、模拟 provider 和失效门禁已实现”。真实 ImageGen/Grok/Suno、真实人物素材、完整新故事 canary 和用户产品验收仍未完成，不得把 M2 工程完成写成产品质量已经验证。
+- 当前增量失效只到模块族级，不是完整逐镜头 dependency graph；正式 Port/adapter、请求级账本、context pack、Agent tree/可观察性、成本币种/真实账单和细粒度 Runtime 重试仍属于后续 Milestone。

@@ -21,7 +21,9 @@ from story_video_synthesizer.image_video import (
 )
 from story_module_registry import (
     build_registry_for_profile,
+    export_module_execution_mode,
     export_module_profile,
+    resolve_module_execution_mode,
     resolve_module_profile,
 )
 from story_semantics import SemanticKind, classify_story
@@ -70,6 +72,11 @@ def main() -> None:
         "--module-profile",
         default="",
         help="允许列表中的模块适配器配置；子进程会校验并继承该选择",
+    )
+    parser.add_argument(
+        "--module-execution-mode",
+        default="",
+        help="模块 production/test 执行锁；子进程会校验并继承该选择",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -454,7 +461,11 @@ def main() -> None:
 
     args = parser.parse_args()
     module_profile = resolve_module_profile(args.module_profile)
+    module_execution_mode = resolve_module_execution_mode(
+        module_profile, args.module_execution_mode
+    )
     export_module_profile(module_profile)
+    export_module_execution_mode(module_execution_mode)
     if args.command == "init-project":
         manifest = init_project(args.project_dir, story_name=args.story_name, slug=args.slug, episode=args.episode)
         print(f"已初始化项目：{args.project_dir.expanduser()}")
@@ -681,7 +692,11 @@ def main() -> None:
         # module Port registry; the concrete adapter still delegates to the
         # unchanged runner and provider configuration.
         provider = build_registry_for_profile(
-            module_profile, load_config(), ROOT, video_provider_override=args.provider
+            module_profile,
+            load_config(),
+            ROOT,
+            video_provider_override=args.provider,
+            execution_mode=module_execution_mode,
         ).video_generator()
         images_dir = resolve_generate_images_dir(args.jobs_csv, args.images_dir)
         if not args.skip_prompt_review and not args.dry_run:
@@ -733,7 +748,11 @@ def main() -> None:
             )
     elif args.command == "rerun-review":
         provider = build_registry_for_profile(
-            module_profile, load_config(), ROOT, video_provider_override=args.provider
+            module_profile,
+            load_config(),
+            ROOT,
+            video_provider_override=args.provider,
+            execution_mode=module_execution_mode,
         ).video_generator()
         scenes = reset_redo_scenes(args.jobs_csv, args.videos_dir, args.decisions_csv)
         if not scenes:

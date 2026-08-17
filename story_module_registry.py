@@ -8,16 +8,22 @@ from typing import Any
 
 from story_module_adapters import (
     ApprovedStoryContractVisualDesignAdapter,
+    CodexImageGeneratorAdapter,
     ExistingStorySemanticsAdapter,
     ExistingVideoGeneratorAdapter,
+    MockImageGeneratorAdapter,
     MockKeyerAdapter,
+    MockMusicProviderAdapter,
     MockStorySemanticsAdapter,
     MockVideoGeneratorAdapter,
     MockVisualDesignAdapter,
     ProductionKeyerAdapter,
+    SunoMusicProviderAdapter,
 )
 from story_module_ports import (
+    ImageGeneratorPort,
     KeyerPort,
+    MusicProviderPort,
     StorySemanticsPort,
     VideoGeneratorPort,
     VisualDesignPort,
@@ -29,19 +35,29 @@ from video_provider_adapter import resolve_video_provider
 ROOT = Path(__file__).resolve().parent
 MODULE_PROFILE_ENV = "STORY_MODULE_PROFILE"
 MODULE_PROFILE_REQUIRED_ENV = "STORY_MODULE_PROFILE_REQUIRED"
+MODULE_EXECUTION_MODE_ENV = "STORY_MODULE_EXECUTION_MODE"
+MODULE_EXECUTION_MODE_REQUIRED_ENV = "STORY_MODULE_EXECUTION_MODE_REQUIRED"
 PRODUCTION_PROFILE = "production-default"
+PRODUCTION_EXECUTION_MODE = "production"
+TEST_EXECUTION_MODE = "test"
 MODULE_PROFILE_ALIASES = {"default": PRODUCTION_PROFILE, "production": PRODUCTION_PROFILE}
 ALLOWED_MODULE_PROFILES = frozenset(
-    {PRODUCTION_PROFILE, "mock-video", "mock-keyer", "mock-semantics", "mock-visual-design"}
+    {
+        PRODUCTION_PROFILE, "mock-video", "mock-keyer", "mock-semantics", "mock-visual-design",
+        "mock-image", "mock-music",
+    }
 )
+ALLOWED_MODULE_EXECUTION_MODES = frozenset({PRODUCTION_EXECUTION_MODE, TEST_EXECUTION_MODE})
+DUAL_LOCK_MOCK_PROFILES = frozenset({"mock-image", "mock-music"})
 
 
 class ModuleRegistry:
     """Explicit adapter registry; it deliberately performs no smart routing."""
 
-    def __init__(self, *, profile_name: str = "") -> None:
+    def __init__(self, *, profile_name: str = "", execution_mode: str = PRODUCTION_EXECUTION_MODE) -> None:
         self._ports: dict[str, object] = {}
         self.profile_name = profile_name
+        self.execution_mode = execution_mode
 
     def register(self, port_name: str, adapter: object) -> None:
         identity = getattr(adapter, "identity", None)
@@ -67,6 +83,12 @@ class ModuleRegistry:
     def visual_design(self) -> VisualDesignPort:
         return self.get("visual_design")  # type: ignore[return-value]
 
+    def image_generator(self) -> ImageGeneratorPort:
+        return self.get("image_generator")  # type: ignore[return-value]
+
+    def music_provider(self) -> MusicProviderPort:
+        return self.get("music_provider")  # type: ignore[return-value]
+
     def describe(self, port_name: str) -> dict[str, Any]:
         adapter = self.get(port_name)
         return {
@@ -82,6 +104,9 @@ class ModuleRegistry:
             raise RuntimeError("module registry has no allowlisted subprocess selection profile")
         return self.profile_name
 
+    def selection_execution_mode(self) -> str:
+        return normalize_module_execution_mode(self.execution_mode)
+
 
 def load_pipeline_config(root: Path = ROOT) -> dict[str, Any]:
     return json.loads((root / "pipeline_config.json").read_text(encoding="utf-8"))
@@ -93,12 +118,14 @@ def build_default_registry(
     *,
     video_provider_override: str = "",
 ) -> ModuleRegistry:
-    registry = ModuleRegistry(profile_name=PRODUCTION_PROFILE)
+    registry = ModuleRegistry(profile_name=PRODUCTION_PROFILE, execution_mode=PRODUCTION_EXECUTION_MODE)
     provider = resolve_video_provider(config or load_pipeline_config(root), root, video_provider_override)
     registry.register("video_generator", ExistingVideoGeneratorAdapter(provider))
     registry.register("keyer", ProductionKeyerAdapter())
     registry.register("story_semantics", ExistingStorySemanticsAdapter())
     registry.register("visual_design", ApprovedStoryContractVisualDesignAdapter())
+    registry.register("image_generator", CodexImageGeneratorAdapter())
+    registry.register("music_provider", SunoMusicProviderAdapter())
     return registry
 
 
@@ -117,6 +144,34 @@ def resolve_module_profile(explicit: str = "") -> str:
     selected = normalize_module_profile(selected_raw or PRODUCTION_PROFILE)
     if required_raw and selected != normalize_module_profile(required_raw):
         raise RuntimeError("module profile does not match required parent selection")
+    if selected in DUAL_LOCK_MOCK_PROFILES and not required_raw:
+        raise RuntimeError("required module profile selection is missing for external mock")
+    return selected
+
+
+def normalize_module_execution_mode(mode: str) -> str:
+    normalized = mode.strip().lower()
+    if normalized not in ALLOWED_MODULE_EXECUTION_MODES:
+        raise ValueError(f"unsupported module execution mode: {mode or '<missing>'}")
+    return normalized
+
+
+def resolve_module_execution_mode(profile: str, explicit: str = "") -> str:
+    selected_profile = normalize_module_profile(profile)
+    required_raw = os.environ.get(MODULE_EXECUTION_MODE_REQUIRED_ENV, "").strip()
+    selected_raw = explicit.strip() or os.environ.get(MODULE_EXECUTION_MODE_ENV, "").strip()
+    if required_raw and not selected_raw:
+        raise RuntimeError("required module execution mode is missing; refusing production fallback")
+    if selected_profile in DUAL_LOCK_MOCK_PROFILES:
+        if not selected_raw:
+            raise RuntimeError("external mock requires explicit test execution mode")
+        if not required_raw:
+            raise RuntimeError("required test execution mode is missing for external mock")
+    selected = normalize_module_execution_mode(selected_raw or PRODUCTION_EXECUTION_MODE)
+    if required_raw and selected != normalize_module_execution_mode(required_raw):
+        raise RuntimeError("module execution mode does not match required parent selection")
+    if selected_profile in DUAL_LOCK_MOCK_PROFILES and selected != TEST_EXECUTION_MODE:
+        raise RuntimeError("external mock is test-only and cannot run in production mode")
     return selected
 
 
@@ -127,15 +182,35 @@ def export_module_profile(profile: str) -> str:
     return selected
 
 
+def export_module_execution_mode(mode: str) -> str:
+    selected = normalize_module_execution_mode(mode)
+    os.environ[MODULE_EXECUTION_MODE_ENV] = selected
+    os.environ[MODULE_EXECUTION_MODE_REQUIRED_ENV] = selected
+    return selected
+
+
+def module_selection_environment(profile: str, execution_mode: str) -> dict[str, str]:
+    selected_profile = normalize_module_profile(profile)
+    selected_mode = normalize_module_execution_mode(execution_mode)
+    return {
+        MODULE_PROFILE_ENV: selected_profile,
+        MODULE_PROFILE_REQUIRED_ENV: selected_profile,
+        MODULE_EXECUTION_MODE_ENV: selected_mode,
+        MODULE_EXECUTION_MODE_REQUIRED_ENV: selected_mode,
+    }
+
+
 def build_registry_for_profile(
     profile: str = "",
     config: dict[str, Any] | None = None,
     root: Path = ROOT,
     *,
     video_provider_override: str = "",
+    execution_mode: str = "",
 ) -> ModuleRegistry:
     selected = resolve_module_profile(profile)
-    registry = ModuleRegistry(profile_name=selected)
+    selected_mode = resolve_module_execution_mode(selected, execution_mode)
+    registry = ModuleRegistry(profile_name=selected, execution_mode=selected_mode)
     if selected == "mock-video":
         registry.register("video_generator", MockVideoGeneratorAdapter())
     else:
@@ -149,6 +224,14 @@ def build_registry_for_profile(
     registry.register(
         "visual_design",
         MockVisualDesignAdapter() if selected == "mock-visual-design" else ApprovedStoryContractVisualDesignAdapter(),
+    )
+    registry.register(
+        "image_generator",
+        MockImageGeneratorAdapter() if selected == "mock-image" else CodexImageGeneratorAdapter(),
+    )
+    registry.register(
+        "music_provider",
+        MockMusicProviderAdapter() if selected == "mock-music" else SunoMusicProviderAdapter(),
     )
     return registry
 
@@ -189,14 +272,21 @@ def build_visual_design_registry(profile: str = "") -> ModuleRegistry:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Story Agent module port diagnostics (read-only)")
     parser.add_argument("--profile", default="", help="Allowlisted adapter selection profile")
+    parser.add_argument(
+        "--execution-mode", default="", help="Explicit production/test execution guard"
+    )
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("list", help="List selected module adapters and capabilities")
     describe = sub.add_parser("describe", help="Describe one selected module adapter")
     describe.add_argument(
-        "port_name", choices=["video_generator", "keyer", "story_semantics", "visual_design"]
+        "port_name",
+        choices=[
+            "video_generator", "keyer", "story_semantics", "visual_design",
+            "image_generator", "music_provider",
+        ],
     )
     args = parser.parse_args()
-    registry = build_registry_for_profile(args.profile)
+    registry = build_registry_for_profile(args.profile, execution_mode=args.execution_mode)
     payload = registry.list_descriptions() if args.command == "list" else registry.describe(args.port_name)
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 

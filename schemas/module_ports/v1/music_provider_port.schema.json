@@ -1,0 +1,48 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "story-music-provider-port/v1",
+  "title": "Story music provider port payload",
+  "type": "object",
+  "required": ["schema_version", "kind"],
+  "properties": {
+    "schema_version": {"const": "story-music-provider-port/v1"},
+    "kind": {"enum": ["music_provider_request", "music_provider_result"]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "music_provider_request"}}},
+      "then": {
+        "required": ["artifact_id", "operation", "execution_request_path", "execution_request_sha256", "input_artifacts", "output_targets", "attempt_id"],
+        "properties": {
+          "artifact_id": {"type": "string"},
+          "operation": {"type": "string"},
+          "execution_request_path": {"type": "string"},
+          "execution_request_sha256": {"type": "string"},
+          "input_artifacts": {"type": "array", "items": {"type": "object"}},
+          "output_targets": {"type": "array", "items": {"type": "string"}},
+          "attempt_id": {"type": "string"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "music_provider_result"}}},
+      "then": {
+        "required": ["success", "operation", "output_artifacts", "provider", "model_or_tool", "request_id", "attempt_id", "execution_request_sha256", "adapter_version", "production_eligible", "usage_events", "failure"],
+        "properties": {
+          "success": {"type": "boolean"},
+          "operation": {"type": "string"},
+          "output_artifacts": {"type": "array", "items": {"type": "object"}},
+          "provider": {"type": "string"},
+          "model_or_tool": {"type": "string"},
+          "request_id": {"type": "string"},
+          "attempt_id": {"type": "string"},
+          "execution_request_sha256": {"type": "string"},
+          "adapter_version": {"type": "string"},
+          "production_eligible": {"type": "boolean"},
+          "usage_events": {"type": "array", "items": {"type": "object"}},
+          "failure": {"type": ["object", "null"]}
+        }
+      }
+    }
+  ]
+}

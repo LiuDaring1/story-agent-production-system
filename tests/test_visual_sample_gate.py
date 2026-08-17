@@ -366,8 +366,10 @@ class VisualSampleGateTests(unittest.TestCase):
     def test_worker_handoff_contains_full_projection_and_identity_expansion_ban(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, manifest, agent, context = _fixture(Path(directory))
+            captured = {}
 
-            def fake_task(**_kwargs):
+            def fake_task(**kwargs):
+                captured.update(kwargs)
                 handoff = visual_sample_paths(project)["handoff"].read_text(encoding="utf-8")
                 for name in ("visual_style", "characters", "world_scale", "story_state"):
                     self.assertIn(f'"{name}"', handoff)
@@ -383,6 +385,14 @@ class VisualSampleGateTests(unittest.TestCase):
             with patch.object(agent, "_codex_task", side_effect=fake_task):
                 result = agent._stage_visual_samples(manifest)
             self.assertEqual(result.status, "done", result.message)
+            self.assertEqual(captured["stage"], "visual_samples")
+            self.assertEqual(captured["label"], "条件式视觉小样生成")
+            self.assertEqual(
+                captured["prompt"],
+                "严格执行 handoff。使用 ImageGen 仅补齐其中列出的 supplemental_sample；"
+                "不要修改合同、计划或正式故事图片。完成前逐文件确认可解码且路径精确。",
+            )
+            self.assertEqual(captured["handoff"], visual_sample_paths(project)["handoff"])
             self.assertTrue(agent._has_visual_samples(manifest))
 
     def test_three_layer_review_p0_is_a_hard_gate_and_batch_never_starts(self) -> None:

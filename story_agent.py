@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import importlib.util
 import json
 import os
@@ -17,10 +18,21 @@ from typing import Any, Callable
 
 from PIL import Image, ImageDraw
 from story_module_registry import (
-    MODULE_PROFILE_ENV,
-    MODULE_PROFILE_REQUIRED_ENV,
+    ALLOWED_MODULE_EXECUTION_MODES,
+    ALLOWED_MODULE_PROFILES,
     ModuleRegistry,
     build_registry_for_profile,
+    module_selection_environment,
+)
+from story_module_ports import (
+    ImageGeneratorPort,
+    ImageGeneratorRequest,
+    ImageGeneratorResult,
+    MusicProviderPort,
+    MusicProviderRequest,
+    MusicProviderResult,
+    ModuleFailure,
+    ModuleFailureCode,
 )
 from story_video_synthesizer.image_video import validate_image_video_jobs
 from story_contract_runtime import (
@@ -386,7 +398,8 @@ class StoryAgent:
 
     def _module_subprocess_env(self) -> dict[str, str]:
         profile = self._modules().selection_profile()
-        return {MODULE_PROFILE_ENV: profile, MODULE_PROFILE_REQUIRED_ENV: profile}
+        execution_mode = self._modules().selection_execution_mode()
+        return module_selection_environment(profile, execution_mode)
 
     def run(self, max_steps: int) -> int:
         if self.context.scheduler == "dag" and self.context.execute:
@@ -670,6 +683,10 @@ class StoryAgent:
                 str(self.context.codex_timeout),
                 "--codex-story-image-batch-size",
                 str(self.context.codex_story_image_batch_size),
+                "--module-profile",
+                self._modules().selection_profile(),
+                "--module-execution-mode",
+                self._modules().selection_execution_mode(),
             ]
             if self.context.codex_model:
                 command.extend(["--codex-model", self.context.codex_model])
@@ -1291,14 +1308,25 @@ class StoryAgent:
                 + "\n",
                 encoding="utf-8",
             )
-            result = self._codex_task(
+            sample_prompt = (
+                "严格执行 handoff。使用 ImageGen 仅补齐其中列出的 supplemental_sample；"
+                "不要修改合同、计划或正式故事图片。完成前逐文件确认可解码且路径精确。"
+            )
+            result = self._execute_image_generation(
+                artifact_id="visual-samples-supplemental",
+                operation="generate_visual_samples",
                 stage="visual_samples",
                 label="条件式视觉小样生成",
                 handoff=paths["handoff"],
-                prompt=(
-                    "严格执行 handoff。使用 ImageGen 仅补齐其中列出的 supplemental_sample；"
-                    "不要修改合同、计划或正式故事图片。完成前逐文件确认可解码且路径精确。"
+                prompt=sample_prompt,
+                output_targets=tuple(
+                    self.context.project_dir / item["expected_path"] for item in missing
                 ),
+                input_artifacts=(
+                    {"role": "visual_sample_plan", "path": str(plan_path), "sha256": file_sha256(plan_path)},
+                    {"role": "storyboard_contract_context", "path": str(context), "sha256": file_sha256(context)},
+                ),
+                attempt_id=f"visual-samples-attempt-{int(manifest.get('agent', {}).get('stages', {}).get('visual_samples', {}).get('attempts', 0))}",
             )
             if result.status != "done":
                 return result
@@ -1738,17 +1766,31 @@ class StoryAgent:
 
         batch_size = max(1, self.context.codex_story_image_batch_size)
         batch = missing[:batch_size]
-        result = self._codex_task(
+        batch_prompt = self._story_images_batch_prompt(
+            handoff=handoff,
+            staging_images=staging_images,
+            staging_storyboard=staging_storyboard,
+            story_lines=story_lines,
+            indices=batch,
+        )
+        result = self._execute_image_generation(
+            artifact_id=f"story-images-{batch[0]:02d}-{batch[-1]:02d}",
+            operation="generate_story_images",
             stage=f"codex_story_images_{batch[0]:02d}_{batch[-1]:02d}",
             label=f"Codex 原生故事批量出图 {len(batch)} 张",
             handoff=handoff,
-            prompt=self._story_images_batch_prompt(
-                handoff=handoff,
-                staging_images=staging_images,
-                staging_storyboard=staging_storyboard,
-                story_lines=story_lines,
-                indices=batch,
+            prompt=batch_prompt,
+            output_targets=tuple(
+                staging_images / self._story_image_filename(index) for index in batch
             ),
+            input_artifacts=(
+                {
+                    "role": "authoritative_storyboard",
+                    "path": str(staging_storyboard),
+                    "sha256": authoritative_storyboard_sha,
+                },
+            ),
+            attempt_id=f"codex-story-images-attempt-{int(manifest.get('agent', {}).get('stages', {}).get('codex_story_images', {}).get('attempts', 0))}",
         )
         if result.status != "done":
             for index in batch:
@@ -2323,16 +2365,32 @@ class StoryAgent:
         if not self._legacy_contract_policy(manifest) and not contract_consumer_context_is_current(self.context.project_dir, "music"):
             return StageResult("blocked", "music 合同请求清单已失效，未打开 Suno 付费生产。")
         handoff = self._write_suno_handoff()
-        result = self._codex_task(
+        suno_prompt = (
+            f"请读取并执行这份 Suno 浏览器自动化任务：\n{handoff}\n\n"
+            "目标是生成并下载第一首可用音乐，按音乐分段 CSV 的 target_audio_filename 重命名，"
+            "保存到指定 suno_downloads 目录。若当前 CLI 无浏览器控制能力、Suno 未登录、遇到验证码或付费弹窗，"
+            f"请写入 `{self._music_dir() / 'suno_cli_blocker.md'}` 说明原因，不要假装完成。"
+        )
+        request_path = self._music_dir() / f"{self.context.slug}_suno_music_request.md"
+        request_manifest = self._music_dir() / f"{self.context.slug}_music_request_manifest.json"
+        input_artifacts = tuple(
+            {"role": role, "path": str(path), "sha256": file_sha256(path)}
+            for role, path in (
+                ("suno_music_request", request_path),
+                ("music_request_manifest", request_manifest),
+            )
+            if path.is_file()
+        )
+        result = self._execute_music_provider(
+            artifact_id="suno-music-execution",
+            operation="generate_music_segments",
             stage="suno_generate",
             label="Codex/Suno 浏览器音乐生成",
             handoff=handoff,
-            prompt=(
-                f"请读取并执行这份 Suno 浏览器自动化任务：\n{handoff}\n\n"
-                "目标是生成并下载第一首可用音乐，按音乐分段 CSV 的 target_audio_filename 重命名，"
-                "保存到指定 suno_downloads 目录。若当前 CLI 无浏览器控制能力、Suno 未登录、遇到验证码或付费弹窗，"
-                f"请写入 `{self._music_dir() / 'suno_cli_blocker.md'}` 说明原因，不要假装完成。"
-            ),
+            prompt=suno_prompt,
+            output_targets=(self._suno_downloads_dir() / f"01_{self.context.slug}_music.mp3",),
+            input_artifacts=input_artifacts,
+            attempt_id=f"suno-generate-attempt-{int(manifest.get('agent', {}).get('stages', {}).get('suno_generate', {}).get('attempts', 0))}",
         )
         if result.status == "blocked":
             blocker = self._music_dir() / "suno_cli_blocker.md"
@@ -3079,7 +3137,16 @@ class StoryAgent:
 
     def _workflow(self, args: list[str], label: str) -> StageResult:
         profile = self._modules().selection_profile()
-        command = [sys.executable, str(ROOT / "story_workflow.py"), "--module-profile", profile, *args]
+        execution_mode = self._modules().selection_execution_mode()
+        command = [
+            sys.executable,
+            str(ROOT / "story_workflow.py"),
+            "--module-profile",
+            profile,
+            "--module-execution-mode",
+            execution_mode,
+            *args,
+        ]
         return self._run_command(
             command,
             label,
@@ -3146,6 +3213,195 @@ class StoryAgent:
         manifest["agent"]["heartbeat_at"] = now()
         write_manifest(self.context.paths, manifest)
         return bool(manifest["agent"].get("cancel_requested"))
+
+    def _execute_image_generation(
+        self,
+        *,
+        artifact_id: str,
+        operation: str,
+        stage: str,
+        label: str,
+        handoff: Path,
+        prompt: str,
+        output_targets: tuple[Path, ...],
+        input_artifacts: tuple[dict[str, Any], ...],
+        attempt_id: str,
+    ) -> StageResult:
+        """Execute one already-planned image envelope through the selected Port."""
+
+        prompt_binding = {
+            "role": "runtime_prompt",
+            "sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        }
+        request = ImageGeneratorRequest(
+            artifact_id=artifact_id,
+            operation=operation,
+            execution_request_path=handoff,
+            execution_request_sha256=file_sha256(handoff),
+            input_artifacts=(*input_artifacts, prompt_binding),
+            output_targets=output_targets,
+            attempt_id=attempt_id,
+        )
+        image_port: ImageGeneratorPort = self._modules().image_generator()
+        runtime_results: list[StageResult] = []
+
+        def current_codex_image_executor(bound_request: ImageGeneratorRequest) -> ImageGeneratorResult:
+            if bound_request != request:
+                return ImageGeneratorResult(
+                    False,
+                    bound_request.operation,
+                    (),
+                    image_port.capabilities.provider,
+                    image_port.capabilities.model_or_tool,
+                    "",
+                    bound_request.attempt_id,
+                    bound_request.execution_request_sha256,
+                    image_port.identity.adapter_version,
+                    True,
+                    failure=ModuleFailure(
+                        ModuleFailureCode.INVALID_INPUT,
+                        "image executor received a request different from the runtime envelope",
+                    ),
+                )
+            stage_result = self._codex_task(
+                stage=stage,
+                label=label,
+                handoff=handoff,
+                prompt=prompt,
+            )
+            runtime_results.append(stage_result)
+            artifacts = tuple(
+                {
+                    "path": str(target),
+                    "sha256": file_sha256(target),
+                    "production_eligible": True,
+                }
+                for target in output_targets
+                if target.is_file()
+            )
+            succeeded = stage_result.status == "done"
+            return ImageGeneratorResult(
+                succeeded,
+                request.operation,
+                artifacts,
+                image_port.capabilities.provider,
+                image_port.capabilities.model_or_tool,
+                "",
+                request.attempt_id,
+                request.execution_request_sha256,
+                image_port.identity.adapter_version,
+                True,
+                failure=None if succeeded else ModuleFailure(
+                    ModuleFailureCode.EXECUTION_FAILED,
+                    stage_result.message,
+                    retryable=stage_result.status in {"blocked", "retrying"},
+                    details={"stage_status": stage_result.status},
+                ),
+            )
+
+        port_result = image_port.execute(request, executor=current_codex_image_executor)
+        if runtime_results and runtime_results[0].status != "done":
+            return runtime_results[0]
+        if not port_result.success:
+            message = port_result.failure.message if port_result.failure else "image generator failed"
+            return StageResult("failed", message, handoff)
+        return StageResult("done", f"{label} 已通过 ImageGeneratorPort 执行。", handoff)
+
+    def _execute_music_provider(
+        self,
+        *,
+        artifact_id: str,
+        operation: str,
+        stage: str,
+        label: str,
+        handoff: Path,
+        prompt: str,
+        output_targets: tuple[Path, ...],
+        input_artifacts: tuple[dict[str, Any], ...],
+        attempt_id: str,
+    ) -> StageResult:
+        """Execute the existing complete Suno handoff through the selected Port."""
+
+        prompt_binding = {
+            "role": "runtime_prompt",
+            "sha256": hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+        }
+        request = MusicProviderRequest(
+            artifact_id=artifact_id,
+            operation=operation,
+            execution_request_path=handoff,
+            execution_request_sha256=file_sha256(handoff),
+            input_artifacts=(*input_artifacts, prompt_binding),
+            output_targets=output_targets,
+            attempt_id=attempt_id,
+        )
+        music_port: MusicProviderPort = self._modules().music_provider()
+        runtime_results: list[StageResult] = []
+
+        def current_suno_codex_executor(bound_request: MusicProviderRequest) -> MusicProviderResult:
+            if bound_request != request:
+                return MusicProviderResult(
+                    False,
+                    bound_request.operation,
+                    (),
+                    music_port.capabilities.provider,
+                    music_port.capabilities.model_or_tool,
+                    "",
+                    bound_request.attempt_id,
+                    bound_request.execution_request_sha256,
+                    music_port.identity.adapter_version,
+                    True,
+                    failure=ModuleFailure(
+                        ModuleFailureCode.INVALID_INPUT,
+                        "music executor received a request different from the runtime envelope",
+                    ),
+                )
+            stage_result = self._codex_task(
+                stage=stage,
+                label=label,
+                handoff=handoff,
+                prompt=prompt,
+            )
+            runtime_results.append(stage_result)
+            downloads = self._suno_downloads_dir()
+            artifacts = tuple(
+                {
+                    "path": str(path),
+                    "sha256": file_sha256(path),
+                    "production_eligible": True,
+                }
+                for path in sorted(downloads.iterdir())
+                if path.is_file() and path.suffix.lower() in AUDIO_EXTENSIONS
+            ) if downloads.is_dir() else ()
+            succeeded = stage_result.status == "done"
+            return MusicProviderResult(
+                succeeded,
+                request.operation,
+                artifacts,
+                music_port.capabilities.provider,
+                music_port.capabilities.model_or_tool,
+                "",
+                request.attempt_id,
+                request.execution_request_sha256,
+                music_port.identity.adapter_version,
+                True,
+                failure=None if succeeded else ModuleFailure(
+                    ModuleFailureCode.EXECUTION_FAILED,
+                    stage_result.message,
+                    retryable=stage_result.status in {"blocked", "retrying"},
+                    details={"stage_status": stage_result.status},
+                ),
+            )
+
+        port_result = music_port.execute(request, executor=current_suno_codex_executor)
+        if runtime_results and runtime_results[0].status != "done":
+            return runtime_results[0]
+        if not port_result.success:
+            message = port_result.failure.message if port_result.failure else "music provider failed"
+            return StageResult("failed", message, handoff)
+        if runtime_results:
+            return runtime_results[0]
+        return StageResult("done", f"{label} 已通过 MusicProviderPort 执行。", handoff)
 
     def _codex_task(
         self,
@@ -3235,7 +3491,16 @@ class StoryAgent:
                 command.extend(["--image", str(image)])
         display_command = list(command)
         display_command[display_command.index(prompt_text)] = "<prompt>"
-        process = subprocess.Popen(command, cwd=str(ROOT), text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        env = os.environ.copy()
+        env.update(self._module_subprocess_env())
+        process = subprocess.Popen(
+            command,
+            cwd=str(ROOT),
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        )
         deadline = time.time() + max(30, self.context.codex_timeout)
         stdout = ""
         stderr = ""
@@ -5075,6 +5340,10 @@ def main() -> None:
     run.add_argument("--codex-story-image-batch-size", default=15, type=int, help="codex_story_images 每个 CLI 子任务批量生成的图片数量；默认 15，通常覆盖一个完整故事")
     run.add_argument("--scheduler", choices=["linear", "dag"], default="linear", help="linear 保留旧行为；dag 并行调度独立分支")
     run.add_argument("--max-parallel", default=3, type=int, help="DAG 最多并行 stage worker 数")
+    run.add_argument("--module-profile", choices=sorted(ALLOWED_MODULE_PROFILES), default="")
+    run.add_argument(
+        "--module-execution-mode", choices=sorted(ALLOWED_MODULE_EXECUTION_MODES), default=""
+    )
 
     start = subparsers.add_parser("start", help="在后台启动无人值守 Agent supervisor")
     start.add_argument("--job", required=True)
@@ -5087,6 +5356,10 @@ def main() -> None:
     start.add_argument("--max-steps", default=999, type=int)
     start.add_argument("--scheduler", choices=["linear", "dag"], default="dag")
     start.add_argument("--max-parallel", default=3, type=int)
+    start.add_argument("--module-profile", choices=sorted(ALLOWED_MODULE_PROFILES), default="")
+    start.add_argument(
+        "--module-execution-mode", choices=sorted(ALLOWED_MODULE_EXECUTION_MODES), default=""
+    )
 
     run_stage = subparsers.add_parser("run-stage", help=argparse.SUPPRESS)
     run_stage.add_argument("--project-dir", required=True, type=Path)
@@ -5106,6 +5379,10 @@ def main() -> None:
     run_stage.add_argument("--codex-path", default="codex")
     run_stage.add_argument("--codex-timeout", default=3600, type=int)
     run_stage.add_argument("--codex-story-image-batch-size", default=15, type=int)
+    run_stage.add_argument("--module-profile", choices=sorted(ALLOWED_MODULE_PROFILES), default="")
+    run_stage.add_argument(
+        "--module-execution-mode", choices=sorted(ALLOWED_MODULE_EXECUTION_MODES), default=""
+    )
 
     status = subparsers.add_parser("status", help="查看 Agent 下一阶段")
     status.add_argument("--job", default="")
@@ -5165,6 +5442,12 @@ def main() -> None:
     if args.command == "run-stage":
         result = StageResult("failed", "worker 未执行")
         try:
+            module_registry = build_registry_for_profile(
+                args.module_profile,
+                load_config(),
+                ROOT,
+                execution_mode=args.module_execution_mode,
+            )
             configured_epoch = int(os.environ.get("STORY_AGENT_RUN_EPOCH", "-1"))
             control = load_control(args.project_dir)
             if configured_epoch != args.run_epoch or int(control.get("run_epoch", -1)) != args.run_epoch:
@@ -5192,7 +5475,7 @@ def main() -> None:
                     scheduler="linear",
                     max_parallel=1,
                 )
-                worker = StoryAgent(context)
+                worker = StoryAgent(context, module_registry=module_registry)
                 manifest = worker._manifest()
                 assert_runnable(manifest, context.project_dir)
                 actions = {name: action for name, _done, action in worker._stage_checks()}
@@ -5257,6 +5540,15 @@ def main() -> None:
         )
         return
     if args.command == "start":
+        module_registry = build_registry_for_profile(
+            args.module_profile,
+            load_config(),
+            ROOT,
+            execution_mode=args.module_execution_mode,
+        )
+        module_env = module_selection_environment(
+            module_registry.selection_profile(), module_registry.selection_execution_mode()
+        )
         registry = JobRegistry(args.registry)
         project_dir = registry.resolve(args.job)
         status_dir = project_paths(project_dir).status
@@ -5291,6 +5583,10 @@ def main() -> None:
                 args.scheduler,
                 "--max-parallel",
                 str(max(1, args.max_parallel)),
+                "--module-profile",
+                module_registry.selection_profile(),
+                "--module-execution-mode",
+                module_registry.selection_execution_mode(),
             ]
             if args.registry:
                 command.extend(["--registry", str(args.registry.expanduser())])
@@ -5307,6 +5603,7 @@ def main() -> None:
                 process = subprocess.Popen(
                     command,
                     cwd=str(ROOT),
+                    env={**os.environ, **module_env},
                     stdin=subprocess.DEVNULL,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
@@ -5351,6 +5648,12 @@ def main() -> None:
         print(json.dumps({**report, "markdown": str(output), "json": str(json_output)}, ensure_ascii=False, indent=2))
         return
     if args.command == "run":
+        module_registry = build_registry_for_profile(
+            args.module_profile,
+            load_config(),
+            ROOT,
+            execution_mode=args.module_execution_mode,
+        )
         if args.job:
             args.project_dir = JobRegistry(args.registry).resolve(args.job)
             existing_manifest = load_manifest(project_paths(args.project_dir)) or {}
@@ -5386,7 +5689,7 @@ def main() -> None:
             max_parallel=max(1, args.max_parallel),
         )
         try:
-            exit_code = StoryAgent(context).run(max(1, args.max_steps))
+            exit_code = StoryAgent(context, module_registry=module_registry).run(max(1, args.max_steps))
         except JobCancelled as exc:
             manifest = ensure_manifest_v2(load_manifest(context.paths) or {})
             manifest["agent"]["status"] = "cancelled"

@@ -11,6 +11,8 @@ VIDEO_GENERATOR_PORT_VERSION = "story-video-generator-port/v1"
 KEYER_PORT_VERSION = "story-keyer-port/v1"
 STORY_SEMANTICS_PORT_VERSION = "story-semantics-port/v1"
 VISUAL_DESIGN_PORT_VERSION = "story-visual-design-port/v1"
+IMAGE_GENERATOR_PORT_VERSION = "story-image-generator-port/v1"
+MUSIC_PROVIDER_PORT_VERSION = "story-music-provider-port/v1"
 STORY_SEMANTICS_COMPILER_VERSION = "story-semantics-classifier/v1"
 STORY_SEMANTIC_KINDS = frozenset(
     {"title", "host_intro", "story_announcement", "story_body", "moral", "outro"}
@@ -181,6 +183,68 @@ class VisualDesignResult:
     failure: ModuleFailure | None = None
 
 
+@dataclass(frozen=True)
+class ImageGeneratorRequest:
+    """One already-planned external image execution envelope."""
+
+    artifact_id: str
+    operation: str
+    execution_request_path: Path
+    execution_request_sha256: str
+    input_artifacts: tuple[Mapping[str, Any], ...]
+    output_targets: tuple[Path, ...]
+    attempt_id: str
+
+
+@dataclass(frozen=True)
+class ImageGeneratorResult:
+    success: bool
+    operation: str
+    output_artifacts: tuple[Mapping[str, Any], ...]
+    provider: str
+    model_or_tool: str
+    request_id: str
+    attempt_id: str
+    execution_request_sha256: str
+    adapter_version: str
+    production_eligible: bool
+    usage_events: tuple[ModuleUsageEvent, ...] = ()
+    failure: ModuleFailure | None = None
+
+
+@dataclass(frozen=True)
+class MusicProviderRequest:
+    """One already-planned external music execution envelope."""
+
+    artifact_id: str
+    operation: str
+    execution_request_path: Path
+    execution_request_sha256: str
+    input_artifacts: tuple[Mapping[str, Any], ...]
+    output_targets: tuple[Path, ...]
+    attempt_id: str
+
+
+@dataclass(frozen=True)
+class MusicProviderResult:
+    success: bool
+    operation: str
+    output_artifacts: tuple[Mapping[str, Any], ...]
+    provider: str
+    model_or_tool: str
+    request_id: str
+    attempt_id: str
+    execution_request_sha256: str
+    adapter_version: str
+    production_eligible: bool
+    usage_events: tuple[ModuleUsageEvent, ...] = ()
+    failure: ModuleFailure | None = None
+
+
+ImageGeneratorExecutor = Callable[[ImageGeneratorRequest], ImageGeneratorResult]
+MusicProviderExecutor = Callable[[MusicProviderRequest], MusicProviderResult]
+
+
 @runtime_checkable
 class VideoGeneratorPort(Protocol):
     identity: ModuleIdentity
@@ -232,6 +296,32 @@ class VisualDesignPort(Protocol):
     capabilities: ModuleCapabilities
 
     def resolve(self, request: VisualDesignRequest) -> VisualDesignResult: ...
+
+
+@runtime_checkable
+class ImageGeneratorPort(Protocol):
+    identity: ModuleIdentity
+    capabilities: ModuleCapabilities
+
+    def execute(
+        self,
+        request: ImageGeneratorRequest,
+        *,
+        executor: ImageGeneratorExecutor,
+    ) -> ImageGeneratorResult: ...
+
+
+@runtime_checkable
+class MusicProviderPort(Protocol):
+    identity: ModuleIdentity
+    capabilities: ModuleCapabilities
+
+    def execute(
+        self,
+        request: MusicProviderRequest,
+        *,
+        executor: MusicProviderExecutor,
+    ) -> MusicProviderResult: ...
 
 
 def module_payload(kind: str, value: Any) -> dict[str, Any]:
@@ -347,6 +437,14 @@ def visual_design_payload(kind: str, value: Any) -> dict[str, Any]:
     return _versioned_payload(VISUAL_DESIGN_PORT_VERSION, kind, value)
 
 
+def image_generator_payload(kind: str, value: Any) -> dict[str, Any]:
+    return _versioned_payload(IMAGE_GENERATOR_PORT_VERSION, kind, value)
+
+
+def music_provider_payload(kind: str, value: Any) -> dict[str, Any]:
+    return _versioned_payload(MUSIC_PROVIDER_PORT_VERSION, kind, value)
+
+
 def validate_story_semantics_payload(payload: Mapping[str, Any]) -> list[str]:
     return _validate_front_half_payload(
         payload,
@@ -418,6 +516,69 @@ def validate_visual_design_payload(payload: Mapping[str, Any]) -> list[str]:
         object_array_value_fields={},
         boolean_fields={"visual_design_result": ("success",)},
         nullable_object_fields={"visual_design_result": ("failure",)},
+    )
+
+
+def validate_image_generator_payload(payload: Mapping[str, Any]) -> list[str]:
+    return _validate_external_execution_payload(
+        payload,
+        schema_version=IMAGE_GENERATOR_PORT_VERSION,
+        request_kind="image_generator_request",
+        result_kind="image_generator_result",
+    )
+
+
+def validate_music_provider_payload(payload: Mapping[str, Any]) -> list[str]:
+    return _validate_external_execution_payload(
+        payload,
+        schema_version=MUSIC_PROVIDER_PORT_VERSION,
+        request_kind="music_provider_request",
+        result_kind="music_provider_result",
+    )
+
+
+def _validate_external_execution_payload(
+    payload: Mapping[str, Any],
+    *,
+    schema_version: str,
+    request_kind: str,
+    result_kind: str,
+) -> list[str]:
+    return _validate_front_half_payload(
+        payload,
+        schema_version=schema_version,
+        required_by_kind={
+            request_kind: (
+                "artifact_id", "operation", "execution_request_path", "execution_request_sha256",
+                "input_artifacts", "output_targets", "attempt_id",
+            ),
+            result_kind: (
+                "success", "operation", "output_artifacts", "provider", "model_or_tool", "request_id",
+                "attempt_id", "execution_request_sha256", "adapter_version", "production_eligible",
+                "usage_events", "failure",
+            ),
+        },
+        string_fields={
+            request_kind: (
+                "artifact_id", "operation", "execution_request_path", "execution_request_sha256", "attempt_id",
+            ),
+            result_kind: (
+                "operation", "provider", "model_or_tool", "request_id", "attempt_id",
+                "execution_request_sha256", "adapter_version",
+            ),
+        },
+        array_fields={
+            request_kind: ("input_artifacts", "output_targets"),
+            result_kind: ("output_artifacts", "usage_events"),
+        },
+        array_item_types={
+            request_kind: {"input_artifacts": Mapping, "output_targets": str},
+            result_kind: {"output_artifacts": Mapping, "usage_events": Mapping},
+        },
+        object_fields={},
+        object_array_value_fields={},
+        boolean_fields={result_kind: ("success", "production_eligible")},
+        nullable_object_fields={result_kind: ("failure",)},
     )
 
 
@@ -498,13 +659,17 @@ def _json_value(value: Any) -> Any:
 
 
 __all__ = [
-    "KEYER_PORT_VERSION", "MODULE_PORT_SCHEMA_VERSION", "STORY_SEMANTICS_COMPILER_VERSION",
+    "IMAGE_GENERATOR_PORT_VERSION", "KEYER_PORT_VERSION", "MODULE_PORT_SCHEMA_VERSION",
+    "MUSIC_PROVIDER_PORT_VERSION", "STORY_SEMANTICS_COMPILER_VERSION",
     "STORY_SEMANTIC_KINDS",
     "STORY_SEMANTICS_PORT_VERSION", "VIDEO_GENERATOR_PORT_VERSION", "VISUAL_DESIGN_PORT_VERSION",
+    "ImageGeneratorExecutor", "ImageGeneratorPort", "ImageGeneratorRequest", "ImageGeneratorResult",
     "KeyerPort", "KeyerRequest", "KeyerResult", "ModuleCapabilities", "ModuleFailure",
-    "ModuleFailureCode", "ModuleIdentity", "ModuleUsageEvent", "StorySemanticsPort",
+    "ModuleFailureCode", "ModuleIdentity", "ModuleUsageEvent", "MusicProviderExecutor",
+    "MusicProviderPort", "MusicProviderRequest", "MusicProviderResult", "StorySemanticsPort",
     "StorySemanticsRequest", "StorySemanticsResult", "VideoGeneratorPort", "VideoGeneratorRequest",
     "VideoGeneratorResult", "VisualDesignPort", "VisualDesignRequest", "VisualDesignResult",
-    "module_payload", "story_semantics_payload", "validate_module_payload",
+    "image_generator_payload", "module_payload", "music_provider_payload", "story_semantics_payload",
+    "validate_image_generator_payload", "validate_module_payload", "validate_music_provider_payload",
     "validate_story_semantics_payload", "validate_visual_design_payload", "visual_design_payload",
 ]

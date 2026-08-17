@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import csv
 import hashlib
+import struct
 import sys
 import shutil
+import zlib
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -17,12 +19,17 @@ from production_keying import (
     render_production_keyed_foreground,
 )
 from story_module_ports import (
+    IMAGE_GENERATOR_PORT_VERSION,
     KEYER_PORT_VERSION,
+    MUSIC_PROVIDER_PORT_VERSION,
     STORY_SEMANTICS_COMPILER_VERSION,
     STORY_SEMANTICS_PORT_VERSION,
     STORY_SEMANTIC_KINDS,
     VIDEO_GENERATOR_PORT_VERSION,
     VISUAL_DESIGN_PORT_VERSION,
+    ImageGeneratorExecutor,
+    ImageGeneratorRequest,
+    ImageGeneratorResult,
     KeyerRequest,
     KeyerResult,
     ModuleCapabilities,
@@ -30,6 +37,9 @@ from story_module_ports import (
     ModuleFailureCode,
     ModuleIdentity,
     ModuleUsageEvent,
+    MusicProviderExecutor,
+    MusicProviderRequest,
+    MusicProviderResult,
     StorySemanticsRequest,
     StorySemanticsResult,
     VideoGeneratorRequest,
@@ -47,6 +57,8 @@ KEYER_ADAPTER_VERSION = "story-production-ffmpeg-keyer/v1"
 VIDEO_BATCH_INVOCATION_VERSION = "story-video-batch-invocation/v1"
 STORY_SEMANTICS_ADAPTER_VERSION = "story-existing-semantics-adapter/v1"
 VISUAL_DESIGN_ADAPTER_VERSION = "story-approved-contract-visual-design-adapter/v1"
+IMAGE_GENERATOR_ADAPTER_VERSION = "story-codex-imagegen-adapter/v1"
+MUSIC_PROVIDER_ADAPTER_VERSION = "story-suno-browser-adapter/v1"
 
 
 def file_sha256(path: Path) -> str:
@@ -390,6 +402,246 @@ class MockVisualDesignAdapter(ApprovedStoryContractVisualDesignAdapter):
         return replace(super().resolve(request), adapter_version="story-mock-visual-design/v1")
 
 
+class CodexImageGeneratorAdapter:
+    """Thin adapter around the current Codex/ImageGen execution envelope."""
+
+    identity = ModuleIdentity(
+        "image_generator", IMAGE_GENERATOR_PORT_VERSION, "codex-imagegen", IMAGE_GENERATOR_ADAPTER_VERSION
+    )
+    capabilities = ModuleCapabilities(
+        provider="codex",
+        model_or_tool="imagegen",
+        runner_or_tool="codex exec",
+        external=True,
+        paid=True,
+        deterministic=False,
+        supported={
+            "preplanned_execution_envelope": True,
+            "owns_prompt_planning": False,
+            "owns_batching": False,
+            "owns_naming": False,
+            "owns_quality_policy": False,
+            "owns_currentness": False,
+        },
+    )
+
+    def execute(
+        self,
+        request: ImageGeneratorRequest,
+        *,
+        executor: ImageGeneratorExecutor,
+    ) -> ImageGeneratorResult:
+        return executor(request)
+
+
+class SunoMusicProviderAdapter:
+    """Thin adapter around the current Codex/Ego Browser/Suno envelope."""
+
+    identity = ModuleIdentity(
+        "music_provider", MUSIC_PROVIDER_PORT_VERSION, "suno-browser", MUSIC_PROVIDER_ADAPTER_VERSION
+    )
+    capabilities = ModuleCapabilities(
+        provider="suno",
+        model_or_tool="current-browser-workflow",
+        runner_or_tool="codex exec + Ego Browser",
+        external=True,
+        paid=True,
+        deterministic=False,
+        supported={
+            "preplanned_execution_envelope": True,
+            "owns_music_planning": False,
+            "owns_target_naming": False,
+            "owns_assembly": False,
+            "owns_quality_policy": False,
+            "owns_currentness": False,
+        },
+    )
+
+    def execute(
+        self,
+        request: MusicProviderRequest,
+        *,
+        executor: MusicProviderExecutor,
+    ) -> MusicProviderResult:
+        return executor(request)
+
+
+class MockImageGeneratorAdapter:
+    identity = ModuleIdentity(
+        "image_generator", IMAGE_GENERATOR_PORT_VERSION, "mock-image", "story-mock-image-generator/v1"
+    )
+    capabilities = ModuleCapabilities(
+        provider="mock",
+        model_or_tool="deterministic-image-fixture",
+        runner_or_tool="in-process",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={"offline": True, "network": False, "production_eligible": False},
+    )
+    # Fixed 256x256 RGB PNG: decodable by the unchanged visual-sample machine QA.
+    _raw = b"".join(b"\x00" + bytes((80, 120, 160)) * 256 for _ in range(256))
+
+    @staticmethod
+    def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+        crc = zlib.crc32(kind + payload) & 0xFFFFFFFF
+        return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", crc)
+
+    _fixture = (
+        b"\x89PNG\r\n\x1a\n"
+        + _png_chunk.__func__(b"IHDR", struct.pack(">IIBBBBB", 256, 256, 8, 2, 0, 0, 0))
+        + _png_chunk.__func__(b"IDAT", zlib.compress(_raw))
+        + _png_chunk.__func__(b"IEND", b"")
+    )
+
+    def __init__(self, mode: str = "success") -> None:
+        self.mode = mode
+
+    def execute(
+        self,
+        request: ImageGeneratorRequest,
+        *,
+        executor: ImageGeneratorExecutor,
+    ) -> ImageGeneratorResult:
+        del executor
+        issue = _external_request_issue(request)
+        if issue:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, issue)
+        failure_code = {
+            "unsupported": ModuleFailureCode.UNSUPPORTED_CAPABILITY,
+            "failure": ModuleFailureCode.EXECUTION_FAILED,
+            "invalid_output": ModuleFailureCode.INVALID_OUTPUT,
+        }.get(self.mode)
+        if failure_code is not None:
+            return self._failure(request, failure_code, f"mock {self.mode}")
+        artifacts = _write_mock_outputs(request.output_targets, self._fixture)
+        return ImageGeneratorResult(
+            True,
+            request.operation,
+            artifacts,
+            "mock",
+            "deterministic-image-fixture",
+            "mock-image-request-0001",
+            request.attempt_id,
+            request.execution_request_sha256,
+            "story-mock-image-generator/v1",
+            False,
+            usage_events=(
+                ModuleUsageEvent(
+                    "mock", "deterministic-image-fixture", request.operation,
+                    unit_type="image", quantity=float(len(artifacts)), actual_amount_status="not_applicable",
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _failure(
+        request: ImageGeneratorRequest, code: ModuleFailureCode, message: str
+    ) -> ImageGeneratorResult:
+        return ImageGeneratorResult(
+            False, request.operation, (), "mock", "deterministic-image-fixture", "",
+            request.attempt_id, request.execution_request_sha256, "story-mock-image-generator/v1",
+            False,
+            failure=ModuleFailure(code, message),
+        )
+
+
+class MockMusicProviderAdapter:
+    identity = ModuleIdentity(
+        "music_provider", MUSIC_PROVIDER_PORT_VERSION, "mock-music", "story-mock-music-provider/v1"
+    )
+    capabilities = ModuleCapabilities(
+        provider="mock",
+        model_or_tool="deterministic-music-fixture",
+        runner_or_tool="in-process",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={"offline": True, "network": False, "production_eligible": False},
+    )
+    _fixture = b"STORY_MODULE_MOCK_MUSIC\n"
+
+    def __init__(self, mode: str = "success") -> None:
+        self.mode = mode
+
+    def execute(
+        self,
+        request: MusicProviderRequest,
+        *,
+        executor: MusicProviderExecutor,
+    ) -> MusicProviderResult:
+        del executor
+        issue = _external_request_issue(request)
+        if issue:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, issue)
+        failure_code = {
+            "unsupported": ModuleFailureCode.UNSUPPORTED_CAPABILITY,
+            "failure": ModuleFailureCode.EXECUTION_FAILED,
+            "invalid_output": ModuleFailureCode.INVALID_OUTPUT,
+        }.get(self.mode)
+        if failure_code is not None:
+            return self._failure(request, failure_code, f"mock {self.mode}")
+        artifacts = _write_mock_outputs(request.output_targets, self._fixture)
+        return MusicProviderResult(
+            True,
+            request.operation,
+            artifacts,
+            "mock",
+            "deterministic-music-fixture",
+            "mock-music-request-0001",
+            request.attempt_id,
+            request.execution_request_sha256,
+            "story-mock-music-provider/v1",
+            False,
+            usage_events=(
+                ModuleUsageEvent(
+                    "mock", "deterministic-music-fixture", request.operation,
+                    unit_type="audio", quantity=float(len(artifacts)), actual_amount_status="not_applicable",
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _failure(
+        request: MusicProviderRequest, code: ModuleFailureCode, message: str
+    ) -> MusicProviderResult:
+        return MusicProviderResult(
+            False, request.operation, (), "mock", "deterministic-music-fixture", "",
+            request.attempt_id, request.execution_request_sha256, "story-mock-music-provider/v1",
+            False,
+            failure=ModuleFailure(code, message),
+        )
+
+
+def _external_request_issue(request: ImageGeneratorRequest | MusicProviderRequest) -> str:
+    if not request.artifact_id.strip() or not request.operation.strip() or not request.attempt_id.strip():
+        return "external execution identity is incomplete"
+    if not request.execution_request_path.is_file():
+        return "external execution request is missing"
+    if not _valid_sha256(request.execution_request_sha256):
+        return "external execution request hash is invalid"
+    if file_sha256(request.execution_request_path) != request.execution_request_sha256:
+        return "external execution request is stale"
+    if not request.output_targets or any(not isinstance(path, Path) for path in request.output_targets):
+        return "external execution output targets are missing or invalid"
+    if len(set(request.output_targets)) != len(request.output_targets):
+        return "external execution output targets are duplicated"
+    if any(not isinstance(item, Mapping) for item in request.input_artifacts):
+        return "external execution input artifacts are invalid"
+    return ""
+
+
+def _write_mock_outputs(targets: Sequence[Path], content: bytes) -> tuple[Mapping[str, Any], ...]:
+    artifacts: list[Mapping[str, Any]] = []
+    for target in targets:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(content)
+        artifacts.append(
+            {"path": str(target), "sha256": file_sha256(target), "production_eligible": False}
+        )
+    return tuple(artifacts)
+
+
 class ExistingVideoGeneratorAdapter:
     """Thin Port adapter around the existing provider configuration/runner."""
 
@@ -675,9 +927,11 @@ class MockKeyerAdapter(ProductionKeyerAdapter):
 
 
 __all__ = [
-    "ApprovedStoryContractVisualDesignAdapter", "ExistingStorySemanticsAdapter",
-    "ExistingVideoGeneratorAdapter", "KEYER_ADAPTER_VERSION", "MockKeyerAdapter",
-    "MockStorySemanticsAdapter", "MockVideoGeneratorAdapter", "MockVisualDesignAdapter",
-    "ProductionKeyerAdapter", "STORY_SEMANTICS_ADAPTER_VERSION", "VIDEO_ADAPTER_VERSION",
+    "ApprovedStoryContractVisualDesignAdapter", "CodexImageGeneratorAdapter",
+    "ExistingStorySemanticsAdapter", "ExistingVideoGeneratorAdapter", "IMAGE_GENERATOR_ADAPTER_VERSION",
+    "KEYER_ADAPTER_VERSION", "MUSIC_PROVIDER_ADAPTER_VERSION", "MockImageGeneratorAdapter",
+    "MockKeyerAdapter", "MockMusicProviderAdapter", "MockStorySemanticsAdapter",
+    "MockVideoGeneratorAdapter", "MockVisualDesignAdapter", "ProductionKeyerAdapter",
+    "STORY_SEMANTICS_ADAPTER_VERSION", "SunoMusicProviderAdapter", "VIDEO_ADAPTER_VERSION",
     "VIDEO_BATCH_INVOCATION_VERSION", "VISUAL_DESIGN_ADAPTER_VERSION",
 ]

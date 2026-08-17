@@ -1,4 +1,4 @@
-# Module Ports（M3-3A + M3-3B-1）
+# Module Ports（M3-3A + M3-3B）
 
 本页记录 Story Agent 的最小模块接口模式。核心原则是“装插座，不换电器”：Runtime 通过 Port 调用当前实现，但不改变 38-stage DAG、供应商、滤镜、质量门禁、重试、预算或 currentness 语义。
 
@@ -21,14 +21,14 @@ Quality Policy（独立审核结果，不属于 Port 执行失败）
 - **Adapter** 委托现有 provider/tool，不复制业务事实源。
 - **Product Policy / Quality Policy** 判断结果如何用于产品、以及结果是否够好。逐产物 include/exclude、视觉替代和互斥仍在 `artifact_semantic_plan.py`；视觉小样要求、身份规则、构图/色彩/光照、解剖一致性、机器 QA、独立审核和 P0 仍在 `visual_sample_gate.py`。视频运动仍由 `video_motion.py` 和独立审核负责；发丝、spill、halo、P0 仍由 `keying_quality.py` 和独立审核负责。
 
-Port Result 是一次调用的结构化返回，不取代 M2 已有 receipt、manifest、review bundle 或 SHA-256 currentness。`ModuleUsageEvent` 只预留调用级事件结构；M3-3A/3B-1 没有建立请求账本、Token 账本、币种结算或 Agent tree。
+Port Result 是一次调用的结构化返回，不取代 M2 已有 receipt、manifest、review bundle 或 SHA-256 currentness。`ModuleUsageEvent` 只预留调用级事件结构；M3-3A/3B 没有建立请求账本、Token 账本、币种结算或 Agent tree。
 
 ## Kernel 与 Registry
 
 - `story_module_ports.py`：冻结 dataclass、`typing.Protocol`、统一 failure vocabulary、usage event、Python validator。
 - `schemas/module_ports/v1/module_ports.schema.json`：Video/Keyer identity、capabilities、request、result、failure、usage event 的机器合同。
-- `schemas/module_ports/v1/story_semantics_port.schema.json` 与 `visual_design_port.schema.json`：前半链两个 Port 的独立 v1 schema；不改变旧 M3-3A payload。
-- `story_module_adapters.py`：现有 Story Semantics、已审核 Story Contract projection、视频 provider 和生产 FFmpeg keyer 的薄适配器，以及 deterministic mock。
+- `schemas/module_ports/v1/story_semantics_port.schema.json`、`visual_design_port.schema.json`、`image_generator_port.schema.json` 与 `music_provider_port.schema.json`：四个 M3-3B Port 的独立 v1 schema；不改变旧 M3-3A payload。
+- `story_module_adapters.py`：现有 Story Semantics、已审核 Story Contract projection、Codex/ImageGen、Suno 浏览器执行、视频 provider 和生产 FFmpeg keyer 的薄适配器，以及 deterministic mock。
 - `story_module_registry.py`：显式注册/选择 adapter；不按价格或质量智能路由，也不自动 fallback。
 
 只读诊断：
@@ -37,7 +37,9 @@ Port Result 是一次调用的结构化返回，不取代 M2 已有 receipt、ma
 python3 story_module_registry.py list
 python3 story_module_registry.py describe story_semantics
 python3 story_module_registry.py describe visual_design
+python3 story_module_registry.py describe image_generator
 python3 story_module_registry.py describe video_generator
+python3 story_module_registry.py describe music_provider
 python3 story_module_registry.py describe keyer
 ```
 
@@ -85,14 +87,36 @@ Request 绑定源文件/SHA、现有 preset settings、crop 所在 settings、�
 
 `MockVisualDesignAdapter` 使用同一已锁事实源做确定性替换，不生成第二合同；`mock-visual-design` profile 丢失时同样 fail closed。
 
+## ImageGeneratorPort v1
+
+版本：`story-image-generator-port/v1`。
+
+Request 只绑定 Runtime 已经确定的一次图片执行 envelope：artifact/operation、当前 handoff 路径与 SHA、输入 artifact bindings、输出目标和 attempt。它不规划 prompt、batch、文件名、路径、staging/sync、paid gate 或 currentness。
+
+`CodexImageGeneratorAdapter` 只委托 Runtime 传入的原 `_codex_task` executor。正式 consumer seam 位于 `StoryAgent._stage_visual_samples()` 的 supplemental sample 调用和 `StoryAgent._stage_codex_story_images()` 的逐 batch 调用；原 handoff、prompt、batch size、`{slug}_scene_XX.png` 命名、staging 到 final sync、authoritative storyboard SHA 保护、visual sample QA/review/lock 与 story image review 均留在 Runtime 和原 Quality Policy。
+
+`MockImageGeneratorAdapter` 完全离线并生成确定性、可解码的测试 PNG；其 Result 和 artifact 均明确 `production_eligible=false`。`mock-image` 只有在 selected profile、required profile、selected execution mode 和 required execution mode 四项同时锁定为 `mock-image`/`test` 时才能执行，任一丢失或错配都 fail closed，不回落 Codex/ImageGen。
+
+## MusicProviderPort v1
+
+版本：`story-music-provider-port/v1`。
+
+Request 只绑定 Runtime 已经确定的一次音乐 provider execution envelope：当前 Suno handoff/request 路径与 SHA、输入 artifact bindings、既有输出目标/位置语义和 attempt。故事情绪、分段、prompt/request、provider 和 target filename policy 仍由原 music planning 决定。
+
+`SunoMusicProviderAdapter` 只委托 Runtime 传入的原 `_codex_task("suno_generate")` executor。正式 consumer seam 仅位于 `StoryAgent._stage_suno_generate()`；原 stage/label/prompt、Ego Browser/Suno 流程、下载目录、`target_audio_filename`、`_has_suno_audio()` 完成判断、`assemble_suno_music.py` 的 exact-name/segment-prefix fallback 和 music QA/currentness 均保持独立。
+
+`MockMusicProviderAdapter` 完全离线，Result 和 artifact 均为 `production_eligible=false`。`mock-music` 使用与 `mock-image` 相同的 profile + execution-mode 双锁，任一传播丢失或错配都在启动 Codex/browser/Suno 前 fail closed。
+
 ## 注入 Mock
 
-`StoryAgent(..., module_registry=custom_registry)` 可注入测试 Registry；独立 consumer 也只依赖 Registry/Port。`MockVideoGeneratorAdapter` 支持确定性成功、unsupported、execution failure 和 invalid output；`MockKeyerAdapter` 支持确定性复制、invalid input 和 execution failure；Semantics/VisualDesign mock 如上所述。Registry profile 是固定 allowlist，禁止任意 import、Python class 或 shell command。mock 不访问网络，也不代表真实产品或视觉质量。
+`StoryAgent(..., module_registry=custom_registry)` 可注入测试 Registry；独立 consumer 也只依赖 Registry/Port。`MockVideoGeneratorAdapter` 支持确定性成功、unsupported、execution failure 和 invalid output；`MockKeyerAdapter` 支持确定性复制、invalid input 和 execution failure；Semantics/VisualDesign/Image/Music mock 如上所述。Registry profile 是固定 allowlist，禁止任意 import、Python class 或 shell command。mock 不访问网络，也不代表真实产品或视觉质量。
+
+profile selection 通过显式 CLI 参数和四个非秘密环境锁在 parent、supervisor、run、run-stage/DAG worker、`story_workflow.py` 与 Codex subprocess boundary 传播：`STORY_MODULE_PROFILE`、`STORY_MODULE_PROFILE_REQUIRED`、`STORY_MODULE_EXECUTION_MODE`、`STORY_MODULE_EXECUTION_MODE_REQUIRED`。required/selected 任一缺失或错配均拒绝执行；不序列化 arbitrary Python object，也不在 profile/env 中携带 provider secret。当前单 profile 一次只替换一个模块，不做组合路由。
 
 ## 兼容与后续
 
 - 旧 `resolve_video_provider()`、CLI、workbench 和 legacy passthrough 保留。
 - required_v1 的 Story Contract、审核哈希、付费门禁和 M2 质量政策没有降低。
-- M3-3A 已完成 VideoGeneratorPort 与 KeyerPort；M3-3B-1 已完成 StorySemanticsPort 与 VisualDesignPort 的 contract、adapter、Registry 和 production seam。
-- ImageGeneratorPort 与 MusicProviderPort 尚未进入 M3-3B-2；Compositor、Release、Publish 和 Product Package 等 Port 也尚未实现。M3-3B-1 完成不代表 M3-3B 或 Milestone 3 完成。
+- M3-3A 已完成 VideoGeneratorPort 与 KeyerPort；M3-3B 已完成 StorySemanticsPort、VisualDesignPort、ImageGeneratorPort 与 MusicProviderPort 的 contract、adapter、Registry、mock 和 production seam。
+- M3-3B 完成不代表 Milestone 3 完成：M3-3C 与 M3-Z 尚未开始，Compositor、Release、Publish 和 Product Package 等后续边界尚未实现，真实新故事 Canary 也尚未运行。
 - 自动多供应商路由、请求级账本、context pack、Agent tree、真实成本结算和逐镜依赖图不属于本阶段。

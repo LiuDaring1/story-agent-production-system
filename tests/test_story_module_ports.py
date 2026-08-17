@@ -39,6 +39,8 @@ from story_module_ports import (
     validate_module_payload,
 )
 from story_module_registry import (
+    MODULE_EXECUTION_MODE_ENV,
+    MODULE_EXECUTION_MODE_REQUIRED_ENV,
     MODULE_PROFILE_ENV,
     MODULE_PROFILE_REQUIRED_ENV,
     ModuleRegistry,
@@ -295,6 +297,41 @@ class StoryModulePortTests(unittest.TestCase):
         self.assertIs(agent._modules(), registry)
         self.assertEqual(agent._provider_for_stage("generate_videos"), "mock-video")
         self.assertIs(agent._modules().keyer(), registry.keyer())
+
+    def test_story_agent_propagates_selected_required_profile_and_execution_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            init_project(project, story_name="media lock", slug="media-lock")
+            locked = {
+                MODULE_PROFILE_ENV: "mock-image",
+                MODULE_PROFILE_REQUIRED_ENV: "mock-image",
+                MODULE_EXECUTION_MODE_ENV: "test",
+                MODULE_EXECUTION_MODE_REQUIRED_ENV: "test",
+            }
+            with patch.dict(os.environ, locked, clear=False):
+                registry = build_registry_for_profile("mock-image", execution_mode="test")
+            context = AgentContext(
+                project, None, "media lock", "media-lock", False, False,
+                "cli", "", "workspace-write", "never", "codex", 30,
+            )
+            agent = StoryAgent(context, module_registry=registry)
+            self.assertEqual(agent._module_subprocess_env(), locked)
+            workflow = agent._workflow(["doctor-project", "--project-dir", str(project)], "doctor")
+            self.assertIn("--module-profile mock-image", workflow.message)
+            self.assertIn("--module-execution-mode test", workflow.message)
+
+            prompt = root / "prompt.md"
+            prompt.write_text("sentinel only", encoding="utf-8")
+            with patch("story_agent.subprocess.Popen") as popen:
+                process = popen.return_value
+                process.communicate.return_value = ("", "")
+                process.returncode = 0
+                agent._run_codex_exec("profile_propagation_test", prompt, [])
+            self.assertEqual(popen.call_args.kwargs["env"][MODULE_PROFILE_ENV], "mock-image")
+            self.assertEqual(popen.call_args.kwargs["env"][MODULE_PROFILE_REQUIRED_ENV], "mock-image")
+            self.assertEqual(popen.call_args.kwargs["env"][MODULE_EXECUTION_MODE_ENV], "test")
+            self.assertEqual(popen.call_args.kwargs["env"][MODULE_EXECUTION_MODE_REQUIRED_ENV], "test")
 
     def test_keyer_adapter_delegates_every_production_fact(self) -> None:
         settings = {

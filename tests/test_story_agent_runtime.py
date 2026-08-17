@@ -17,7 +17,14 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
-from story_agent import AgentContext, StageResult, StoryAgent, WorkerAttempt, classify_command_failure
+from story_agent import AgentContext, StageResult, StoryAgent, WorkerAttempt, classify_command_failure, main as story_agent_main
+from story_module_registry import (
+    MODULE_EXECUTION_MODE_ENV,
+    MODULE_EXECUTION_MODE_REQUIRED_ENV,
+    MODULE_PROFILE_ENV,
+    MODULE_PROFILE_REQUIRED_ENV,
+    build_registry_for_profile,
+)
 from story_agent_runtime import (
     AgentRuntimeError,
     BudgetExceeded,
@@ -459,6 +466,38 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             )
             self.assertEqual(selected, ["codex_story_images", "music_request"])
 
+    def test_dag_worker_propagates_media_profile_and_dual_lock_explicitly(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：传播锁"
+            manifest = ensure_manifest_v2(init_project(project, story_name="传播锁", slug="propagation-lock"))
+            write_manifest(project_paths(project), manifest)
+            locked = {
+                MODULE_PROFILE_ENV: "mock-music",
+                MODULE_PROFILE_REQUIRED_ENV: "mock-music",
+                MODULE_EXECUTION_MODE_ENV: "test",
+                MODULE_EXECUTION_MODE_REQUIRED_ENV: "test",
+            }
+            with patch.dict(os.environ, locked, clear=False):
+                registry = build_registry_for_profile("mock-music", execution_mode="test")
+            context = AgentContext(
+                project, None, "传播锁", "propagation-lock", True, False,
+                "cli", "", "workspace-write", "never", "codex", 30,
+                scheduler="dag", max_parallel=1,
+            )
+            agent = StoryAgent(context, module_registry=registry)
+            with patch("story_agent.subprocess.Popen") as popen:
+                popen.return_value.pid = 12345
+                attempts = agent._launch_worker_batch(
+                    ["import_inbox"], manifest, run_id="lock-run", run_epoch=7
+                )
+            self.assertEqual(len(attempts), 1)
+            command = popen.call_args.args[0]
+            env = popen.call_args.kwargs["env"]
+            self.assertEqual(command[command.index("--module-profile") + 1], "mock-music")
+            self.assertEqual(command[command.index("--module-execution-mode") + 1], "test")
+            for name, value in locked.items():
+                self.assertEqual(env[name], value)
+
     def test_run_stage_worker_writes_envelope_without_touching_canonical_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：worker"
@@ -479,6 +518,10 @@ class StoryAgentRuntimeTests(unittest.TestCase):
                     "STORY_AGENT_PROJECT_ROOT": str(project.resolve()),
                     "STORY_AGENT_WORKER_DIR": str(work),
                     "STORY_AGENT_RUN_EPOCH": str(epoch),
+                    MODULE_PROFILE_ENV: "mock-image",
+                    MODULE_PROFILE_REQUIRED_ENV: "mock-image",
+                    MODULE_EXECUTION_MODE_ENV: "test",
+                    MODULE_EXECUTION_MODE_REQUIRED_ENV: "test",
                 }
             )
             process = subprocess.run(
@@ -500,6 +543,10 @@ class StoryAgentRuntimeTests(unittest.TestCase):
                     str(epoch),
                     "--attempt-id",
                     "attempt-1",
+                    "--module-profile",
+                    "mock-image",
+                    "--module-execution-mode",
+                    "test",
                 ],
                 cwd=str(Path(__file__).resolve().parents[1]),
                 env=env,
@@ -510,6 +557,39 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(process.returncode, 0, process.stdout + process.stderr)
             self.assertEqual(json.loads(result_file.read_text(encoding="utf-8"))["status"], "done")
             self.assertEqual(file_sha256(paths.manifest), canonical_before)
+
+    def test_start_supervisor_propagates_media_profile_and_dual_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "故事剪辑：supervisor-lock"
+            init_project(project, story_name="supervisor-lock", slug="supervisor-lock")
+            registry_path = root / "jobs.json"
+            JobRegistry(registry_path).register("job-lock", project, "fixture")
+            locked = {
+                MODULE_PROFILE_ENV: "mock-image",
+                MODULE_PROFILE_REQUIRED_ENV: "mock-image",
+                MODULE_EXECUTION_MODE_ENV: "test",
+                MODULE_EXECUTION_MODE_REQUIRED_ENV: "test",
+            }
+            argv = [
+                "story_agent.py", "start", "--job", "job-lock", "--registry", str(registry_path),
+                "--module-profile", "mock-image", "--module-execution-mode", "test",
+            ]
+            with (
+                patch.dict(os.environ, locked, clear=False),
+                patch.object(sys, "argv", argv),
+                patch("story_agent.subprocess.Popen") as popen,
+                patch("story_agent.record_unattended_launch"),
+                redirect_stdout(io.StringIO()),
+            ):
+                popen.return_value.pid = 23456
+                story_agent_main()
+            command = popen.call_args.args[0]
+            env = popen.call_args.kwargs["env"]
+            self.assertEqual(command[command.index("--module-profile") + 1], "mock-image")
+            self.assertEqual(command[command.index("--module-execution-mode") + 1], "test")
+            for name, value in locked.items():
+                self.assertEqual(env[name], value)
 
     def test_worker_shadow_three_way_merge_preserves_disjoint_updates_and_rejects_collision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -796,8 +876,10 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             shutil.rmtree(staging_root, ignore_errors=True)
             staging_root.mkdir(parents=True, exist_ok=True)
             self.addCleanup(shutil.rmtree, staging_root, True)
+            captured = {}
 
-            def generate_one(**_kwargs):
+            def generate_one(**kwargs):
+                captured.update(kwargs)
                 staging = staging_root / "images"
                 staging.mkdir(parents=True, exist_ok=True)
                 (staging / "image-batch_scene_01.png").write_bytes(b"one")
@@ -809,6 +891,18 @@ class StoryAgentRuntimeTests(unittest.TestCase):
                 result = agent._stage_codex_story_images(manifest)
             self.assertEqual(result.status, "retrying")
             self.assertIn("1/2", result.message)
+            self.assertEqual(captured["stage"], "codex_story_images_01_02")
+            self.assertEqual(captured["label"], "Codex 原生故事批量出图 2 张")
+            self.assertEqual(
+                captured["prompt"],
+                agent._story_images_batch_prompt(
+                    handoff=captured["handoff"],
+                    staging_images=staging_root / "images",
+                    staging_storyboard=staging_root / "image-batch_storyboard_lines.txt",
+                    story_lines=["第一镜。", "第二镜。"],
+                    indices=[1, 2],
+                ),
+            )
 
     def test_story_image_batch_rejects_producer_storyboard_rewrite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1394,12 +1488,29 @@ class StoryAgentRuntimeTests(unittest.TestCase):
                 codex_timeout=30,
             )
             agent = StoryAgent(context)
-            with patch.object(agent, "_codex_task", return_value=StageResult("blocked", "No browser is available")):
+            captured = {}
+
+            def blocked_task(**kwargs):
+                captured.update(kwargs)
+                return StageResult("blocked", "No browser is available")
+
+            with patch.object(agent, "_codex_task", side_effect=blocked_task):
                 result = agent._stage_suno_generate(manifest)
             self.assertEqual(result.status, "blocked")
             blocker = project / "02_图生视频" / "music" / "suno_cli_blocker.md"
             self.assertTrue(blocker.exists())
             self.assertIn("Codex 主任务", blocker.read_text(encoding="utf-8"))
+            handoff = agent._music_dir() / "suno-block_suno_browser_handoff.md"
+            self.assertEqual(captured["stage"], "suno_generate")
+            self.assertEqual(captured["label"], "Codex/Suno 浏览器音乐生成")
+            self.assertEqual(captured["handoff"], handoff)
+            self.assertEqual(
+                captured["prompt"],
+                f"请读取并执行这份 Suno 浏览器自动化任务：\n{handoff}\n\n"
+                "目标是生成并下载第一首可用音乐，按音乐分段 CSV 的 target_audio_filename 重命名，"
+                "保存到指定 suno_downloads 目录。若当前 CLI 无浏览器控制能力、Suno 未登录、遇到验证码或付费弹窗，"
+                f"请写入 `{agent._music_dir() / 'suno_cli_blocker.md'}` 说明原因，不要假装完成。",
+            )
 
     def test_stage_record_tracks_context_output_provider_cost_and_retry_reason(self) -> None:
         manifest = ensure_manifest_v2({"story": {"name": "证据测试"}})

@@ -22,7 +22,7 @@ Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_ru
 10. [`docs/roadmaps/V3.5_QUALITY_AND_MODULARIZATION.md`](docs/roadmaps/V3.5_QUALITY_AND_MODULARIZATION.md)：V3.5 范围与非目标。
 11. [`docs/contracts/story-production-contract.md`](docs/contracts/story-production-contract.md)：合同前置、七类合同、锁和消费者失效语义。
 12. [`docs/roadmaps/V3.5_M2_CLOSEOUT_2026-08-17.md`](docs/roadmaps/V3.5_M2_CLOSEOUT_2026-08-17.md)：Milestone 2 的 16 个实现提交、证据边界和当前安全点。
-13. [`docs/architecture/module-ports.md`](docs/architecture/module-ports.md)：M3-3A 与 M3-3B-1 的 Port/Adapter、Product/Quality Policy 边界、Registry 与 mock 注入。
+13. [`docs/architecture/module-ports.md`](docs/architecture/module-ports.md)：M3-3A 与 M3-3B 六个 Port/Adapter、Product/Quality Policy 边界、Registry、双锁传播与 mock 注入。
 
 ## 核心代码地图
 
@@ -39,7 +39,7 @@ Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_ru
 | `story_project.py` | 项目目录、产物检测、机器 QA、交付和内部报告 |
 | `story_semantics.py` | 标题、主持人口播、正文、道理和结尾的语义合同 |
 | `video_provider_adapter.py` | 视频供应商、模型能力、时长与成本接口 |
-| `story_module_ports.py` / `story_module_registry.py` / `story_module_adapters.py` | M3 版本化 Port kernel、显式 Registry、现有 Semantics/Story Contract projection/Video/Keyer 薄适配器与 deterministic mock |
+| `story_module_ports.py` / `story_module_registry.py` / `story_module_adapters.py` | M3 版本化 Port kernel、显式 Registry、Semantics/VisualDesign/Image/Video/Music/Keyer 薄适配器与 deterministic mock |
 | `run_image_video_jobs.py` | 视频任务提交、轮询、下载和逐镜时长 |
 | `video_motion.py` | 逐镜动作计划、上下文相关运动 QA、provider receipt 与局部返工证据 |
 | `production_keying.py` / `keying_quality.py` | 正式 keying 滤镜事实源、分区证据、机器 QA 与 preset 锁 |
@@ -92,4 +92,4 @@ python3 story_agent.py --help
 - Milestone 2 已完成工程实现：2A 语义计划、条件式视觉小样与风格自适应审核；2B 逐镜动作计划、上下文运动门禁、正式 provider provenance 与单镜返工；2C 生产同链 keying 证据、Demo Logo/字幕/geometry receipt、Release 最小水平修正和确定性布局；2D 封面血缘与品牌排版、creative base 原图审核，以及 PPT/客户文稿/朗读标注/资料包的语义与来源 currentness。
 - M2 的完成口径是“通用质量机制、离线 fixture、模拟 provider 和失效门禁已实现”。真实 ImageGen/Grok/Suno、真实人物素材、完整新故事 canary 和用户产品验收仍未完成，不得把 M2 工程完成写成产品质量已经验证。
 - 当前增量失效只到模块族级，不是完整逐镜头 dependency graph；正式 Port/adapter、请求级账本、context pack、Agent tree/可观察性、成本币种/真实账单和细粒度 Runtime 重试仍属于后续 Milestone。
-- M3-3A 已建立最小 Module Port kernel，并接入 `VideoGeneratorPort`、`KeyerPort`。M3-3B-1 已接入 `StorySemanticsPort` 与 `VisualDesignPort`：前者委托现有 classifier，后者只消费已审核锁定的 Story Contract projection；Product/Quality Policy、持久格式和 38-stage DAG 未改变。ImageGeneratorPort、MusicProviderPort（M3-3B-2）、其余 Port、智能路由和 M4 账本/可观察性尚未实现。
+- M3-3A 已接入 `VideoGeneratorPort`、`KeyerPort`；M3-3B 已接入 `StorySemanticsPort`、`VisualDesignPort`、`ImageGeneratorPort` 与 `MusicProviderPort`。production-default 仍委托原 classifier、审核锁定的 Story Contract projection、Codex/ImageGen 与 Codex/Ego Browser/Suno；Product/Quality Policy、持久事实源和 38-stage DAG 未改变。Image/Music mock 使用 profile + execution-mode 双锁并 fail closed。M3 尚未完成：M3-3C、M3-Z、智能路由和 M4 账本/可观察性均未开始，真实新故事 Canary 尚未运行。

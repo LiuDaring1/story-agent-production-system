@@ -41,6 +41,7 @@ python3 story_module_registry.py describe image_generator
 python3 story_module_registry.py describe video_generator
 python3 story_module_registry.py describe music_provider
 python3 story_module_registry.py describe keyer
+python3 story_module_registry.py describe compositor
 ```
 
 诊断只输出版本和能力，不输出 API key、secret 或浏览器凭据。
@@ -119,6 +120,18 @@ Request 只绑定 `create_package_dirs()` 的一次已规划 filesystem executio
 
 `MockProductPackageAdapter` 只把确定性 fixture 写入请求 output root 下的 `_mock_product_package` 测试隔离目录，不调用 production executor、不写请求中的正式客户 targets，并始终返回 `production_eligible=false`。C1 不新增 CLI mock profile；测试通过 Protocol 注入 mock/fake，因此没有新增第二套 profile 安全机制。
 
+## CompositorPort v1
+
+版本：`story-compositor-port/v1`。
+
+Request 只绑定 caller 已决定的一次本地合成 invocation：`background_story`、`presenter_demo` 或 `a_only_background`，输入路径/SHA-256、既定输出目标、已经解析的 execution/config binding 和 attempt。时间线、视频顺序、semantic card、完整/sales/Demo 字幕选择、旁白/音乐 mix、音量、Demo geometry、A 镜 layout 与 canonical filename 均留在原 caller/core。
+
+`LocalCompositorAdapter` 先验证全部输入 SHA，再精确委托 caller 提供的原 Python/FFmpeg executor；不重写 filter graph、编码参数或失败策略。三个正式 seam 分别位于 `story_video_synthesizer.pipeline.synthesize_story()`、`product_package.render_demo_video()` 和 `product_package.render_a_only_background_video()`，原函数体作为 executor 保留。
+
+Result 只记录一次执行观察到的输出路径/SHA-256、adapter、usage/failure 和 production eligibility，不声明 QA、review、currentness、stage complete、product complete 或 release ready。`project_manifest.json`、artifact semantic plan/assembly manifest、music QA、Demo render manifest、machine QA 和 hash-bound review 仍是原权威事实源。
+
+`MockCompositorAdapter` 完全离线，只在系统临时目录的 `_mock_compositor` 隔离目录写 deterministic marker，不调用 production executor，也不写正式 targets，并始终返回 `production_eligible=false`。C2 不新增 runtime selectable mock profile。
+
 ## 注入 Mock
 
 `StoryAgent(..., module_registry=custom_registry)` 可注入测试 Registry；独立 consumer 也只依赖 Registry/Port。`MockVideoGeneratorAdapter` 支持确定性成功、unsupported、execution failure 和 invalid output；`MockKeyerAdapter` 支持确定性复制、invalid input 和 execution failure；Semantics/VisualDesign/Image/Music mock 如上所述。Registry profile 是固定 allowlist，禁止任意 import、Python class 或 shell command。mock 不访问网络，也不代表真实产品或视觉质量。
@@ -130,5 +143,5 @@ profile selection 通过显式 CLI 参数和四个非秘密环境锁在 parent�
 - 旧 `resolve_video_provider()`、CLI、workbench 和 legacy passthrough 保留。
 - required_v1 的 Story Contract、审核哈希、付费门禁和 M2 质量政策没有降低。
 - M3-3A 已完成 VideoGeneratorPort 与 KeyerPort；M3-3B 已完成 StorySemanticsPort、VisualDesignPort、ImageGeneratorPort 与 MusicProviderPort 的 contract、adapter、Registry、mock 和 production seam。
-- M3-3C C1 只完成 ProductPackage filesystem seam；不代表 M3-3C 或 Milestone 3 完成。Compositor、ReleaseLayout、PublishAsset 与 M3-Z 尚未实现，真实新故事 Canary 也尚未运行。
+- M3-3C C1 已完成 ProductPackage filesystem seam；C2 已安装 Compositor 的三个本地 leaf execution seam。这不代表 M3-3C 或 Milestone 3 完成；ReleaseLayout、PublishAsset 与 M3-Z 尚未实现，真实新故事 Canary 也尚未运行。
 - 自动多供应商路由、请求级账本、context pack、Agent tree、真实成本结算和逐镜依赖图不属于本阶段。

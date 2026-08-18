@@ -1,0 +1,65 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "story-compositor-port/v1",
+  "title": "Story local compositor execution port payload",
+  "type": "object",
+  "required": ["schema_version", "kind"],
+  "properties": {
+    "schema_version": {"const": "story-compositor-port/v1"},
+    "kind": {"enum": ["compositor_request", "compositor_result"]}
+  },
+  "allOf": [
+    {
+      "if": {"properties": {"kind": {"const": "compositor_request"}}},
+      "then": {
+        "required": ["artifact_id", "operation", "input_artifacts", "output_targets", "execution_binding", "attempt_id"],
+        "properties": {
+          "artifact_id": {"type": "string"},
+          "operation": {"type": "string"},
+          "input_artifacts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["role", "path", "sha256"],
+              "properties": {
+                "role": {"type": "string"},
+                "path": {"type": "string"},
+                "sha256": {"type": "string"}
+              }
+            }
+          },
+          "output_targets": {"type": "array", "items": {"type": "string"}},
+          "execution_binding": {"type": "object"},
+          "attempt_id": {"type": "string"}
+        }
+      }
+    },
+    {
+      "if": {"properties": {"kind": {"const": "compositor_result"}}},
+      "then": {
+        "required": ["success", "operation", "output_artifacts", "attempt_id", "adapter_version", "production_eligible", "usage_events", "failure"],
+        "properties": {
+          "success": {"type": "boolean"},
+          "operation": {"type": "string"},
+          "output_artifacts": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["path", "sha256", "production_eligible"],
+              "properties": {
+                "path": {"type": "string"},
+                "sha256": {"type": "string"},
+                "production_eligible": {"type": "boolean"}
+              }
+            }
+          },
+          "attempt_id": {"type": "string"},
+          "adapter_version": {"type": "string"},
+          "production_eligible": {"type": "boolean"},
+          "usage_events": {"type": "array", "items": {"type": "object"}},
+          "failure": {"type": ["object", "null"]}
+        }
+      }
+    }
+  ]
+}

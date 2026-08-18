@@ -20,6 +20,7 @@ from production_keying import (
     render_production_keyed_foreground,
 )
 from story_module_ports import (
+    COMPOSITOR_PORT_VERSION,
     IMAGE_GENERATOR_PORT_VERSION,
     KEYER_PORT_VERSION,
     MUSIC_PROVIDER_PORT_VERSION,
@@ -29,6 +30,9 @@ from story_module_ports import (
     STORY_SEMANTIC_KINDS,
     VIDEO_GENERATOR_PORT_VERSION,
     VISUAL_DESIGN_PORT_VERSION,
+    CompositorExecutor,
+    CompositorRequest,
+    CompositorResult,
     ImageGeneratorExecutor,
     ImageGeneratorRequest,
     ImageGeneratorResult,
@@ -65,6 +69,7 @@ VISUAL_DESIGN_ADAPTER_VERSION = "story-approved-contract-visual-design-adapter/v
 IMAGE_GENERATOR_ADAPTER_VERSION = "story-codex-imagegen-adapter/v1"
 MUSIC_PROVIDER_ADAPTER_VERSION = "story-suno-browser-adapter/v1"
 PRODUCT_PACKAGE_ADAPTER_VERSION = "story-local-product-package-adapter/v1"
+COMPOSITOR_ADAPTER_VERSION = "story-local-ffmpeg-compositor-adapter/v1"
 
 
 def file_sha256(path: Path) -> str:
@@ -679,6 +684,152 @@ class LocalProductPackageAdapter:
         )
 
 
+class LocalCompositorAdapter:
+    """Thin adapter around caller-owned deterministic Python/FFmpeg execution."""
+
+    identity = ModuleIdentity(
+        "compositor", COMPOSITOR_PORT_VERSION, "local-ffmpeg", COMPOSITOR_ADAPTER_VERSION
+    )
+    capabilities = ModuleCapabilities(
+        provider="local",
+        model_or_tool="existing-python-ffmpeg-compositor",
+        runner_or_tool="in-process",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={
+            "background_story": True,
+            "presenter_demo": True,
+            "a_only_background": True,
+            "owns_timeline_policy": False,
+            "owns_subtitle_policy": False,
+            "owns_music_policy": False,
+            "owns_geometry_policy": False,
+            "owns_manifest": False,
+            "owns_quality_policy": False,
+            "owns_currentness": False,
+        },
+    )
+
+    def execute(
+        self,
+        request: CompositorRequest,
+        *,
+        executor: CompositorExecutor,
+    ) -> CompositorResult:
+        issue = _compositor_request_issue(request)
+        if issue:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, issue)
+        try:
+            result = executor(request)
+        except Exception as exc:
+            return self._failure(request, ModuleFailureCode.EXECUTION_FAILED, str(exc))
+        if result.success:
+            issue = _compositor_result_issue(request, result)
+            if issue:
+                return self._failure(request, ModuleFailureCode.INVALID_OUTPUT, issue)
+        return result
+
+    @staticmethod
+    def _failure(
+        request: CompositorRequest, code: ModuleFailureCode, message: str
+    ) -> CompositorResult:
+        return CompositorResult(
+            False,
+            request.operation,
+            (),
+            request.attempt_id,
+            COMPOSITOR_ADAPTER_VERSION,
+            True,
+            failure=ModuleFailure(code, message),
+        )
+
+
+class MockCompositorAdapter:
+    """Offline deterministic mock that never calls the production executor."""
+
+    identity = ModuleIdentity(
+        "compositor", COMPOSITOR_PORT_VERSION, "mock-compositor", "story-mock-compositor/v1"
+    )
+    capabilities = ModuleCapabilities(
+        provider="mock",
+        model_or_tool="deterministic-media-marker",
+        runner_or_tool="in-process",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={"offline": True, "network": False, "production_eligible": False},
+    )
+
+    def __init__(self, mode: str = "success") -> None:
+        self.mode = mode
+
+    def execute(
+        self,
+        request: CompositorRequest,
+        *,
+        executor: CompositorExecutor,
+    ) -> CompositorResult:
+        del executor
+        issue = _compositor_request_issue(request)
+        if issue:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, issue)
+        failure_code = {
+            "unsupported": ModuleFailureCode.UNSUPPORTED_CAPABILITY,
+            "failure": ModuleFailureCode.EXECUTION_FAILED,
+            "invalid_output": ModuleFailureCode.INVALID_OUTPUT,
+        }.get(self.mode)
+        if failure_code is not None:
+            return self._failure(request, failure_code, f"mock {self.mode}")
+        temporary_root = Path(tempfile.gettempdir()).resolve()
+        for target in request.output_targets:
+            try:
+                target.resolve().relative_to(temporary_root)
+            except ValueError:
+                return self._failure(
+                    request,
+                    ModuleFailureCode.CONFIGURATION_ERROR,
+                    "mock compositor targets must be inside the system temporary directory",
+                )
+        mock_root = request.output_targets[0].parent / "_mock_compositor"
+        artifacts: list[Mapping[str, Any]] = []
+        for index, requested in enumerate(request.output_targets, start=1):
+            target = mock_root / f"{index:02d}_{requested.name}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(b"story-compositor-mock/v1\n")
+            artifacts.append(
+                {"path": str(target), "sha256": file_sha256(target), "production_eligible": False}
+            )
+        return CompositorResult(
+            True,
+            request.operation,
+            tuple(artifacts),
+            request.attempt_id,
+            "story-mock-compositor/v1",
+            False,
+            usage_events=(
+                ModuleUsageEvent(
+                    "mock", "deterministic-media-marker", request.operation,
+                    unit_type="artifact", quantity=float(len(artifacts)), actual_amount_status="not_applicable",
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _failure(
+        request: CompositorRequest, code: ModuleFailureCode, message: str
+    ) -> CompositorResult:
+        return CompositorResult(
+            False,
+            request.operation,
+            (),
+            request.attempt_id,
+            "story-mock-compositor/v1",
+            False,
+            failure=ModuleFailure(code, message),
+        )
+
+
 class MockProductPackageAdapter:
     """Offline fixture adapter that never writes the requested customer targets."""
 
@@ -841,6 +992,56 @@ def _product_package_result_issue(
         observed.append(path)
     if tuple(observed) != request.output_targets:
         return "product package executor outputs do not match planned targets"
+    return ""
+
+
+def _compositor_request_issue(request: CompositorRequest) -> str:
+    if not request.artifact_id.strip() or not request.operation.strip() or not request.attempt_id.strip():
+        return "compositor execution identity is incomplete"
+    if request.operation not in {"background_story", "presenter_demo", "a_only_background"}:
+        return "compositor operation is unsupported"
+    if not request.input_artifacts or not request.output_targets or not request.execution_binding:
+        return "compositor execution binding is incomplete"
+    if any(not isinstance(target, Path) for target in request.output_targets):
+        return "compositor output targets are invalid"
+    if len(set(request.output_targets)) != len(request.output_targets):
+        return "compositor output targets are duplicated"
+    for artifact in request.input_artifacts:
+        if not isinstance(artifact, Mapping):
+            return "compositor input artifact is invalid"
+        role = str(artifact.get("role") or "")
+        path = Path(str(artifact.get("path") or ""))
+        expected_sha = str(artifact.get("sha256") or "")
+        if not role:
+            return "compositor input role is missing"
+        if not path.is_file():
+            return f"compositor input is missing: {path}"
+        if not _valid_sha256(expected_sha) or file_sha256(path) != expected_sha:
+            return f"compositor input is stale: {path}"
+    return ""
+
+
+def _compositor_result_issue(request: CompositorRequest, result: CompositorResult) -> str:
+    if (
+        result.operation != request.operation
+        or result.attempt_id != request.attempt_id
+        or result.production_eligible is not True
+    ):
+        return "compositor executor result binding mismatch"
+    if len(result.output_artifacts) != len(request.output_targets):
+        return "compositor executor output count mismatch"
+    observed: list[Path] = []
+    for artifact in result.output_artifacts:
+        if not isinstance(artifact, Mapping):
+            return "compositor executor output artifact is invalid"
+        path = Path(str(artifact.get("path") or ""))
+        if artifact.get("production_eligible") is not True:
+            return "compositor executor output is not production eligible"
+        if not path.is_file() or artifact.get("sha256") != file_sha256(path):
+            return f"compositor executor output is missing or stale: {path}"
+        observed.append(path)
+    if tuple(observed) != request.output_targets:
+        return "compositor executor outputs do not match planned targets"
     return ""
 
 
@@ -1160,9 +1361,10 @@ class MockKeyerAdapter(ProductionKeyerAdapter):
 __all__ = [
     "ApprovedStoryContractVisualDesignAdapter", "CodexImageGeneratorAdapter",
     "ExistingStorySemanticsAdapter", "ExistingVideoGeneratorAdapter", "IMAGE_GENERATOR_ADAPTER_VERSION",
-    "KEYER_ADAPTER_VERSION", "LocalProductPackageAdapter", "MUSIC_PROVIDER_ADAPTER_VERSION",
+    "COMPOSITOR_ADAPTER_VERSION", "KEYER_ADAPTER_VERSION", "LocalCompositorAdapter",
+    "LocalProductPackageAdapter", "MUSIC_PROVIDER_ADAPTER_VERSION",
     "MockImageGeneratorAdapter", "MockKeyerAdapter", "MockMusicProviderAdapter",
-    "MockProductPackageAdapter", "MockStorySemanticsAdapter",
+    "MockCompositorAdapter", "MockProductPackageAdapter", "MockStorySemanticsAdapter",
     "MockVideoGeneratorAdapter", "MockVisualDesignAdapter", "ProductionKeyerAdapter",
     "STORY_SEMANTICS_ADAPTER_VERSION", "SunoMusicProviderAdapter", "VIDEO_ADAPTER_VERSION",
     "PRODUCT_PACKAGE_ADAPTER_VERSION", "VIDEO_BATCH_INVOCATION_VERSION", "VISUAL_DESIGN_ADAPTER_VERSION",

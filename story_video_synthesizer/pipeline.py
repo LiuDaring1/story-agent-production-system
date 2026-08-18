@@ -5,6 +5,7 @@ import shutil
 import json
 import os
 import tempfile
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -14,6 +15,15 @@ from .align import LineTiming, align_script_to_narration, read_script_lines, sav
 from .media import ensure_dir, probe_duration, run_command, sorted_video_files
 from .subtitles import SubtitleCue, build_subtitle_cues, write_srt
 from story_semantics import SemanticKind, classify_story, select_line_numbers
+from story_module_ports import (
+    CompositorPort,
+    CompositorRequest,
+    CompositorResult,
+    ModuleFailure,
+    ModuleFailureCode,
+    ModuleUsageEvent,
+)
+from story_module_registry import build_compositor_registry
 
 
 @dataclass(frozen=True)
@@ -57,7 +67,103 @@ class SynthesisResult:
     total_duration: float
 
 
-def synthesize_story(config: SynthesisConfig) -> SynthesisResult:
+def synthesize_story(
+    config: SynthesisConfig,
+    compositor_port: CompositorPort | None = None,
+) -> SynthesisResult:
+    """Run the existing background assembly through the local CompositorPort seam."""
+
+    input_paths: list[tuple[str, Path]] = [
+        (f"video_segment:{index}", path)
+        for index, path in enumerate(sorted_video_files(config.video_dir), start=1)
+    ]
+    input_paths.extend(
+        [
+            ("script", config.script_path),
+            ("narration", config.narration_path),
+            ("music", config.music_path),
+        ]
+    )
+    if config.subtitle_script_path is not None:
+        input_paths.append(("subtitle_script", config.subtitle_script_path))
+    if config.artifact_semantic_plan_path is not None:
+        input_paths.append(("artifact_semantic_plan", config.artifact_semantic_plan_path))
+    output_targets = [
+        config.output_dir / "story_no_subs_bgm.mp4",
+        config.output_dir / "story_subs_bgm.mp4",
+        config.output_dir / "story_sales_subs_bgm.mp4",
+        config.output_dir / "story_demo_voice_bgm.mp4",
+        config.output_dir / "timings.json",
+        config.output_dir / "story_subtitles.srt",
+        config.output_dir / "story_sales_subtitles.srt",
+        config.output_dir / "story_semantic_timeline.srt",
+    ]
+    if config.artifact_semantic_plan_path is not None:
+        output_targets.append(config.output_dir / "artifact_semantic_plan_manifest.json")
+    request = CompositorRequest(
+        artifact_id=f"background-story:{config.output_dir.name}",
+        operation="background_story",
+        input_artifacts=tuple(
+            {"role": role, "path": str(path), "sha256": _file_sha256(path)}
+            for role, path in input_paths
+        ),
+        output_targets=tuple(output_targets),
+        execution_binding={
+            "alignment_mode": config.alignment_mode,
+            "whisper_model": config.whisper_model,
+            "language": config.language,
+            "width": config.width,
+            "height": config.height,
+            "fps": config.fps,
+            "music_volume": config.music_volume,
+            "narration_volume": config.narration_volume,
+            "x264_preset": config.x264_preset,
+            "x264_crf": config.x264_crf,
+            "subtitle_style": config.subtitle_style,
+            "sales_skip_head_lines": config.sales_skip_head_lines,
+            "sales_skip_tail_lines": config.sales_skip_tail_lines,
+            "keep_workdir": config.keep_workdir,
+        },
+        attempt_id="background-story-compositor",
+    )
+    port = compositor_port or build_compositor_registry().compositor()
+    synthesis_result: SynthesisResult | None = None
+
+    def execute_background(execution_request: CompositorRequest) -> CompositorResult:
+        nonlocal synthesis_result
+        try:
+            synthesis_result = _synthesize_story_core(config)
+            artifacts = tuple(
+                {"path": str(path), "sha256": _file_sha256(path), "production_eligible": True}
+                for path in execution_request.output_targets
+            )
+        except Exception as exc:
+            return CompositorResult(
+                False, execution_request.operation, (), execution_request.attempt_id,
+                port.identity.adapter_version, True,
+                failure=ModuleFailure(ModuleFailureCode.EXECUTION_FAILED, str(exc)),
+            )
+        return CompositorResult(
+            True, execution_request.operation, artifacts, execution_request.attempt_id,
+            port.identity.adapter_version, True,
+            usage_events=(
+                ModuleUsageEvent(
+                    "local", "existing-python-ffmpeg-compositor", execution_request.operation,
+                    unit_type="render", quantity=1.0, actual_amount_status="not_applicable",
+                ),
+            ),
+        )
+
+    result = port.execute(request, executor=execute_background)
+    if not result.success:
+        message = result.failure.message if result.failure is not None else "unknown compositor failure"
+        raise RuntimeError(f"背景故事合成失败：{message}")
+    if result.production_eligible is not True or synthesis_result is None:
+        raise RuntimeError("compositor mock 结果不可作为正式背景故事合成")
+    return synthesis_result
+
+
+def _synthesize_story_core(config: SynthesisConfig) -> SynthesisResult:
     # Lazy import avoids the existing story_project -> package -> pipeline
     # import cycle while keeping validation on every required_v1 execution.
     from artifact_semantic_plan import (
@@ -254,6 +360,10 @@ def synthesize_story(config: SynthesisConfig) -> SynthesisResult:
         semantic_plan_manifest=semantic_plan_manifest,
         total_duration=total_duration,
     )
+
+
+def _file_sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
 def _write_json_atomic(path: Path, payload: dict) -> None:

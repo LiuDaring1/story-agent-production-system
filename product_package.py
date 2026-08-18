@@ -9,7 +9,7 @@ import subprocess
 import sys
 import time
 import zipfile
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -39,6 +39,9 @@ from production_keying import (
     person_grade_filter as shared_person_grade_filter,
 )
 from story_module_ports import (
+    CompositorPort,
+    CompositorRequest,
+    CompositorResult,
     ModuleFailure,
     ModuleFailureCode,
     ModuleUsageEvent,
@@ -46,7 +49,7 @@ from story_module_ports import (
     ProductPackageRequest,
     ProductPackageResult,
 )
-from story_module_registry import build_keyer_registry, build_product_package_registry
+from story_module_registry import build_compositor_registry, build_keyer_registry, build_product_package_registry
 from release_geometry import compile_demo_presenter_geometry
 from story_video_synthesizer.image_video import sorted_image_files
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
@@ -1351,6 +1354,105 @@ def render_demo_video(
     logo_y: int = 20,
     background_brightness: float = 1.0,
     presenter_geometry: dict[str, Any] | None = None,
+    compositor_port: CompositorPort | None = None,
+) -> None:
+    input_paths = [
+        ("presenter", person_video),
+        ("background_image", background_image),
+        ("narration", narration),
+        ("music", music),
+        ("subtitles", subtitles),
+    ]
+    if logo_path is not None:
+        input_paths.append(("logo", logo_path))
+    request = CompositorRequest(
+        artifact_id=f"presenter-demo:{output_path.stem}",
+        operation="presenter_demo",
+        input_artifacts=tuple(
+            {"role": role, "path": str(path), "sha256": file_sha256(path)}
+            for role, path in input_paths
+        ),
+        output_targets=(output_path,),
+        execution_binding={
+            "keying_preset": asdict(preset),
+            "width": width,
+            "height": height,
+            "crf": crf,
+            "x264_preset": x264_preset,
+            "music_volume": music_volume,
+            "narration_volume": narration_volume,
+            "crop_bottom_ratio": crop_bottom_ratio,
+            "crop_mode": crop_mode,
+            "vertical_align": vertical_align,
+            "logo_width": logo_width,
+            "logo_x": logo_x,
+            "logo_y": logo_y,
+            "background_brightness": background_brightness,
+            "presenter_geometry": presenter_geometry,
+        },
+        attempt_id="presenter-demo-compositor",
+    )
+    port = compositor_port or build_compositor_registry().compositor()
+
+    def execute_demo(execution_request: CompositorRequest) -> CompositorResult:
+        try:
+            _render_demo_video_core(
+                person_video, background_image, narration, music, subtitles, output_path, preset,
+                width, height, crf, x264_preset, music_volume, narration_volume, crop_bottom_ratio,
+                crop_mode, vertical_align, logo_path, logo_width, logo_x, logo_y,
+                background_brightness, presenter_geometry,
+            )
+            artifacts = (
+                {"path": str(output_path), "sha256": file_sha256(output_path), "production_eligible": True},
+            )
+        except Exception as exc:
+            return CompositorResult(
+                False, execution_request.operation, (), execution_request.attempt_id,
+                port.identity.adapter_version, True,
+                failure=ModuleFailure(ModuleFailureCode.EXECUTION_FAILED, str(exc)),
+            )
+        return CompositorResult(
+            True, execution_request.operation, artifacts, execution_request.attempt_id,
+            port.identity.adapter_version, True,
+            usage_events=(
+                ModuleUsageEvent(
+                    "local", "ffmpeg", execution_request.operation,
+                    unit_type="render", quantity=1.0, actual_amount_status="not_applicable",
+                ),
+            ),
+        )
+
+    result = port.execute(request, executor=execute_demo)
+    if not result.success:
+        message = result.failure.message if result.failure is not None else "unknown compositor failure"
+        raise RuntimeError(f"Demo 合成失败：{message}")
+    if result.production_eligible is not True:
+        raise RuntimeError("compositor mock 结果不可作为正式 Demo")
+
+
+def _render_demo_video_core(
+    person_video: Path,
+    background_image: Path,
+    narration: Path,
+    music: Path,
+    subtitles: Path,
+    output_path: Path,
+    preset: KeyingPreset,
+    width: int,
+    height: int,
+    crf: int,
+    x264_preset: str,
+    music_volume: float,
+    narration_volume: float,
+    crop_bottom_ratio: float,
+    crop_mode: str = "preset",
+    vertical_align: str = "center",
+    logo_path: Path | None = None,
+    logo_width: int = 150,
+    logo_x: int = 24,
+    logo_y: int = 20,
+    background_brightness: float = 1.0,
+    presenter_geometry: dict[str, Any] | None = None,
 ) -> None:
     duration = probe_duration(narration)
     work_dir = output_path.parent / "_demo_work"
@@ -1871,6 +1973,75 @@ def render_background_candidate_sheet(images: list[Path], output_path: Path) -> 
 
 
 def render_a_only_background_video(
+    bg_video: Path,
+    background_image: Path,
+    frame_image: Path,
+    output_path: Path,
+    keying_preset: Path,
+    width: int,
+    height: int,
+    crf: int,
+    x264_preset: str,
+    compositor_port: CompositorPort | None = None,
+) -> None:
+    request = CompositorRequest(
+        artifact_id=f"a-only-background:{output_path.stem}",
+        operation="a_only_background",
+        input_artifacts=tuple(
+            {"role": role, "path": str(path), "sha256": file_sha256(path)}
+            for role, path in (
+                ("background_video", bg_video),
+                ("background_image", background_image),
+                ("story_frame", frame_image),
+                ("keying_preset", keying_preset),
+            )
+        ),
+        output_targets=(output_path,),
+        execution_binding={
+            "width": width,
+            "height": height,
+            "crf": crf,
+            "x264_preset": x264_preset,
+        },
+        attempt_id="a-only-background-compositor",
+    )
+    port = compositor_port or build_compositor_registry().compositor()
+
+    def execute_a_only(execution_request: CompositorRequest) -> CompositorResult:
+        try:
+            _render_a_only_background_video_core(
+                bg_video, background_image, frame_image, output_path, keying_preset,
+                width, height, crf, x264_preset,
+            )
+            artifacts = (
+                {"path": str(output_path), "sha256": file_sha256(output_path), "production_eligible": True},
+            )
+        except Exception as exc:
+            return CompositorResult(
+                False, execution_request.operation, (), execution_request.attempt_id,
+                port.identity.adapter_version, True,
+                failure=ModuleFailure(ModuleFailureCode.EXECUTION_FAILED, str(exc)),
+            )
+        return CompositorResult(
+            True, execution_request.operation, artifacts, execution_request.attempt_id,
+            port.identity.adapter_version, True,
+            usage_events=(
+                ModuleUsageEvent(
+                    "local", "ffmpeg", execution_request.operation,
+                    unit_type="render", quantity=1.0, actual_amount_status="not_applicable",
+                ),
+            ),
+        )
+
+    result = port.execute(request, executor=execute_a_only)
+    if not result.success:
+        message = result.failure.message if result.failure is not None else "unknown compositor failure"
+        raise RuntimeError(f"A 镜无人物背景视频合成失败：{message}")
+    if result.production_eligible is not True:
+        raise RuntimeError("compositor mock 结果不可作为正式 A 镜无人物背景视频")
+
+
+def _render_a_only_background_video_core(
     bg_video: Path,
     background_image: Path,
     frame_image: Path,

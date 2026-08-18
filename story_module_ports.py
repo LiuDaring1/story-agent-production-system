@@ -14,6 +14,7 @@ VISUAL_DESIGN_PORT_VERSION = "story-visual-design-port/v1"
 IMAGE_GENERATOR_PORT_VERSION = "story-image-generator-port/v1"
 MUSIC_PROVIDER_PORT_VERSION = "story-music-provider-port/v1"
 PRODUCT_PACKAGE_PORT_VERSION = "story-product-package-port/v1"
+COMPOSITOR_PORT_VERSION = "story-compositor-port/v1"
 STORY_SEMANTICS_COMPILER_VERSION = "story-semantics-classifier/v1"
 STORY_SEMANTIC_KINDS = frozenset(
     {"title", "host_intro", "story_announcement", "story_body", "moral", "outro"}
@@ -275,6 +276,33 @@ class ProductPackageResult:
 ProductPackageExecutor = Callable[[ProductPackageRequest], ProductPackageResult]
 
 
+@dataclass(frozen=True)
+class CompositorRequest:
+    """One caller-resolved local compositor invocation."""
+
+    artifact_id: str
+    operation: str
+    input_artifacts: tuple[Mapping[str, Any], ...]
+    output_targets: tuple[Path, ...]
+    execution_binding: Mapping[str, Any]
+    attempt_id: str
+
+
+@dataclass(frozen=True)
+class CompositorResult:
+    success: bool
+    operation: str
+    output_artifacts: tuple[Mapping[str, Any], ...]
+    attempt_id: str
+    adapter_version: str
+    production_eligible: bool
+    usage_events: tuple[ModuleUsageEvent, ...] = ()
+    failure: ModuleFailure | None = None
+
+
+CompositorExecutor = Callable[[CompositorRequest], CompositorResult]
+
+
 @runtime_checkable
 class VideoGeneratorPort(Protocol):
     identity: ModuleIdentity
@@ -365,6 +393,19 @@ class ProductPackagePort(Protocol):
         *,
         executor: ProductPackageExecutor,
     ) -> ProductPackageResult: ...
+
+
+@runtime_checkable
+class CompositorPort(Protocol):
+    identity: ModuleIdentity
+    capabilities: ModuleCapabilities
+
+    def execute(
+        self,
+        request: CompositorRequest,
+        *,
+        executor: CompositorExecutor,
+    ) -> CompositorResult: ...
 
 
 def module_payload(kind: str, value: Any) -> dict[str, Any]:
@@ -490,6 +531,10 @@ def music_provider_payload(kind: str, value: Any) -> dict[str, Any]:
 
 def product_package_payload(kind: str, value: Any) -> dict[str, Any]:
     return _versioned_payload(PRODUCT_PACKAGE_PORT_VERSION, kind, value)
+
+
+def compositor_payload(kind: str, value: Any) -> dict[str, Any]:
+    return _versioned_payload(COMPOSITOR_PORT_VERSION, kind, value)
 
 
 def validate_story_semantics_payload(payload: Mapping[str, Any]) -> list[str]:
@@ -642,6 +687,60 @@ def validate_product_package_payload(payload: Mapping[str, Any]) -> list[str]:
     return issues
 
 
+def validate_compositor_payload(payload: Mapping[str, Any]) -> list[str]:
+    issues = _validate_front_half_payload(
+        payload,
+        schema_version=COMPOSITOR_PORT_VERSION,
+        required_by_kind={
+            "compositor_request": (
+                "artifact_id", "operation", "input_artifacts", "output_targets",
+                "execution_binding", "attempt_id",
+            ),
+            "compositor_result": (
+                "success", "operation", "output_artifacts", "attempt_id", "adapter_version",
+                "production_eligible", "usage_events", "failure",
+            ),
+        },
+        string_fields={
+            "compositor_request": ("artifact_id", "operation", "attempt_id"),
+            "compositor_result": ("operation", "attempt_id", "adapter_version"),
+        },
+        array_fields={
+            "compositor_request": ("input_artifacts", "output_targets"),
+            "compositor_result": ("output_artifacts", "usage_events"),
+        },
+        array_item_types={
+            "compositor_request": {"input_artifacts": Mapping, "output_targets": str},
+            "compositor_result": {"output_artifacts": Mapping, "usage_events": Mapping},
+        },
+        object_fields={"compositor_request": ("execution_binding",)},
+        object_array_value_fields={},
+        boolean_fields={"compositor_result": ("success", "production_eligible")},
+        nullable_object_fields={"compositor_result": ("failure",)},
+    )
+    kind = payload.get("kind")
+    field_name = "input_artifacts" if kind == "compositor_request" else "output_artifacts"
+    required = (
+        ("role", "path", "sha256")
+        if kind == "compositor_request"
+        else ("path", "sha256", "production_eligible")
+    )
+    artifacts = payload.get(field_name)
+    if isinstance(artifacts, list):
+        for index, artifact in enumerate(artifacts):
+            if not isinstance(artifact, Mapping):
+                continue
+            for name in required:
+                if name not in artifact:
+                    issues.append(f"missing:{field_name}[{index}].{name}")
+                elif name == "production_eligible":
+                    if type(artifact[name]) is not bool:
+                        issues.append(f"type:{field_name}[{index}].{name}")
+                elif not isinstance(artifact[name], str):
+                    issues.append(f"type:{field_name}[{index}].{name}")
+    return issues
+
+
 def _validate_external_execution_payload(
     payload: Mapping[str, Any],
     *,
@@ -764,10 +863,11 @@ def _json_value(value: Any) -> Any:
 
 
 __all__ = [
-    "IMAGE_GENERATOR_PORT_VERSION", "KEYER_PORT_VERSION", "MODULE_PORT_SCHEMA_VERSION",
+    "COMPOSITOR_PORT_VERSION", "IMAGE_GENERATOR_PORT_VERSION", "KEYER_PORT_VERSION", "MODULE_PORT_SCHEMA_VERSION",
     "MUSIC_PROVIDER_PORT_VERSION", "PRODUCT_PACKAGE_PORT_VERSION", "STORY_SEMANTICS_COMPILER_VERSION",
     "STORY_SEMANTIC_KINDS",
     "STORY_SEMANTICS_PORT_VERSION", "VIDEO_GENERATOR_PORT_VERSION", "VISUAL_DESIGN_PORT_VERSION",
+    "CompositorExecutor", "CompositorPort", "CompositorRequest", "CompositorResult",
     "ImageGeneratorExecutor", "ImageGeneratorPort", "ImageGeneratorRequest", "ImageGeneratorResult",
     "KeyerPort", "KeyerRequest", "KeyerResult", "ModuleCapabilities", "ModuleFailure",
     "ModuleFailureCode", "ModuleIdentity", "ModuleUsageEvent", "MusicProviderExecutor",
@@ -775,9 +875,9 @@ __all__ = [
     "ProductPackagePort", "ProductPackageRequest", "ProductPackageResult", "StorySemanticsPort",
     "StorySemanticsRequest", "StorySemanticsResult", "VideoGeneratorPort", "VideoGeneratorRequest",
     "VideoGeneratorResult", "VisualDesignPort", "VisualDesignRequest", "VisualDesignResult",
-    "image_generator_payload", "module_payload", "music_provider_payload", "product_package_payload",
+    "compositor_payload", "image_generator_payload", "module_payload", "music_provider_payload", "product_package_payload",
     "story_semantics_payload",
     "validate_image_generator_payload", "validate_module_payload", "validate_music_provider_payload",
-    "validate_product_package_payload", "validate_story_semantics_payload", "validate_visual_design_payload",
+    "validate_compositor_payload", "validate_product_package_payload", "validate_story_semantics_payload", "validate_visual_design_payload",
     "visual_design_payload",
 ]

@@ -25,6 +25,7 @@ from story_module_ports import (
     KEYER_PORT_VERSION,
     MUSIC_PROVIDER_PORT_VERSION,
     PRODUCT_PACKAGE_PORT_VERSION,
+    PUBLISH_ASSET_PORT_VERSION,
     RELEASE_LAYOUT_PORT_VERSION,
     STORY_SEMANTICS_COMPILER_VERSION,
     STORY_SEMANTICS_PORT_VERSION,
@@ -50,6 +51,9 @@ from story_module_ports import (
     ProductPackageExecutor,
     ProductPackageRequest,
     ProductPackageResult,
+    PublishAssetExecutor,
+    PublishAssetRequest,
+    PublishAssetResult,
     ReleaseLayoutExecutor,
     ReleaseLayoutRequest,
     ReleaseLayoutResult,
@@ -75,6 +79,7 @@ MUSIC_PROVIDER_ADAPTER_VERSION = "story-suno-browser-adapter/v1"
 PRODUCT_PACKAGE_ADAPTER_VERSION = "story-local-product-package-adapter/v1"
 COMPOSITOR_ADAPTER_VERSION = "story-local-ffmpeg-compositor-adapter/v1"
 RELEASE_LAYOUT_ADAPTER_VERSION = "story-local-release-layout-adapter/v1"
+PUBLISH_ASSET_ADAPTER_VERSION = "story-local-publish-asset-adapter/v1"
 
 
 def file_sha256(path: Path) -> str:
@@ -969,6 +974,140 @@ class MockReleaseLayoutAdapter:
         )
 
 
+class LocalPublishAssetAdapter:
+    """Thin adapter around caller-owned deterministic publish asset execution."""
+
+    identity = ModuleIdentity(
+        "publish_asset", PUBLISH_ASSET_PORT_VERSION, "local-publish-asset",
+        PUBLISH_ASSET_ADAPTER_VERSION,
+    )
+    capabilities = ModuleCapabilities(
+        provider="local",
+        model_or_tool="existing-publish-ffmpeg-pillow-execution",
+        runner_or_tool="in-process-or-local-subprocess",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={
+            "reference_frames": True,
+            "reference_contact_sheet": True,
+            "final_cover_render": True,
+            "owns_image_provider": False,
+            "owns_product_policy": False,
+            "owns_lineage": False,
+            "owns_manifest": False,
+            "owns_quality_policy": False,
+            "owns_currentness": False,
+        },
+    )
+
+    def execute(
+        self,
+        request: PublishAssetRequest,
+        *,
+        executor: PublishAssetExecutor,
+    ) -> PublishAssetResult:
+        issue = _publish_asset_request_issue(request)
+        if issue:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, issue)
+        try:
+            result = executor(request)
+        except Exception as exc:
+            return self._failure(request, ModuleFailureCode.EXECUTION_FAILED, str(exc))
+        if result.success:
+            issue = _publish_asset_result_issue(request, result)
+            if issue:
+                return self._failure(request, ModuleFailureCode.INVALID_OUTPUT, issue)
+        return result
+
+    @staticmethod
+    def _failure(
+        request: PublishAssetRequest, code: ModuleFailureCode, message: str
+    ) -> PublishAssetResult:
+        return PublishAssetResult(
+            False, request.operation, (), request.attempt_id,
+            "local-publish-asset", PUBLISH_ASSET_ADAPTER_VERSION, True,
+            failure=ModuleFailure(code, message),
+        )
+
+
+class MockPublishAssetAdapter:
+    """Offline mock that never calls FFmpeg, Pillow, Codex, or ImageGen executors."""
+
+    identity = ModuleIdentity(
+        "publish_asset", PUBLISH_ASSET_PORT_VERSION, "mock-publish-asset",
+        "story-mock-publish-asset/v1",
+    )
+    capabilities = ModuleCapabilities(
+        provider="mock",
+        model_or_tool="deterministic-publish-marker",
+        runner_or_tool="in-process",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={"offline": True, "network": False, "production_eligible": False},
+    )
+
+    def __init__(self, mode: str = "success") -> None:
+        self.mode = mode
+
+    def execute(
+        self,
+        request: PublishAssetRequest,
+        *,
+        executor: PublishAssetExecutor,
+    ) -> PublishAssetResult:
+        del executor
+        issue = _publish_asset_request_issue(request)
+        if issue:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, issue)
+        failure_code = {
+            "unsupported": ModuleFailureCode.UNSUPPORTED_CAPABILITY,
+            "failure": ModuleFailureCode.EXECUTION_FAILED,
+            "invalid_output": ModuleFailureCode.INVALID_OUTPUT,
+        }.get(self.mode)
+        if failure_code is not None:
+            return self._failure(request, failure_code, f"mock {self.mode}")
+        temp_root = Path(tempfile.gettempdir()).resolve()
+        for target in request.output_targets:
+            try:
+                target.resolve().relative_to(temp_root)
+            except ValueError:
+                return self._failure(
+                    request, ModuleFailureCode.CONFIGURATION_ERROR,
+                    "mock publish asset target must be inside the system temporary directory",
+                )
+        artifacts: list[Mapping[str, Any]] = []
+        for target in request.output_targets:
+            marker = target.parent / "_mock_publish_asset" / target.name
+            marker.parent.mkdir(parents=True, exist_ok=True)
+            marker.write_bytes(b"story-publish-asset-mock/v1\n")
+            artifacts.append({
+                "path": str(marker),
+                "sha256": file_sha256(marker),
+                "production_eligible": False,
+            })
+        return PublishAssetResult(
+            True, request.operation, tuple(artifacts), request.attempt_id,
+            "mock-publish-asset", "story-mock-publish-asset/v1", False,
+            usage_events=(ModuleUsageEvent(
+                "mock", "deterministic-publish-marker", request.operation,
+                unit_type="artifact", quantity=float(len(artifacts)),
+                actual_amount_status="not_applicable",
+            ),),
+        )
+
+    @staticmethod
+    def _failure(
+        request: PublishAssetRequest, code: ModuleFailureCode, message: str
+    ) -> PublishAssetResult:
+        return PublishAssetResult(
+            False, request.operation, (), request.attempt_id,
+            "mock-publish-asset", "story-mock-publish-asset/v1", False,
+            failure=ModuleFailure(code, message),
+        )
+
+
 class MockProductPackageAdapter:
     """Offline fixture adapter that never writes the requested customer targets."""
 
@@ -1226,6 +1365,54 @@ def _release_layout_result_issue(
         return "release layout executor output does not match planned target"
     if not path.is_file() or artifact.get("sha256") != file_sha256(path):
         return f"release layout executor output is missing or stale: {path}"
+    return ""
+
+
+def _publish_asset_request_issue(request: PublishAssetRequest) -> str:
+    if not request.artifact_id.strip() or not request.operation.strip() or not request.attempt_id.strip():
+        return "publish asset execution identity is incomplete"
+    if request.operation not in {"reference_frames", "reference_contact_sheet", "final_cover_render"}:
+        return "publish asset operation is unsupported"
+    if not request.input_artifacts or not request.execution_binding or not request.output_targets:
+        return "publish asset execution binding is incomplete"
+    if any(not isinstance(target, Path) for target in request.output_targets):
+        return "publish asset output target is invalid"
+    for artifact in request.input_artifacts:
+        if not isinstance(artifact, Mapping):
+            return "publish asset input artifact is invalid"
+        role = str(artifact.get("role") or "")
+        path = Path(str(artifact.get("path") or ""))
+        expected_sha = str(artifact.get("sha256") or "")
+        if not role:
+            return "publish asset input role is missing"
+        if not path.is_file():
+            return f"publish asset input is missing: {path}"
+        if not _valid_sha256(expected_sha) or file_sha256(path) != expected_sha:
+            return f"publish asset input is stale: {path}"
+    return ""
+
+
+def _publish_asset_result_issue(
+    request: PublishAssetRequest, result: PublishAssetResult
+) -> str:
+    if (
+        result.operation != request.operation
+        or result.attempt_id != request.attempt_id
+        or result.production_eligible is not True
+    ):
+        return "publish asset executor result binding mismatch"
+    if len(result.output_artifacts) != len(request.output_targets):
+        return "publish asset executor output count mismatch"
+    observed: list[Path] = []
+    for artifact in result.output_artifacts:
+        if not isinstance(artifact, Mapping) or artifact.get("production_eligible") is not True:
+            return "publish asset executor output artifact is invalid"
+        path = Path(str(artifact.get("path") or ""))
+        if not path.is_file() or artifact.get("sha256") != file_sha256(path):
+            return f"publish asset executor output is missing or stale: {path}"
+        observed.append(path)
+    if tuple(observed) != request.output_targets:
+        return "publish asset executor outputs do not match planned targets"
     return ""
 
 
@@ -1546,11 +1733,11 @@ __all__ = [
     "ApprovedStoryContractVisualDesignAdapter", "CodexImageGeneratorAdapter",
     "ExistingStorySemanticsAdapter", "ExistingVideoGeneratorAdapter", "IMAGE_GENERATOR_ADAPTER_VERSION",
     "COMPOSITOR_ADAPTER_VERSION", "KEYER_ADAPTER_VERSION", "LocalCompositorAdapter",
-    "LocalProductPackageAdapter", "LocalReleaseLayoutAdapter", "MUSIC_PROVIDER_ADAPTER_VERSION",
+    "LocalProductPackageAdapter", "LocalPublishAssetAdapter", "LocalReleaseLayoutAdapter", "MUSIC_PROVIDER_ADAPTER_VERSION",
     "MockImageGeneratorAdapter", "MockKeyerAdapter", "MockMusicProviderAdapter",
-    "MockCompositorAdapter", "MockProductPackageAdapter", "MockReleaseLayoutAdapter", "MockStorySemanticsAdapter",
+    "MockCompositorAdapter", "MockProductPackageAdapter", "MockPublishAssetAdapter", "MockReleaseLayoutAdapter", "MockStorySemanticsAdapter",
     "MockVideoGeneratorAdapter", "MockVisualDesignAdapter", "ProductionKeyerAdapter",
     "STORY_SEMANTICS_ADAPTER_VERSION", "SunoMusicProviderAdapter", "VIDEO_ADAPTER_VERSION",
-    "PRODUCT_PACKAGE_ADAPTER_VERSION", "RELEASE_LAYOUT_ADAPTER_VERSION",
+    "PRODUCT_PACKAGE_ADAPTER_VERSION", "PUBLISH_ASSET_ADAPTER_VERSION", "RELEASE_LAYOUT_ADAPTER_VERSION",
     "VIDEO_BATCH_INVOCATION_VERSION", "VISUAL_DESIGN_ADAPTER_VERSION",
 ]

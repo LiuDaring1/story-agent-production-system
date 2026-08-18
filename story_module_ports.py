@@ -16,6 +16,7 @@ MUSIC_PROVIDER_PORT_VERSION = "story-music-provider-port/v1"
 PRODUCT_PACKAGE_PORT_VERSION = "story-product-package-port/v1"
 COMPOSITOR_PORT_VERSION = "story-compositor-port/v1"
 RELEASE_LAYOUT_PORT_VERSION = "story-release-layout-port/v1"
+PUBLISH_ASSET_PORT_VERSION = "story-publish-asset-port/v1"
 STORY_SEMANTICS_COMPILER_VERSION = "story-semantics-classifier/v1"
 STORY_SEMANTIC_KINDS = frozenset(
     {"title", "host_intro", "story_announcement", "story_body", "moral", "outro"}
@@ -332,6 +333,34 @@ class ReleaseLayoutResult:
 ReleaseLayoutExecutor = Callable[[ReleaseLayoutRequest], ReleaseLayoutResult]
 
 
+@dataclass(frozen=True)
+class PublishAssetRequest:
+    """One caller-resolved deterministic local publish asset invocation."""
+
+    artifact_id: str
+    operation: str
+    input_artifacts: tuple[Mapping[str, Any], ...]
+    execution_binding: Mapping[str, Any]
+    output_targets: tuple[Path, ...]
+    attempt_id: str
+
+
+@dataclass(frozen=True)
+class PublishAssetResult:
+    success: bool
+    operation: str
+    output_artifacts: tuple[Mapping[str, Any], ...]
+    attempt_id: str
+    adapter_name: str
+    adapter_version: str
+    production_eligible: bool
+    usage_events: tuple[ModuleUsageEvent, ...] = ()
+    failure: ModuleFailure | None = None
+
+
+PublishAssetExecutor = Callable[[PublishAssetRequest], PublishAssetResult]
+
+
 @runtime_checkable
 class VideoGeneratorPort(Protocol):
     identity: ModuleIdentity
@@ -448,6 +477,19 @@ class ReleaseLayoutPort(Protocol):
         *,
         executor: ReleaseLayoutExecutor,
     ) -> ReleaseLayoutResult: ...
+
+
+@runtime_checkable
+class PublishAssetPort(Protocol):
+    identity: ModuleIdentity
+    capabilities: ModuleCapabilities
+
+    def execute(
+        self,
+        request: PublishAssetRequest,
+        *,
+        executor: PublishAssetExecutor,
+    ) -> PublishAssetResult: ...
 
 
 def module_payload(kind: str, value: Any) -> dict[str, Any]:
@@ -581,6 +623,10 @@ def compositor_payload(kind: str, value: Any) -> dict[str, Any]:
 
 def release_layout_payload(kind: str, value: Any) -> dict[str, Any]:
     return _versioned_payload(RELEASE_LAYOUT_PORT_VERSION, kind, value)
+
+
+def publish_asset_payload(kind: str, value: Any) -> dict[str, Any]:
+    return _versioned_payload(PUBLISH_ASSET_PORT_VERSION, kind, value)
 
 
 def validate_story_semantics_payload(payload: Mapping[str, Any]) -> list[str]:
@@ -844,6 +890,60 @@ def validate_release_layout_payload(payload: Mapping[str, Any]) -> list[str]:
     return issues
 
 
+def validate_publish_asset_payload(payload: Mapping[str, Any]) -> list[str]:
+    issues = _validate_front_half_payload(
+        payload,
+        schema_version=PUBLISH_ASSET_PORT_VERSION,
+        required_by_kind={
+            "publish_asset_request": (
+                "artifact_id", "operation", "input_artifacts", "execution_binding",
+                "output_targets", "attempt_id",
+            ),
+            "publish_asset_result": (
+                "success", "operation", "output_artifacts", "attempt_id", "adapter_name",
+                "adapter_version", "production_eligible", "usage_events", "failure",
+            ),
+        },
+        string_fields={
+            "publish_asset_request": ("artifact_id", "operation", "attempt_id"),
+            "publish_asset_result": ("operation", "attempt_id", "adapter_name", "adapter_version"),
+        },
+        array_fields={
+            "publish_asset_request": ("input_artifacts", "output_targets"),
+            "publish_asset_result": ("output_artifacts", "usage_events"),
+        },
+        array_item_types={
+            "publish_asset_request": {"input_artifacts": Mapping, "output_targets": str},
+            "publish_asset_result": {"output_artifacts": Mapping, "usage_events": Mapping},
+        },
+        object_fields={"publish_asset_request": ("execution_binding",)},
+        object_array_value_fields={},
+        boolean_fields={"publish_asset_result": ("success", "production_eligible")},
+        nullable_object_fields={"publish_asset_result": ("failure",)},
+    )
+    kind = payload.get("kind")
+    field_name = "input_artifacts" if kind == "publish_asset_request" else "output_artifacts"
+    required = (
+        ("role", "path", "sha256")
+        if kind == "publish_asset_request"
+        else ("path", "sha256", "production_eligible")
+    )
+    artifacts = payload.get(field_name)
+    if isinstance(artifacts, list):
+        for index, artifact in enumerate(artifacts):
+            if not isinstance(artifact, Mapping):
+                continue
+            for name in required:
+                if name not in artifact:
+                    issues.append(f"missing:{field_name}[{index}].{name}")
+                elif name == "production_eligible":
+                    if type(artifact[name]) is not bool:
+                        issues.append(f"type:{field_name}[{index}].{name}")
+                elif not isinstance(artifact[name], str):
+                    issues.append(f"type:{field_name}[{index}].{name}")
+    return issues
+
+
 def _validate_external_execution_payload(
     payload: Mapping[str, Any],
     *,
@@ -967,7 +1067,7 @@ def _json_value(value: Any) -> Any:
 
 __all__ = [
     "COMPOSITOR_PORT_VERSION", "IMAGE_GENERATOR_PORT_VERSION", "KEYER_PORT_VERSION", "MODULE_PORT_SCHEMA_VERSION",
-    "RELEASE_LAYOUT_PORT_VERSION",
+    "PUBLISH_ASSET_PORT_VERSION", "RELEASE_LAYOUT_PORT_VERSION",
     "MUSIC_PROVIDER_PORT_VERSION", "PRODUCT_PACKAGE_PORT_VERSION", "STORY_SEMANTICS_COMPILER_VERSION",
     "STORY_SEMANTIC_KINDS",
     "STORY_SEMANTICS_PORT_VERSION", "VIDEO_GENERATOR_PORT_VERSION", "VISUAL_DESIGN_PORT_VERSION",
@@ -977,14 +1077,15 @@ __all__ = [
     "ModuleFailureCode", "ModuleIdentity", "ModuleUsageEvent", "MusicProviderExecutor",
     "MusicProviderPort", "MusicProviderRequest", "MusicProviderResult", "ProductPackageExecutor",
     "ProductPackagePort", "ProductPackageRequest", "ProductPackageResult", "StorySemanticsPort",
+    "PublishAssetExecutor", "PublishAssetPort", "PublishAssetRequest", "PublishAssetResult",
     "ReleaseLayoutExecutor", "ReleaseLayoutPort", "ReleaseLayoutRequest", "ReleaseLayoutResult",
     "StorySemanticsRequest", "StorySemanticsResult", "VideoGeneratorPort", "VideoGeneratorRequest",
     "VideoGeneratorResult", "VisualDesignPort", "VisualDesignRequest", "VisualDesignResult",
     "compositor_payload", "image_generator_payload", "module_payload", "music_provider_payload", "product_package_payload",
-    "release_layout_payload",
+    "publish_asset_payload", "release_layout_payload",
     "story_semantics_payload",
     "validate_image_generator_payload", "validate_module_payload", "validate_music_provider_payload",
-    "validate_compositor_payload", "validate_product_package_payload", "validate_release_layout_payload",
+    "validate_compositor_payload", "validate_product_package_payload", "validate_publish_asset_payload", "validate_release_layout_payload",
     "validate_story_semantics_payload", "validate_visual_design_payload",
     "visual_design_payload",
 ]

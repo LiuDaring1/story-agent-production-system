@@ -17,6 +17,16 @@ from typing import Any, Mapping
 
 from PIL import Image, ImageDraw, ImageFont
 
+from story_module_ports import (
+    ModuleFailure,
+    ModuleFailureCode,
+    ModuleUsageEvent,
+    PublishAssetPort,
+    PublishAssetRequest,
+    PublishAssetResult,
+)
+from story_module_registry import build_publish_asset_registry
+
 
 COVER_RENDER_VERSION = "cover-render-v1"
 RATIO_NAMES = {"3x4": "3:4", "4x3": "4:3", "16x9": "16:9"}
@@ -263,12 +273,144 @@ def _brand_projection_sha256(compiled: Mapping[str, Any]) -> str:
     })
 
 
+def _execute_publish_asset(
+    port: PublishAssetPort,
+    *,
+    artifact_id: str,
+    input_artifacts: tuple[dict[str, str], ...],
+    execution_binding: Mapping[str, Any],
+    output_target: Path,
+    attempt_id: str,
+    executor,
+) -> None:
+    request = PublishAssetRequest(
+        artifact_id=artifact_id,
+        operation="final_cover_render",
+        input_artifacts=input_artifacts,
+        execution_binding=execution_binding,
+        output_targets=(output_target,),
+        attempt_id=attempt_id,
+    )
+    execution_error: Exception | None = None
+
+    def execute_local(actual: PublishAssetRequest) -> PublishAssetResult:
+        nonlocal execution_error
+        try:
+            executor()
+            artifact = {
+                "path": str(output_target),
+                "sha256": file_sha256(output_target),
+                "production_eligible": True,
+            }
+        except Exception as exc:
+            execution_error = exc
+            return PublishAssetResult(
+                False, actual.operation, (), actual.attempt_id,
+                port.identity.adapter_name, port.identity.adapter_version, True,
+                failure=ModuleFailure(ModuleFailureCode.EXECUTION_FAILED, str(exc)),
+            )
+        return PublishAssetResult(
+            True, actual.operation, (artifact,), actual.attempt_id,
+            port.identity.adapter_name, port.identity.adapter_version, True,
+            usage_events=(ModuleUsageEvent(
+                "local", "existing-publish-pillow-finalizer", actual.operation,
+                unit_type="cover", quantity=1.0, actual_amount_status="not_applicable",
+            ),),
+        )
+
+    result = port.execute(request, executor=execute_local)
+    if not result.success:
+        if execution_error is not None:
+            raise execution_error
+        message = result.failure.message if result.failure is not None else "unknown publish asset failure"
+        raise RuntimeError(f"发布封面定版失败：{message}")
+    if result.production_eligible is not True:
+        raise RuntimeError("publish asset mock 结果不可作为正式发布产物")
+
+
+def _render_final_cover_execution(
+    *,
+    base_path: Path,
+    output_path: Path,
+    ratio_name: str,
+    asset_id: str,
+    variant: Mapping[str, Any],
+    title: str,
+    secondary: str,
+    usage: str,
+    logo: Image.Image,
+) -> dict[str, Any]:
+    with Image.open(base_path) as source:
+        canvas = source.convert("RGBA")
+    if abs(canvas.width / max(1, canvas.height) - RATIO_VALUES[ratio_name]) > 0.015:
+        raise ValueError(f"封面创意底图比例错误：{base_path.name}")
+    regions = {
+        str(item.get("role")): item
+        for item in variant.get("regions", [])
+        if isinstance(item, Mapping) and item.get("role")
+    }
+    if not (regions.get("title_safe") or regions.get("title")):
+        raise ValueError(f"封面合同 {ratio_name} 缺少标题安全区")
+    if not (regions.get("logo") or regions.get("brand_logo")):
+        raise ValueError(f"封面合同 {ratio_name} 缺少官方 Logo 安全区")
+    title_safe = _pixel_box(regions.get("title_safe") or regions.get("title"), canvas.width, canvas.height, (.16, .08, .68, .24))
+    secondary_safe = _pixel_box(regions.get("secondary_info") or regions.get("metadata"), canvas.width, canvas.height, (.20, .32, .60, .09))
+    logo_safe = _pixel_box(regions.get("logo") or regions.get("brand_logo"), canvas.width, canvas.height, (.38, .015, .24, .07))
+    usage_safe = _pixel_box(regions.get("usage_info") or regions.get("footer"), canvas.width, canvas.height, (.08, .88, .84, .08))
+    person_safe = _pixel_box(regions.get("person") or regions.get("host"), canvas.width, canvas.height, (0, 0, 0, 0)) if (regions.get("person") or regions.get("host")) else None
+    story_safe = _pixel_box(regions.get("story_character") or regions.get("story_media"), canvas.width, canvas.height, (0, 0, 0, 0)) if (regions.get("story_character") or regions.get("story_media")) else None
+    for label, box in (("title", title_safe), ("secondary", secondary_safe), ("logo", logo_safe), ("usage", usage_safe)):
+        if not _contains([0, 0, canvas.width, canvas.height], box):
+            raise ValueError(f"封面 {asset_id} 的 {label} 安全区越界")
+    if any(_overlap(title_safe, protected) for protected in (person_safe, story_safe) if protected):
+        raise ValueError(f"封面 {asset_id} 的标题安全区与受保护主体区域冲突")
+
+    draw = ImageDraw.Draw(canvas)
+    title_font, title_lines, _ = _fit_text(draw, title, title_safe, max_lines=2)
+    title_bbox = _draw_centered_lines(draw, title_lines, title_font, title_safe, fill=(255, 246, 214), stroke_fill=(142, 65, 16))
+    secondary_bbox = None
+    if secondary:
+        secondary_font, secondary_lines, _ = _fit_text(draw, secondary, secondary_safe, max_lines=1)
+        secondary_bbox = _draw_centered_lines(draw, secondary_lines, secondary_font, secondary_safe, fill=(255, 255, 255), stroke_fill=(91, 74, 34))
+    usage_font, usage_lines, _ = _fit_text(draw, usage, usage_safe, max_lines=1)
+    usage_bbox = _draw_centered_lines(draw, usage_lines, usage_font, usage_safe, fill=(255, 255, 255), stroke_fill=(70, 93, 31))
+    logo_scale = min(logo_safe[2] / logo.width, logo_safe[3] / logo.height)
+    rendered_logo = logo.resize((max(1, round(logo.width * logo_scale)), max(1, round(logo.height * logo_scale))), Image.Resampling.LANCZOS)
+    logo_x = logo_safe[0] + (logo_safe[2] - rendered_logo.width) // 2
+    logo_y = logo_safe[1] + (logo_safe[3] - rendered_logo.height) // 2
+    logo_bbox = [logo_x, logo_y, rendered_logo.width, rendered_logo.height]
+    occupied = [title_bbox, secondary_bbox, usage_bbox, logo_bbox]
+    if any(_overlap(left, right) for index, left in enumerate(occupied) if left for right in occupied[index + 1:] if right):
+        raise ValueError(f"封面 {asset_id} 的确定性文字或 Logo 发生碰撞")
+    if any(_overlap(item, protected) for item in occupied if item for protected in (person_safe, story_safe) if protected):
+        raise ValueError(f"封面 {asset_id} 的确定性信息与受保护主体区域冲突")
+    canvas.alpha_composite(rendered_logo, (logo_x, logo_y))
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = output_path.with_name(f".{output_path.name}.tmp.png")
+    canvas.convert("RGB").save(temporary, format="PNG", optimize=True)
+    os.replace(temporary, output_path)
+    return {
+        "canvas": [canvas.width, canvas.height],
+        "title_bbox": title_bbox,
+        "title_safe": title_safe,
+        "secondary_bbox": secondary_bbox,
+        "secondary_safe": secondary_safe,
+        "usage_bbox": usage_bbox,
+        "usage_safe": usage_safe,
+        "logo_bbox": logo_bbox,
+        "logo_safe": logo_safe,
+        "person_safe": person_safe,
+        "story_safe": story_safe,
+    }
+
+
 def render_required_covers(
     publish_dir: Path,
     *,
     compiled_spec: Mapping[str, Any],
     logo_path: Path,
     story: Mapping[str, Any],
+    publish_asset_port: PublishAssetPort | None = None,
 ) -> tuple[Path, Path, Path]:
     """Render six final covers and deterministic receipts from creative bases."""
     creative_lineage_path = publish_dir / "cover_creative_lineage.json"
@@ -304,6 +446,7 @@ def render_required_covers(
         if bbox is None:
             raise ValueError("官方 Logo 全透明")
         logo = logo.crop(bbox)
+    port = publish_asset_port or build_publish_asset_registry().publish_asset()
 
     render_records: dict[str, Any] = {}
     lineage_entries: list[dict[str, Any]] = []
@@ -314,58 +457,62 @@ def render_required_covers(
         output_path = publish_dir / cover_relative(account, ratio)
         if not base_path.is_file():
             raise FileNotFoundError(f"required_v1 封面缺少无字创意底图：{base_path}")
-        with Image.open(base_path) as source:
-            canvas = source.convert("RGBA")
-        if abs(canvas.width / max(1, canvas.height) - RATIO_VALUES[ratio_name]) > 0.015:
-            raise ValueError(f"封面创意底图比例错误：{base_path.name}")
         variant = _variant(compiled_spec, ratio_name)
-        regions = {str(item.get("role")): item for item in variant.get("regions", []) if isinstance(item, Mapping) and item.get("role")}
-        if not (regions.get("title_safe") or regions.get("title")):
-            raise ValueError(f"封面合同 {ratio_name} 缺少标题安全区")
-        if not (regions.get("logo") or regions.get("brand_logo")):
-            raise ValueError(f"封面合同 {ratio_name} 缺少官方 Logo 安全区")
-        title_safe = _pixel_box(regions.get("title_safe") or regions.get("title"), canvas.width, canvas.height, (.16, .08, .68, .24))
-        secondary_safe = _pixel_box(regions.get("secondary_info") or regions.get("metadata"), canvas.width, canvas.height, (.20, .32, .60, .09))
-        logo_safe = _pixel_box(regions.get("logo") or regions.get("brand_logo"), canvas.width, canvas.height, (.38, .015, .24, .07))
-        usage_safe = _pixel_box(regions.get("usage_info") or regions.get("footer"), canvas.width, canvas.height, (.08, .88, .84, .08))
-        person_safe = _pixel_box(regions.get("person") or regions.get("host"), canvas.width, canvas.height, (0, 0, 0, 0)) if (regions.get("person") or regions.get("host")) else None
-        story_safe = _pixel_box(regions.get("story_character") or regions.get("story_media"), canvas.width, canvas.height, (0, 0, 0, 0)) if (regions.get("story_character") or regions.get("story_media")) else None
-        for label, box in (("title", title_safe), ("secondary", secondary_safe), ("logo", logo_safe), ("usage", usage_safe)):
-            if not _contains([0, 0, canvas.width, canvas.height], box):
-                raise ValueError(f"封面 {asset_id} 的 {label} 安全区越界")
-        if any(_overlap(title_safe, protected) for protected in (person_safe, story_safe) if protected):
-            raise ValueError(f"封面 {asset_id} 的标题安全区与受保护主体区域冲突")
+        rendered: dict[str, Any] = {}
 
-        draw = ImageDraw.Draw(canvas)
-        title_font, title_lines, _ = _fit_text(draw, title, title_safe, max_lines=2)
-        title_bbox = _draw_centered_lines(draw, title_lines, title_font, title_safe, fill=(255, 246, 214), stroke_fill=(142, 65, 16))
-        secondary_bbox = None
-        if secondary:
-            secondary_font, secondary_lines, _ = _fit_text(draw, secondary, secondary_safe, max_lines=1)
-            secondary_bbox = _draw_centered_lines(draw, secondary_lines, secondary_font, secondary_safe, fill=(255, 255, 255), stroke_fill=(91, 74, 34))
-        usage_font, usage_lines, _ = _fit_text(draw, usage, usage_safe, max_lines=1)
-        usage_bbox = _draw_centered_lines(draw, usage_lines, usage_font, usage_safe, fill=(255, 255, 255), stroke_fill=(70, 93, 31))
-        logo_scale = min(logo_safe[2] / logo.width, logo_safe[3] / logo.height)
-        rendered_logo = logo.resize((max(1, round(logo.width * logo_scale)), max(1, round(logo.height * logo_scale))), Image.Resampling.LANCZOS)
-        logo_x = logo_safe[0] + (logo_safe[2] - rendered_logo.width) // 2
-        logo_y = logo_safe[1] + (logo_safe[3] - rendered_logo.height) // 2
-        logo_bbox = [logo_x, logo_y, rendered_logo.width, rendered_logo.height]
-        occupied = [title_bbox, secondary_bbox, usage_bbox, logo_bbox]
-        if any(_overlap(left, right) for index, left in enumerate(occupied) if left for right in occupied[index + 1:] if right):
-            raise ValueError(f"封面 {asset_id} 的确定性文字或 Logo 发生碰撞")
-        if any(_overlap(item, protected) for item in occupied if item for protected in (person_safe, story_safe) if protected):
-            raise ValueError(f"封面 {asset_id} 的确定性信息与受保护主体区域冲突")
-        canvas.alpha_composite(rendered_logo, (logo_x, logo_y))
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = output_path.with_name(f".{output_path.name}.tmp.png")
-        canvas.convert("RGB").save(temporary, format="PNG", optimize=True)
-        os.replace(temporary, output_path)
+        def execute_render() -> None:
+            rendered.update(_render_final_cover_execution(
+                base_path=base_path,
+                output_path=output_path,
+                ratio_name=ratio_name,
+                asset_id=asset_id,
+                variant=variant,
+                title=title,
+                secondary=secondary,
+                usage=usage,
+                logo=logo,
+            ))
+
+        _execute_publish_asset(
+            port,
+            artifact_id=f"publish-final-cover:{asset_id}",
+            input_artifacts=(
+                {"role": "creative_base", "path": str(base_path), "sha256": file_sha256(base_path)},
+                {"role": "official_logo", "path": str(logo_path), "sha256": logo_sha},
+                {"role": "creative_lineage", "path": str(creative_lineage_path), "sha256": file_sha256(creative_lineage_path)},
+            ),
+            execution_binding={
+                "asset_id": asset_id,
+                "ratio": ratio_name,
+                "variant": variant,
+                "title": title,
+                "secondary": secondary,
+                "usage": usage,
+                "compiled_cover_spec_sha256": spec_sha,
+                "brand_projection_sha256": brand_projection_sha,
+                **bindings,
+            },
+            output_target=output_path,
+            attempt_id=f"final-cover-{account}-{ratio}",
+            executor=execute_render,
+        )
+        canvas_width, canvas_height = rendered["canvas"]
+        title_bbox = rendered["title_bbox"]
+        title_safe = rendered["title_safe"]
+        secondary_bbox = rendered["secondary_bbox"]
+        secondary_safe = rendered["secondary_safe"]
+        usage_bbox = rendered["usage_bbox"]
+        usage_safe = rendered["usage_safe"]
+        logo_bbox = rendered["logo_bbox"]
+        logo_safe = rendered["logo_safe"]
+        person_safe = rendered["person_safe"]
+        story_safe = rendered["story_safe"]
         parent_base = publish_dir / cover_relative(*parent_id.split(":"), creative=True) if parent_id else None
         record = {
             "asset_id": asset_id,
             "account": account,
             "ratio": ratio_name,
-            "canvas": [canvas.width, canvas.height],
+            "canvas": [canvas_width, canvas_height],
             "creative_base_path": str(base_path),
             "creative_base_sha256": file_sha256(base_path),
             "output_path": str(output_path),
@@ -385,8 +532,8 @@ def render_required_covers(
             "official_logo_count": 1,
             "protected_regions": {key: value for key, value in (("presenter", person_safe), ("story_character", story_safe)) if value},
             "margins": {
-                "title": [title_bbox[0], title_bbox[1], canvas.width - title_bbox[0] - title_bbox[2], canvas.height - title_bbox[1] - title_bbox[3]],
-                "logo": [logo_bbox[0], logo_bbox[1], canvas.width - logo_bbox[0] - logo_bbox[2], canvas.height - logo_bbox[1] - logo_bbox[3]],
+                "title": [title_bbox[0], title_bbox[1], canvas_width - title_bbox[0] - title_bbox[2], canvas_height - title_bbox[1] - title_bbox[3]],
+                "logo": [logo_bbox[0], logo_bbox[1], canvas_width - logo_bbox[0] - logo_bbox[2], canvas_height - logo_bbox[1] - logo_bbox[3]],
             },
             "layout_variant_id": variant.get("variant_id"),
             "render_version": COVER_RENDER_VERSION,

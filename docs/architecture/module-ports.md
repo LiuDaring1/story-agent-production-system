@@ -43,6 +43,7 @@ python3 story_module_registry.py describe music_provider
 python3 story_module_registry.py describe keyer
 python3 story_module_registry.py describe compositor
 python3 story_module_registry.py describe release_layout
+python3 story_module_registry.py describe publish_asset
 ```
 
 诊断只输出版本和能力，不输出 API key、secret 或浏览器凭据。
@@ -145,6 +146,18 @@ Release geometry manifest 与 release render manifest 仍由 `release_video.py` 
 
 `MockReleaseLayoutAdapter` 只在系统临时目录 `_mock_release_layout` 写 deterministic marker，不调用 production renderer、不写 canonical targets，也不生成 geometry/render manifest、QA、review 或 lock，并始终返回 `production_eligible=false`。C3 不新增 runtime selectable mock profile。
 
+## PublishAssetPort v1
+
+版本：`story-publish-asset-port/v1`。
+
+Request 只绑定 caller 已决定的一次本地 publish execution：输入路径/SHA-256、已解析 reference/cover binding、输出目标和 attempt。正式 seam 位于 `publish_package.py` 的候选帧抽取/contact sheet leaf，以及 `cover_quality.render_required_covers()` 已解析 creative base、比例 variant、标题、官方 Logo 和安全区后的逐封面 deterministic render。Creative base 的真实生成仍只经过现有 `ImageGeneratorPort`，PublishAssetPort 不持有 Codex/ImageGen provider、model、prompt 或 fallback。
+
+`LocalPublishAssetAdapter` 在 FFmpeg/Pillow executor 前验证全部输入 SHA，再精确委托原本地实现。六比例、文案、account positioning、creative/final lineage、official Logo policy、canonical filenames、ratio/size/near-duplicate QA、独立审核和 currentness 均留在 caller 与原 Product/Quality Policy。
+
+`cover_creative_lineage.json`、`cover_lineage.json`、`cover_render_manifest.json`、`publish_asset_manifest.json`、`publish_cover_branding.json`、`qa_publish_report.json`、publish bundle/review、Story Contract receipt 与 `project_manifest.json` 继续由原逻辑写入和验证。Port Result 只报告本次输出路径/SHA、adapter、usage/failure 和 production eligibility，不替代这些事实源。
+
+`MockPublishAssetAdapter` 只在系统临时目录 `_mock_publish_asset` 写 deterministic marker，不调用 production executor、Codex 或 ImageGen，不写正式封面或伪造 lineage/manifest/QA/review/receipt，并始终返回 `production_eligible=false`。C4 不新增 runtime selectable mock profile。
+
 ## 注入 Mock
 
 `StoryAgent(..., module_registry=custom_registry)` 可注入测试 Registry；独立 consumer 也只依赖 Registry/Port。`MockVideoGeneratorAdapter` 支持确定性成功、unsupported、execution failure 和 invalid output；`MockKeyerAdapter` 支持确定性复制、invalid input 和 execution failure；Semantics/VisualDesign/Image/Music mock 如上所述。Registry profile 是固定 allowlist，禁止任意 import、Python class 或 shell command。mock 不访问网络，也不代表真实产品或视觉质量。
@@ -156,5 +169,5 @@ profile selection 通过显式 CLI 参数和四个非秘密环境锁在 parent�
 - 旧 `resolve_video_provider()`、CLI、workbench 和 legacy passthrough 保留。
 - required_v1 的 Story Contract、审核哈希、付费门禁和 M2 质量政策没有降低。
 - M3-3A 已完成 VideoGeneratorPort 与 KeyerPort；M3-3B 已完成 StorySemanticsPort、VisualDesignPort、ImageGeneratorPort 与 MusicProviderPort 的 contract、adapter、Registry、mock 和 production seam。
-- M3-3C C1 已完成 ProductPackage filesystem seam；C2 已安装 Compositor 的三个本地 leaf execution seam；C3 已安装 ReleaseLayout 的 preview/full leaf render seam。这不代表 M3-3C 或 Milestone 3 完成；PublishAsset 与 M3-Z 尚未实现，真实新故事 Canary 也尚未运行。
+- M3-3C C1 已完成 ProductPackage filesystem seam；C2 已安装 Compositor 的三个本地 leaf execution seam；C3 已安装 ReleaseLayout 的 preview/full leaf render seam；C4 已安装 PublishAsset 的 reference/final-cover 本地 leaf execution seam。这不代表 M3-3C 总封箱或 Milestone 3 完成；M3-Z 尚未进入，真实新故事 Canary 也尚未运行。
 - 自动多供应商路由、请求级账本、context pack、Agent tree、真实成本结算和逐镜依赖图不属于本阶段。

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import math
 import subprocess
 from dataclasses import dataclass
@@ -8,6 +9,16 @@ from pathlib import Path
 
 from PIL import Image, ImageEnhance, ImageFont
 from PIL import ImageDraw
+
+from story_module_ports import (
+    ModuleFailure,
+    ModuleFailureCode,
+    ModuleUsageEvent,
+    PublishAssetPort,
+    PublishAssetRequest,
+    PublishAssetResult,
+)
+from story_module_registry import build_publish_asset_registry
 
 
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -174,16 +185,96 @@ def probe_duration(video_path: Path) -> float:
         raise RuntimeError(f"无法读取视频时长：{video_path}") from exc
 
 
-def extract_candidate_frames(video_path: Path, output_dir: Path, count: int) -> None:
+def _execute_publish_asset(
+    port: PublishAssetPort,
+    *,
+    artifact_id: str,
+    operation: str,
+    input_artifacts: tuple[dict[str, str], ...],
+    execution_binding: dict,
+    output_targets: tuple[Path, ...],
+    attempt_id: str,
+    executor,
+) -> None:
+    request = PublishAssetRequest(
+        artifact_id=artifact_id,
+        operation=operation,
+        input_artifacts=input_artifacts,
+        execution_binding=execution_binding,
+        output_targets=output_targets,
+        attempt_id=attempt_id,
+    )
+    execution_error: Exception | None = None
+
+    def execute_local(actual: PublishAssetRequest) -> PublishAssetResult:
+        nonlocal execution_error
+        try:
+            executor()
+            artifacts = tuple({
+                "path": str(path),
+                "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                "production_eligible": True,
+            } for path in output_targets)
+        except Exception as exc:
+            execution_error = exc
+            return PublishAssetResult(
+                False, actual.operation, (), actual.attempt_id,
+                port.identity.adapter_name, port.identity.adapter_version, True,
+                failure=ModuleFailure(ModuleFailureCode.EXECUTION_FAILED, str(exc)),
+            )
+        return PublishAssetResult(
+            True, actual.operation, artifacts, actual.attempt_id,
+            port.identity.adapter_name, port.identity.adapter_version, True,
+            usage_events=(ModuleUsageEvent(
+                "local", "existing-publish-ffmpeg-pillow-execution", actual.operation,
+                unit_type="artifact", quantity=float(len(artifacts)),
+                actual_amount_status="not_applicable",
+            ),),
+        )
+
+    result = port.execute(request, executor=execute_local)
+    if not result.success:
+        if execution_error is not None:
+            raise execution_error
+        message = result.failure.message if result.failure is not None else "unknown publish asset failure"
+        raise RuntimeError(f"发布物料执行失败：{message}")
+    if result.production_eligible is not True:
+        raise RuntimeError("publish asset mock 结果不可作为正式发布产物")
+
+
+def extract_candidate_frames(
+    video_path: Path,
+    output_dir: Path,
+    count: int,
+    publish_asset_port: PublishAssetPort | None = None,
+) -> None:
     ensure_dir(output_dir)
     count = max(1, min(12, count))
+    output_targets = tuple(output_dir / f"candidate_{index:02d}.jpg" for index in range(1, count + 1))
+    port = publish_asset_port or build_publish_asset_registry().publish_asset()
+    _execute_publish_asset(
+        port,
+        artifact_id=f"publish-reference-frames:{video_path.name}",
+        operation="reference_frames",
+        input_artifacts=({
+            "role": "source_video",
+            "path": str(video_path),
+            "sha256": hashlib.sha256(video_path.read_bytes()).hexdigest(),
+        },),
+        execution_binding={"candidate_count": count, "filename_pattern": "candidate_{index:02d}.jpg"},
+        output_targets=output_targets,
+        attempt_id="reference-frames",
+        executor=lambda: _extract_candidate_frames_execution(video_path, output_targets),
+    )
+
+
+def _extract_candidate_frames_execution(video_path: Path, output_targets: tuple[Path, ...]) -> None:
     duration = max(1.0, probe_duration(video_path))
     start = min(duration * 0.12, 12.0)
     end = max(start + 1.0, duration * 0.86)
-    step = (end - start) / (count + 1)
-    for index in range(1, count + 1):
+    step = (end - start) / (len(output_targets) + 1)
+    for index, output_path in enumerate(output_targets, start=1):
         timestamp = start + step * index
-        output_path = output_dir / f"candidate_{index:02d}.jpg"
         subprocess.run(
             [
                 "ffmpeg",
@@ -204,10 +295,35 @@ def extract_candidate_frames(video_path: Path, output_dir: Path, count: int) -> 
         )
 
 
-def render_contact_sheet(frames_dir: Path, output_path: Path, title: str) -> None:
+def render_contact_sheet(
+    frames_dir: Path,
+    output_path: Path,
+    title: str,
+    publish_asset_port: PublishAssetPort | None = None,
+) -> None:
     frame_paths = sorted(path for path in frames_dir.iterdir() if path.suffix.lower() in SUPPORTED_IMAGE_EXTENSIONS)
     if not frame_paths:
         return
+    port = publish_asset_port or build_publish_asset_registry().publish_asset()
+    _execute_publish_asset(
+        port,
+        artifact_id=f"publish-reference-contact-sheet:{frames_dir.name}",
+        operation="reference_contact_sheet",
+        input_artifacts=tuple({
+            "role": f"candidate_{index:02d}",
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        } for index, path in enumerate(frame_paths, start=1)),
+        execution_binding={"title": title, "candidate_count": len(frame_paths)},
+        output_targets=(output_path,),
+        attempt_id="reference-contact-sheet",
+        executor=lambda: _render_contact_sheet_execution(frame_paths, output_path, title, frames_dir.name),
+    )
+
+
+def _render_contact_sheet_execution(
+    frame_paths: list[Path], output_path: Path, title: str, frames_dir_name: str
+) -> None:
     thumb_width = 360
     thumb_height = 480
     cols = 4
@@ -226,7 +342,7 @@ def render_contact_sheet(frames_dir: Path, output_path: Path, title: str) -> Non
     draw = ImageDraw.Draw(sheet)
     font = load_font(28)
     small_font = load_font(22)
-    draw.text((padding, 22), f"{title}候选帧：选中编号后用 --{frames_dir.name}-frame N", fill=(38, 38, 34), font=font)
+    draw.text((padding, 22), f"{title}候选帧：选中编号后用 --{frames_dir_name}-frame N", fill=(38, 38, 34), font=font)
     for idx, frame_path in enumerate(frame_paths):
         row = idx // cols
         col = idx % cols

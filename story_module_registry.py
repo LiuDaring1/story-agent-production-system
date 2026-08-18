@@ -11,6 +11,7 @@ from story_module_adapters import (
     CodexImageGeneratorAdapter,
     ExistingStorySemanticsAdapter,
     ExistingVideoGeneratorAdapter,
+    LocalProductPackageAdapter,
     MockImageGeneratorAdapter,
     MockKeyerAdapter,
     MockMusicProviderAdapter,
@@ -24,6 +25,7 @@ from story_module_ports import (
     ImageGeneratorPort,
     KeyerPort,
     MusicProviderPort,
+    ProductPackagePort,
     StorySemanticsPort,
     VideoGeneratorPort,
     VisualDesignPort,
@@ -89,6 +91,9 @@ class ModuleRegistry:
     def music_provider(self) -> MusicProviderPort:
         return self.get("music_provider")  # type: ignore[return-value]
 
+    def product_package(self) -> ProductPackagePort:
+        return self.get("product_package")  # type: ignore[return-value]
+
     def describe(self, port_name: str) -> dict[str, Any]:
         adapter = self.get(port_name)
         return {
@@ -126,6 +131,7 @@ def build_default_registry(
     registry.register("visual_design", ApprovedStoryContractVisualDesignAdapter())
     registry.register("image_generator", CodexImageGeneratorAdapter())
     registry.register("music_provider", SunoMusicProviderAdapter())
+    registry.register("product_package", LocalProductPackageAdapter())
     return registry
 
 
@@ -233,6 +239,7 @@ def build_registry_for_profile(
         "music_provider",
         MockMusicProviderAdapter() if selected == "mock-music" else SunoMusicProviderAdapter(),
     )
+    registry.register("product_package", LocalProductPackageAdapter())
     return registry
 
 
@@ -269,6 +276,15 @@ def build_visual_design_registry(profile: str = "") -> ModuleRegistry:
     return registry
 
 
+def build_product_package_registry(profile: str = "") -> ModuleRegistry:
+    """Build the local-only product-package registry without provider config."""
+
+    selected = resolve_module_profile(profile)
+    registry = ModuleRegistry(profile_name=selected)
+    registry.register("product_package", LocalProductPackageAdapter())
+    return registry
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Story Agent module port diagnostics (read-only)")
     parser.add_argument("--profile", default="", help="Allowlisted adapter selection profile")
@@ -282,7 +298,7 @@ def main() -> None:
         "port_name",
         choices=[
             "video_generator", "keyer", "story_semantics", "visual_design",
-            "image_generator", "music_provider",
+            "image_generator", "music_provider", "product_package",
         ],
     )
     args = parser.parse_args()

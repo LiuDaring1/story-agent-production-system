@@ -11,7 +11,7 @@ import time
 import zipfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from docx import Document
 from docx.enum.section import WD_ORIENT
@@ -38,7 +38,15 @@ from production_keying import (
     person_beauty_filter as shared_person_beauty_filter,
     person_grade_filter as shared_person_grade_filter,
 )
-from story_module_registry import build_keyer_registry
+from story_module_ports import (
+    ModuleFailure,
+    ModuleFailureCode,
+    ModuleUsageEvent,
+    ProductPackagePort,
+    ProductPackageRequest,
+    ProductPackageResult,
+)
+from story_module_registry import build_keyer_registry, build_product_package_registry
 from release_geometry import compile_demo_presenter_geometry
 from story_video_synthesizer.image_video import sorted_image_files
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
@@ -1986,17 +1994,10 @@ def create_package_dirs(
     ppt_no_sub: Path,
     a_only_video: Path | None = None,
     backup_root: Path | None = None,
+    product_package_port: ProductPackagePort | None = None,
 ) -> tuple[Path, Path, dict[str, Path]]:
     base_dir = output_root / f"绵羊故事锦囊：{story_name}（基础版）"
     advanced_dir = output_root / f"绵羊故事锦囊：{story_name}（进阶版）"
-    for directory in (base_dir, advanced_dir):
-        if directory.exists():
-            backup_dir = backup_root if backup_root is not None else directory.parent
-            backup_dir.mkdir(parents=True, exist_ok=True)
-            backup = backup_dir / f"{directory.name}_旧版_{time.strftime('%Y%m%d_%H%M%S')}"
-            shutil.move(str(directory), str(backup))
-        directory.mkdir(parents=True, exist_ok=True)
-
     base_items = [
         (story_docx, f"故事文稿：{story_name}.docx"),
         (music, f"故事配乐：{story_name}{music.suffix.lower()}"),
@@ -2012,16 +2013,112 @@ def create_package_dirs(
     ]
     if a_only_video is not None:
         advanced_items.append((a_only_video, f"A镜无人物背景视频：{story_name}.mp4"))
-    source_map: dict[str, Path] = {}
-    for source, filename in base_items:
-        shutil.copy2(source, base_dir / filename)
-        source_map[f"base:{filename}"] = source
-    for source, filename in advanced_items:
-        shutil.copy2(source, advanced_dir / filename)
-        source_map[f"advanced:{filename}"] = source
+
+    planned_items = [
+        ("base", source, base_dir / filename) for source, filename in base_items
+    ] + [
+        ("advanced", source, advanced_dir / filename) for source, filename in advanced_items
+    ]
+    source_artifacts = tuple(
+        {
+            "package_variant": variant,
+            "source_path": str(source),
+            "source_sha256": file_sha256(source),
+            "destination_path": str(destination),
+        }
+        for variant, source, destination in planned_items
+    )
+    request = ProductPackageRequest(
+        artifact_id=f"product-package:{story_name}",
+        operation="copy_product_packages",
+        package_variant="base_and_advanced",
+        output_root=output_root,
+        source_artifacts=source_artifacts,
+        output_targets=tuple(destination for _variant, _source, destination in planned_items),
+        attempt_id="product-package-filesystem",
+    )
+    port = product_package_port or build_product_package_registry().product_package()
+
+    def execute_filesystem(execution_request: ProductPackageRequest) -> ProductPackageResult:
+        return _execute_product_package_filesystem(
+            execution_request,
+            package_directories=(base_dir, advanced_dir),
+            backup_root=backup_root,
+            adapter_version=port.identity.adapter_version,
+        )
+
+    result = port.execute(request, executor=execute_filesystem)
+    if not result.success:
+        message = result.failure.message if result.failure is not None else "unknown filesystem execution failure"
+        raise RuntimeError(f"资料包文件复制失败：{message}")
+    if result.production_eligible is not True:
+        raise RuntimeError("资料包 mock 结果不可作为正式客户资料包")
+    source_map = {
+        f"{variant}:{destination.name}": source
+        for variant, source, destination in planned_items
+    }
     print(f"已生成基础版：{base_dir}")
     print(f"已生成进阶版：{advanced_dir}")
     return base_dir, advanced_dir, source_map
+
+
+def _execute_product_package_filesystem(
+    request: ProductPackageRequest,
+    *,
+    package_directories: tuple[Path, Path],
+    backup_root: Path | None,
+    adapter_version: str,
+) -> ProductPackageResult:
+    try:
+        for directory in package_directories:
+            if directory.exists():
+                backup_dir = backup_root if backup_root is not None else directory.parent
+                backup_dir.mkdir(parents=True, exist_ok=True)
+                backup = backup_dir / f"{directory.name}_旧版_{time.strftime('%Y%m%d_%H%M%S')}"
+                shutil.move(str(directory), str(backup))
+            directory.mkdir(parents=True, exist_ok=True)
+
+        artifacts: list[Mapping[str, Any]] = []
+        for item in request.source_artifacts:
+            source = Path(str(item["source_path"]))
+            destination = Path(str(item["destination_path"]))
+            shutil.copy2(source, destination)
+            artifacts.append(
+                {
+                    "package_variant": str(item["package_variant"]),
+                    "source_path": str(source),
+                    "source_sha256": str(item["source_sha256"]),
+                    "path": str(destination),
+                    "sha256": file_sha256(destination),
+                    "production_eligible": True,
+                }
+            )
+    except Exception as exc:
+        return ProductPackageResult(
+            False,
+            request.operation,
+            request.package_variant,
+            (),
+            request.attempt_id,
+            adapter_version,
+            True,
+            failure=ModuleFailure(ModuleFailureCode.EXECUTION_FAILED, str(exc)),
+        )
+    return ProductPackageResult(
+        True,
+        request.operation,
+        request.package_variant,
+        tuple(artifacts),
+        request.attempt_id,
+        adapter_version,
+        True,
+        usage_events=(
+            ModuleUsageEvent(
+                "local", "shutil.copy2", request.operation,
+                unit_type="file", quantity=float(len(artifacts)), actual_amount_status="not_applicable",
+            ),
+        ),
+    )
 
 
 def load_keying_preset(path: Path) -> KeyingPreset:

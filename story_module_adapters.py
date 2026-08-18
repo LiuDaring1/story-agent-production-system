@@ -5,6 +5,7 @@ import hashlib
 import struct
 import sys
 import shutil
+import tempfile
 import zlib
 from dataclasses import replace
 from pathlib import Path
@@ -22,6 +23,7 @@ from story_module_ports import (
     IMAGE_GENERATOR_PORT_VERSION,
     KEYER_PORT_VERSION,
     MUSIC_PROVIDER_PORT_VERSION,
+    PRODUCT_PACKAGE_PORT_VERSION,
     STORY_SEMANTICS_COMPILER_VERSION,
     STORY_SEMANTICS_PORT_VERSION,
     STORY_SEMANTIC_KINDS,
@@ -40,6 +42,9 @@ from story_module_ports import (
     MusicProviderExecutor,
     MusicProviderRequest,
     MusicProviderResult,
+    ProductPackageExecutor,
+    ProductPackageRequest,
+    ProductPackageResult,
     StorySemanticsRequest,
     StorySemanticsResult,
     VideoGeneratorRequest,
@@ -59,6 +64,7 @@ STORY_SEMANTICS_ADAPTER_VERSION = "story-existing-semantics-adapter/v1"
 VISUAL_DESIGN_ADAPTER_VERSION = "story-approved-contract-visual-design-adapter/v1"
 IMAGE_GENERATOR_ADAPTER_VERSION = "story-codex-imagegen-adapter/v1"
 MUSIC_PROVIDER_ADAPTER_VERSION = "story-suno-browser-adapter/v1"
+PRODUCT_PACKAGE_ADAPTER_VERSION = "story-local-product-package-adapter/v1"
 
 
 def file_sha256(path: Path) -> str:
@@ -613,6 +619,231 @@ class MockMusicProviderAdapter:
         )
 
 
+class LocalProductPackageAdapter:
+    """Thin adapter around the caller-owned product filesystem executor."""
+
+    identity = ModuleIdentity(
+        "product_package", PRODUCT_PACKAGE_PORT_VERSION, "local-filesystem", PRODUCT_PACKAGE_ADAPTER_VERSION
+    )
+    capabilities = ModuleCapabilities(
+        provider="local",
+        model_or_tool="shutil.copy2",
+        runner_or_tool="in-process",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={
+            "preplanned_source_destination_mapping": True,
+            "copy2": True,
+            "directory_backup": True,
+            "owns_product_policy": False,
+            "owns_naming": False,
+            "owns_manifest": False,
+            "owns_quality_policy": False,
+            "owns_currentness": False,
+        },
+    )
+
+    def execute(
+        self,
+        request: ProductPackageRequest,
+        *,
+        executor: ProductPackageExecutor,
+    ) -> ProductPackageResult:
+        issue = _product_package_request_issue(request)
+        if issue:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, issue)
+        try:
+            result = executor(request)
+        except Exception as exc:
+            return self._failure(request, ModuleFailureCode.EXECUTION_FAILED, str(exc))
+        if result.success:
+            issue = _product_package_result_issue(request, result)
+            if issue:
+                return self._failure(request, ModuleFailureCode.INVALID_OUTPUT, issue)
+        return result
+
+    @staticmethod
+    def _failure(
+        request: ProductPackageRequest, code: ModuleFailureCode, message: str
+    ) -> ProductPackageResult:
+        return ProductPackageResult(
+            False,
+            request.operation,
+            request.package_variant,
+            (),
+            request.attempt_id,
+            PRODUCT_PACKAGE_ADAPTER_VERSION,
+            True,
+            failure=ModuleFailure(code, message),
+        )
+
+
+class MockProductPackageAdapter:
+    """Offline fixture adapter that never writes the requested customer targets."""
+
+    identity = ModuleIdentity(
+        "product_package", PRODUCT_PACKAGE_PORT_VERSION, "mock-product-package", "story-mock-product-package/v1"
+    )
+    capabilities = ModuleCapabilities(
+        provider="mock",
+        model_or_tool="copy2-fixture",
+        runner_or_tool="in-process",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={"offline": True, "network": False, "production_eligible": False},
+    )
+
+    def __init__(self, mode: str = "success") -> None:
+        self.mode = mode
+
+    def execute(
+        self,
+        request: ProductPackageRequest,
+        *,
+        executor: ProductPackageExecutor,
+    ) -> ProductPackageResult:
+        del executor
+        issue = _product_package_request_issue(request)
+        if issue:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, issue)
+        failure_code = {
+            "unsupported": ModuleFailureCode.UNSUPPORTED_CAPABILITY,
+            "failure": ModuleFailureCode.EXECUTION_FAILED,
+            "invalid_output": ModuleFailureCode.INVALID_OUTPUT,
+        }.get(self.mode)
+        if failure_code is not None:
+            return self._failure(request, failure_code, f"mock {self.mode}")
+        try:
+            request.output_root.resolve().relative_to(Path(tempfile.gettempdir()).resolve())
+        except ValueError:
+            return self._failure(
+                request,
+                ModuleFailureCode.CONFIGURATION_ERROR,
+                "mock product package output root must be inside the system temporary directory",
+            )
+        fixture_root = request.output_root / "_mock_product_package"
+        artifacts: list[Mapping[str, Any]] = []
+        for index, item in enumerate(request.source_artifacts, start=1):
+            source = Path(str(item["source_path"]))
+            variant = str(item["package_variant"])
+            requested = Path(str(item["destination_path"]))
+            target = fixture_root / variant / f"{index:02d}_{requested.name}"
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source, target)
+            artifacts.append(
+                {
+                    "package_variant": variant,
+                    "source_path": str(source),
+                    "source_sha256": str(item["source_sha256"]),
+                    "path": str(target),
+                    "sha256": file_sha256(target),
+                    "production_eligible": False,
+                }
+            )
+        return ProductPackageResult(
+            True,
+            request.operation,
+            request.package_variant,
+            tuple(artifacts),
+            request.attempt_id,
+            "story-mock-product-package/v1",
+            False,
+            usage_events=(
+                ModuleUsageEvent(
+                    "mock", "copy2-fixture", request.operation,
+                    unit_type="file", quantity=float(len(artifacts)), actual_amount_status="not_applicable",
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _failure(
+        request: ProductPackageRequest, code: ModuleFailureCode, message: str
+    ) -> ProductPackageResult:
+        return ProductPackageResult(
+            False,
+            request.operation,
+            request.package_variant,
+            (),
+            request.attempt_id,
+            "story-mock-product-package/v1",
+            False,
+            failure=ModuleFailure(code, message),
+        )
+
+
+def _product_package_request_issue(request: ProductPackageRequest) -> str:
+    if not request.artifact_id.strip() or not request.operation.strip() or not request.attempt_id.strip():
+        return "product package execution identity is incomplete"
+    if request.operation != "copy_product_packages" or request.package_variant != "base_and_advanced":
+        return "product package execution operation or variant is unsupported"
+    if not isinstance(request.output_root, Path) or not request.source_artifacts or not request.output_targets:
+        return "product package filesystem mapping is missing"
+    if len(request.source_artifacts) != len(request.output_targets):
+        return "product package source and output counts differ"
+    destinations: list[Path] = []
+    output_root = request.output_root.resolve()
+    for item in request.source_artifacts:
+        if not isinstance(item, Mapping):
+            return "product package source artifact is invalid"
+        if str(item.get("package_variant") or "") not in {"base", "advanced"}:
+            return "product package artifact variant is invalid"
+        source = Path(str(item.get("source_path") or ""))
+        source_sha = str(item.get("source_sha256") or "")
+        destination = Path(str(item.get("destination_path") or ""))
+        if not source.is_file():
+            return f"product package source is missing: {source}"
+        if not _valid_sha256(source_sha) or file_sha256(source) != source_sha:
+            return f"product package source is stale: {source}"
+        try:
+            destination.resolve().relative_to(output_root)
+        except ValueError:
+            return f"product package destination escapes output root: {destination}"
+        if destination.resolve() == source.resolve():
+            return f"product package destination aliases source: {destination}"
+        destinations.append(destination)
+    if tuple(destinations) != request.output_targets:
+        return "product package output targets do not match the planned mapping"
+    if len(set(destinations)) != len(destinations):
+        return "product package output targets are duplicated"
+    return ""
+
+
+def _product_package_result_issue(
+    request: ProductPackageRequest, result: ProductPackageResult
+) -> str:
+    if (
+        result.operation != request.operation
+        or result.package_variant != request.package_variant
+        or result.attempt_id != request.attempt_id
+        or result.production_eligible is not True
+    ):
+        return "product package executor result binding mismatch"
+    if len(result.output_artifacts) != len(request.output_targets):
+        return "product package executor output count mismatch"
+    observed: list[Path] = []
+    for index, artifact in enumerate(result.output_artifacts):
+        if not isinstance(artifact, Mapping):
+            return "product package executor output artifact is invalid"
+        source = request.source_artifacts[index]
+        if (
+            artifact.get("package_variant") != source.get("package_variant")
+            or artifact.get("source_path") != source.get("source_path")
+            or artifact.get("source_sha256") != source.get("source_sha256")
+            or artifact.get("production_eligible") is not True
+        ):
+            return "product package executor source/output binding mismatch"
+        path = Path(str(artifact.get("path") or ""))
+        if not path.is_file() or artifact.get("sha256") != file_sha256(path):
+            return f"product package executor output is missing or stale: {path}"
+        observed.append(path)
+    if tuple(observed) != request.output_targets:
+        return "product package executor outputs do not match planned targets"
+    return ""
+
+
 def _external_request_issue(request: ImageGeneratorRequest | MusicProviderRequest) -> str:
     if not request.artifact_id.strip() or not request.operation.strip() or not request.attempt_id.strip():
         return "external execution identity is incomplete"
@@ -929,9 +1160,10 @@ class MockKeyerAdapter(ProductionKeyerAdapter):
 __all__ = [
     "ApprovedStoryContractVisualDesignAdapter", "CodexImageGeneratorAdapter",
     "ExistingStorySemanticsAdapter", "ExistingVideoGeneratorAdapter", "IMAGE_GENERATOR_ADAPTER_VERSION",
-    "KEYER_ADAPTER_VERSION", "MUSIC_PROVIDER_ADAPTER_VERSION", "MockImageGeneratorAdapter",
-    "MockKeyerAdapter", "MockMusicProviderAdapter", "MockStorySemanticsAdapter",
+    "KEYER_ADAPTER_VERSION", "LocalProductPackageAdapter", "MUSIC_PROVIDER_ADAPTER_VERSION",
+    "MockImageGeneratorAdapter", "MockKeyerAdapter", "MockMusicProviderAdapter",
+    "MockProductPackageAdapter", "MockStorySemanticsAdapter",
     "MockVideoGeneratorAdapter", "MockVisualDesignAdapter", "ProductionKeyerAdapter",
     "STORY_SEMANTICS_ADAPTER_VERSION", "SunoMusicProviderAdapter", "VIDEO_ADAPTER_VERSION",
-    "VIDEO_BATCH_INVOCATION_VERSION", "VISUAL_DESIGN_ADAPTER_VERSION",
+    "PRODUCT_PACKAGE_ADAPTER_VERSION", "VIDEO_BATCH_INVOCATION_VERSION", "VISUAL_DESIGN_ADAPTER_VERSION",
 ]

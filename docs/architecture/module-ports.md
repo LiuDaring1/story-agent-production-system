@@ -1,4 +1,4 @@
-# Module Ports（M3-3A + M3-3B）
+# Module Ports（M3-3A + M3-3B + M3-3C C1）
 
 本页记录 Story Agent 的最小模块接口模式。核心原则是“装插座，不换电器”：Runtime 通过 Port 调用当前实现，但不改变 38-stage DAG、供应商、滤镜、质量门禁、重试、预算或 currentness 语义。
 
@@ -107,6 +107,18 @@ Request 只绑定 Runtime 已经确定的一次音乐 provider execution envelop
 
 `MockMusicProviderAdapter` 完全离线，Result 和 artifact 均为 `production_eligible=false`。`mock-music` 使用与 `mock-image` 相同的 profile + execution-mode 双锁，任一传播丢失或错配都在启动 Codex/browser/Suno 前 fail closed。
 
+## ProductPackagePort v1
+
+版本：`story-product-package-port/v1`。
+
+Request 只绑定 `create_package_dirs()` 的一次已规划 filesystem execution：artifact/operation、base+advanced invocation、output root、caller 已确定的 source SHA-256 → destination mapping、output targets 和 attempt。基础版/进阶版包含内容、客户目录名、客户文件名和 canonical naming 仍由 `product_package.py` 的原 Product Policy 决定。
+
+`LocalProductPackageAdapter` 在任何目录变更前验证全部 source 文件和 SHA-256，再原样委托 caller 提供的现有 backup/mkdir/`shutil.copy2` executor。Result 只记录本次复制观察到的路径与 SHA-256；它不声明 package approved、QA passed、current、complete 或 delivery ready，也不替代 `product_package_manifest.json` 及其依赖 receipts。
+
+正式 consumer seam 仅位于 `product_package.create_package_dirs()`。DOCX/PPT/Demo 生成、semantic selection、product content manifest、package manifest、机器 QA、独立审核与 Runtime completion 均保持原调用链。
+
+`MockProductPackageAdapter` 只把确定性 fixture 写入请求 output root 下的 `_mock_product_package` 测试隔离目录，不调用 production executor、不写请求中的正式客户 targets，并始终返回 `production_eligible=false`。C1 不新增 CLI mock profile；测试通过 Protocol 注入 mock/fake，因此没有新增第二套 profile 安全机制。
+
 ## 注入 Mock
 
 `StoryAgent(..., module_registry=custom_registry)` 可注入测试 Registry；独立 consumer 也只依赖 Registry/Port。`MockVideoGeneratorAdapter` 支持确定性成功、unsupported、execution failure 和 invalid output；`MockKeyerAdapter` 支持确定性复制、invalid input 和 execution failure；Semantics/VisualDesign/Image/Music mock 如上所述。Registry profile 是固定 allowlist，禁止任意 import、Python class 或 shell command。mock 不访问网络，也不代表真实产品或视觉质量。
@@ -118,5 +130,5 @@ profile selection 通过显式 CLI 参数和四个非秘密环境锁在 parent�
 - 旧 `resolve_video_provider()`、CLI、workbench 和 legacy passthrough 保留。
 - required_v1 的 Story Contract、审核哈希、付费门禁和 M2 质量政策没有降低。
 - M3-3A 已完成 VideoGeneratorPort 与 KeyerPort；M3-3B 已完成 StorySemanticsPort、VisualDesignPort、ImageGeneratorPort 与 MusicProviderPort 的 contract、adapter、Registry、mock 和 production seam。
-- M3-3B 完成不代表 Milestone 3 完成：M3-3C 与 M3-Z 尚未开始，Compositor、Release、Publish 和 Product Package 等后续边界尚未实现，真实新故事 Canary 也尚未运行。
+- M3-3C C1 只完成 ProductPackage filesystem seam；不代表 M3-3C 或 Milestone 3 完成。Compositor、ReleaseLayout、PublishAsset 与 M3-Z 尚未实现，真实新故事 Canary 也尚未运行。
 - 自动多供应商路由、请求级账本、context pack、Agent tree、真实成本结算和逐镜依赖图不属于本阶段。

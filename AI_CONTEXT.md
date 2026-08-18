@@ -23,6 +23,7 @@ Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_ru
 11. [`docs/contracts/story-production-contract.md`](docs/contracts/story-production-contract.md)：合同前置、七类合同、锁和消费者失效语义。
 12. [`docs/roadmaps/V3.5_M2_CLOSEOUT_2026-08-17.md`](docs/roadmaps/V3.5_M2_CLOSEOUT_2026-08-17.md)：Milestone 2 的 16 个实现提交、证据边界和当前安全点。
 13. [`docs/architecture/module-ports.md`](docs/architecture/module-ports.md)：M3-3A、M3-3B 与 M3-3C 十个 Port/Adapter、Product/Quality Policy 边界、Registry、双锁传播与 mock 注入。
+14. [`docs/roadmaps/V3.5_M3_CLOSEOUT_2026-08-19.md`](docs/roadmaps/V3.5_M3_CLOSEOUT_2026-08-19.md)：Milestone 3 的十 Port 对照、离线总回归、行为不变量和收口安全点。
 
 ## 核心代码地图
 
@@ -92,4 +93,4 @@ python3 story_agent.py --help
 - Milestone 2 已完成工程实现：2A 语义计划、条件式视觉小样与风格自适应审核；2B 逐镜动作计划、上下文运动门禁、正式 provider provenance 与单镜返工；2C 生产同链 keying 证据、Demo Logo/字幕/geometry receipt、Release 最小水平修正和确定性布局；2D 封面血缘与品牌排版、creative base 原图审核，以及 PPT/客户文稿/朗读标注/资料包的语义与来源 currentness。
 - M2 的完成口径是“通用质量机制、离线 fixture、模拟 provider 和失效门禁已实现”。真实 ImageGen/Grok/Suno、真实人物素材、完整新故事 canary 和用户产品验收仍未完成，不得把 M2 工程完成写成产品质量已经验证。
 - 当前增量失效只到模块族级，不是完整逐镜头 dependency graph；请求级账本、context pack、Agent tree/可观察性、成本币种/真实账单和细粒度 Runtime 重试仍属于后续 Milestone。
-- M3-3A、M3-3B 与 M3-3C 已完成十个 Port：`StorySemanticsPort`、`VisualDesignPort`、`ImageGeneratorPort`、`VideoGeneratorPort`、`MusicProviderPort`、`KeyerPort`、`ProductPackagePort`、`CompositorPort`、`ReleaseLayoutPort`、`PublishAssetPort`。production-default 仍委托原 classifier、审核锁定的 Story Contract projection、Codex/ImageGen、Codex/Ego Browser/Suno 和原本地 filesystem/FFmpeg/Pillow executor；Product/Quality Policy、持久事实源、Story Production Contract 和 38-stage DAG 未改变。Image/Music mock 使用 profile + execution-mode 双锁并 fail closed。Milestone 3 尚未完成：M3-Z 尚未开始，真实新故事 Canary 尚未运行；M4 也尚未开始。
+- V3.5 Milestone 3 engineering implementation 已收口：M3-3A/3B/3C 形成 `StorySemanticsPort`、`VisualDesignPort`、`ImageGeneratorPort`、`VideoGeneratorPort`、`MusicProviderPort`、`KeyerPort`、`ProductPackagePort`、`CompositorPort`、`ReleaseLayoutPort`、`PublishAssetPort` 十个可替换边界，M3-Z 以离线跨 Port smoke、production parity、Schema/Protocol 与完整回归封箱。production-default 仍委托原 classifier、审核锁定的 Story Contract projection、Codex/ImageGen、Codex/Ego Browser/Suno 和原本地 filesystem/FFmpeg/Pillow executor；Product/Quality Policy、持久事实源、Story Production Contract 和 38-stage DAG 未改变。真实新故事 Canary 与用户验收未运行，M4 未开始。

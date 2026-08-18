@@ -1,4 +1,4 @@
-# Module Ports（M3-3A + M3-3B + M3-3C completed）
+# Module Ports（V3.5 Milestone 3 engineering implementation complete）
 
 本页记录 Story Agent 的最小模块接口模式。核心原则是“装插座，不换电器”：Runtime 通过 Port 调用当前实现，但不改变 38-stage DAG、供应商、滤镜、质量门禁、重试、预算或 currentness 语义。
 
@@ -44,6 +44,7 @@ python3 story_module_registry.py describe keyer
 python3 story_module_registry.py describe compositor
 python3 story_module_registry.py describe release_layout
 python3 story_module_registry.py describe publish_asset
+python3 story_module_registry.py describe product_package
 ```
 
 诊断只输出版本和能力，不输出 API key、secret 或浏览器凭据。
@@ -164,11 +165,23 @@ Request 只绑定 caller 已决定的一次本地 publish execution：输入路�
 
 profile selection 通过显式 CLI 参数和四个非秘密环境锁在 parent、supervisor、run、run-stage/DAG worker、`story_workflow.py` 与 Codex subprocess boundary 传播：`STORY_MODULE_PROFILE`、`STORY_MODULE_PROFILE_REQUIRED`、`STORY_MODULE_EXECUTION_MODE`、`STORY_MODULE_EXECUTION_MODE_REQUIRED`。required/selected 任一缺失或错配均拒绝执行；不序列化 arbitrary Python object，也不在 profile/env 中携带 provider secret。当前单 profile 一次只替换一个模块，不做组合路由。
 
+## M3-Z 总体离线验证
+
+`tests/test_m3_cross_port_smoke.py` 在同一个 `ModuleRegistry` 中注册十个 deterministic mock，并以哈希绑定的 Request/Result 串起 Semantics → VisualDesign → Image → Video → Music → Keyer → Compositor → Release → Publish → Product。测试为外部 executor 和 subprocess 设置 zero-call sentinel，并确认：
+
+- mock 不调用 ImageGen、Grok、Suno、browser 或其他外部执行；
+- 下游 Request 消费上游产物路径与 SHA-256；
+- 四个本地 Compositor/Release/Publish/Product mock 只写系统临时目录下的隔离 fixture，不写 canonical target；
+- 所有可用于产品判定的 mock Result 都保持 `production_eligible=false`；
+- QA/currentness sentinel 不被 Port 修改，Port Result 不会伪造 review、lock、receipt 或 manifest；
+- production-default 仍精确解析当前十个正式 adapter，profile/execution-mode 四锁跨 subprocess 传播，丢锁则 fail closed。
+
 ## 兼容与后续
 
 - 旧 `resolve_video_provider()`、CLI、workbench 和 legacy passthrough 保留。
 - required_v1 的 Story Contract、审核哈希、付费门禁和 M2 质量政策没有降低。
 - M3-3A 已完成 VideoGeneratorPort 与 KeyerPort；M3-3B 已完成 StorySemanticsPort、VisualDesignPort、ImageGeneratorPort 与 MusicProviderPort 的 contract、adapter、Registry、mock 和 production seam。
-- M3-3C 已完成并通过总体验收：C1 ProductPackage filesystem seam、C2 Compositor 三个本地 leaf execution seam、C3 ReleaseLayout preview/full leaf render seam、C4 PublishAsset reference/final-cover leaf execution seam。当前共十个正式 Port，完整回归为 415/415 passed。
-- M3-3C completed 不代表 Milestone 3 completed：M3-Z 尚未开始，真实新故事 Canary 尚未运行，M4 尚未开始。
+- M3-3C 完成 C1 ProductPackage filesystem seam、C2 Compositor 三个本地 leaf execution seam、C3 ReleaseLayout preview/full leaf render seam、C4 PublishAsset reference/final-cover leaf execution seam。
+- M3-Z 已完成十 Port 总审计、跨 Port 离线 smoke、production-default parity、Schema/Protocol 总回归和文档收口。详细证据见 `docs/roadmaps/V3.5_M3_CLOSEOUT_2026-08-19.md`。
+- “Milestone 3 engineering implementation complete” 只表示十个模块插座的工程边界和离线兼容验证已完成；真实新故事 Canary、真实供应商产品质量和用户验收均未进行，M4 未开始。
 - 自动多供应商路由、请求级账本、context pack、Agent tree、真实成本结算和逐镜依赖图不属于本阶段。

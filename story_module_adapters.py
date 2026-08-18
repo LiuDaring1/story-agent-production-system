@@ -25,6 +25,7 @@ from story_module_ports import (
     KEYER_PORT_VERSION,
     MUSIC_PROVIDER_PORT_VERSION,
     PRODUCT_PACKAGE_PORT_VERSION,
+    RELEASE_LAYOUT_PORT_VERSION,
     STORY_SEMANTICS_COMPILER_VERSION,
     STORY_SEMANTICS_PORT_VERSION,
     STORY_SEMANTIC_KINDS,
@@ -49,6 +50,9 @@ from story_module_ports import (
     ProductPackageExecutor,
     ProductPackageRequest,
     ProductPackageResult,
+    ReleaseLayoutExecutor,
+    ReleaseLayoutRequest,
+    ReleaseLayoutResult,
     StorySemanticsRequest,
     StorySemanticsResult,
     VideoGeneratorRequest,
@@ -70,6 +74,7 @@ IMAGE_GENERATOR_ADAPTER_VERSION = "story-codex-imagegen-adapter/v1"
 MUSIC_PROVIDER_ADAPTER_VERSION = "story-suno-browser-adapter/v1"
 PRODUCT_PACKAGE_ADAPTER_VERSION = "story-local-product-package-adapter/v1"
 COMPOSITOR_ADAPTER_VERSION = "story-local-ffmpeg-compositor-adapter/v1"
+RELEASE_LAYOUT_ADAPTER_VERSION = "story-local-release-layout-adapter/v1"
 
 
 def file_sha256(path: Path) -> str:
@@ -830,6 +835,140 @@ class MockCompositorAdapter:
         )
 
 
+class LocalReleaseLayoutAdapter:
+    """Thin adapter around caller-owned release layout render execution."""
+
+    identity = ModuleIdentity(
+        "release_layout", RELEASE_LAYOUT_PORT_VERSION, "local-release-layout",
+        RELEASE_LAYOUT_ADAPTER_VERSION,
+    )
+    capabilities = ModuleCapabilities(
+        provider="local",
+        model_or_tool="existing-release-python-ffmpeg-layout",
+        runner_or_tool="in-process",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={
+            "preview_render": True,
+            "main_wide_render": True,
+            "vertical_package_render": True,
+            "library_window_render": True,
+            "plate_package_render": True,
+            "owns_product_policy": False,
+            "owns_geometry_policy": False,
+            "owns_keying_policy": False,
+            "owns_manifest": False,
+            "owns_quality_policy": False,
+            "owns_currentness": False,
+        },
+    )
+
+    def execute(
+        self,
+        request: ReleaseLayoutRequest,
+        *,
+        executor: ReleaseLayoutExecutor,
+    ) -> ReleaseLayoutResult:
+        issue = _release_layout_request_issue(request)
+        if issue:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, issue)
+        try:
+            result = executor(request)
+        except Exception as exc:
+            return self._failure(request, ModuleFailureCode.EXECUTION_FAILED, str(exc))
+        if result.success:
+            issue = _release_layout_result_issue(request, result)
+            if issue:
+                return self._failure(request, ModuleFailureCode.INVALID_OUTPUT, issue)
+        return result
+
+    @staticmethod
+    def _failure(
+        request: ReleaseLayoutRequest, code: ModuleFailureCode, message: str
+    ) -> ReleaseLayoutResult:
+        return ReleaseLayoutResult(
+            False, request.operation, None, request.attempt_id,
+            "local-release-layout", RELEASE_LAYOUT_ADAPTER_VERSION, True,
+            failure=ModuleFailure(code, message),
+        )
+
+
+class MockReleaseLayoutAdapter:
+    """Offline mock that never calls the production release renderer."""
+
+    identity = ModuleIdentity(
+        "release_layout", RELEASE_LAYOUT_PORT_VERSION, "mock-release-layout",
+        "story-mock-release-layout/v1",
+    )
+    capabilities = ModuleCapabilities(
+        provider="mock",
+        model_or_tool="deterministic-release-marker",
+        runner_or_tool="in-process",
+        external=False,
+        paid=False,
+        deterministic=True,
+        supported={"offline": True, "network": False, "production_eligible": False},
+    )
+
+    def __init__(self, mode: str = "success") -> None:
+        self.mode = mode
+
+    def execute(
+        self,
+        request: ReleaseLayoutRequest,
+        *,
+        executor: ReleaseLayoutExecutor,
+    ) -> ReleaseLayoutResult:
+        del executor
+        issue = _release_layout_request_issue(request)
+        if issue:
+            return self._failure(request, ModuleFailureCode.INVALID_INPUT, issue)
+        failure_code = {
+            "unsupported": ModuleFailureCode.UNSUPPORTED_CAPABILITY,
+            "failure": ModuleFailureCode.EXECUTION_FAILED,
+            "invalid_output": ModuleFailureCode.INVALID_OUTPUT,
+        }.get(self.mode)
+        if failure_code is not None:
+            return self._failure(request, failure_code, f"mock {self.mode}")
+        try:
+            request.output_target.resolve().relative_to(Path(tempfile.gettempdir()).resolve())
+        except ValueError:
+            return self._failure(
+                request,
+                ModuleFailureCode.CONFIGURATION_ERROR,
+                "mock release layout target must be inside the system temporary directory",
+            )
+        target = request.output_target.parent / "_mock_release_layout" / request.output_target.name
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(b"story-release-layout-mock/v1\n")
+        return ReleaseLayoutResult(
+            True,
+            request.operation,
+            {"path": str(target), "sha256": file_sha256(target), "production_eligible": False},
+            request.attempt_id,
+            "mock-release-layout",
+            "story-mock-release-layout/v1",
+            False,
+            usage_events=(
+                ModuleUsageEvent(
+                    "mock", "deterministic-release-marker", request.operation,
+                    unit_type="render", quantity=1.0, actual_amount_status="not_applicable",
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _failure(
+        request: ReleaseLayoutRequest, code: ModuleFailureCode, message: str
+    ) -> ReleaseLayoutResult:
+        return ReleaseLayoutResult(
+            False, request.operation, None, request.attempt_id,
+            "mock-release-layout", "story-mock-release-layout/v1", False,
+            failure=ModuleFailure(code, message),
+        )
+
+
 class MockProductPackageAdapter:
     """Offline fixture adapter that never writes the requested customer targets."""
 
@@ -1042,6 +1181,51 @@ def _compositor_result_issue(request: CompositorRequest, result: CompositorResul
         observed.append(path)
     if tuple(observed) != request.output_targets:
         return "compositor executor outputs do not match planned targets"
+    return ""
+
+
+def _release_layout_request_issue(request: ReleaseLayoutRequest) -> str:
+    if not request.artifact_id.strip() or not request.operation.strip() or not request.attempt_id.strip():
+        return "release layout execution identity is incomplete"
+    if request.operation not in {
+        "preview_main", "preview_library", "main_wide_render", "main_vertical_render",
+        "library_window_render", "library_vertical_render", "plate_package_render",
+    }:
+        return "release layout operation is unsupported"
+    if not request.input_artifacts or not request.layout_binding or not isinstance(request.output_target, Path):
+        return "release layout execution binding is incomplete"
+    for artifact in request.input_artifacts:
+        if not isinstance(artifact, Mapping):
+            return "release layout input artifact is invalid"
+        role = str(artifact.get("role") or "")
+        path = Path(str(artifact.get("path") or ""))
+        expected_sha = str(artifact.get("sha256") or "")
+        if not role:
+            return "release layout input role is missing"
+        if not path.is_file():
+            return f"release layout input is missing: {path}"
+        if not _valid_sha256(expected_sha) or file_sha256(path) != expected_sha:
+            return f"release layout input is stale: {path}"
+    return ""
+
+
+def _release_layout_result_issue(
+    request: ReleaseLayoutRequest, result: ReleaseLayoutResult
+) -> str:
+    if (
+        result.operation != request.operation
+        or result.attempt_id != request.attempt_id
+        or result.production_eligible is not True
+    ):
+        return "release layout executor result binding mismatch"
+    artifact = result.output_artifact
+    if not isinstance(artifact, Mapping) or artifact.get("production_eligible") is not True:
+        return "release layout executor output artifact is invalid"
+    path = Path(str(artifact.get("path") or ""))
+    if path != request.output_target:
+        return "release layout executor output does not match planned target"
+    if not path.is_file() or artifact.get("sha256") != file_sha256(path):
+        return f"release layout executor output is missing or stale: {path}"
     return ""
 
 
@@ -1362,10 +1546,11 @@ __all__ = [
     "ApprovedStoryContractVisualDesignAdapter", "CodexImageGeneratorAdapter",
     "ExistingStorySemanticsAdapter", "ExistingVideoGeneratorAdapter", "IMAGE_GENERATOR_ADAPTER_VERSION",
     "COMPOSITOR_ADAPTER_VERSION", "KEYER_ADAPTER_VERSION", "LocalCompositorAdapter",
-    "LocalProductPackageAdapter", "MUSIC_PROVIDER_ADAPTER_VERSION",
+    "LocalProductPackageAdapter", "LocalReleaseLayoutAdapter", "MUSIC_PROVIDER_ADAPTER_VERSION",
     "MockImageGeneratorAdapter", "MockKeyerAdapter", "MockMusicProviderAdapter",
-    "MockCompositorAdapter", "MockProductPackageAdapter", "MockStorySemanticsAdapter",
+    "MockCompositorAdapter", "MockProductPackageAdapter", "MockReleaseLayoutAdapter", "MockStorySemanticsAdapter",
     "MockVideoGeneratorAdapter", "MockVisualDesignAdapter", "ProductionKeyerAdapter",
     "STORY_SEMANTICS_ADAPTER_VERSION", "SunoMusicProviderAdapter", "VIDEO_ADAPTER_VERSION",
-    "PRODUCT_PACKAGE_ADAPTER_VERSION", "VIDEO_BATCH_INVOCATION_VERSION", "VISUAL_DESIGN_ADAPTER_VERSION",
+    "PRODUCT_PACKAGE_ADAPTER_VERSION", "RELEASE_LAYOUT_ADAPTER_VERSION",
+    "VIDEO_BATCH_INVOCATION_VERSION", "VISUAL_DESIGN_ADAPTER_VERSION",
 ]

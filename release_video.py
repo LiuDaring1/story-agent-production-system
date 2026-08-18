@@ -6,6 +6,7 @@ import json
 import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
+from typing import Callable
 
 from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 
@@ -18,7 +19,15 @@ from production_keying import (
     person_beauty_filter as shared_person_beauty_filter,
     person_grade_filter as shared_person_grade_filter,
 )
-from story_module_registry import build_keyer_registry
+from story_module_ports import (
+    ModuleFailure,
+    ModuleFailureCode,
+    ModuleUsageEvent,
+    ReleaseLayoutPort,
+    ReleaseLayoutRequest,
+    ReleaseLayoutResult,
+)
+from story_module_registry import build_keyer_registry, build_release_layout_registry
 from release_geometry import (
     RELEASE_GEOMETRY_COMPILER_VERSION,
     RELEASE_GEOMETRY_SCHEMA_VERSION,
@@ -720,7 +729,145 @@ def find_transparent_seed(mask: Image.Image, preferred: tuple[int, int], window:
     raise ValueError("故事框窗口中心附近没有可用透明开口")
 
 
-def package_release_videos(config: ReleaseConfig, contract_spec: dict | None = None) -> None:
+def _release_layout_input_artifacts(
+    config: ReleaseConfig,
+    paths: list[tuple[str, Path | None]],
+) -> tuple[dict[str, str], ...]:
+    currentness_paths: list[tuple[str, Path | None]] = [
+        ("artifact_semantic_plan", config.artifact_semantic_plan),
+        ("keying_preset", config.keying_preset_path),
+        ("demo_render_manifest", config.demo_render_manifest),
+    ]
+    if config.keying_preset_path is not None:
+        lock_path = config.keying_preset_path.with_name("keying_preset.lock.json")
+        currentness_paths.append(("keying_preset_lock", lock_path if lock_path.is_file() else None))
+    return tuple(
+        {
+            "role": role,
+            "path": str(path),
+            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+        }
+        for role, path in [*paths, *currentness_paths]
+        if path is not None
+    )
+
+
+def _release_layout_binding(
+    config: ReleaseConfig,
+    geometry: dict | None,
+    **operation_binding,
+) -> dict:
+    return {
+        "variant": config.variant,
+        "video_box": list(config.video_box),
+        "story_box": list(config.story_box),
+        "b_story_box": list(config.b_story_box),
+        "b_windows": [list(window) for window in config.b_windows],
+        "c_windows": [list(window) for window in config.c_windows],
+        "story_bleed": config.story_bleed,
+        "background_blur": config.background_blur,
+        "story_logo": {
+            "width_a": config.story_logo_width_a,
+            "width_b": config.story_logo_width_b,
+            "x": config.story_logo_x,
+            "y": config.story_logo_y,
+        },
+        "subtitle": {"font_size": config.subtitle_font_size, "margin_v": config.subtitle_margin_v},
+        "audio": {
+            "mix_bg_audio": config.mix_bg_audio,
+            "voice_volume": config.voice_volume,
+            "bg_audio_volume": config.bg_audio_volume,
+        },
+        "presenter": {
+            "height": config.person_height,
+            "x": config.person_x,
+            "y": config.person_y,
+            "crop": list(config.person_crop) if config.person_crop is not None else None,
+            "detected_bbox": list(config.detected_person_bbox) if config.detected_person_bbox is not None else None,
+        },
+        "keying": {
+            "keyer": config.keyer,
+            "chroma_color": config.chroma_color,
+            "chroma_similarity": config.chroma_similarity,
+            "chroma_blend": config.chroma_blend,
+            "person_grade": config.person_grade,
+            "person_beauty": config.person_beauty,
+        },
+        "watermark": {
+            "width": config.watermark_width,
+            "opacity": config.watermark_opacity,
+            "speed": config.watermark_speed,
+        },
+        "tail": {"seconds": config.tail_seconds, "notice_text": config.tail_notice_text},
+        "encoding": {"crf": config.crf, "preset": config.preset, "output_scale": config.output_scale},
+        "release_geometry_sha256": str((geometry or {}).get("geometry_sha256") or ""),
+        "operation": operation_binding,
+    }
+
+
+def _execute_release_layout(
+    port: ReleaseLayoutPort,
+    *,
+    artifact_id: str,
+    operation: str,
+    input_artifacts: tuple[dict[str, str], ...],
+    layout_binding: dict,
+    output_target: Path,
+    attempt_id: str,
+    executor: Callable[[], None],
+) -> None:
+    request = ReleaseLayoutRequest(
+        artifact_id=artifact_id,
+        operation=operation,
+        input_artifacts=input_artifacts,
+        layout_binding=layout_binding,
+        output_target=output_target,
+        attempt_id=attempt_id,
+    )
+    execution_error: Exception | None = None
+
+    def execute_render(execution_request: ReleaseLayoutRequest) -> ReleaseLayoutResult:
+        nonlocal execution_error
+        try:
+            executor()
+            artifact = {
+                "path": str(output_target),
+                "sha256": hashlib.sha256(output_target.read_bytes()).hexdigest(),
+                "production_eligible": True,
+            }
+        except Exception as exc:
+            execution_error = exc
+            return ReleaseLayoutResult(
+                False, execution_request.operation, None, execution_request.attempt_id,
+                port.identity.adapter_name, port.identity.adapter_version, True,
+                failure=ModuleFailure(ModuleFailureCode.EXECUTION_FAILED, str(exc)),
+            )
+        return ReleaseLayoutResult(
+            True, execution_request.operation, artifact, execution_request.attempt_id,
+            port.identity.adapter_name, port.identity.adapter_version, True,
+            usage_events=(
+                ModuleUsageEvent(
+                    "local", "existing-release-python-ffmpeg-layout", execution_request.operation,
+                    unit_type="render", quantity=1.0, actual_amount_status="not_applicable",
+                ),
+            ),
+        )
+
+    result = port.execute(request, executor=execute_render)
+    if not result.success:
+        if execution_error is not None:
+            raise execution_error
+        message = result.failure.message if result.failure is not None else "unknown release layout failure"
+        raise RuntimeError(f"发布布局渲染失败：{message}")
+    if result.production_eligible is not True:
+        raise RuntimeError("release layout mock 结果不可作为正式发布产物")
+
+
+def package_release_videos(
+    config: ReleaseConfig,
+    contract_spec: dict | None = None,
+    release_layout_port: ReleaseLayoutPort | None = None,
+) -> None:
     validate_config(config)
     ensure_dir(config.output_dir)
     work_dir = config.output_dir / "_release_work"
@@ -737,26 +884,70 @@ def package_release_videos(config: ReleaseConfig, contract_spec: dict | None = N
         if issues or persisted != geometry:
             raise ValueError("release geometry manifest write verification failed: " + "; ".join(issues))
     assets = render_static_assets(config, work_dir, geometry)
+    port = release_layout_port or build_release_layout_registry().release_layout()
     generated: list[Path] = []
     if config.variant in {"both", "main"}:
         main_wide = work_dir / "main_account_16x9.mp4"
         main_vertical = config.output_dir / "主账号发布视频.mp4"
-        render_main_wide(
-            config, assets["frame"], main_wide,
-            presenter_geometry=(geometry or {}).get("presenter", {}).get("a"),
-            presenter_c_geometry=(geometry or {}).get("presenter", {}).get("c"),
+        _execute_release_layout(
+            port,
+            artifact_id=f"release-main-wide:{config.story_name}",
+            operation="main_wide_render",
+            input_artifacts=_release_layout_input_artifacts(config, [
+                ("background_image", config.bg_image), ("background_video", config.bg_video),
+                ("presenter", config.person_greenscreen), ("audio_mix", config.audio_mix),
+                ("story_frame_a", assets["frame"]), ("story_frame_b", config.frame_image_b),
+                ("watermark_logo", config.watermark_logo), ("story_logo", config.story_logo),
+                ("subtitle_srt", config.subtitle_srt),
+            ]),
+            layout_binding=_release_layout_binding(config, geometry, render="main_wide"),
+            output_target=main_wide,
+            attempt_id="release-main-wide",
+            executor=lambda: render_main_wide(
+                config, assets["frame"], main_wide,
+                presenter_geometry=(geometry or {}).get("presenter", {}).get("a"),
+                presenter_c_geometry=(geometry or {}).get("presenter", {}).get("c"),
+            ),
         )
         if config.plate_image is not None:
-            render_plate_package(main_wide, config.plate_image, main_vertical, config, output_scale=config.output_scale)
+            _execute_release_layout(
+                port,
+                artifact_id=f"release-main-vertical:{config.story_name}",
+                operation="plate_package_render",
+                input_artifacts=_release_layout_input_artifacts(config, [
+                    ("source_video", main_wide), ("plate_image", config.plate_image),
+                ]),
+                layout_binding=_release_layout_binding(config, geometry, render="main_plate_package"),
+                output_target=main_vertical,
+                attempt_id="release-main-vertical",
+                executor=lambda: render_plate_package(
+                    main_wide, config.plate_image, main_vertical, config, output_scale=config.output_scale,
+                ),
+            )
         else:
-            render_vertical_package(
-                source_video=main_wide,
-                top_panel=assets["main_top"],
-                bottom_panel=assets["main_bottom"],
-                output_path=main_vertical,
-                duration=probe_duration(main_wide),
-                config=config,
-                output_scale=config.output_scale,
+            main_duration = probe_duration(main_wide)
+            _execute_release_layout(
+                port,
+                artifact_id=f"release-main-vertical:{config.story_name}",
+                operation="main_vertical_render",
+                input_artifacts=_release_layout_input_artifacts(config, [
+                    ("source_video", main_wide), ("top_panel", assets["main_top"]),
+                    ("bottom_panel", assets["main_bottom"]),
+                ]),
+                layout_binding=_release_layout_binding(
+                    config, geometry, render="main_vertical", duration=main_duration,
+                ),
+                output_target=main_vertical,
+                attempt_id="release-main-vertical",
+                executor=lambda: render_vertical_package(
+                    source_video=main_wide,
+                    top_panel=assets["main_top"],
+                    bottom_panel=assets["main_bottom"],
+                    output_path=main_vertical,
+                    duration=main_duration,
+                    config=config,
+                    output_scale=config.output_scale,
+                ),
             )
         print(f"已生成主账号发布视频：{main_vertical}")
         generated.append(main_vertical)
@@ -764,24 +955,66 @@ def package_release_videos(config: ReleaseConfig, contract_spec: dict | None = N
     if config.variant in {"both", "library"}:
         library_output = config.output_dir / "宝库号发布视频.mp4"
         library_window = work_dir / "library_video_window.mp4"
-        render_library_window_video(
-            source_video=config.bg_video,
-            watermark_png=assets["library_watermark"],
-            tail_notice_png=assets["tail_notice"],
-            output_path=library_window,
-            config=config,
+        _execute_release_layout(
+            port,
+            artifact_id=f"release-library-window:{config.story_name}",
+            operation="library_window_render",
+            input_artifacts=_release_layout_input_artifacts(config, [
+                ("background_video", config.bg_video),
+                ("library_watermark", assets["library_watermark"]),
+                ("tail_notice", assets["tail_notice"]),
+                ("subtitle_srt", config.subtitle_srt), ("audio_mix", config.audio_mix),
+            ]),
+            layout_binding=_release_layout_binding(config, geometry, render="library_window"),
+            output_target=library_window,
+            attempt_id="release-library-window",
+            executor=lambda: render_library_window_video(
+                source_video=config.bg_video,
+                watermark_png=assets["library_watermark"],
+                tail_notice_png=assets["tail_notice"],
+                output_path=library_window,
+                config=config,
+            ),
         )
         if config.plate_image is not None:
-            render_plate_package(library_window, config.plate_image, library_output, config, output_scale=1)
+            _execute_release_layout(
+                port,
+                artifact_id=f"release-library-vertical:{config.story_name}",
+                operation="plate_package_render",
+                input_artifacts=_release_layout_input_artifacts(config, [
+                    ("source_video", library_window), ("plate_image", config.plate_image),
+                ]),
+                layout_binding=_release_layout_binding(config, geometry, render="library_plate_package"),
+                output_target=library_output,
+                attempt_id="release-library-vertical",
+                executor=lambda: render_plate_package(
+                    library_window, config.plate_image, library_output, config, output_scale=1,
+                ),
+            )
         else:
-            render_vertical_package(
-                source_video=library_window,
-                top_panel=assets["library_top"],
-                bottom_panel=assets["library_bottom"],
-                output_path=library_output,
-                duration=probe_duration(library_window),
-                config=config,
-                output_scale=1,
+            library_duration = probe_duration(library_window)
+            _execute_release_layout(
+                port,
+                artifact_id=f"release-library-vertical:{config.story_name}",
+                operation="library_vertical_render",
+                input_artifacts=_release_layout_input_artifacts(config, [
+                    ("source_video", library_window), ("top_panel", assets["library_top"]),
+                    ("bottom_panel", assets["library_bottom"]),
+                ]),
+                layout_binding=_release_layout_binding(
+                    config, geometry, render="library_vertical", duration=library_duration,
+                ),
+                output_target=library_output,
+                attempt_id="release-library-vertical",
+                executor=lambda: render_vertical_package(
+                    source_video=library_window,
+                    top_panel=assets["library_top"],
+                    bottom_panel=assets["library_bottom"],
+                    output_path=library_output,
+                    duration=library_duration,
+                    config=config,
+                    output_scale=1,
+                ),
             )
         print(f"已生成宝库号发布视频：{library_output}")
         generated.append(library_output)
@@ -803,6 +1036,7 @@ def render_release_previews(
     times: list[float],
     person_layouts: list[tuple[str, ReleaseConfig]] | None = None,
     contract_spec: dict | None = None,
+    release_layout_port: ReleaseLayoutPort | None = None,
 ) -> None:
     validate_config(config)
     ensure_dir(preview_dir)
@@ -812,6 +1046,7 @@ def render_release_previews(
     if geometry is not None:
         write_json_atomic(preview_dir / f"release_geometry_manifest_{config.variant}.json", geometry)
     assets = render_static_assets(config, work_dir, geometry)
+    port = release_layout_port or build_release_layout_registry().release_layout()
     if config.variant in {"both", "main"}:
         if config.bg_image is None or config.person_greenscreen is None or config.frame_image is None:
             raise ValueError("主账号预览需要 --bg-image、--person-greenscreen 和 --frame-image")
@@ -821,35 +1056,104 @@ def render_release_previews(
             use_c = any(start <= timestamp <= end for start, end in config.c_windows)
             if use_b:
                 output = preview_dir / f"main_{int(round(timestamp)):03d}s_b.png"
-                render_main_preview_frame(
-                    config, assets["frame"], output, work_dir, timestamp, "b", geometry,
-                    assets["main_top"], assets["main_bottom"],
+                _execute_release_layout(
+                    port,
+                    artifact_id=f"release-preview-main-b:{config.story_name}:{timestamp:.3f}",
+                    operation="preview_main",
+                    input_artifacts=_release_layout_input_artifacts(config, [
+                        ("background_image", config.bg_image), ("background_video", config.bg_video),
+                        ("presenter", config.person_greenscreen), ("story_frame", assets["frame"]),
+                        ("story_frame_b", config.frame_image_b), ("watermark_logo", config.watermark_logo),
+                        ("story_logo", config.story_logo), ("subtitle_srt", config.subtitle_srt),
+                        ("top_panel", assets["main_top"]), ("bottom_panel", assets["main_bottom"]),
+                    ]),
+                    layout_binding=_release_layout_binding(
+                        config, geometry, render="preview_main", scene="b", timestamp=timestamp,
+                    ),
+                    output_target=output,
+                    attempt_id=f"release-preview-main-b-{timestamp:.3f}",
+                    executor=lambda: render_main_preview_frame(
+                        config, assets["frame"], output, work_dir, timestamp, "b", geometry,
+                        assets["main_top"], assets["main_bottom"],
+                    ),
                 )
                 print(f"已生成主账号预览帧：{output}")
                 continue
             if use_c:
                 output = preview_dir / f"main_{int(round(timestamp)):03d}s_c.png"
-                render_main_preview_frame(
-                    config, assets["frame"], output, work_dir, timestamp, "c", geometry,
-                    assets["main_top"], assets["main_bottom"],
+                _execute_release_layout(
+                    port,
+                    artifact_id=f"release-preview-main-c:{config.story_name}:{timestamp:.3f}",
+                    operation="preview_main",
+                    input_artifacts=_release_layout_input_artifacts(config, [
+                        ("background_image", config.bg_image), ("background_video", config.bg_video),
+                        ("presenter", config.person_greenscreen), ("story_frame", assets["frame"]),
+                        ("watermark_logo", config.watermark_logo), ("story_logo", config.story_logo),
+                        ("subtitle_srt", config.subtitle_srt), ("top_panel", assets["main_top"]),
+                        ("bottom_panel", assets["main_bottom"]),
+                    ]),
+                    layout_binding=_release_layout_binding(
+                        config, geometry, render="preview_main", scene="c", timestamp=timestamp,
+                    ),
+                    output_target=output,
+                    attempt_id=f"release-preview-main-c-{timestamp:.3f}",
+                    executor=lambda: render_main_preview_frame(
+                        config, assets["frame"], output, work_dir, timestamp, "c", geometry,
+                        assets["main_top"], assets["main_bottom"],
+                    ),
                 )
                 print(f"已生成主账号预览帧：{output}")
                 continue
             for label, layout_config in layouts:
                 suffix = "" if label == "current" and len(layouts) == 1 else f"_{label}"
                 output = preview_dir / f"main_{int(round(timestamp)):03d}s_a{suffix}.png"
-                render_main_preview_frame(
-                    layout_config, assets["frame"], output, work_dir, timestamp, "a", geometry,
-                    assets["main_top"], assets["main_bottom"],
+                _execute_release_layout(
+                    port,
+                    artifact_id=f"release-preview-main-a:{config.story_name}:{timestamp:.3f}:{label}",
+                    operation="preview_main",
+                    input_artifacts=_release_layout_input_artifacts(layout_config, [
+                        ("background_image", layout_config.bg_image), ("background_video", layout_config.bg_video),
+                        ("presenter", layout_config.person_greenscreen), ("story_frame", assets["frame"]),
+                        ("watermark_logo", layout_config.watermark_logo), ("story_logo", layout_config.story_logo),
+                        ("subtitle_srt", layout_config.subtitle_srt), ("top_panel", assets["main_top"]),
+                        ("bottom_panel", assets["main_bottom"]),
+                    ]),
+                    layout_binding=_release_layout_binding(
+                        layout_config, geometry, render="preview_main", scene="a",
+                        timestamp=timestamp, layout_label=label,
+                    ),
+                    output_target=output,
+                    attempt_id=f"release-preview-main-a-{timestamp:.3f}-{label}",
+                    executor=lambda layout_config=layout_config, output=output: render_main_preview_frame(
+                        layout_config, assets["frame"], output, work_dir, timestamp, "a", geometry,
+                        assets["main_top"], assets["main_bottom"],
+                    ),
                 )
                 print(f"已生成主账号预览帧：{output}")
     if config.variant in {"both", "library"}:
         for timestamp in times:
             output = preview_dir / f"library_{int(round(timestamp)):03d}s.png"
-            render_library_preview_frame(
-                config, assets["library_watermark"], output, work_dir, timestamp,
-                assets["library_top"] if geometry is not None else None,
-                assets["library_bottom"] if geometry is not None else None,
+            library_top = assets["library_top"] if geometry is not None else None
+            library_bottom = assets["library_bottom"] if geometry is not None else None
+            _execute_release_layout(
+                port,
+                artifact_id=f"release-preview-library:{config.story_name}:{timestamp:.3f}",
+                operation="preview_library",
+                input_artifacts=_release_layout_input_artifacts(config, [
+                    ("background_video", config.bg_video),
+                    ("library_watermark", assets["library_watermark"]),
+                    ("subtitle_srt", config.subtitle_srt), ("plate_image", config.plate_image),
+                    ("top_panel", library_top), ("bottom_panel", library_bottom),
+                ]),
+                layout_binding=_release_layout_binding(
+                    config, geometry, render="preview_library", timestamp=timestamp,
+                ),
+                output_target=output,
+                attempt_id=f"release-preview-library-{timestamp:.3f}",
+                executor=lambda: render_library_preview_frame(
+                    config, assets["library_watermark"], output, work_dir, timestamp,
+                    library_top, library_bottom,
+                ),
             )
             print(f"已生成宝库号预览帧：{output}")
 

@@ -262,6 +262,19 @@ class StoryContractRuntimeTests(unittest.TestCase):
                 {"image_style": "项目指定的通用绘本风格"},
             )
 
+    def test_trusted_defaults_bind_the_resolved_style_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            chain = build_trusted_input_chain(project, manifest, load_config())
+            default_source = next(
+                item for item in chain["sources"] if item["source"] == "brand_or_global_default"
+            )
+            resolved = default_source["json"]["resolved_image_style"]
+            self.assertEqual(resolved["key"], "3d_cartoon")
+            self.assertEqual(resolved["label"], "3D卡通")
+            self.assertIn("圆润可爱的角色比例", resolved["prompt"])
+            self.assertIn("材质细腻但不过度真实", resolved["prompt"])
+
     def test_independent_review_hash_binds_and_runtime_lock_invalidates_on_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, manifest = _new_project(Path(directory))
@@ -312,6 +325,56 @@ class StoryContractRuntimeTests(unittest.TestCase):
         payload = {"evidence_matrix": [{"section": "visual_style", "evidence": "contracts.visual_style"}]}
         issues = contract_review_payload_issues(payload)
         self.assertTrue(any("缺少合同节" in issue for issue in issues), issues)
+
+    def test_rejected_contract_review_triggers_bounded_automatic_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            agent = StoryAgent(_context(project))
+            paths = contract_paths(project)
+            write_trusted_input_chain(
+                paths["trusted_inputs"], build_trusted_input_chain(project, manifest, load_config())
+            )
+            save_json(paths["contract"], _runtime_valid_contract(project, manifest))
+            paths["summary"].write_text("# Contract\n", encoding="utf-8")
+
+            def fake_review(**kwargs):
+                payload = {
+                    "approved": False,
+                    "score": 80,
+                    "critical_errors": ["preview quality"],
+                    "issues": [],
+                    "retry_indices": [],
+                    "retry_files": [],
+                    "retry_instructions": ["regenerate the required preview"],
+                    "evidence_matrix": [
+                        {"section": section, "evidence": f"contracts.{section}"}
+                        for section in (
+                            "semantic_artifacts",
+                            "visual_style",
+                            "characters",
+                            "world_scale",
+                            "story_state",
+                            "brand",
+                            "release_layout",
+                        )
+                    ],
+                    "artifact_sha256": file_sha256(kwargs["bundle"]),
+                }
+                save_json(paths["review"], payload)
+                return StageResult("blocked", "review rejected", paths["review"]), payload
+
+            with (
+                patch.object(agent, "_structured_review", side_effect=fake_review),
+                patch.object(
+                    agent,
+                    "_revise_story_contract_after_review",
+                    return_value=StageResult("done", "revised", paths["contract"]),
+                ) as revise,
+            ):
+                result = agent._stage_story_contract_review(manifest)
+            self.assertEqual(result.status, "retrying")
+            revise.assert_called_once()
+            self.assertFalse(paths["lock"].exists())
 
     def test_legacy_project_passes_both_new_predicates_without_files(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

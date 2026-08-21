@@ -18,6 +18,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 from story_agent import AgentContext, StageResult, StoryAgent, WorkerAttempt, classify_command_failure, main as story_agent_main
+from story_contract_runtime import contract_paths
 from story_module_registry import (
     MODULE_EXECUTION_MODE_ENV,
     MODULE_EXECUTION_MODE_REQUIRED_ENV,
@@ -65,6 +66,40 @@ def as_frozen_v3_legacy(manifest: dict) -> dict:
     return ensure_manifest_v2(manifest)
 
 
+def make_test_video(path: Path) -> Path:
+    """Create a tiny, valid 1280x720 MP4 with audio for isolated submit tests."""
+
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            "color=c=0x20C840:s=1280x720:d=0.4:r=5",
+            "-f",
+            "lavfi",
+            "-i",
+            "sine=frequency=440:duration=0.4",
+            "-shortest",
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "10",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            str(path),
+        ],
+        check=True,
+    )
+    return path
+
+
 class StoryAgentRuntimeTests(unittest.TestCase):
     def test_two_role_model_routing_uses_commander_for_judgment_and_worker_for_execution(self) -> None:
         context = AgentContext(
@@ -93,9 +128,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_prepared_entry_binds_clean_video_and_confirmed_text_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
-            video = root / "prepared.mp4"
-            shutil.copy2(fixture, video)
+            video = make_test_video(root / "prepared.mp4")
             confirmed = root / "confirmed.txt"
             confirmed.write_text("小老虎认真听大家唱歌。\n最后，它学会了公平。\n", encoding="utf-8")
             _job, project, created = submit_video_job(
@@ -257,7 +290,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             manifest = as_frozen_v3_legacy(
                 init_project(project, story_name="字幕接入", slug="subtitle-assembly")
             )
-            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
+            fixture = make_test_video(root / "fixture.mp4")
             subtitles = project_paths(project).inputs / "subtitle-assembly_confirmed_subtitles.txt"
             subtitles.write_text("逐行字幕一。\n逐行字幕二。\n", encoding="utf-8")
             manifest["inputs"]["narration"] = str(fixture)
@@ -288,9 +321,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_prepared_entry_accepts_reviewed_docx_and_derives_plain_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
-            video = root / "prepared.mp4"
-            shutil.copy2(fixture, video)
+            video = make_test_video(root / "prepared.mp4")
             confirmed = root / "confirmed.docx"
             document_xml = """<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">
@@ -331,9 +362,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_prepared_entry_accepts_optional_confirmed_subtitles_as_audited_input(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
-            video = root / "prepared.mp4"
-            shutil.copy2(fixture, video)
+            video = make_test_video(root / "prepared.mp4")
             confirmed = root / "confirmed.txt"
             confirmed.write_text(
                 "小壁虎借尾巴\n大家好，我是绵羊姐姐。\n小壁虎爬呀爬，爬到小河边。\n",
@@ -383,9 +412,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_confirmed_subtitles_are_prepared_only_and_must_be_utf8_text(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
-            video = root / "prepared.mp4"
-            shutil.copy2(fixture, video)
+            video = make_test_video(root / "prepared.mp4")
             confirmed = root / "confirmed.txt"
             confirmed.write_text("小故事\n故事正文。\n", encoding="utf-8")
             subtitles = root / "subtitles.srt"
@@ -410,9 +437,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_prepared_semantic_contract_separates_customer_and_full_transcript_views(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
-            video = root / "prepared.mp4"
-            shutil.copy2(fixture, video)
+            video = make_test_video(root / "prepared.mp4")
             confirmed = root / "confirmed.txt"
             confirmed.write_text(
                 "大家好\n我是故事老师\n今天给大家讲的故事是《小兔子找太阳》。\n"
@@ -847,6 +872,79 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertFalse(stale_bible.exists())
             self.assertGreaterEqual(len(list(quarantine.iterdir())), 4)
 
+    def test_story_image_generation_lineage_rejects_unbound_or_changed_images(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：图片血缘"
+            manifest = init_project(project, story_name="图片血缘", slug="image-lineage")
+            paths = project_paths(project)
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="图片血缘",
+                slug="image-lineage",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context)
+            contract_context = paths.status / "contracts" / "consumers" / "storyboard_images.json"
+            contract_context.parent.mkdir(parents=True, exist_ok=True)
+            contract_context.write_text('{"binding":"current"}\n', encoding="utf-8")
+            sample_lock = paths.status / "visual_samples" / "visual_sample.lock.json"
+            sample_lock.parent.mkdir(parents=True, exist_ok=True)
+            sample_lock.write_text('{"locked":true}\n', encoding="utf-8")
+            storyboard = paths.images / "image-lineage_storyboard_lines.txt"
+            storyboard.write_text("第一镜。\n", encoding="utf-8")
+            final_image = paths.images / "images" / "image-lineage_scene_01.png"
+            staging_image = agent._codex_stage_dir("codex_story_images") / "images" / final_image.name
+            final_image.parent.mkdir(parents=True, exist_ok=True)
+            staging_image.parent.mkdir(parents=True, exist_ok=True)
+            final_image.write_bytes(b"current-image")
+            staging_image.write_bytes(b"current-image")
+
+            self.assertFalse(agent._story_image_generation_context_current(contract_context, storyboard))
+            agent._write_story_image_generation_manifest(contract_context, storyboard, ["第一镜。"])
+            self.assertTrue(agent._story_image_generation_context_current(contract_context, storyboard))
+            self.assertTrue(agent._story_image_generation_complete(manifest, contract_context, storyboard))
+
+            final_image.write_bytes(b"changed-after-generation")
+            self.assertFalse(agent._story_image_generation_context_current(contract_context, storyboard))
+
+    def test_contract_invalidation_archives_final_and_staging_story_images(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：双目录失效"
+            init_project(project, story_name="双目录失效", slug="dual-invalidation")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="双目录失效",
+                slug="dual-invalidation",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context)
+            final_image = project_paths(project).images / "images" / "dual-invalidation_scene_01.png"
+            staging_image = agent._codex_stage_dir("codex_story_images") / "images" / final_image.name
+            final_image.parent.mkdir(parents=True, exist_ok=True)
+            staging_image.parent.mkdir(parents=True, exist_ok=True)
+            final_image.write_bytes(b"final-old")
+            staging_image.write_bytes(b"staging-old")
+            archive = agent._archive_contract_consumer_outputs("storyboard_images")
+            self.assertFalse(final_image.exists())
+            self.assertFalse(staging_image.exists())
+            self.assertEqual(len(list(archive.glob("dual-invalidation_scene_01*.png"))), 2)
+
     def test_partial_story_image_batch_is_retrying_not_passed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：图片分批"
@@ -1184,6 +1282,52 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(reconciled["agent"]["stages"]["source_edit"]["status"], "passed")
             self.assertEqual(reconciled["agent"]["blocked_reason"], "")
 
+    def test_prepare_jobs_contract_blocker_is_requeued_after_contract_recovers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：合同恢复"
+            manifest = init_project(project, story_name="合同恢复", slug="contract-recovery")
+            paths = project_paths(project)
+            contract_files = contract_paths(project)
+            contract_files["directory"].mkdir(parents=True, exist_ok=True)
+            for key in ("contract", "lock", "review"):
+                contract_files[key].parent.mkdir(parents=True, exist_ok=True)
+                contract_files[key].write_text(f"{key}\n", encoding="utf-8")
+            mark_stage(
+                manifest,
+                "prepare_jobs",
+                "blocked",
+                message="image_video 无法读取已审核合同锁：story contract invalid",
+            )
+            write_manifest(paths, manifest)
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="合同恢复",
+                slug="contract-recovery",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context)
+            with patch.object(agent, "_legacy_contract_policy", return_value=False), patch.object(
+                agent, "_has_story_contract_review", return_value=True
+            ), patch.object(agent, "_has_story_images_review", return_value=True):
+                changed = agent._recover_stale_stage_blockers(manifest, set(), {"prepare_jobs"})
+            self.assertTrue(changed)
+            self.assertEqual(manifest["agent"]["stages"]["prepare_jobs"]["status"], "pending")
+            self.assertNotIn("prepare_jobs", manifest["agent"]["branch_blockers"])
+            fingerprint = manifest["agent"]["stages"]["prepare_jobs"]["auto_recovery_fingerprint"]
+            with patch.object(agent, "_legacy_contract_policy", return_value=False), patch.object(
+                agent, "_has_story_contract_review", return_value=True
+            ), patch.object(agent, "_has_story_images_review", return_value=True):
+                self.assertFalse(agent._recover_stale_stage_blockers(manifest, set(), set()))
+            self.assertEqual(manifest["agent"]["stages"]["prepare_jobs"]["auto_recovery_fingerprint"], fingerprint)
+
     def test_hashed_source_qa_rejects_media_drift(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：源媒体哈希"
@@ -1383,6 +1527,31 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertLess(command.index("exec"), command.index("--ignore-user-config"))
             self.assertEqual(command[command.index("--image") + 1], str(image_path))
 
+    def test_visual_review_prompt_explicitly_forbids_external_vision_bridges(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：禁用外部视觉桥接"
+            init_project(project, story_name="禁用外部视觉桥接", slug="native-only-review")
+            agent = StoryAgent(
+                AgentContext(
+                    project_dir=project,
+                    inbox=None,
+                    story_name="禁用外部视觉桥接",
+                    slug="native-only-review",
+                    execute=False,
+                    update_latest_episode=False,
+                    codex_mode="cli",
+                    codex_model="",
+                    codex_sandbox="workspace-write",
+                    codex_approval="never",
+                    codex_path="codex",
+                    codex_timeout=30,
+                )
+            )
+            prompt = agent._write_codex_prompt("story_images_review", "审核图片", None).read_text(encoding="utf-8")
+            self.assertIn("GPT 模型", prompt)
+            self.assertIn("禁止调用 Claude Vision", prompt)
+            self.assertIn("bigmodel.cn", prompt)
+
     def test_visual_producer_with_images_keeps_user_config_compatibility(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：视觉生产兼容"
@@ -1507,8 +1676,9 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(
                 captured["prompt"],
                 f"请读取并执行这份 Suno 浏览器自动化任务：\n{handoff}\n\n"
-                "目标是生成并下载第一首可用音乐，按音乐分段 CSV 的 target_audio_filename 重命名，"
-                "保存到指定 suno_downloads 目录。若当前 CLI 无浏览器控制能力、Suno 未登录、遇到验证码或付费弹窗，"
+                "目标是逐行生成并下载音乐分段 CSV 中全部 1 段音乐；每一段都必须按 "
+                "target_audio_filename 精确重命名，全部保存到指定 suno_downloads 目录。"
+                "只有所有目标文件均已落盘才可报告完成。若当前 CLI 无浏览器控制能力、Suno 未登录、遇到验证码或付费弹窗，"
                 f"请写入 `{agent._music_dir() / 'suno_cli_blocker.md'}` 说明原因，不要假装完成。",
             )
 
@@ -1644,9 +1814,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_submit_is_idempotent_and_cancel_is_reversible(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            video = root / "测试故事_绿幕.mp4"
-            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
-            shutil.copy2(fixture, video)
+            video = make_test_video(root / "测试故事_绿幕.mp4")
             registry = JobRegistry(root / "registry.json")
             job_id, project, created = submit_video_job(video, projects_root=root / "projects", registry=registry)
             self.assertTrue(created)
@@ -1684,9 +1852,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_submit_copies_and_hashes_input_lut(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            video = root / "测试故事_绿幕.mp4"
-            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
-            shutil.copy2(fixture, video)
+            video = make_test_video(root / "测试故事_绿幕.mp4")
             lut = root / "sony.cube"
             lut.write_text("LUT_3D_SIZE 2\n0 0 0\n0 0 1\n0 1 0\n0 1 1\n1 0 0\n1 0 1\n1 1 0\n1 1 1\n", encoding="utf-8")
             registry = JobRegistry(root / "registry.json")
@@ -1705,9 +1871,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_submit_replaces_interrupted_partial_copy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
-            video = root / "恢复测试_绿幕.mp4"
-            fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
-            shutil.copy2(fixture, video)
+            video = make_test_video(root / "恢复测试_绿幕.mp4")
             project = root / "projects" / "故事剪辑：恢复测试"
             partial = project / "00_输入素材" / "recovery-test_greenscreen_source.mp4"
             partial.parent.mkdir(parents=True)

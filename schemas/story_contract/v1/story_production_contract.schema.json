@@ -40,7 +40,7 @@
         "required": ["preview_id", "kind", "need_reason", "content_refs", "provenance"],
         "properties": {
           "preview_id": {"type": "string", "minLength": 1},
-          "kind": {"enum": ["style_anchor", "character_sheet", "scale_anchor", "layout_preview"]},
+          "kind": {"enum": ["style_anchor", "character_sheet", "scale_anchor", "state_anchor", "layout_preview"]},
           "need_reason": {"type": "string", "minLength": 1},
           "content_refs": {"$ref": "common.schema.json#/$defs/stringList"},
           "path": {"type": "string", "minLength": 1},

@@ -53,9 +53,11 @@ class FullAutoContractTests(unittest.TestCase):
             self.assertFalse(video_prompt_review_matches_current(jobs, snapshot, decisions))
 
     def test_outputs_without_independent_reviews_cannot_complete(self) -> None:
-        fixture_video = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
         with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory) / "故事剪辑：模拟供应商闭环"
+            root = Path(directory)
+            fixture_video = root / "fixture.mp4"
+            make_vertical_video(fixture_video)
+            project = root / "故事剪辑：模拟供应商闭环"
             manifest = init_project(project, story_name="模拟供应商闭环", slug="mock-e2e")
             paths = project_paths(project)
             manifest["agent"]["job_id"] = "mock-e2e-job"

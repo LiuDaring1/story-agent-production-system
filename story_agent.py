@@ -38,6 +38,7 @@ from story_video_synthesizer.image_video import validate_image_video_jobs
 from story_contract_runtime import (
     CONTRACT_POLICY_LEGACY,
     CONTRACT_POLICY_REQUIRED,
+    bind_contract_visual_style_to_trusted_default,
     build_trusted_input_chain,
     contract_consumer_context_is_current,
     contract_consumer_completion_is_current,
@@ -160,6 +161,20 @@ from story_project import (
     slugify,
 )
 from story_qualification import build_promotion_report, record_human_signoff, record_unattended_launch, render_promotion_markdown
+from story_agent_observability import (
+    acknowledge_notification,
+    age_seconds,
+    append_agent_event,
+    emit_notification,
+    event_log_path,
+    load_agent_events,
+    load_notifications,
+    notification_sinks as build_notification_sinks,
+    notification_log_path,
+    read_ndjson,
+    recovery_log_path,
+    supervisor_state_path,
+)
 
 
 ROOT = Path(__file__).resolve().parent
@@ -236,6 +251,7 @@ class AgentContext:
     codex_story_image_batch_size: int = 15
     scheduler: str = "linear"
     max_parallel: int = 1
+    notification_sinks: str = "project"
 
     @property
     def paths(self):
@@ -244,6 +260,7 @@ class AgentContext:
     def codex_route(self, stage: str) -> tuple[str, str, str]:
         """Return the fixed two-role route: commander for judgment, worker otherwise."""
         commander_stages = {
+            "recovery_controller",
             "source_edit_review",
             "story_contract_review",
             "visual_sample_review",
@@ -447,6 +464,14 @@ class StoryAgent:
                         provider=self._provider_for_stage(stage_name),
                     )
                     write_manifest(self.context.paths, manifest)
+                    self._record_event(
+                        "stage_started",
+                        {
+                            "stage": stage_name,
+                            "status": "running",
+                            "message": "线性调度阶段开始",
+                        },
+                    )
                 result = action(manifest)
                 if result.status == "failed":
                     critical_stage = stage_name in {
@@ -482,6 +507,10 @@ class StoryAgent:
             manifest = self._manifest()
             ensure_manifest_v2(manifest)
             assert_runnable(manifest, self.context.project_dir)
+            if self._recover_interrupted_dag_workers(manifest):
+                from story_project import write_manifest
+
+                write_manifest(self.context.paths, manifest)
             control = update_control(self.context.project_dir, cancel_requested=False, increment_epoch=True)
             run_epoch = int(control["run_epoch"])
             run_id = f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
@@ -512,6 +541,8 @@ class StoryAgent:
                 self._reconcile_all_completed_stage_records(manifest)
                 manifest = load_manifest(self.context.paths) or manifest
                 completed = self._completed_stage_names(manifest)
+                if self._recover_stale_stage_blockers(manifest, completed, blocked_this_run):
+                    write_manifest(self.context.paths, manifest)
                 if len(completed) == len(STORY_STAGE_SEQUENCE):
                     freeze_runtime(manifest["agent"])
                     manifest["agent"]["status"] = "completed"
@@ -577,7 +608,9 @@ class StoryAgent:
         completed: set[str] = set()
         for name, done, _action in self._stage_checks():
             try:
-                if done(manifest):
+                if done(manifest) and all(
+                    dependency in completed for dependency in STORY_STAGE_DEPENDENCIES[name]
+                ):
                     completed.add(name)
             except Exception:
                 continue
@@ -595,6 +628,121 @@ class StoryAgent:
             if all(dependency in completed for dependency in STORY_STAGE_DEPENDENCIES[name]):
                 ready.append(name)
         return ready
+
+    def _recover_stale_stage_blockers(
+        self,
+        manifest: dict[str, Any],
+        completed: set[str],
+        blocked_this_run: set[str],
+    ) -> bool:
+        """Requeue blockers whose recorded prerequisite failure is now obsolete.
+
+        Recovery is keyed by a hash of the prerequisite artifacts. A given
+        prerequisite state is retried at most once, preventing infinite loops
+        while allowing another DAG branch to repair the inputs.
+        """
+
+        agent = manifest.get("agent", {})
+        stages = agent.get("stages", {}) if isinstance(agent, dict) else {}
+        blockers = agent.get("branch_blockers", {}) if isinstance(agent, dict) else {}
+        if not isinstance(stages, dict) or not isinstance(blockers, dict):
+            return False
+
+        prepare_record = stages.get("prepare_jobs", {})
+        prepare_message = str(prepare_record.get("message", "")) if isinstance(prepare_record, dict) else ""
+        prepare_paths = contract_paths(self.context.project_dir)
+        recoveries: dict[str, tuple[bool, tuple[Path, ...], str]] = {
+            "prepare_jobs": (
+                (
+                    not self._legacy_contract_policy(manifest)
+                    and "合同" in prepare_message
+                    and self._has_story_contract_review(manifest)
+                    and self._has_story_images_review(manifest)
+                ),
+                (prepare_paths["contract"], prepare_paths["lock"], prepare_paths["review"]),
+                "已审核合同与图片审核现已有效，自动清除旧 prepare_jobs 阻塞并重新排队。",
+            ),
+            "assemble_music": (
+                "suno_generate" in completed and self._has_suno_audio(manifest),
+                (self._music_plan(), *self._expected_suno_audio_targets(manifest)),
+                "音乐计划所需片段现已齐全，自动清除旧 assemble_music 失败并重新排队。",
+            ),
+        }
+
+        changed = False
+        for stage, (prerequisites_ready, paths, message) in recoveries.items():
+            record = stages.get(stage, {})
+            if not isinstance(record, dict) or record.get("status") not in {"blocked", "failed", "cancelled"}:
+                continue
+            if not prerequisites_ready or not all(path.is_file() for path in paths):
+                continue
+            fingerprint = hashlib.sha256(
+                json.dumps(
+                    {str(path): file_sha256(path) for path in paths},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ).encode("utf-8")
+            ).hexdigest()
+            if record.get("auto_recovery_fingerprint") == fingerprint:
+                continue
+            record["status"] = "pending"
+            record["message"] = message
+            record["finished_at"] = ""
+            record["retry_reason"] = message
+            record["auto_recovery_fingerprint"] = fingerprint
+            blockers.pop(stage, None)
+            blocked_this_run.discard(stage)
+            agent["events"] = [
+                *agent.get("events", []),
+                {"time": now(), "event": "stale_blocker_recovered", "stage": stage, "message": message},
+            ][-500:]
+            changed = True
+        return changed
+
+    def _recover_interrupted_dag_workers(self, manifest: dict[str, Any]) -> bool:
+        agent = manifest.get("agent", {}) if isinstance(manifest.get("agent"), dict) else {}
+        scheduler = agent.get("scheduler", {}) if isinstance(agent.get("scheduler"), dict) else {}
+        running = scheduler.get("running", {}) if isinstance(scheduler.get("running"), dict) else {}
+        changed = False
+        for stage, item in list(running.items()):
+            pid = int(item.get("pid") or 0) if isinstance(item, dict) else 0
+            if process_is_alive(pid):
+                raise AgentRuntimeError(
+                    f"orphan worker still alive: stage={stage}, pid={pid}; supervisor must monitor it"
+                )
+            record = agent.get("stages", {}).get(stage, {})
+            if isinstance(record, dict) and record.get("status") == "running":
+                record["status"] = "pending"
+                record["finished_at"] = ""
+                record["retry_reason"] = "supervisor restart recovered an interrupted worker"
+                record["infrastructure_attempts"] = int(
+                    record.get("infrastructure_attempts") or 0
+                ) + 1
+            running.pop(stage, None)
+            agent.get("branch_blockers", {}).pop(stage, None)
+            agent["events"] = [
+                *agent.get("events", []),
+                {
+                    "time": now(),
+                    "event": "interrupted_worker_requeued",
+                    "stage": stage,
+                    "pid": pid,
+                },
+            ][-500:]
+            append_agent_event(
+                self.context.project_dir,
+                event_type="interrupted_worker_requeued",
+                status="pending",
+                summary=f"dead worker PID {pid} was requeued after supervisor restart",
+                job_id=str(agent.get("job_id") or ""),
+                run_id=str(scheduler.get("run_id") or ""),
+                stage=stage,
+                attempt_id=str(item.get("attempt_id") or "") if isinstance(item, dict) else "",
+                blocker_category="interrupted_worker",
+                recovery_decision="repair_and_retry",
+            )
+            changed = True
+        return changed
 
     def _select_parallel_batch(self, ready: list[str], *, max_count: int) -> list[str]:
         selected: list[str] = []
@@ -687,6 +835,8 @@ class StoryAgent:
                 self._modules().selection_profile(),
                 "--module-execution-mode",
                 self._modules().selection_execution_mode(),
+                "--notification-sinks",
+                self.context.notification_sinks,
             ]
             if self.context.codex_model:
                 command.extend(["--codex-model", self.context.codex_model])
@@ -701,6 +851,7 @@ class StoryAgent:
             env["STORY_AGENT_PROJECT_ROOT"] = str(self.context.project_dir.expanduser().resolve())
             env["STORY_AGENT_WORKER_DIR"] = str(work_dir)
             env["STORY_AGENT_RUN_EPOCH"] = str(run_epoch)
+            env["STORY_AGENT_ATTEMPT_ID"] = attempt_id
             env.update(self._module_subprocess_env())
             with log_file.open("w", encoding="utf-8") as worker_log:
                 process = subprocess.Popen(
@@ -714,6 +865,15 @@ class StoryAgent:
                 )
             attempts.append(
                 WorkerAttempt(stage, attempt_id, run_epoch, work_dir, base_manifest, shadow_manifest, result_file, log_file, process)
+            )
+            self._record_event(
+                "stage_started",
+                {
+                    "stage": stage,
+                    "status": "running",
+                    "attempt_id": attempt_id,
+                    "message": f"DAG worker 已启动，PID {process.pid}",
+                },
             )
             manifest["agent"]["scheduler"].setdefault("running", {})[stage] = {
                 "attempt_id": attempt_id,
@@ -839,7 +999,7 @@ class StoryAgent:
             "product_package",
         }
 
-    def status(self) -> None:
+    def status_payload(self) -> dict[str, Any]:
         manifest = self._manifest()
         stage_name, _ = self._next_stage(manifest)
         agent_data = manifest.get("agent", {})
@@ -864,8 +1024,14 @@ class StoryAgent:
         dag_ready = self._ready_dag_stages(manifest, completed, set()) if scheduler_mode == "dag" else ([] if stage_name == "done" else [stage_name])
         branch_status: dict[str, list[dict[str, str]]] = {}
         for name in STORY_STAGE_SEQUENCE:
+            recorded_status = str(agent_data.get("stages", {}).get(name, {}).get("status", "pending"))
+            effective_status = (
+                "passed"
+                if name in completed
+                else ("stale" if recorded_status == "passed" else recorded_status)
+            )
             branch_status.setdefault(STAGE_BRANCHES.get(name, "other"), []).append(
-                {"stage": name, "status": "passed" if name in completed else str(agent_data.get("stages", {}).get(name, {}).get("status", "pending"))}
+                {"stage": name, "status": effective_status}
             )
         timing = self._timing_status(agent_data)
         stage_records = agent_data.get("stages", {}) if isinstance(agent_data.get("stages"), dict) else {}
@@ -893,7 +1059,7 @@ class StoryAgent:
                 supervisor["running"] = process_is_alive(pid)
             except (ValueError, json.JSONDecodeError):
                 supervisor["running"] = False
-        print(json.dumps({
+        payload = {
             "job_id": manifest.get("agent", {}).get("job_id", ""),
             "project_dir": str(self.context.project_dir),
             "next_stage": stage_name,
@@ -946,7 +1112,371 @@ class StoryAgent:
             "final_delivery": manifest.get("outputs", {}).get("final_delivery_checklist", ""),
             "completed_at": manifest.get("completed_at", ""),
             "completion_valid": stage_name == "done" and bool(manifest.get("completed_at")),
-        }, ensure_ascii=False, indent=2))
+        }
+        payload.update(
+            self._observability_status(
+                manifest,
+                stage_name=stage_name,
+                completed=completed,
+                supervisor=supervisor,
+                stage_records=stage_records,
+                storyboard=storyboard,
+                image_dir=image_dir,
+                staging_images=staging_images,
+            )
+        )
+        return payload
+
+    def status(self) -> None:
+        print(json.dumps(self.status_payload(), ensure_ascii=False, indent=2))
+
+    @staticmethod
+    def _record_duration_seconds(record: dict[str, Any], *, running: bool) -> int | None:
+        started = str(record.get("started_at") or "")
+        finished = str(record.get("finished_at") or "")
+        if not started:
+            return None
+        try:
+            start_value = time.mktime(time.strptime(started, "%Y-%m-%d %H:%M:%S"))
+            end_value = (
+                time.time()
+                if running or not finished
+                else time.mktime(time.strptime(finished, "%Y-%m-%d %H:%M:%S"))
+            )
+        except ValueError:
+            return None
+        return max(0, round(end_value - start_value))
+
+    @staticmethod
+    def _read_json_object(path: Path) -> dict[str, Any]:
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return {}
+        return payload if isinstance(payload, dict) else {}
+
+    def _observability_status(
+        self,
+        manifest: dict[str, Any],
+        *,
+        stage_name: str,
+        completed: set[str],
+        supervisor: dict[str, Any],
+        stage_records: dict[str, Any],
+        storyboard: Path | None,
+        image_dir: Path | None,
+        staging_images: Path,
+    ) -> dict[str, Any]:
+        agent = manifest.get("agent", {}) if isinstance(manifest.get("agent"), dict) else {}
+        scheduler = agent.get("scheduler", {}) if isinstance(agent.get("scheduler"), dict) else {}
+        running_attempts = scheduler.get("running", {}) if isinstance(scheduler.get("running"), dict) else {}
+        ready = self._ready_dag_stages(manifest, completed, set()) if scheduler.get("mode") == "dag" else []
+        current_stage = next(iter(running_attempts), "") or (ready[0] if ready else stage_name)
+
+        mutable_supervisor = self._read_json_object(supervisor_state_path(self.context.project_dir))
+        merged_supervisor = {**supervisor, **mutable_supervisor}
+        try:
+            supervisor_pid = int(mutable_supervisor.get("pid") or supervisor.get("pid") or 0)
+        except (TypeError, ValueError):
+            supervisor_pid = 0
+        supervisor_alive = process_is_alive(supervisor_pid)
+        heartbeat_at = str(mutable_supervisor.get("heartbeat_at") or "")
+        heartbeat_age = age_seconds(heartbeat_at)
+        heartbeat_limit = int(mutable_supervisor.get("heartbeat_timeout_seconds") or 120)
+        recorded_supervisor_status = str(mutable_supervisor.get("status") or "")
+        if supervisor_alive and heartbeat_age is not None and heartbeat_age > heartbeat_limit:
+            effective_supervisor_status = "unresponsive"
+        elif supervisor_alive:
+            effective_supervisor_status = recorded_supervisor_status or "running"
+        elif recorded_supervisor_status in {"completed", "cancelled", "terminal_bug"}:
+            effective_supervisor_status = recorded_supervisor_status
+        else:
+            effective_supervisor_status = "stopped"
+        child = (
+            mutable_supervisor.get("child")
+            if isinstance(mutable_supervisor.get("child"), dict)
+            else {}
+        )
+        try:
+            child_pid = int(child.get("pid") or 0)
+        except (TypeError, ValueError):
+            child_pid = 0
+        merged_supervisor.update(
+            {
+                "pid": supervisor_pid,
+                "running": supervisor_alive,
+                "heartbeat_at": heartbeat_at,
+                "heartbeat_age_seconds": round(heartbeat_age, 1) if heartbeat_age is not None else None,
+                "effective_status": effective_supervisor_status,
+                "child": {**child, "running": process_is_alive(child_pid)},
+                "state_file": str(supervisor_state_path(self.context.project_dir)),
+            }
+        )
+
+        stage_rows: list[dict[str, Any]] = []
+        provider_receipts: list[dict[str, Any]] = []
+        for name in STORY_STAGE_SEQUENCE:
+            raw_record = stage_records.get(name, {})
+            record = raw_record if isinstance(raw_record, dict) else {}
+            recorded = str(record.get("status") or "pending")
+            effective = "passed" if name in completed else ("stale" if recorded == "passed" else recorded)
+            running = name in running_attempts or effective in {"running", "reviewing"}
+            attempt = running_attempts.get(name, {}) if isinstance(running_attempts.get(name), dict) else {}
+            request_id = str(record.get("request_id") or attempt.get("attempt_id") or "")
+            row = {
+                "stage": name,
+                "branch": STAGE_BRANCHES.get(name, "other"),
+                "recorded_status": recorded,
+                "effective_status": effective,
+                "attempts": int(record.get("attempts") or 0),
+                "infrastructure_attempts": int(record.get("infrastructure_attempts") or 0),
+                "quality_attempts": int(record.get("quality_attempts") or 0),
+                "attempt_id": str(attempt.get("attempt_id") or ""),
+                "duration_seconds": self._record_duration_seconds(record, running=running),
+                "provider": str(record.get("provider") or ""),
+                "request_id": request_id,
+                "actual_cost": float(record.get("actual_cost") or 0.0),
+                "message": str(record.get("message") or ""),
+                "input_hashes": record.get("input_hashes", {}),
+                "output_hashes": record.get("output_hashes", {}),
+                "artifacts": record.get("artifacts", []),
+            }
+            stage_rows.append(row)
+            if row["provider"] or request_id:
+                provider_receipts.append(
+                    {
+                        "stage": name,
+                        "provider": row["provider"],
+                        "request_id": request_id,
+                        "attempt_id": row["attempt_id"],
+                        "output_hashes": row["output_hashes"],
+                        "actual_cost": row["actual_cost"],
+                    }
+                )
+
+        expected_images = self._expected_story_image_count(manifest, storyboard)
+        actual_images = self._expected_named_story_image_count(image_dir, manifest, storyboard)
+        staging_actual = self._expected_named_story_image_count(
+            staging_images, manifest, storyboard
+        )
+
+        jobs = self._jobs_csv(manifest)
+        video_targets: list[str] = []
+        invalid_video_targets: list[str] = []
+        if jobs and jobs.is_file():
+            try:
+                with jobs.open(encoding="utf-8-sig", newline="") as source:
+                    for row in csv.DictReader(source):
+                        name = str(row.get("target_video_filename") or "").strip()
+                        if not name:
+                            invalid_video_targets.append("<empty>")
+                        elif Path(name).name != name or Path(name).suffix.lower() != ".mp4":
+                            invalid_video_targets.append(name)
+                        elif name not in video_targets:
+                            video_targets.append(name)
+                        request_id = str(
+                            row.get("provider_request_id")
+                            or row.get("request_id")
+                            or row.get("task_id")
+                            or ""
+                        ).strip()
+                        if request_id:
+                            provider_receipts.append(
+                                {
+                                    "stage": "generate_videos",
+                                    "provider": str(row.get("provider") or ""),
+                                    "request_id": request_id,
+                                    "attempt_id": str(row.get("attempt_id") or ""),
+                                    "target": name,
+                                    "receipt": str(row.get("receipt_path") or ""),
+                                }
+                            )
+            except (OSError, csv.Error):
+                invalid_video_targets.append("<unreadable jobs CSV>")
+        videos_dir = self.context.paths.video_jobs / "videos"
+        actual_videos = sum(
+            1
+            for name in video_targets
+            if (videos_dir / name).is_file() and (videos_dir / name).stat().st_size > 0
+        )
+
+        music_names: list[str] = []
+        invalid_music_targets: list[str] = []
+        plan = self._music_plan()
+        if plan.is_file():
+            try:
+                with plan.open(encoding="utf-8-sig", newline="") as source:
+                    for row in csv.DictReader(source):
+                        name = str(row.get("target_audio_filename") or "").strip()
+                        suffix = Path(name).suffix.lower()
+                        if (
+                            not name
+                            or Path(name).name != name
+                            or suffix not in AUDIO_EXTENSIONS
+                            or name in music_names
+                        ):
+                            invalid_music_targets.append(name or "<empty>")
+                        else:
+                            music_names.append(name)
+            except (OSError, csv.Error):
+                invalid_music_targets.append("<unreadable music plan>")
+        downloads = self._suno_downloads_dir()
+        actual_music = sum(
+            1
+            for name in music_names
+            if (downloads / name).is_file() and (downloads / name).stat().st_size > 0
+        )
+
+        events = load_agent_events(self.context.project_dir, limit=100)
+        if not events:
+            legacy_events = self.state.get("events", []) if isinstance(self.state.get("events"), list) else []
+            events = [
+                {
+                    "kind": "legacy_agent_event_v1",
+                    "timestamp": item.get("time", ""),
+                    "event_type": item.get("event", ""),
+                    "stage": item.get("stage", item.get("event", "")),
+                    "status": item.get("status", ""),
+                    "summary": item.get("message", ""),
+                }
+                for item in legacy_events[-100:]
+                if isinstance(item, dict)
+            ]
+        for item in events:
+            if item.get("event_type") != "provider_receipt":
+                continue
+            provider = item.get("provider", {}) if isinstance(item.get("provider"), dict) else {}
+            provider_receipts.append(
+                {
+                    "stage": str(item.get("stage") or ""),
+                    "provider": str(provider.get("name") or ""),
+                    "request_id": str(provider.get("request_id") or ""),
+                    "receipt_id": str(provider.get("receipt_id") or ""),
+                    "attempt_id": str(item.get("attempt_id") or ""),
+                    "output_hashes": item.get("output_evidence_hashes", {}),
+                    "actual_cost": item.get("cost_cny"),
+                }
+            )
+        notifications = load_notifications(self.context.project_dir, limit=100)
+        recovery_records = [
+            item
+            for item in read_ndjson(recovery_log_path(self.context.project_dir), limit=100)
+            if str(item.get("kind") or "").startswith("recovery_decision")
+        ]
+        recovery = recovery_records[-1] if recovery_records else {}
+        if not recovery and isinstance(mutable_supervisor.get("recovery"), dict):
+            recovery = dict(mutable_supervisor["recovery"])
+
+        agent_log_dir = self.context.paths.status / "agent_logs"
+        recent_logs = (
+            sorted(
+                (path for path in agent_log_dir.iterdir() if path.is_file()),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )[:12]
+            if agent_log_dir.is_dir()
+            else []
+        )
+        immutable_supervisor_path = self.context.paths.status / "story_agent_supervisor.json"
+        supervisor_log = self.context.paths.status / "story_agent_supervisor.log"
+        evidence = {
+            "manifest": str(self.context.paths.manifest),
+            "legacy_state": str(self.state_path),
+            "events": str(event_log_path(self.context.project_dir)),
+            "notifications": str(notification_log_path(self.context.project_dir)),
+            "recovery_decisions": str(recovery_log_path(self.context.project_dir)),
+            "supervisor_record": str(immutable_supervisor_path),
+            "supervisor_state": str(supervisor_state_path(self.context.project_dir)),
+            "supervisor_log": str(supervisor_log),
+        }
+        if recent_logs:
+            evidence["latest_stage_log"] = str(recent_logs[0])
+        reviews_dir = self.context.paths.status / "reviews"
+        contact_sheets = (
+            sorted(
+                (
+                    path
+                    for path in reviews_dir.glob("*contact_sheet*")
+                    if path.is_file()
+                ),
+                key=lambda item: item.stat().st_mtime,
+                reverse=True,
+            )
+            if reviews_dir.is_dir()
+            else []
+        )
+        if contact_sheets:
+            evidence["latest_contact_sheet"] = str(contact_sheets[0])
+
+        job_lock_path = self.context.paths.status / "story_agent.lock"
+        job_lock_payload = self._read_json_object(job_lock_path)
+        try:
+            job_lock_pid = int(job_lock_payload.get("pid") or 0)
+        except (TypeError, ValueError):
+            job_lock_pid = 0
+
+        return {
+            "current_stage": current_stage,
+            "agent_heartbeat_age_seconds": age_seconds(str(agent.get("heartbeat_at") or "")),
+            "supervisor": merged_supervisor,
+            "stage_rows": stage_rows,
+            "dag": {
+                "nodes": STORY_STAGE_SEQUENCE,
+                "edges": [
+                    {"from": dependency, "to": stage}
+                    for stage in STORY_STAGE_SEQUENCE
+                    for dependency in STORY_STAGE_DEPENDENCIES[stage]
+                ],
+            },
+            "artifact_progress": {
+                "故事图片": {
+                    "actual": actual_images,
+                    "expected": expected_images,
+                    "detail": str(image_dir or ""),
+                },
+                "图片 staging": {
+                    "actual": staging_actual,
+                    "expected": expected_images,
+                    "detail": str(staging_images),
+                },
+                "图生视频片段": {
+                    "actual": actual_videos,
+                    "expected": len(video_targets),
+                    "detail": (
+                        "存在非法 target_video_filename：" + "、".join(invalid_video_targets[:5])
+                        if invalid_video_targets
+                        else str(videos_dir)
+                    ),
+                },
+                "Suno 音乐分段": {
+                    "actual": actual_music,
+                    "expected": len(music_names) + len(invalid_music_targets),
+                    "detail": (
+                        "音乐计划含非法目标：" + "、".join(invalid_music_targets[:5])
+                        if invalid_music_targets
+                        else str(downloads)
+                    ),
+                },
+            },
+            "provider_receipts": provider_receipts,
+            "notifications": notifications,
+            "unacknowledged_notifications": sum(
+                1 for item in notifications if not item.get("acknowledged_at")
+            ),
+            "events": events,
+            "recovery": recovery,
+            "locks": {
+                "job_lock": {
+                    "path": str(job_lock_path),
+                    "exists": job_lock_path.exists(),
+                    "pid": job_lock_pid,
+                    "owner_alive": process_is_alive(job_lock_pid),
+                },
+                "control": load_control(self.context.project_dir),
+            },
+            "evidence": evidence,
+            "recent_logs": [str(path) for path in recent_logs],
+        }
 
     def _timing_status(self, agent_data: dict[str, Any]) -> dict[str, Any]:
         deadline_hours = float(agent_data.get("deadline_hours", 10.0))
@@ -1134,7 +1664,13 @@ class StoryAgent:
         if self._legacy_contract_policy(manifest):
             return StageResult("done", "V3 冻结项目采用 legacy_passthrough，不补写或重做合同。")
         paths = contract_paths(self.context.project_dir)
+        style_references = self._approved_style_reference_paths()
+        approved_preview_manifest = (
+            self.context.paths.status / "style_references" / "approved_preview_manifest.json"
+        )
         paths["directory"].mkdir(parents=True, exist_ok=True)
+        if paths["contract"].is_file() and contract_runtime_issues(self.context.project_dir):
+            self._archive_story_contract_attempt("runtime_invalid_or_trusted_input_drift")
         # A regeneration attempt immediately revokes any prior approval lock.
         # If the worker crashes or emits an invalid draft, stale approval must
         # not remain visually or mechanically plausible.
@@ -1156,6 +1692,17 @@ class StoryAgent:
                     f"- 输出说明：`{paths['summary']}`",
                     "",
                     "必须按故事实际需要决定预览资产；无角色不得生成角色卡，无可靠尺度依据不得编造数值比例。",
+                    "需要视觉预览时必须使用原生 ImageGen 生成真实设计小样；禁止用 Pillow、SVG、HTML、几何图形或其他程序绘图冒充视觉小样。",
+                    *( ["以下是用户确认的整体风格参考，仅用于角色可爱度、3D 动画感和渲染质感，不复制具体角色：", *[f"- `{path}`" for path in style_references]] if style_references else [] ),
+                    *(
+                        [
+                            f"- 已存在用户批准的预览清单：`{approved_preview_manifest}`",
+                            "- 清单中 replace_allowed=false 时，必须原样复用其 path 与 sha256 写入合同 preview_assets，禁止重生、改写或替换这些文件。",
+                            "- 同一个批准文件可以在清单中承担多个预览角色；这表示复用同一身份母版，不得为每个角色另生成一张图。",
+                        ]
+                        if approved_preview_manifest.is_file()
+                        else []
+                    ),
                 ]
             )
             + "\n",
@@ -1170,11 +1717,18 @@ class StoryAgent:
                 "可信高优先级来源只能使用 Runtime 可信来源链中已有的 source/source_ref/sha256：",
                 "task_input 必须附逐字存在的 evidence_quote；配置/品牌默认必须附可解析的 evidence_pointer。",
                 "你自己的分析、视觉补全和推断一律标记 agent_inference；禁止伪装成高优先级来源。",
-                "角色卡、尺度锚点、风格锚点、布局预览按故事实际需要条件生成；无需预览的类型不要创建占位。",
+                "视觉风格只能由用户/项目配置的明确选择决定；必须把可信来源链 /resolved_image_style 中的 key、label 和 prompt 原样绑定到 visual_style.style_profile，不得根据故事类型、标题或文本关键词换风格。",
+                "角色身份锚点只锁定原文明确说明或用户明确指定的特征。未指定的外观不写成合同硬约束，由图像模型按已选整体风格完成角色设计。",
+                "角色卡、尺度锚点、风格锚点、布局预览按故事实际需要条件生成；无需预览的类型不要创建占位。一个已批准文件覆盖多个角色时必须复用同一路径和哈希，不能把逻辑检查角色误解成多张独立图片。",
                 "尺度优先 qualitative_relation；只有可信依据或机器布局需要时才写宽容数值区间及 numeric_basis。",
+                "如果多个角色会在同一画面出现，world_scale.relationships 只覆盖有故事或布局必要的宽松视觉层级；不得为所有角色两两建立无依据的总排序。儿童卡通允许为了表演和可读性适度夸张小角色，不能按现实物种厘米比例机械判定。已有用户批准母版时，定性关系应忠于母版实际画面，不得仅凭现实常识写成 much_smaller。环境或动作参照不是角色尺度证明，不要求为其另画尺度图。",
+                "scale_anchor 的 content_refs 只能列出该图实际可比较的角色大小关系；啄木鸟在树上、青蛙在稻田、蜜蜂采蜜等环境/动作关系不得为了凑覆盖率塞入尺度预览。",
+                "release_layout 只能登记可信来源链能复核的画布或布局默认；没有画布收据时不要凭经验补写精确比例变体。",
                 "semantic_artifacts.mappings 必须按语义源中实际出现的 semantic_kind，完整覆盖 demo_subtitles、background_visual、background_subtitles、sales_subtitles、ppt、customer_manuscript、reading_annotation 七类产物；不得缺项或私自留给下游默认补齐。",
+                "语义源中若有‘故事告诉我们’、对受众的总结性教训或独立寓意，必须拆成 semantic_kind=moral 并单独建立七类产物 mapping，不得并入 story_body。",
                 "标题或道理若用 visual_substitute，必须给出唯一 mutual_exclusion_group；同组 background_subtitles 必须 action=exclude 且 subtitle_policy=hide。Demo 必须按自身 mapping 决定，不借用销售版规则。",
                 "如实际生成预览文件，写入项目 99_项目状态/contracts/previews 下，并在合同记录项目相对 path 和真实 SHA-256。",
+                "需要预览时使用原生 ImageGen 生成真实设计小样；禁止用 Pillow、SVG、HTML、几何图形或代码图表冒充。不需要的预览就不要声明 required。",
                 f"写入 `{paths['contract']}` 和便于人读的 `{paths['summary']}`。不要写合同锁，锁只能由 Runtime 在独立审核通过后生成。",
             ]
         )
@@ -1190,6 +1744,8 @@ class StoryAgent:
             return result
         if not paths["contract"].is_file() or not paths["summary"].is_file():
             return StageResult("blocked", "合同生成任务未写入 JSON 与说明文档。", paths["handoff"])
+        trusted = json.loads(paths["trusted_inputs"].read_text(encoding="utf-8"))
+        bind_contract_visual_style_to_trusted_default(paths["contract"], trusted)
         issues = contract_runtime_issues(self.context.project_dir)
         if issues:
             return StageResult("blocked", "合同机器校验或可信来源校验失败：" + "；".join(issues[:12]), paths["contract"])
@@ -1218,10 +1774,12 @@ class StoryAgent:
             rubric=(
                 "逐项审核七类合同是否忠于可信输入、是否把推断错误伪装成高优先级来源、语义/角色/状态/尺度/品牌/布局是否互相一致；"
                 "预览资产必须按故事实际需要条件存在，不得为了模板造角色或假精度。"
+                "视觉风格必须与可信来源链 /resolved_image_style/prompt 原样一致；角色美感按整体效果与已通过参考图判断，不得增设固定配色公式。"
+                "world_scale 只审核合同声明的宽松画面层级是否可读，并结合儿童卡通的镜头表演、透视和可读性判断；不得用现实物种厘米比例反推硬门槛，也不得因蜜蜂、青蛙等小角色为动画可读性适度放大而判错。环境或动作参照不要求独立尺度小样。"
                 "必须提供 evidence_matrix，逐节引用合同 JSON 路径、可信来源记录及必要预览文件。"
             ),
         )
-        if result.status != "done" or payload is None:
+        if payload is None:
             paths["lock"].unlink(missing_ok=True)
             return result
         review_issues = contract_review_payload_issues(payload)
@@ -1232,8 +1790,168 @@ class StoryAgent:
                 "合同独立审核缺少可验证的逐节证据：" + "；".join(review_issues),
                 paths["review"],
             )
+        if result.status != "done":
+            paths["lock"].unlink(missing_ok=True)
+            quality_attempts = self._story_contract_quality_attempts(paths["review"])
+            if self._can_retry_stage(
+                "story_contract_review",
+                critical=True,
+                attempts_override=quality_attempts,
+            ):
+                revision = self._revise_story_contract_after_review(manifest, payload)
+                if revision.status == "done":
+                    return StageResult(
+                        "retrying",
+                        "已按独立审核意见自动修订合同与必要视觉小样，将使用新哈希重新审核。",
+                        revision.handoff,
+                    )
+                return revision
+            return result
         lock = write_contract_lock(self.context.project_dir, bundle=bundle, review=paths["review"])
         return StageResult("done", f"合同独立审核通过并由 Runtime 确定性锁定：{payload.get('score')} 分", lock)
+
+    def _archive_story_contract_attempt(self, reason: str) -> Path:
+        """Move a rejected/stale contract attempt aside without deleting evidence."""
+
+        paths = contract_paths(self.context.project_dir)
+        archive = (
+            self.context.paths.status
+            / "rejected"
+            / "story_contract"
+            / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+        )
+        candidates = {
+            "story_production_contract.json": paths["contract"],
+            "story_production_contract.md": paths["summary"],
+            "story_contract_trusted_inputs.json": paths["trusted_inputs"],
+            "story_contract_handoff.md": paths["handoff"],
+            "story_contract.lock.json": paths["lock"],
+            "story_contract_bundle.json": paths["bundle"],
+            "story_contract_review_review.json": paths["review"],
+        }
+        existing = [(name, source) for name, source in candidates.items() if source.exists()]
+        previews = paths["directory"] / "previews"
+        if not existing and not previews.exists():
+            return archive
+        archive.mkdir(parents=True, exist_ok=True)
+        for name, source in existing:
+            shutil.move(str(source), str(archive / name))
+        if previews.exists():
+            approved_manifest = (
+                self.context.paths.status / "style_references" / "approved_preview_manifest.json"
+            )
+            preserve_approved = False
+            try:
+                approved_payload = json.loads(approved_manifest.read_text(encoding="utf-8"))
+                preserve_approved = approved_payload.get("replace_allowed") is False
+            except (OSError, json.JSONDecodeError):
+                pass
+            if preserve_approved:
+                shutil.copytree(previews, archive / "previews")
+            else:
+                shutil.move(str(previews), str(archive / "previews"))
+        (archive / "archive_reason.txt").write_text(reason.strip() + "\n", encoding="utf-8")
+        return archive
+
+    def _story_contract_quality_attempts(self, current_review: Path) -> int:
+        candidates = [current_review]
+        rejected_root = self.context.paths.status / "rejected" / "story_contract"
+        if rejected_root.exists():
+            candidates.extend(rejected_root.glob("*/story_contract_review_review.json"))
+        current_trusted = contract_paths(self.context.project_dir)["trusted_inputs"]
+        try:
+            current_trusted_sha = file_sha256(current_trusted)
+        except OSError:
+            current_trusted_sha = ""
+        reviewed_hashes: set[str] = set()
+        for candidate in candidates:
+            bundle_path = (
+                contract_paths(self.context.project_dir)["bundle"]
+                if candidate == current_review
+                else candidate.parent / "story_contract_bundle.json"
+            )
+            try:
+                bundle_payload = json.loads(bundle_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            trusted_hashes = {
+                str(item.get("sha256") or "")
+                for item in bundle_payload.get("artifacts", [])
+                if isinstance(item, dict)
+                and Path(str(item.get("path") or "")).name == "story_contract_trusted_inputs.json"
+            }
+            if current_trusted_sha not in trusted_hashes:
+                continue
+            try:
+                payload = json.loads(candidate.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            artifact_sha = str(payload.get("artifact_sha256", "")) if isinstance(payload, dict) else ""
+            if len(artifact_sha) == 64:
+                reviewed_hashes.add(artifact_sha)
+        return max(1, len(reviewed_hashes))
+
+    def _revise_story_contract_after_review(
+        self,
+        manifest: dict[str, Any],
+        review_payload: dict[str, Any],
+    ) -> StageResult:
+        paths = contract_paths(self.context.project_dir)
+        old_contract_sha = file_sha256(paths["contract"])
+        archive = self._archive_story_contract_attempt("independent_review_rejected")
+        paths["directory"].mkdir(parents=True, exist_ok=True)
+        trusted = build_trusted_input_chain(self.context.project_dir, manifest, load_config())
+        write_trusted_input_chain(paths["trusted_inputs"], trusted)
+        archived_contract = archive / "story_production_contract.json"
+        archived_review = archive / "story_contract_review_review.json"
+        paths["handoff"].write_text(
+            "\n".join(
+                [
+                    "# Story Production Contract 自动修订任务",
+                    "",
+                    f"- 被拒绝合同（只读）：`{archived_contract}`",
+                    f"- 独立审核（只读）：`{archived_review}`",
+                    f"- 当前可信来源链：`{paths['trusted_inputs']}`",
+                    f"- 根 Schema：`{ROOT / 'schemas/story_contract/v1/story_production_contract.schema.json'}`",
+                    f"- 新合同 JSON：`{paths['contract']}`",
+                    f"- 新说明：`{paths['summary']}`",
+                    "- 只修正审核指出的问题及其直接一致性影响，不得篡改可信故事事实。",
+                    "- visual_style.style_profile 必须原样继承可信来源链 /resolved_image_style 的 key、label 和 prompt；故事类型和文本关键词不得改变风格。",
+                    "- 角色只锁定可信来源明确特征；未指定的外观不写成合同硬约束，由图像模型按已选整体风格完成。",
+                    "- world_scale 只保留故事和构图确有必要的宽松层级。儿童卡通可为表演与可读性适度夸张小角色；不得按现实厘米比例硬判，也不得为了环境/动作参照再生成尺度图。用户批准母版是当前视觉关系依据。",
+                    "- 复用批准清单中的两张唯一参考；禁止按审核意见另生成第三张尺度或角色参考。",
+                    "- 需要的视觉小样必须使用原生 ImageGen；禁止 Pillow/SVG/HTML/几何代码图。不需要则取消 required 声明。",
+                    "- 不要修改独立审核文件，不要生成合同锁。",
+                    "",
+                    "## 审核结构化意见",
+                    "```json",
+                    json.dumps(review_payload, ensure_ascii=False, indent=2, sort_keys=True),
+                    "```",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        result = self._codex_task(
+            stage="story_contract",
+            label="Story Production Contract 自动修订",
+            handoff=paths["handoff"],
+            prompt=(
+                "你是合同修订生产者。完整读取 handoff、被拒绝合同、当前可信来源链与独立审核，"
+                "生成新合同和说明。必要的真实视觉小样仅用原生 ImageGen 生成。"
+            ),
+        )
+        if result.status != "done":
+            return result
+        if not paths["contract"].is_file() or not paths["summary"].is_file():
+            return StageResult("blocked", "合同自动修订未写入 JSON 与说明文档。", paths["handoff"])
+        bind_contract_visual_style_to_trusted_default(paths["contract"], trusted)
+        if file_sha256(paths["contract"]) == old_contract_sha:
+            return StageResult("blocked", "合同自动修订没有改变被拒绝的合同哈希。", paths["contract"])
+        issues = contract_runtime_issues(self.context.project_dir)
+        if issues:
+            return StageResult("blocked", "合同自动修订后机器校验失败：" + "；".join(issues[:12]), paths["contract"])
+        return StageResult("done", "合同自动修订完成。", paths["contract"])
 
     def _stage_artifact_semantic_plan(self, manifest: dict[str, Any]) -> StageResult:
         if self._legacy_contract_policy(manifest):
@@ -1260,6 +1978,7 @@ class StoryAgent:
         if context is None:
             return StageResult("blocked", "缺少 storyboard_images 合同投影，无法编译视觉小样。")
         paths = visual_sample_paths(self.context.project_dir)
+        style_references = self._approved_style_reference_paths()
         paths["lock"].unlink(missing_ok=True)
         if not self.context.execute:
             return StageResult("done", "dry-run：将优先复用合同预览，并只生成故事实际缺少的视觉小样。")
@@ -1284,10 +2003,12 @@ class StoryAgent:
                         f"- 合同投影：`{context}`",
                         f"- 输出目录：`{paths['assets']}`",
                         "- 必须完整遵守 visual_style、characters、world_scale、story_state。",
+                        "- 仅当计划确实要求角色间尺度小样时，检查宽松的画面层级和透视可读性；儿童卡通允许为表演适度放大小角色，不按现实厘米比例机械处理。环境/动作参照不生成尺度小样。",
                         "- 不得擅自新增会成为跨镜头身份锚点的特殊标记、固定配饰、徽记，或违反合同/角色设定的非意图结构。",
                         "- 允许不违背合同的正常人体/动物结构、时代和场景合理的普通服饰及非身份性自然细节；这些推断细节不得升级为永久身份锚点。合同 required/forbidden 始终优先。",
                         "- 不得生成文字、标题、字幕、水印或 Logo。",
                         "- 每张只验证该 sample_id 的合同约束；不要扩展故事事实。",
+                        *( ["- 以下图片是用户确认的整体风格参考，必须用作 ImageGen 参考图，不复制具体角色：", *[f"  - `{path}`" for path in style_references]] if style_references else [] ),
                         "",
                         "## 当前完整视觉投影",
                         "```json",
@@ -1325,6 +2046,10 @@ class StoryAgent:
                 input_artifacts=(
                     {"role": "visual_sample_plan", "path": str(plan_path), "sha256": file_sha256(plan_path)},
                     {"role": "storyboard_contract_context", "path": str(context), "sha256": file_sha256(context)},
+                    *(
+                        {"role": "approved_style_reference", "path": str(path), "sha256": file_sha256(path)}
+                        for path in style_references
+                    ),
                 ),
                 attempt_id=f"visual-samples-attempt-{int(manifest.get('agent', {}).get('stages', {}).get('visual_samples', {}).get('attempts', 0))}",
             )
@@ -1362,21 +2087,23 @@ class StoryAgent:
         if machine_issues:
             return StageResult("retrying", "视觉小样机器完整性未通过：" + "；".join(machine_issues), machine_qa)
         assets = visual_sample_asset_paths(self.context.project_dir, plan)
+        style_references = self._approved_style_reference_paths()
         bundle = write_review_bundle(
             paths["bundle"],
-            [paths["plan"], machine_qa, context, contract_paths(self.context.project_dir)["contract"], *assets],
+            [paths["plan"], machine_qa, context, contract_paths(self.context.project_dir)["contract"], *style_references, *assets],
         )
         result, payload = self._structured_review(
             stage="visual_sample_review",
             label="条件式视觉小样独立审核",
             bundle=bundle,
-            images=assets,
+            images=[*style_references, *assets],
             rubric=(
                 "这是批量生图前门禁，审核必须分三层并在 JSON 中分别写 machine_completeness、contract_adherence、product_quality。"
                 "machine_completeness 必须 passed=true 且引用文件/哈希证据；contract_adherence.checks 必须逐项覆盖计划要求的 visual_style、characters、world_scale、story_state；"
-                "product_quality.dimensions 必须逐项覆盖计划中的风格中性维度；有角色时覆盖 character_design_fit、identity_coherence、anatomical_coherence，但不得默认要求可爱或写实解剖。"
+                "product_quality.dimensions 必须逐项覆盖计划中的风格中性维度；有角色时覆盖 character_design_fit、identity_coherence、anatomical_coherence。"
+                "如 product_quality 包含 scale_readability，逐 relationship_id 检查宽松画面层级、落点、前后景与透视是否清楚；儿童卡通为表演和可读性适度放大小角色是允许的，不使用现实厘米比例作为门禁。"
                 f"{ANATOMICAL_COHERENCE_REVIEW_RULE}"
-                "product_quality.style_contract 必须原样引用并逐条审核计划中 visual_style.style_profile 的 description、required_traits、forbidden_traits：合同要求可爱才审核可爱，要求历史感、庄重或写实就审核相应条款。"
+                "product_quality.style_contract 必须原样引用并逐条审核计划中 visual_style.style_profile 的 description、required_traits、forbidden_traits；整体判断角色设计与渲染是否真正符合该风格和已提供参考图，不得仅因画面明亮、安全、物种可辨就判定风格通过。"
                 "style_contract 输出 description、description_fit=true、description_evidence，并分别用 required_traits[{trait,passed,evidence}] 和 forbidden_traits[{trait,absent,evidence}] 逐条举证。"
                 "JSON 还必须写 p0_errors、retry_sample_ids 和逐 sample_id 的 evidence_matrix。"
                 "任何擅自新增的身份定义性特殊标记、固定配饰、徽记、违反合同/角色设定的结构，或非意图性的多肢、缺肢、器官错位、结构崩坏及跨镜头身份锚点，均可构成 anatomy_or_organ_error 等 P0；"
@@ -1758,9 +2485,25 @@ class StoryAgent:
                 contract_context,
                 "分镜/生图的产物语义、视觉风格、角色身份、世界尺度与故事状态",
             )
+        if (
+            contract_context is not None
+            and not self._story_image_generation_context_current(contract_context, staging_storyboard)
+        ):
+            final_images = self.context.paths.images / "images"
+            has_unbound_images = any(
+                directory.exists()
+                and any(directory.glob(f"{self.context.slug}_scene_*.png"))
+                for directory in (staging_images, final_images)
+            )
+            if has_unbound_images:
+                self._invalidate_story_image_derivatives(staging_images)
         self._sync_story_images_from_staging(staging, staging_storyboard, staging_images)
         missing = self._missing_story_image_indices(story_lines)
         if not missing:
+            if contract_context is not None and not self._story_image_generation_complete(
+                manifest, contract_context, staging_storyboard
+            ):
+                return StageResult("retrying", "现有故事图片缺少当前合同/视觉小样的生产血缘，必须重新生成。", handoff)
             self._complete_contract_consumer(manifest, "storyboard_images")
             return StageResult("done", f"故事图片已完整：{len(story_lines)}/{len(story_lines)} 张。", handoff)
 
@@ -1789,6 +2532,22 @@ class StoryAgent:
                     "path": str(staging_storyboard),
                     "sha256": authoritative_storyboard_sha,
                 },
+                *(
+                    (
+                        {
+                            "role": "storyboard_contract_context",
+                            "path": str(contract_context),
+                            "sha256": file_sha256(contract_context),
+                        },
+                        {
+                            "role": "visual_sample_lock",
+                            "path": str(visual_sample_paths(self.context.project_dir)["lock"]),
+                            "sha256": file_sha256(visual_sample_paths(self.context.project_dir)["lock"]),
+                        },
+                    )
+                    if contract_context is not None
+                    else ()
+                ),
             ),
             attempt_id=f"codex-story-images-attempt-{int(manifest.get('agent', {}).get('stages', {}).get('codex_story_images', {}).get('attempts', 0))}",
         )
@@ -1805,6 +2564,12 @@ class StoryAgent:
                 handoff,
             )
         self._sync_story_images_from_staging(staging, staging_storyboard, staging_images)
+        if contract_context is not None:
+            self._write_story_image_generation_manifest(
+                contract_context,
+                staging_storyboard,
+                story_lines,
+            )
         completed = []
         for index in batch:
             target = self.context.paths.images / "images" / self._story_image_filename(index)
@@ -1824,7 +2589,10 @@ class StoryAgent:
             )
 
         manifest = self._manifest()
-        if self._has_story_image_files(manifest):
+        if self._has_story_image_files(manifest) and (
+            contract_context is None
+            or self._story_image_generation_complete(manifest, contract_context, staging_storyboard)
+        ):
             self._complete_contract_consumer(manifest, "storyboard_images")
             return StageResult("done", f"故事图片已完整生成：{len(story_lines)}/{len(story_lines)} 张。", handoff)
         image_dir = self._image_dir()
@@ -1931,7 +2699,7 @@ class StoryAgent:
                 "V3.5 required_v1 项目还必须分层写 contract_adherence 和 product_quality，并写 p0_errors。"
                 "product_quality 必须覆盖 audience_fit、composition、color、lighting、style_suitability；有角色时还要覆盖 character_design_fit、identity_coherence、anatomical_coherence。"
                 f"{ANATOMICAL_COHERENCE_REVIEW_RULE}"
-                "product_quality.style_contract 必须原样逐条审核当前视觉小样计划中的风格 description、required_traits、forbidden_traits；只有合同要求可爱时才审核可爱，不能把目标受众适配偷换成可爱度。"
+                "product_quality.style_contract 必须原样逐条审核当前视觉小样计划中的风格 description、required_traits、forbidden_traits；整体判断角色设计与渲染是否真正符合该风格和已通过参考图，不得仅因画面明亮、安全、物种可辨就判定风格通过。"
                 "style_contract 输出 description、description_fit=true、description_evidence，并分别用 required_traits[{trait,passed,evidence}] 和 forbidden_traits[{trait,absent,evidence}] 逐条举证。"
                 "擅自新增身份定义性特殊标记、固定配饰、徽记、违反合同/角色设定的结构，或非意图性的多肢、缺肢、器官错位、结构崩坏及跨镜头身份锚点，均可构成 anatomy_or_organ_error 等 P0；符合合同的非写实结构本身不是 P0。身份错、尺度或状态矛盾、儿童不适、不可用构图仍为 P0；普通合理服饰和非身份自然细节不自动构成 P0。P0 非空时无论总分多高都不得通过。"
                 "输出 retry_indices（需要重做的镜头编号整数数组）。角色身份或在场关系错、肢体/五官崩坏、错误文字、漏镜头属于关键错误。"
@@ -2365,10 +3133,14 @@ class StoryAgent:
         if not self._legacy_contract_policy(manifest) and not contract_consumer_context_is_current(self.context.project_dir, "music"):
             return StageResult("blocked", "music 合同请求清单已失效，未打开 Suno 付费生产。")
         handoff = self._write_suno_handoff()
+        output_targets = self._expected_suno_audio_targets(manifest)
+        if not output_targets:
+            return StageResult("blocked", f"音乐分段 CSV 没有可执行的 target_audio_filename：{self._music_plan()}", self._music_plan())
         suno_prompt = (
             f"请读取并执行这份 Suno 浏览器自动化任务：\n{handoff}\n\n"
-            "目标是生成并下载第一首可用音乐，按音乐分段 CSV 的 target_audio_filename 重命名，"
-            "保存到指定 suno_downloads 目录。若当前 CLI 无浏览器控制能力、Suno 未登录、遇到验证码或付费弹窗，"
+            f"目标是逐行生成并下载音乐分段 CSV 中全部 {len(output_targets)} 段音乐；每一段都必须按 "
+            "target_audio_filename 精确重命名，全部保存到指定 suno_downloads 目录。"
+            "只有所有目标文件均已落盘才可报告完成。若当前 CLI 无浏览器控制能力、Suno 未登录、遇到验证码或付费弹窗，"
             f"请写入 `{self._music_dir() / 'suno_cli_blocker.md'}` 说明原因，不要假装完成。"
         )
         request_path = self._music_dir() / f"{self.context.slug}_suno_music_request.md"
@@ -2378,6 +3150,7 @@ class StoryAgent:
             for role, path in (
                 ("suno_music_request", request_path),
                 ("music_request_manifest", request_manifest),
+                ("music_segment_plan", self._music_plan()),
             )
             if path.is_file()
         )
@@ -2388,7 +3161,7 @@ class StoryAgent:
             label="Codex/Suno 浏览器音乐生成",
             handoff=handoff,
             prompt=suno_prompt,
-            output_targets=(self._suno_downloads_dir() / f"01_{self.context.slug}_music.mp3",),
+            output_targets=output_targets,
             input_artifacts=input_artifacts,
             attempt_id=f"suno-generate-attempt-{int(manifest.get('agent', {}).get('stages', {}).get('suno_generate', {}).get('attempts', 0))}",
         )
@@ -2414,13 +3187,14 @@ class StoryAgent:
             return result
         if not self._music_plan_contract_bound(manifest):
             return StageResult("blocked", "Suno 音乐计划缺少当前合同绑定字段。", self._music_plan())
-        self._complete_contract_consumer(manifest, "music")
         if self._has_suno_audio(self._manifest()):
+            self._complete_contract_consumer(manifest, "music")
             return result
         blocker = self._music_dir() / "suno_cli_blocker.md"
         if blocker.exists():
             return StageResult("blocked", f"Suno 需要外部恢复动作：{blocker}", blocker)
-        return StageResult("failed", "Suno 子任务返回但没有下载任何目标音频。", handoff)
+        missing = [path.name for path in output_targets if not path.is_file()]
+        return StageResult("failed", f"Suno 子任务返回但仍缺少 {len(missing)} 个目标音频：{'、'.join(missing)}", handoff)
 
     def _stage_assemble_music(self, manifest: dict[str, Any]) -> StageResult:
         provided_music = self._provided_music(manifest)
@@ -3214,6 +3988,55 @@ class StoryAgent:
         write_manifest(self.context.paths, manifest)
         return bool(manifest["agent"].get("cancel_requested"))
 
+    def _record_provider_receipt(self, stage: str, result: Any) -> None:
+        manifest = ensure_manifest_v2(load_manifest(self.context.paths) or {})
+        agent = manifest.get("agent", {}) if isinstance(manifest.get("agent"), dict) else {}
+        scheduler = agent.get("scheduler", {}) if isinstance(agent.get("scheduler"), dict) else {}
+        output_hashes: dict[str, str] = {}
+        for artifact in getattr(result, "output_artifacts", ()) or ():
+            if not isinstance(artifact, dict):
+                continue
+            path = str(artifact.get("path") or "")
+            digest = str(artifact.get("sha256") or "")
+            if path and digest:
+                output_hashes[path] = digest
+        failure = getattr(result, "failure", None)
+        append_agent_event(
+            self.context.project_dir,
+            event_type="provider_receipt",
+            status="passed" if bool(getattr(result, "success", False)) else "failed",
+            summary=(
+                str(getattr(failure, "message", ""))
+                if failure is not None
+                else f"{stage} provider receipt 已记录"
+            ),
+            job_id=str(agent.get("job_id") or ""),
+            run_id=str(scheduler.get("run_id") or ""),
+            stage=stage,
+            attempt_id=str(getattr(result, "attempt_id", "") or ""),
+            output_evidence_hashes=output_hashes,
+            provider=str(getattr(result, "provider", "") or ""),
+            request_id=str(getattr(result, "request_id", "") or ""),
+            receipt_id=str(getattr(result, "execution_request_sha256", "") or ""),
+            metadata={
+                "model_or_tool": str(getattr(result, "model_or_tool", "") or ""),
+                "adapter_version": str(getattr(result, "adapter_version", "") or ""),
+                "production_eligible": bool(getattr(result, "production_eligible", False)),
+                "usage_events": [
+                    {
+                        "provider": getattr(item, "provider", ""),
+                        "model_or_tool": getattr(item, "model_or_tool", ""),
+                        "operation": getattr(item, "operation", ""),
+                        "quantity": getattr(item, "quantity", None),
+                        "currency": getattr(item, "currency", ""),
+                        "estimated_amount": getattr(item, "estimated_amount", None),
+                        "actual_amount_status": getattr(item, "actual_amount_status", ""),
+                    }
+                    for item in (getattr(result, "usage_events", ()) or ())
+                ],
+            },
+        )
+
     def _execute_image_generation(
         self,
         *,
@@ -3300,6 +4123,7 @@ class StoryAgent:
             )
 
         port_result = image_port.execute(request, executor=current_codex_image_executor)
+        self._record_provider_receipt(stage, port_result)
         if runtime_results and runtime_results[0].status != "done":
             return runtime_results[0]
         if not port_result.success:
@@ -3394,6 +4218,7 @@ class StoryAgent:
             )
 
         port_result = music_port.execute(request, executor=current_suno_codex_executor)
+        self._record_provider_receipt(stage, port_result)
         if runtime_results and runtime_results[0].status != "done":
             return runtime_results[0]
         if not port_result.success:
@@ -3440,6 +4265,14 @@ class StoryAgent:
                     "- 只处理本阶段任务，不要重跑无关阶段。",
                     "- 可以修改当前故事项目目录内的文件。",
                     "- 不要改旧路径 `/Users/baiyanglin/Documents/New project`。",
+                    *(
+                        [
+                            "- 视觉审核只使用当前 GPT 模型通过 --image 附件获得的原生多模态能力。",
+                            "- 禁止调用 Claude Vision、claude-vision、vision bridge、GLM/智谱视觉桥接、bigmodel.cn 或任何其他外部视觉服务；也不得把‘尝试但失败’当作正常流程。",
+                        ]
+                        if stage in NATIVE_VISION_REVIEW_STAGES
+                        else []
+                    ),
                     "- 完成后用简短中文总结实际写入/修改的文件。",
                     "",
                     "## 任务正文",
@@ -3634,6 +4467,7 @@ class StoryAgent:
         candidates.extend(staging_images.parent.glob(f"{self.context.slug}_storyboard.md"))
         candidates.extend(staging_images.parent.glob(f"{self.context.slug}_visual_bible.md"))
         candidates.extend(staging_images.parent.glob(f"{self.context.slug}_storyboard_plan.json"))
+        candidates.append(self._story_image_generation_manifest_path())
         seen: set[Path] = set()
         for source in candidates:
             resolved = source.resolve()
@@ -3701,7 +4535,7 @@ class StoryAgent:
                 "机器可读分镜计划还必须原样记录当前逐产物语义呈现计划的 artifact_semantic_plan_sha256、artifact_semantic_plan_schema_version、artifact_semantic_plan_dependency_sha256；缺失或旧绑定将被 Runtime 拒绝。",
                 "机器可读分镜计划还必须原样记录 visual_sample_schema_version、visual_sample_plan_sha256、visual_sample_review_bundle_sha256、visual_sample_lock_sha256；旧小样或旧审核绑定将被 Runtime 拒绝。",
                 "每镜必须记录 scale_basis、current_story_state、visual_state_evidence。scale_basis 必须说明是否适用、引用合同 relationship_id 或说明不适用原因；有状态机时必须逐 machine_id 记录当前 state_id 及可见/不可见证据。",
-                "每镜还必须写机器可读视频动作字段 subject_action、environment_motion、camera_motion、entry_state、exit_state、screen_direction、adjacent_handoff、expected_motion。expected_motion.primary 只能是 subject/environment/camera/quiet，并分别声明 subject/environment/camera 的 none/low/moderate/high 预期和理由；adjacent_handoff 必须显式包含 boolean 类型的 allows_direction_change 与 allows_state_transition，相邻镜头用同一 handoff 标识承接 entry/exit、视线与移动方向。连续性用于稳定身份、状态、尺度和故事逻辑，不能靠完全静止逃避动作。",
+                "每镜还必须写机器可读视频动作字段 subject_action、environment_motion、camera_motion、entry_state、exit_state、screen_direction、adjacent_handoff、expected_motion。顶层 screen_direction 只能是 left_to_right、right_to_left、toward_camera、away_from_camera、stationary、mixed 之一，不得写自由文本。expected_motion.primary 只能是 subject/environment/camera/quiet，并分别声明 subject/environment/camera 的 none/low/moderate/high 预期和理由；adjacent_handoff 必须显式包含 boolean 类型的 allows_direction_change 与 allows_state_transition，相邻镜头用同一 handoff 标识承接 entry/exit、视线与移动方向。连续性用于稳定身份、状态、尺度和故事逻辑，不能靠完全静止逃避动作。",
                 "不得丢弃、缩写或覆盖合同角色、风格、尺度、状态约束；不得擅自新增会成为跨镜头身份锚点的特殊标记、固定配饰、徽记，或违反合同/角色设定的非意图结构。",
                 "允许不违背合同的正常人体/动物结构、时代和场景合理普通服饰及非身份性自然细节，但推断细节不得升级为永久身份锚点；合同 required/forbidden 始终优先。",
                 "每个唱歌、关键发言、关键动作或明显受挫的角色都要获得焦点镜头；连续场景要安排建立全景、表演者中近景、反应镜头等景别变化，不能所有角色都和主角挤在同一种双人中景。",
@@ -3723,6 +4557,15 @@ class StoryAgent:
                 "完成后只用简短中文说明生成成功的文件路径，以及任何未能完成的镜头编号。",
             ]
         )
+        style_references = self._approved_style_reference_paths()
+        if style_references:
+            lines.extend(
+                [
+                    "",
+                    "以下是用户确认的整体风格参考。每次 ImageGen 必须将它们中的可爱 3D 动画感与已审核视觉小样一起作为参考，不复制具体角色或构图：",
+                    *[f"- `{path}`" for path in style_references],
+                ]
+            )
         context_path = contract_consumer_path(self.context.project_dir, "storyboard_images")
         if context_path.is_file() and not self._legacy_contract_policy(self._manifest()):
             try:
@@ -3772,6 +4615,108 @@ class StoryAgent:
             except (OSError, ValueError, KeyError, TypeError):
                 lines.extend(["", "ERROR: 当前视觉小样锁无效，禁止生成正式图片。"])
         return "\n".join(lines)
+
+    def _approved_style_reference_paths(self) -> list[Path]:
+        """Return user-approved project-local style references in stable order."""
+
+        directory = self.context.paths.status / "style_references"
+        if not directory.is_dir():
+            return []
+        return sorted(
+            path.resolve()
+            for path in directory.iterdir()
+            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        )
+
+    def _story_image_generation_manifest_path(self) -> Path:
+        return self.context.paths.status / "story_images_generation_manifest.json"
+
+    def _story_image_generation_binding(self, context: Path, storyboard: Path) -> dict[str, Any]:
+        sample_lock = visual_sample_paths(self.context.project_dir)["lock"]
+        if not context.is_file() or not storyboard.is_file() or not sample_lock.is_file():
+            raise OSError("story image generation binding inputs are incomplete")
+        return {
+            "contract_request_path": str(context),
+            "contract_request_sha256": file_sha256(context),
+            "visual_sample_lock_path": str(sample_lock),
+            "visual_sample_lock_sha256": file_sha256(sample_lock),
+            "authoritative_storyboard_path": str(storyboard),
+            "authoritative_storyboard_sha256": file_sha256(storyboard),
+        }
+
+    def _story_image_generation_context_current(self, context: Path, storyboard: Path) -> bool:
+        try:
+            payload = json.loads(self._story_image_generation_manifest_path().read_text(encoding="utf-8"))
+            expected = self._story_image_generation_binding(context, storyboard)
+        except (OSError, json.JSONDecodeError):
+            return False
+        if payload.get("version") != 1 or any(payload.get(key) != value for key, value in expected.items()):
+            return False
+        images = payload.get("images")
+        if not isinstance(images, dict):
+            return False
+        final_images = self.context.paths.images / "images"
+        staging_images = self._codex_stage_dir("codex_story_images") / "images"
+        for name, item in images.items():
+            if not isinstance(item, dict) or Path(name).name != name:
+                return False
+            expected_sha = str(item.get("sha256") or "")
+            final_path = final_images / name
+            staging_path = staging_images / name
+            if (
+                len(expected_sha) != 64
+                or not final_path.is_file()
+                or not staging_path.is_file()
+                or file_sha256(final_path) != expected_sha
+                or file_sha256(staging_path) != expected_sha
+            ):
+                return False
+        return True
+
+    def _write_story_image_generation_manifest(
+        self,
+        context: Path,
+        storyboard: Path,
+        story_lines: list[str],
+    ) -> Path:
+        payload: dict[str, Any] = {
+            "version": 1,
+            **self._story_image_generation_binding(context, storyboard),
+            "images": {},
+        }
+        final_images = self.context.paths.images / "images"
+        staging_images = self._codex_stage_dir("codex_story_images") / "images"
+        for index in range(1, len(story_lines) + 1):
+            name = self._story_image_filename(index)
+            final_path = final_images / name
+            staging_path = staging_images / name
+            if not final_path.is_file() or not staging_path.is_file():
+                continue
+            final_sha = file_sha256(final_path)
+            if file_sha256(staging_path) != final_sha:
+                continue
+            payload["images"][name] = {"sha256": final_sha, "bytes": final_path.stat().st_size}
+        target = self._story_image_generation_manifest_path()
+        save_json(target, payload)
+        return target
+
+    def _story_image_generation_complete(
+        self,
+        manifest: dict[str, Any],
+        context: Path,
+        storyboard: Path,
+    ) -> bool:
+        if not self._story_image_generation_context_current(context, storyboard):
+            return False
+        try:
+            payload = json.loads(self._story_image_generation_manifest_path().read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        expected = self._expected_story_image_count(manifest, storyboard)
+        images = payload.get("images", {})
+        return expected > 0 and all(
+            self._story_image_filename(index) in images for index in range(1, expected + 1)
+        )
 
     def _missing_story_image_indices(self, story_lines: list[str]) -> list[int]:
         final_images = self.context.paths.images / "images"
@@ -4400,6 +5345,12 @@ class StoryAgent:
             candidates.extend((self.context.paths.images / "images").glob(f"{self.context.slug}_scene_*.png"))
             candidates.extend(self.context.paths.images.glob(f"{self.context.slug}_visual_bible.md"))
             candidates.extend(self.context.paths.images.glob(f"{self.context.slug}_storyboard_plan.json"))
+            staging = self._codex_stage_dir("codex_story_images")
+            candidates.extend((staging / "images").glob(f"{self.context.slug}_scene_*.png"))
+            candidates.extend(staging.glob(f"{self.context.slug}_visual_bible.md"))
+            candidates.extend(staging.glob(f"{self.context.slug}_storyboard_plan.json"))
+            candidates.extend((staging / "images").glob(f"{self.context.slug}_flow_*"))
+            candidates.append(self._story_image_generation_manifest_path())
         elif consumer == "image_video":
             candidates.extend((self.context.paths.video_jobs / "videos").glob("*.mp4"))
         elif consumer == "music":
@@ -4481,7 +5432,13 @@ class StoryAgent:
     def _has_story_images(self, manifest: dict[str, Any]) -> bool:
         if not self._consumer_output_current(manifest, "storyboard_images"):
             return False
-        return self._has_story_image_files(manifest)
+        if not self._has_story_image_files(manifest):
+            return False
+        if self._legacy_contract_policy(manifest):
+            return True
+        context = contract_consumer_path(self.context.project_dir, "storyboard_images")
+        storyboard = self._storyboard_path(manifest)
+        return storyboard is not None and self._story_image_generation_complete(manifest, context, storyboard)
 
     def _has_story_image_files(self, manifest: dict[str, Any]) -> bool:
         image_dir = self._image_dir()
@@ -4627,7 +5584,43 @@ class StoryAgent:
         if self._provided_music(manifest) is not None:
             return True
         downloads = self._suno_downloads_dir()
-        return downloads.exists() and any(path.suffix.lower() in AUDIO_EXTENSIONS for path in downloads.iterdir())
+        if self._legacy_contract_policy(manifest) and not self._music_plan().is_file():
+            return downloads.exists() and any(path.suffix.lower() in AUDIO_EXTENSIONS for path in downloads.iterdir())
+        targets = self._expected_suno_audio_targets(manifest)
+        return bool(targets) and all(path.is_file() and path.stat().st_size > 0 for path in targets)
+
+    def _expected_suno_audio_targets(self, manifest: dict[str, Any]) -> tuple[Path, ...]:
+        plan = self._music_plan()
+        targets: list[Path] = []
+        invalid_plan = False
+        if plan.is_file():
+            try:
+                with plan.open(encoding="utf-8-sig", newline="") as file:
+                    rows = list(csv.DictReader(file))
+            except (OSError, csv.Error):
+                rows = []
+                invalid_plan = True
+            seen: set[str] = set()
+            for row in rows:
+                name = str(row.get("target_audio_filename") or "").strip()
+                candidate = Path(name)
+                if (
+                    not name
+                    or candidate.name != name
+                    or candidate.suffix.lower() not in AUDIO_EXTENSIONS
+                    or name in seen
+                ):
+                    invalid_plan = True
+                    continue
+                seen.add(name)
+                targets.append(self._suno_downloads_dir() / name)
+        if targets and not invalid_plan:
+            return tuple(targets)
+        if invalid_plan or plan.is_file():
+            return ()
+        if self._legacy_contract_policy(manifest):
+            return (self._suno_downloads_dir() / f"01_{self.context.slug}_music.mp3",)
+        return ()
 
     def _has_background_music(self, manifest: dict[str, Any]) -> bool:
         if self._provided_music(manifest) is not None:
@@ -4947,6 +5940,7 @@ class StoryAgent:
             f"必须把逐镜叙事覆盖、焦点角色、景别、在场/不在场角色、连续场景组和 appearance_id 保存到：{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}。",
             "V3.5 required_v1 项目必须读取已审核 visual_sample.lock.json 和 visual_sample_plan.json；优先复用其中合同预览/条件小样，不得另造一套风格锚点。",
             "visual_style、characters、world_scale、story_state 必须完整进入最终逐镜计划和真实生图指令，不得删减或用模型偏好覆盖。",
+            "多角色同框镜头必须在 scale_basis 逐项引用对应 relationship_id，并在 visual_description 写明大小层级、落点、前后景和透视。单角色特写可改变画面占比，多角色同框不得放大小角色到破坏合同相对尺度。",
             "不得擅自新增合同没有可信来源的身份定义性标记、固定配饰、徽记、非意图结构或永久解剖锚点；允许符合合同和 visual_style 的风格化、拟人化、奇幻结构、夸张比例、普通服饰及非身份自然细节。",
             "每镜必须写 scale_basis、current_story_state、visual_state_evidence，并引用合同中的 relationship_id、machine_id、state_id；不适用也要写明原因。",
             "每镜必须写 subject_action、environment_motion、camera_motion、entry_state、exit_state、screen_direction、adjacent_handoff、expected_motion；adjacent_handoff 必须显式包含 boolean 类型的 allows_direction_change 与 allows_state_transition；动作计划必须明确该动什么、该保持什么，不能用完全静止代替连续性。",
@@ -5032,7 +6026,7 @@ class StoryAgent:
                 f"- 下载保存目录：`{downloads}`",
                 f"- 外部阻塞报告：`{music_dir / 'suno_cli_blocker.md'}`",
                 "",
-                "执行口径：如果提示词和分段 CSV 尚未从任务书生成，请先由 Codex 生成它们。然后打开 Suno，逐条粘贴提示词，选择 instrumental，点击 create，下载第一首可用结果，并按 CSV 的 target_audio_filename 重命名保存。",
+                "执行口径：如果提示词和分段 CSV 尚未从任务书生成，请先由 Codex 生成它们。然后打开 Suno，逐条粘贴提示词，选择 instrumental，点击 create。CSV 每一行都必须下载一首可用结果，并按该行 target_audio_filename 精确重命名保存；不得只完成第一行。",
             ]) + "\n",
             encoding="utf-8",
         )
@@ -5218,6 +6212,15 @@ class StoryAgent:
         output_hashes = {"manifest_context": manifest_context_sha256(manifest)}
         if artifacts:
             output_hashes.update(existing_artifact_hashes(artifacts))
+        stage_attempt_record = manifest.get("agent", {}).get("stages", {}).get(stage, {})
+        if runtime_status == "retrying" and isinstance(stage_attempt_record, dict):
+            message_lower = result.message.lower()
+            quality_retry = stage.endswith("_review") or any(
+                marker in message_lower
+                for marker in ("审核", "quality", "score", "门禁", "重做镜头", "review")
+            )
+            counter = "quality_attempts" if quality_retry else "infrastructure_attempts"
+            stage_attempt_record[counter] = int(stage_attempt_record.get(counter) or 0) + 1
         mark_stage(
             manifest,
             stage,
@@ -5236,6 +6239,77 @@ class StoryAgent:
         from story_project import write_manifest
 
         write_manifest(self.context.paths, manifest)
+        try:
+            sinks = build_notification_sinks(self.context.notification_sinks)
+        except ValueError:
+            sinks = []
+        job_id = str(manifest.get("agent", {}).get("job_id") or "")
+        notification_fingerprint = hashlib.sha256(
+            json.dumps(
+                {
+                    "stage": stage,
+                    "status": runtime_status,
+                    "message": result.message,
+                    "output_hashes": output_hashes,
+                },
+                ensure_ascii=False,
+                sort_keys=True,
+            ).encode("utf-8")
+        ).hexdigest()[:16]
+        if runtime_status == "passed":
+            emit_notification(
+                self.context.project_dir,
+                category="stage_completed",
+                severity="info",
+                message=f"{stage} 已通过当前产物与哈希门禁。",
+                dedupe_key=f"{job_id}:{stage}:passed:{notification_fingerprint}",
+                recovery_mode="none",
+                stage=stage,
+                job_id=job_id,
+                sinks=sinks,
+            )
+        elif runtime_status == "retrying":
+            emit_notification(
+                self.context.project_dir,
+                category="automatic_recovery",
+                severity="warning",
+                message=f"{stage} 将在新 attempt 中自动恢复：{result.message}",
+                dedupe_key=f"{job_id}:{stage}:retrying:{notification_fingerprint}",
+                recovery_mode="automatic",
+                stage=stage,
+                job_id=job_id,
+                sinks=sinks,
+            )
+        elif runtime_status in {"blocked", "failed"}:
+            emit_notification(
+                self.context.project_dir,
+                category="stage_blocked" if runtime_status == "blocked" else "stage_failed",
+                severity="warning" if runtime_status == "blocked" else "error",
+                message=f"{stage} {runtime_status}：{result.message}",
+                dedupe_key=f"{job_id}:{stage}:{runtime_status}:{notification_fingerprint}",
+                required_action="系统正在收集证据并判断能否自动恢复；需要授权时会另发通知。",
+                recovery_mode="diagnosing",
+                stage=stage,
+                job_id=job_id,
+                sinks=sinks,
+            )
+        budget = manifest.get("agent", {}).get("budget", {})
+        if isinstance(budget, dict):
+            spent = float(budget.get("spent") or 0.0)
+            soft_limit = float(budget.get("soft_limit") or 0.0)
+            hard_limit = float(budget.get("hard_limit") or 0.0)
+            if soft_limit > 0 and spent >= soft_limit:
+                emit_notification(
+                    self.context.project_dir,
+                    category="budget_risk",
+                    severity="critical" if hard_limit > 0 and spent >= hard_limit * 0.9 else "warning",
+                    message=f"成本已达 ¥{spent:.2f}，软上限 ¥{soft_limit:.2f}，硬上限 ¥{hard_limit:.2f}。",
+                    dedupe_key=f"{job_id}:budget:soft-limit",
+                    required_action="硬上限前不会越权新增付费调用；如需调整预算必须由用户明确确认。",
+                    recovery_mode="wait_for_user" if hard_limit > 0 and spent >= hard_limit else "monitoring",
+                    job_id=job_id,
+                    sinks=sinks,
+                )
 
     def _provider_for_stage(self, stage: str) -> str:
         if stage == "generate_videos":
@@ -5258,6 +6332,49 @@ class StoryAgent:
     def _record_event(self, event: str, payload: dict[str, Any]) -> None:
         if self.read_only:
             return
+        manifest = ensure_manifest_v2(load_manifest(self.context.paths) or {})
+        agent = manifest.get("agent", {}) if isinstance(manifest.get("agent"), dict) else {}
+        stage = str(payload.get("stage") or (event if event in STORY_STAGE_SEQUENCE else ""))
+        stage_record = (
+            agent.get("stages", {}).get(stage, {})
+            if stage and isinstance(agent.get("stages"), dict)
+            else {}
+        )
+        if not isinstance(stage_record, dict):
+            stage_record = {}
+        scheduler = agent.get("scheduler", {}) if isinstance(agent.get("scheduler"), dict) else {}
+        attempt_id = str(
+            payload.get("attempt_id")
+            or os.environ.get("STORY_AGENT_ATTEMPT_ID", "")
+            or scheduler.get("running", {}).get(stage, {}).get("attempt_id", "")
+            if isinstance(scheduler.get("running"), dict)
+            else payload.get("attempt_id") or os.environ.get("STORY_AGENT_ATTEMPT_ID", "")
+        )
+        try:
+            append_agent_event(
+                self.context.project_dir,
+                event_type="stage_result" if event in STORY_STAGE_SEQUENCE else event,
+                status=str(payload.get("status") or ""),
+                summary=str(payload.get("message") or ""),
+                job_id=str(agent.get("job_id") or ""),
+                run_id=str(scheduler.get("run_id") or ""),
+                stage=stage,
+                attempt_id=attempt_id,
+                input_evidence_hashes=stage_record.get("input_hashes", {}),
+                output_evidence_hashes=stage_record.get("output_hashes", {}),
+                blocker_category=str(payload.get("blocker_category") or ""),
+                recovery_decision=str(payload.get("recovery_decision") or ""),
+                provider=str(stage_record.get("provider") or ""),
+                request_id=str(stage_record.get("request_id") or ""),
+                cost_cny=float(stage_record.get("actual_cost") or 0.0),
+                metadata={
+                    key: value
+                    for key, value in payload.items()
+                    if key not in {"message", "status", "stage", "attempt_id"}
+                },
+            )
+        except (OSError, ValueError) as exc:
+            self.state["event_log_error"] = f"{type(exc).__name__}: {exc}"
         events = self.state.setdefault("events", [])
         events.append({"time": now(), "event": event, **payload})
         self.state["events"] = events[-200:]
@@ -5304,7 +6421,12 @@ def main() -> None:
     submit.add_argument("--registry", type=Path)
     submit.add_argument("--soft-budget", default=50.0, type=float)
     submit.add_argument("--hard-budget", default=100.0, type=float)
-    submit.add_argument("--deadline-hours", default=10.0, type=float)
+    submit.add_argument(
+        "--deadline-hours",
+        default=10.0,
+        type=float,
+        help="累计运行时限（小时），默认 10",
+    )
     submit.add_argument("--force", action="store_true", help="即使同一原片已投喂也创建新任务")
 
     refresh_prepared = subparsers.add_parser(
@@ -5344,6 +6466,11 @@ def main() -> None:
     run.add_argument(
         "--module-execution-mode", choices=sorted(ALLOWED_MODULE_EXECUTION_MODES), default=""
     )
+    run.add_argument(
+        "--notification-sinks",
+        default="project",
+        help="逗号分隔：project,codex,desktop,lark；project 始终写 notifications.ndjson",
+    )
 
     start = subparsers.add_parser("start", help="在后台启动无人值守 Agent supervisor")
     start.add_argument("--job", required=True)
@@ -5360,6 +6487,39 @@ def main() -> None:
     start.add_argument(
         "--module-execution-mode", choices=sorted(ALLOWED_MODULE_EXECUTION_MODES), default=""
     )
+    start.add_argument("--heartbeat-interval", default=5.0, type=float)
+    start.add_argument("--heartbeat-timeout", default=120, type=int)
+    start.add_argument("--initial-backoff", default=10, type=int)
+    start.add_argument("--max-backoff", default=600, type=int)
+    start.add_argument("--notification-sinks", default="project,codex,desktop")
+    start.add_argument(
+        "--disable-codex-recovery",
+        action="store_true",
+        help="只使用确定性安全恢复分类，不调用 Codex 恢复判断",
+    )
+
+    supervise = subparsers.add_parser("supervise", help=argparse.SUPPRESS)
+    supervise.add_argument("--job", required=True)
+    supervise.add_argument("--registry", type=Path)
+    supervise.add_argument("--codex-model", default="")
+    supervise.add_argument("--codex-worker-model", default="")
+    supervise.add_argument("--codex-reasoning-effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default="")
+    supervise.add_argument("--codex-worker-reasoning-effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default="")
+    supervise.add_argument("--codex-timeout", default=3600, type=int)
+    supervise.add_argument("--max-steps", default=999, type=int)
+    supervise.add_argument("--scheduler", choices=["linear", "dag"], default="dag")
+    supervise.add_argument("--max-parallel", default=3, type=int)
+    supervise.add_argument("--module-profile", choices=sorted(ALLOWED_MODULE_PROFILES), default="")
+    supervise.add_argument(
+        "--module-execution-mode", choices=sorted(ALLOWED_MODULE_EXECUTION_MODES), default=""
+    )
+    supervise.add_argument("--heartbeat-interval", default=5.0, type=float)
+    supervise.add_argument("--heartbeat-timeout", default=120, type=int)
+    supervise.add_argument("--initial-backoff", default=10, type=int)
+    supervise.add_argument("--max-backoff", default=600, type=int)
+    supervise.add_argument("--notification-sinks", default="project,codex,desktop")
+    supervise.add_argument("--disable-codex-recovery", action="store_true")
+    supervise.add_argument("--max-supervisor-cycles", default=0, type=int, help=argparse.SUPPRESS)
 
     run_stage = subparsers.add_parser("run-stage", help=argparse.SUPPRESS)
     run_stage.add_argument("--project-dir", required=True, type=Path)
@@ -5383,6 +6543,7 @@ def main() -> None:
     run_stage.add_argument(
         "--module-execution-mode", choices=sorted(ALLOWED_MODULE_EXECUTION_MODES), default=""
     )
+    run_stage.add_argument("--notification-sinks", default="project")
 
     status = subparsers.add_parser("status", help="查看 Agent 下一阶段")
     status.add_argument("--job", default="")
@@ -5390,6 +6551,35 @@ def main() -> None:
     status.add_argument("--project-dir", type=Path)
     status.add_argument("--story-name", default="")
     status.add_argument("--slug", default="")
+
+    dashboard = subparsers.add_parser("dashboard", help="启动只读本地实时 Web 看板")
+    dashboard.add_argument("--job", default="")
+    dashboard.add_argument("--registry", type=Path)
+    dashboard.add_argument("--project-dir", type=Path)
+    dashboard.add_argument("--story-name", default="")
+    dashboard.add_argument("--slug", default="")
+    dashboard.add_argument("--host", default="127.0.0.1")
+    dashboard.add_argument("--port", default=8765, type=int)
+    dashboard.add_argument("--poll-seconds", default=2.0, type=float)
+    dashboard.add_argument("--snapshot", action="store_true", help="只输出一次看板快照，不启动服务器")
+
+    preflight = subparsers.add_parser("preflight", help="只读执行 supervisor 启动前检查，不调用 provider")
+    preflight.add_argument("--job", default="")
+    preflight.add_argument("--registry", type=Path)
+    preflight.add_argument("--project-dir", type=Path)
+    preflight.add_argument("--story-name", default="")
+    preflight.add_argument("--slug", default="")
+    preflight.add_argument("--module-profile", choices=sorted(ALLOWED_MODULE_PROFILES), default="")
+    preflight.add_argument(
+        "--module-execution-mode", choices=sorted(ALLOWED_MODULE_EXECUTION_MODES), default=""
+    )
+
+    notifications = subparsers.add_parser("notifications", help="查看或确认项目通知")
+    notifications.add_argument("--job", default="")
+    notifications.add_argument("--registry", type=Path)
+    notifications.add_argument("--project-dir", type=Path)
+    notifications.add_argument("--ack", default="", help="确认一个 notification_id")
+    notifications.add_argument("--acknowledged-by", default="user")
 
     for command_name, help_text in (
         ("resume", "清除取消/阻塞标记，允许任务继续"),
@@ -5474,6 +6664,7 @@ def main() -> None:
                     codex_story_image_batch_size=max(1, args.codex_story_image_batch_size),
                     scheduler="linear",
                     max_parallel=1,
+                    notification_sinks=args.notification_sinks,
                 )
                 worker = StoryAgent(context, module_registry=module_registry)
                 manifest = worker._manifest()
@@ -5540,6 +6731,7 @@ def main() -> None:
         )
         return
     if args.command == "start":
+        build_notification_sinks(args.notification_sinks)
         module_registry = build_registry_for_profile(
             args.module_profile,
             load_config(),
@@ -5569,12 +6761,9 @@ def main() -> None:
             command = [
                 resolve_agent_runtime_python(),
                 str(Path(__file__).resolve()),
-                "run",
+                "supervise",
                 "--job",
                 args.job,
-                "--execute",
-                "--codex-mode",
-                "cli",
                 "--max-steps",
                 str(max(1, args.max_steps)),
                 "--codex-timeout",
@@ -5587,7 +6776,19 @@ def main() -> None:
                 module_registry.selection_profile(),
                 "--module-execution-mode",
                 module_registry.selection_execution_mode(),
+                "--heartbeat-interval",
+                str(max(0.5, args.heartbeat_interval)),
+                "--heartbeat-timeout",
+                str(max(10, args.heartbeat_timeout)),
+                "--initial-backoff",
+                str(max(5, args.initial_backoff)),
+                "--max-backoff",
+                str(max(5, args.max_backoff)),
+                "--notification-sinks",
+                args.notification_sinks,
             ]
+            if args.disable_codex_recovery:
+                command.append("--disable-codex-recovery")
             if args.registry:
                 command.extend(["--registry", str(args.registry.expanduser())])
             if args.codex_model:
@@ -5622,11 +6823,140 @@ def main() -> None:
                     "command": command,
                     "scheduler": args.scheduler,
                     "max_parallel": max(1, args.max_parallel),
+                    "supervisor_mode": "persistent_v1",
+                    "state": str(supervisor_state_path(project_dir)),
                 },
             )
         record_unattended_launch(project_dir, supervisor_record=supervisor_path)
         print(json.dumps({"job_id": args.job, "project_dir": str(project_dir), "pid": process.pid, "started": True, "log": str(log_path)}, ensure_ascii=False, indent=2))
         return
+    if args.command == "supervise":
+        from story_agent_supervisor import PersistentSupervisor, SupervisorConfig
+
+        module_registry = build_registry_for_profile(
+            args.module_profile,
+            load_config(),
+            ROOT,
+            execution_mode=args.module_execution_mode,
+        )
+        build_notification_sinks(args.notification_sinks)
+        registry = JobRegistry(args.registry)
+        project_dir = registry.resolve(args.job)
+        paths = project_paths(project_dir)
+        existing_manifest = ensure_manifest_v2(load_manifest(paths) or {})
+        story = existing_manifest.get("story", {}) if isinstance(existing_manifest.get("story"), dict) else {}
+        story_name = str(story.get("name") or infer_story_name(None, "", project_dir))
+        slug = str(story.get("slug") or slugify(story_name))
+        agent_defaults = load_config().get("agent_defaults", {})
+        commander_model = args.codex_model or str(agent_defaults.get("commander_model", ""))
+        worker_model = args.codex_worker_model or str(agent_defaults.get("worker_model", ""))
+        commander_effort = args.codex_reasoning_effort or str(
+            agent_defaults.get("commander_reasoning_effort", "")
+        )
+        worker_effort = args.codex_worker_reasoning_effort or str(
+            agent_defaults.get("worker_reasoning_effort", "")
+        )
+        run_command = [
+            resolve_agent_runtime_python(),
+            str(Path(__file__).resolve()),
+            "run",
+            "--job",
+            args.job,
+            "--execute",
+            "--codex-mode",
+            "cli",
+            "--max-steps",
+            str(max(1, args.max_steps)),
+            "--codex-timeout",
+            str(max(30, args.codex_timeout)),
+            "--scheduler",
+            args.scheduler,
+            "--max-parallel",
+            str(max(1, args.max_parallel)),
+            "--module-profile",
+            module_registry.selection_profile(),
+            "--module-execution-mode",
+            module_registry.selection_execution_mode(),
+            "--notification-sinks",
+            args.notification_sinks,
+        ]
+        if args.registry:
+            run_command.extend(["--registry", str(args.registry.expanduser())])
+        if commander_model:
+            run_command.extend(["--codex-model", commander_model])
+        if worker_model:
+            run_command.extend(["--codex-worker-model", worker_model])
+        if commander_effort:
+            run_command.extend(["--codex-reasoning-effort", commander_effort])
+        if worker_effort:
+            run_command.extend(["--codex-worker-reasoning-effort", worker_effort])
+        shared_context = dict(
+            project_dir=project_dir,
+            inbox=None,
+            story_name=story_name,
+            slug=slug,
+            update_latest_episode=False,
+            codex_model=commander_model,
+            codex_sandbox="workspace-write",
+            codex_approval="never",
+            codex_path="codex",
+            codex_timeout=max(30, args.codex_timeout),
+            codex_worker_model=worker_model,
+            codex_reasoning_effort=commander_effort,
+            codex_worker_reasoning_effort=worker_effort,
+            scheduler=args.scheduler,
+            max_parallel=max(1, args.max_parallel),
+            notification_sinks=args.notification_sinks,
+        )
+        snapshot_agent = StoryAgent(
+            AgentContext(
+                **shared_context,
+                execute=False,
+                codex_mode="handoff",
+            ),
+            read_only=True,
+        )
+        recovery_agent = StoryAgent(
+            AgentContext(
+                **shared_context,
+                execute=True,
+                codex_mode="cli",
+            ),
+            module_registry=module_registry,
+        )
+
+        def recovery_runner(prompt_path: Path, evidence_path: Path) -> tuple[bool, str, str]:
+            del evidence_path
+            result = recovery_agent._run_codex_exec("recovery_controller", prompt_path, [])
+            _role, model, _effort = recovery_agent.context.codex_route("recovery_controller")
+            if result.status != "done" or result.handoff is None:
+                return False, result.message, model
+            try:
+                output = result.handoff.read_text(encoding="utf-8")
+            except OSError as exc:
+                return False, f"{type(exc).__name__}: {exc}", model
+            return True, output, model
+
+        supervisor = PersistentSupervisor(
+            SupervisorConfig(
+                project_dir=project_dir,
+                job_id=args.job,
+                run_command=tuple(run_command),
+                log_path=paths.status / "story_agent_supervisor.log",
+                heartbeat_interval_seconds=max(0.5, args.heartbeat_interval),
+                heartbeat_timeout_seconds=max(10, args.heartbeat_timeout),
+                initial_backoff_seconds=max(5, args.initial_backoff),
+                max_backoff_seconds=max(
+                    max(5, args.initial_backoff),
+                    max(5, args.max_backoff),
+                ),
+                notification_sink_names=args.notification_sinks,
+                max_cycles=max(0, args.max_supervisor_cycles),
+            ),
+            snapshot_provider=snapshot_agent.status_payload,
+            recovery_runner=None if args.disable_codex_recovery else recovery_runner,
+        )
+        raise SystemExit(supervisor.run())
     if args.command == "signoff":
         project_dir = JobRegistry(args.registry).resolve(args.job) if args.job else args.project_dir
         if project_dir is None:
@@ -5687,6 +7017,7 @@ def main() -> None:
             codex_story_image_batch_size=max(1, args.codex_story_image_batch_size),
             scheduler=args.scheduler,
             max_parallel=max(1, args.max_parallel),
+            notification_sinks=args.notification_sinks,
         )
         try:
             exit_code = StoryAgent(context, module_registry=module_registry).run(max(1, args.max_steps))
@@ -5711,7 +7042,7 @@ def main() -> None:
             print(f"BLOCKED: {exc}")
             exit_code = 2
         raise SystemExit(exit_code)
-    if args.command == "status":
+    if args.command in {"status", "dashboard", "preflight"}:
         if args.job:
             args.project_dir = JobRegistry(args.registry).resolve(args.job)
             existing_manifest = load_manifest(project_paths(args.project_dir)) or {}
@@ -5719,7 +7050,7 @@ def main() -> None:
             args.story_name = args.story_name or str(existing_story.get("name") or "")
             args.slug = args.slug or str(existing_story.get("slug") or "")
         if args.project_dir is None:
-            parser.error("status 需要 --job 或 --project-dir")
+            parser.error(f"{args.command} 需要 --job 或 --project-dir")
         story_name = infer_story_name(None, args.story_name, args.project_dir)
         slug = args.slug.strip() or slugify(story_name)
         agent_defaults = load_config().get("agent_defaults", {})
@@ -5740,7 +7071,62 @@ def main() -> None:
             codex_reasoning_effort=str(agent_defaults.get("commander_reasoning_effort", "")),
             codex_worker_reasoning_effort=str(agent_defaults.get("worker_reasoning_effort", "")),
         )
-        StoryAgent(context, read_only=True).status()
+        agent = StoryAgent(context, read_only=True)
+        if args.command == "status":
+            agent.status()
+        elif args.command == "preflight":
+            from story_agent_preflight import build_start_preflight_report
+
+            selected_modules = build_registry_for_profile(
+                args.module_profile,
+                load_config(),
+                ROOT,
+                execution_mode=args.module_execution_mode,
+            )
+            report = build_start_preflight_report(
+                agent.status_payload(),
+                code_paths=(
+                    Path(__file__).resolve(),
+                    ROOT / "story_agent_observability.py",
+                    ROOT / "story_agent_dashboard.py",
+                    ROOT / "story_agent_preflight.py",
+                    ROOT / "story_agent_recovery.py",
+                    ROOT / "story_agent_supervisor.py",
+                ),
+                module_profile=selected_modules.selection_profile(),
+                module_execution_mode=selected_modules.selection_execution_mode(),
+            )
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+            raise SystemExit(0 if report["passed"] else 1)
+        elif args.snapshot:
+            print(json.dumps(agent.status_payload(), ensure_ascii=False, indent=2))
+        else:
+            if args.host not in {"127.0.0.1", "localhost", "::1"}:
+                parser.error("dashboard 默认只允许本机回环地址")
+            from story_agent_dashboard import serve_dashboard
+
+            serve_dashboard(
+                agent.status_payload,
+                project_dir=context.project_dir,
+                host=args.host,
+                port=max(0, args.port),
+                poll_seconds=max(0.5, args.poll_seconds),
+            )
+        return
+    if args.command == "notifications":
+        project_dir = JobRegistry(args.registry).resolve(args.job) if args.job else args.project_dir
+        if project_dir is None:
+            parser.error("notifications 需要 --job 或 --project-dir")
+        project_dir = project_dir.expanduser()
+        if args.ack:
+            acknowledgement = acknowledge_notification(
+                project_dir,
+                args.ack,
+                acknowledged_by=args.acknowledged_by,
+            )
+            print(json.dumps(acknowledgement, ensure_ascii=False, indent=2))
+        else:
+            print(json.dumps(load_notifications(project_dir, limit=200), ensure_ascii=False, indent=2))
         return
     if args.command in {"resume", "cancel", "report"}:
         project_dir = JobRegistry(args.registry).resolve(args.job) if args.job else args.project_dir

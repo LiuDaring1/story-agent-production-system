@@ -94,8 +94,9 @@ class MusicProviderProductionSeamTests(unittest.TestCase):
             self.assertEqual(
                 captured_task["prompt"],
                 f"请读取并执行这份 Suno 浏览器自动化任务：\n{handoff}\n\n"
-                "目标是生成并下载第一首可用音乐，按音乐分段 CSV 的 target_audio_filename 重命名，"
-                "保存到指定 suno_downloads 目录。若当前 CLI 无浏览器控制能力、Suno 未登录、遇到验证码或付费弹窗，"
+                "目标是逐行生成并下载音乐分段 CSV 中全部 1 段音乐；每一段都必须按 "
+                "target_audio_filename 精确重命名，全部保存到指定 suno_downloads 目录。"
+                "只有所有目标文件均已落盘才可报告完成。若当前 CLI 无浏览器控制能力、Suno 未登录、遇到验证码或付费弹窗，"
                 f"请写入 `{agent._music_dir() / 'suno_cli_blocker.md'}` 说明原因，不要假装完成。",
             )
             self.assertEqual(len(captured_request), 1)
@@ -183,6 +184,75 @@ class MusicProviderProductionSeamTests(unittest.TestCase):
             downloads.mkdir(parents=True, exist_ok=True)
             (downloads / "unrelated-name.wav").write_bytes(b"nonempty")
             self.assertTrue(agent._has_suno_audio(manifest))
+
+    def test_required_contract_requires_every_planned_suno_segment(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, manifest = _music_agent(Path(directory), "all-segments")
+            agent._music_plan().write_text(
+                "segment,target_audio_filename\n"
+                "1,01_all-segments_music.mp3\n"
+                "2,02_all-segments_music.mp3\n"
+                "3,03_all-segments_music.mp3\n",
+                encoding="utf-8",
+            )
+            downloads = agent._suno_downloads_dir()
+            downloads.mkdir(parents=True, exist_ok=True)
+            (downloads / "01_all-segments_music.mp3").write_bytes(b"one")
+            with patch.object(agent, "_legacy_contract_policy", return_value=False):
+                self.assertFalse(agent._has_suno_audio(manifest))
+                (downloads / "02_all-segments_music.mp3").write_bytes(b"two")
+                (downloads / "03_all-segments_music.mp3").write_bytes(b"three")
+                self.assertTrue(agent._has_suno_audio(manifest))
+
+    def test_invalid_planned_target_fails_closed(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, manifest = _music_agent(Path(directory), "unsafe-target")
+            agent._music_plan().write_text(
+                "segment,target_audio_filename\n"
+                "1,01_unsafe-target_music.mp3\n"
+                "2,../outside.mp3\n",
+                encoding="utf-8",
+            )
+            with patch.object(agent, "_legacy_contract_policy", return_value=False):
+                self.assertEqual(agent._expected_suno_audio_targets(manifest), ())
+                self.assertFalse(agent._has_suno_audio(manifest))
+
+    def test_suno_request_exposes_every_planned_output_target(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            agent, manifest = _music_agent(Path(directory), "multi-output")
+            agent._music_plan().write_text(
+                "segment,target_audio_filename\n"
+                "1,01_multi-output_music.mp3\n"
+                "2,02_multi-output_music.mp3\n",
+                encoding="utf-8",
+            )
+            captured: list[MusicProviderRequest] = []
+
+            class ProtocolFake:
+                identity = ModuleIdentity("music_provider", "fake/v1", "protocol-fake", "protocol-fake/v1")
+                capabilities = ModuleCapabilities(provider="fake", deterministic=True)
+
+                def execute(self, request: MusicProviderRequest, *, executor) -> MusicProviderResult:
+                    del executor
+                    captured.append(request)
+                    for target in request.output_targets:
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        target.write_bytes(b"audio")
+                    return MusicProviderResult(
+                        True, request.operation, (), "fake", "fixture", "fake-music-multi",
+                        request.attempt_id, request.execution_request_sha256, "protocol-fake/v1", True,
+                    )
+
+            registry = ModuleRegistry(profile_name="production-default")
+            registry.register("music_provider", ProtocolFake())
+            agent._module_registry = registry
+            with patch.object(agent, "_codex_task", side_effect=AssertionError("executor called")):
+                result = agent._stage_suno_generate(manifest)
+            self.assertEqual(result.status, "done", result.message)
+            self.assertEqual(
+                [path.name for path in captured[0].output_targets],
+                ["01_multi-output_music.mp3", "02_multi-output_music.mp3"],
+            )
 
     def test_assemble_find_audio_prefers_exact_name_then_segment_prefix(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

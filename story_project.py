@@ -54,7 +54,7 @@ PROJECT_DIRS = {
 DEFAULT_CONFIG: dict[str, Any] = {
     "latest_episode": 92,
     "default_story_type": "童话故事",
-    "default_image_style": "自动",
+    "default_image_style": "3D卡通",
     "story_type_options": ["寓言故事", "成语故事", "童话故事", "民间故事", "神话故事", "红色故事", "历史故事", "科普故事"],
     "age_range_options": ["3-6岁", "4-6岁", "6-8岁", "9-11岁", "12-14岁", "15岁以上"],
     "default_age_range": "6-8岁",
@@ -274,7 +274,7 @@ def default_manifest(paths: ProjectPaths, config: dict[str, Any], story_name: st
             "short_slug": short_slug(slug),
             "episode": episode,
             "story_type": config.get("default_story_type", "童话故事"),
-            "image_style": config.get("default_image_style", "自动"),
+            "image_style": config.get("default_image_style", "3D卡通"),
             "age_range": config.get("default_age_range", "6-8岁"),
             "duration_text": "",
             "update_latest_episode_on_delivery": True,

@@ -34,8 +34,6 @@ STYLE_PRESETS: dict[str, dict[str, str]] = {
 }
 
 DEFAULT_STYLE_KEY = "3d_cartoon"
-CHINESE_STYLE_STORY_TYPES = {"民间故事", "神话故事", "成语故事", "历史故事"}
-CHINESE_STYLE_KEY = "chinese_2d_storybook"
 
 
 def image_style_options() -> list[str]:
@@ -54,27 +52,15 @@ def resolve_image_style(style: str | None = None, *, story_type: str = "", story
 
 
 def infer_image_style_key(*, story_type: str = "", story_title: str = "", story: str = "") -> str:
-    if story_type.strip() in CHINESE_STYLE_STORY_TYPES:
-        return CHINESE_STYLE_KEY
-    source = f"{story_title}\n{story}"
-    chinese_markers = (
-        "民间故事",
-        "神话",
-        "天帝",
-        "姑娘",
-        "田螺",
-        "灶",
-        "水缸",
-        "村",
-        "从前",
-        "古时候",
-        "天上",
-        "仙",
-        "书生",
-        "农夫",
-        "皇帝",
-    )
-    return CHINESE_STYLE_KEY if any(marker in source for marker in chinese_markers) else DEFAULT_STYLE_KEY
+    """Return the stable default when the user has not selected a style.
+
+    Story genre and story text are deliberately ignored.  A myth, idiom or
+    historical story may still be produced as 3D cartoon, so keywords cannot
+    safely express visual intent.  Explicit selections are handled by
+    ``resolve_image_style`` before this function is called.
+    """
+    del story_type, story_title, story
+    return DEFAULT_STYLE_KEY
 
 
 def _style_key_from_label_or_key(value: str) -> str:
@@ -172,16 +158,17 @@ def build_children_story_image_request(
 
 - 本次选用：{style["label"]}
 - 风格说明：{style["prompt"]}
-- 视觉圣经必须沿用这个风格写角色、服装、道具、场景、光线和色彩；如果故事有中国民间/神话/历史元素，优先保留中国绘本气质，不要自动退回通用 3D 卡通。
+- 视觉圣经必须沿用这个风格写角色、服装、道具、场景、光线和色彩。故事中的民间/神话/历史元素只影响场景与时代细节，不得改变已选风格；未指定/自动时仍为明亮温暖 3D 卡通。
 
 请按 skill 的规则执行：
 
 1. 先阅读故事，拆成适合视频节奏的镜头。
 {confirmation_rule}
 3. 确认后先建立视觉圣经：固定主角长相、服装、道具、场景、光线和整体风格。
-   - 视觉圣经必须记录每个角色的物种、颜色、关键外形特征与正常解剖约束（四足动物四条腿，嘴必须位于头部而非鼻子/象鼻等部位）。
+   - 视觉圣经必须记录每个角色的物种、原文明确颜色、关键外形特征与正常解剖约束（四足动物四条腿，嘴必须位于头部而非鼻子/象鼻等部位）。未明确的颜色不得自行锁定。
    - 分镜表每一镜增加“在场角色 / 明确不在场角色 / 本镜头已知信息”三项。对白里提到某角色，不等于该角色物理在场；角色尚未听到的信息不得提前表演。
-   - 为每个反复出现的角色建立稳定 `appearance_id`，固定脸部特征、花纹、服装主色/款式和饰品；后续镜头必须复用同一 id 和最近一张已通过参考图，不得重新随机捏角色。
+   - 为每个反复出现的角色建立稳定 `appearance_id`，只固定原文/用户明确或小样已通过审核的脸部特征、花纹、服装主色/款式和饰品；后续镜头必须复用同一 id 和最近一张已通过参考图，不得重新随机捏角色。
+   - 未指定的外观不要写成硬性设计规格；让图像模型按已选整体风格完成角色设计，并由独立视觉审核整体判断是否美观、适合受众。
    - 把机器可读分镜计划写入 `{image_dir.parent / (slug + '_storyboard_plan.json')}`。每镜必须包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description；story_text 与锁定分镜逐行一致。
    - 先检查叙事覆盖：每个唱歌/发言/关键动作/受挫反应角色都要有焦点镜头；同一场比赛要有全景建立、表演者中近景、评委反应、受挫者反应等合理景别变化，不能所有角色都和主角挤在同一种双人中景。
 4. 出图不要人为限制总张数，也不要把“每批 8 张以内”当作业务规则。确认后应按完整分镜连续生成到本故事全部镜头完成；如果工具、网络或工程中断，再根据目标目录里已经存在的 `{slug}_scene_XX.png` 从断点继续。

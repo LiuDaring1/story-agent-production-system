@@ -60,7 +60,9 @@ class ContractSection(str, Enum):
 
 
 REQUIRED_CONTRACT_SECTIONS = tuple(section.value for section in ContractSection)
-PREVIEW_KINDS = frozenset({"style_anchor", "character_sheet", "scale_anchor", "layout_preview"})
+PREVIEW_KINDS = frozenset(
+    {"style_anchor", "character_sheet", "scale_anchor", "state_anchor", "layout_preview"}
+)
 QUALITATIVE_SCALE_RELATIONS = frozenset(
     {
         "much_smaller",
@@ -317,8 +319,9 @@ def validate_story_contract(contract: Mapping[str, Any]) -> list[ContractIssue]:
     if isinstance(scale, Mapping):
         scale_relation_ids = _validate_scale_contract(scale, character_ids, issues)
     state = contracts.get(ContractSection.STORY_STATE.value)
+    state_machine_ids: set[str] = set()
     if isinstance(state, Mapping):
-        _validate_state_contract(state, character_ids, issues)
+        state_machine_ids = _validate_state_contract(state, character_ids, issues)
     brand = contracts.get(ContractSection.BRAND.value)
     if isinstance(brand, Mapping):
         _validate_brand_contract(brand, issues)
@@ -332,6 +335,7 @@ def validate_story_contract(contract: Mapping[str, Any]) -> list[ContractIssue]:
         characters=characters if isinstance(characters, Mapping) else {},
         character_ids=character_ids,
         scale_relation_ids=scale_relation_ids,
+        state_machine_ids=state_machine_ids,
         layout_variant_ids=layout_variant_ids,
         issues=issues,
     )
@@ -719,12 +723,12 @@ def _validate_numeric_scale_range(value: object, path: str, issues: list[Contrac
 
 def _validate_state_contract(
     value: Mapping[str, Any], character_ids: set[str], issues: list[ContractIssue]
-) -> None:
+) -> set[str]:
     machines = value.get("machines")
     path = "$.contracts.story_state.machines"
     if not isinstance(machines, list):
         issues.append(ContractIssue(path, "type", "must be an array"))
-        return
+        return set()
     machine_ids: set[str] = set()
     for index, machine in enumerate(machines):
         item_path = f"{path}[{index}]"
@@ -777,6 +781,7 @@ def _validate_state_contract(
             if machine_id in machine_ids:
                 issues.append(ContractIssue(item_path + ".machine_id", "duplicate", "machine_id must be unique"))
             machine_ids.add(machine_id)
+    return machine_ids
 
 
 def _validate_brand_contract(value: Mapping[str, Any], issues: list[ContractIssue]) -> None:
@@ -859,6 +864,7 @@ def _validate_preview_assets(
     characters: Mapping[str, Any],
     character_ids: set[str],
     scale_relation_ids: set[str],
+    state_machine_ids: set[str],
     layout_variant_ids: set[str],
     issues: list[ContractIssue],
 ) -> None:
@@ -897,6 +903,12 @@ def _validate_preview_assets(
             if not refs or unknown:
                 issues.append(
                     ContractIssue(item_path + ".content_refs", "unknown_reference", "must reference declared scale relationships")
+                )
+        elif kind == "state_anchor":
+            unknown = [ref for ref in refs if ref not in state_machine_ids]
+            if not refs or unknown:
+                issues.append(
+                    ContractIssue(item_path + ".content_refs", "unknown_reference", "must reference declared state machines")
                 )
         elif kind == "layout_preview":
             unknown = [ref for ref in refs if ref not in layout_variant_ids]

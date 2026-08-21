@@ -19,6 +19,7 @@ from story_contracts import (
     validate_preview_asset_files,
     validate_trusted_provenance,
 )
+from story_codex_tasks import resolve_image_style
 from story_project import load_config, save_json
 
 
@@ -111,6 +112,16 @@ def build_trusted_input_chain(
         )
         if key in config
     }
+    explicit_style = project_rules.get("image_style")
+    resolved_style = resolve_image_style(
+        str(explicit_style or config.get("default_image_style") or "").strip(),
+    )
+    global_defaults["resolved_image_style"] = {
+        "key": resolved_style["key"],
+        "label": resolved_style["label"],
+        "goal": resolved_style["goal"],
+        "prompt": resolved_style["prompt"],
+    }
     sources.append(
         {
             "source": "brand_or_global_default",
@@ -129,6 +140,50 @@ def build_trusted_input_chain(
 def write_trusted_input_chain(path: Path, payload: Mapping[str, Any]) -> Path:
     save_json(path, dict(payload))
     return path
+
+
+def bind_contract_visual_style_to_trusted_default(
+    contract_path: Path, trusted_inputs: Mapping[str, Any]
+) -> Path:
+    """Bind style selection exactly; aesthetic elaboration stays out of the contract."""
+
+    default_source = next(
+        (
+            item
+            for item in trusted_inputs.get("sources", [])
+            if isinstance(item, Mapping)
+            and item.get("source") == "brand_or_global_default"
+            and isinstance(item.get("json"), Mapping)
+            and isinstance(item["json"].get("resolved_image_style"), Mapping)
+        ),
+        None,
+    )
+    if default_source is None:
+        raise ValueError("trusted inputs missing resolved_image_style")
+    resolved = default_source["json"]["resolved_image_style"]
+    payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    try:
+        profile = payload["contracts"]["visual_style"]["style_profile"]
+    except (KeyError, TypeError) as exc:
+        raise ValueError("contract missing visual_style.style_profile") from exc
+    profile.clear()
+    profile.update(
+        {
+            "style_id": str(resolved["key"]),
+            "description": str(resolved["prompt"]),
+            "required_traits": [],
+            "forbidden_traits": [],
+            "provenance": {
+                "source": "brand_or_global_default",
+                "source_ref": str(default_source["source_ref"]),
+                "source_sha256": str(default_source["sha256"]),
+                "evidence_pointer": "/resolved_image_style/prompt",
+                "source_order": 0,
+            },
+        }
+    )
+    save_json(contract_path, payload)
+    return contract_path
 
 
 def contract_runtime_issues(project_root: Path | str) -> list[str]:

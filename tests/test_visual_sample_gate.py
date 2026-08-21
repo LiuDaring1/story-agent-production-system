@@ -363,6 +363,55 @@ class VisualSampleGateTests(unittest.TestCase):
             self.assertEqual(by_kind["scale_anchor"]["fulfillment"], "contract_preview")
             self.assertEqual(by_kind["state_anchor"]["fulfillment"], "supplemental_sample")
 
+    def test_state_anchor_reuses_approved_state_reference_without_another_image(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project, manifest = _new_project(root)
+            contract = _visual_contract(
+                project,
+                manifest,
+                preview_kinds=("style_anchor", "character_sheet", "scale_anchor"),
+            )
+            state_ids = [
+                row["machine_id"] for row in contract["contracts"]["story_state"]["machines"]
+            ]
+            state_path = _image(project / "99_项目状态" / "story_contract" / "previews" / "state.png")
+            contract["preview_assets"].append(
+                {
+                    "preview_id": "state_anchor_fixture",
+                    "kind": "state_anchor",
+                    "need_reason": "One approved state sheet reuses the same character identity.",
+                    "content_refs": state_ids,
+                    "path": str(state_path.relative_to(project)),
+                    "sha256": file_sha256(state_path),
+                    "provenance": {
+                        "source": "agent_inference",
+                        "source_ref": "generic state preview fixture",
+                        "source_order": 0,
+                    },
+                }
+            )
+            _agent, _paths = _lock_contract(project, manifest, contract_payload=contract)
+            context = write_contract_consumer_context(project, "storyboard_images")
+
+            plan = compile_visual_sample_plan(project, context)
+            by_kind = {item["kind"]: item for item in plan["requirements"]}
+            self.assertEqual(by_kind["state_anchor"]["fulfillment"], "contract_preview")
+            self.assertEqual(by_kind["state_anchor"]["expected_path"], str(state_path.relative_to(project)))
+
+    def test_environment_only_relationships_do_not_multiply_scale_reference_images(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project, manifest = _new_project(root)
+            contract = _visual_contract(project, manifest, preview_kinds=("style_anchor", "character_sheet"))
+            for relationship in contract["contracts"]["world_scale"]["relationships"]:
+                relationship["qualitative_relation"] = "environment_reference"
+            _agent, _paths = _lock_contract(project, manifest, contract_payload=contract)
+            context = write_contract_consumer_context(project, "storyboard_images")
+
+            plan = compile_visual_sample_plan(project, context)
+            self.assertNotIn("scale_anchor", {item["kind"] for item in plan["requirements"]})
+
     def test_worker_handoff_contains_full_projection_and_identity_expansion_ban(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, manifest, agent, context = _fixture(Path(directory))

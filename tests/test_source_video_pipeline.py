@@ -20,11 +20,44 @@ from story_agent_runtime import file_sha256
 from story_project import init_project, load_manifest, project_paths, write_manifest
 
 
+def make_source_video(path: Path, *, duration: float = 3.0) -> Path:
+    subprocess.run(
+        [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"color=c=0x20C840:s=640x360:d={duration}:r=12",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency=440:duration={duration}",
+            "-shortest",
+            "-c:v",
+            "mpeg4",
+            "-q:v",
+            "8",
+            "-pix_fmt",
+            "yuv420p",
+            "-c:a",
+            "aac",
+            str(path),
+        ],
+        check=True,
+    )
+    return path
+
+
 class SourceVideoPipelineTests(unittest.TestCase):
     def test_rendered_source_edit_emits_clean_video_and_clean_audio(self) -> None:
-        fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
         with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory) / "故事剪辑：媒体输出"
+            root = Path(directory)
+            fixture = make_source_video(root / "fixture.mp4")
+            project = root / "故事剪辑：媒体输出"
             manifest = init_project(project, story_name="媒体输出", slug="clean-media")
             manifest["agent"]["source"] = {"sha256": file_sha256(fixture), "project_copy": str(fixture)}
             manifest["agent"]["input_contract"] = {
@@ -105,9 +138,10 @@ class SourceVideoPipelineTests(unittest.TestCase):
         self.assertEqual(intervals, [{"start": 0.0, "end": 10.35}])
 
     def test_audio_grounded_insertion_restores_whole_asr_omission(self) -> None:
-        fixture = Path(__file__).resolve().parents[1] / "tools" / "video-subtitle-remover" / "test" / "test2.mp4"
         with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory) / "故事剪辑：漏听补回"
+            root = Path(directory)
+            fixture = make_source_video(root / "fixture.mp4")
+            project = root / "故事剪辑：漏听补回"
             init_project(project, story_name="漏听补回", slug="asr-insertion")
             outputs = build_source_outputs(
                 project,

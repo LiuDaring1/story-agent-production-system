@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import math
@@ -7,6 +8,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 import uuid
 import zipfile
@@ -32,6 +34,8 @@ DEFAULT_HARD_BUDGET_CNY = 100.0
 DEFAULT_DEADLINE_HOURS = 10.0
 DEFAULT_MIN_FREE_DISK_GB = 10.0
 PASS_SCORE = 85
+_CONTROL_THREAD_LOCKS: dict[str, threading.Lock] = {}
+_CONTROL_THREAD_LOCKS_GUARD = threading.Lock()
 STAGE_STATUSES = {"pending", "running", "reviewing", "retrying", "passed", "blocked", "failed", "cancelled"}
 STORY_STAGE_SEQUENCE = (
     "import_inbox",
@@ -420,6 +424,8 @@ def ensure_manifest_v2(
         for key, default in (
             ("status", "pending"),
             ("attempts", 0),
+            ("infrastructure_attempts", 0),
+            ("quality_attempts", 0),
             ("started_at", ""),
             ("finished_at", ""),
             ("message", ""),
@@ -444,6 +450,8 @@ def stage_record(manifest: dict[str, Any], stage: str) -> dict[str, Any]:
         {
             "status": "pending",
             "attempts": 0,
+            "infrastructure_attempts": 0,
+            "quality_attempts": 0,
             "started_at": "",
             "finished_at": "",
             "message": "",
@@ -458,6 +466,8 @@ def stage_record(manifest: dict[str, Any], stage: str) -> dict[str, Any]:
         },
     )
     for key, default in (
+        ("infrastructure_attempts", 0),
+        ("quality_attempts", 0),
         ("input_hashes", {}),
         ("output_hashes", {}),
         ("provider", ""),
@@ -1685,38 +1695,40 @@ def control_path(project_dir: Path) -> Path:
 def control_update_lock(project_dir: Path, *, timeout_seconds: float = 5.0) -> Iterator[Path]:
     lock = project_paths(project_dir).status / "story_agent_control.lock"
     lock.parent.mkdir(parents=True, exist_ok=True)
-    token = uuid.uuid4().hex
     deadline = time.monotonic() + max(0.1, timeout_seconds)
-    while True:
-        try:
-            descriptor = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            break
-        except FileExistsError as exc:
-            try:
-                payload = json.loads(lock.read_text(encoding="utf-8"))
-                owner_alive = process_is_alive(int(payload.get("pid", 0)))
-            except (OSError, ValueError, json.JSONDecodeError):
-                try:
-                    owner_alive = time.time() - lock.stat().st_mtime < max(10.0, timeout_seconds)
-                except OSError:
-                    owner_alive = False
-            if not owner_alive:
-                lock.unlink(missing_ok=True)
-                continue
-            if time.monotonic() >= deadline:
-                raise AgentRuntimeError("控制面正在更新，未能在 5 秒内取得锁") from exc
-            time.sleep(0.02)
+    lock_key = str(lock.resolve())
+    with _CONTROL_THREAD_LOCKS_GUARD:
+        thread_lock = _CONTROL_THREAD_LOCKS.setdefault(lock_key, threading.Lock())
+    if not thread_lock.acquire(timeout=max(0.1, timeout_seconds)):
+        raise AgentRuntimeError("控制面正在更新，未能在 5 秒内取得线程锁")
+    descriptor: int | None = None
+    acquired_file_lock = False
     try:
-        os.write(descriptor, json.dumps({"pid": os.getpid(), "token": token, "created_at": now()}).encode("utf-8"))
-        os.close(descriptor)
+        descriptor = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        while True:
+            try:
+                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired_file_lock = True
+                break
+            except BlockingIOError as exc:
+                if time.monotonic() >= deadline:
+                    raise AgentRuntimeError("控制面正在更新，未能在 5 秒内取得进程锁") from exc
+                time.sleep(0.02)
+        payload = json.dumps(
+            {"pid": os.getpid(), "token": uuid.uuid4().hex, "updated_at": now()},
+            ensure_ascii=False,
+        ).encode("utf-8")
+        os.ftruncate(descriptor, 0)
+        os.lseek(descriptor, 0, os.SEEK_SET)
+        os.write(descriptor, payload)
+        os.fsync(descriptor)
         yield lock
     finally:
-        try:
-            payload = json.loads(lock.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError):
-            payload = {}
-        if payload.get("token") == token:
-            lock.unlink(missing_ok=True)
+        if acquired_file_lock and descriptor is not None:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+        if descriptor is not None:
+            os.close(descriptor)
+        thread_lock.release()
 
 
 def load_control(project_dir: Path) -> dict[str, Any]:

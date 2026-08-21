@@ -24,7 +24,7 @@ from story_module_registry import build_visual_design_registry
 
 
 VISUAL_SAMPLE_SCHEMA_VERSION = "1.0"
-VISUAL_SAMPLE_COMPILER_VERSION = "m2-2a1.1.2"
+VISUAL_SAMPLE_COMPILER_VERSION = "m2-2a1.1.3"
 VISUAL_SAMPLE_LOCK_VERSION = 1
 VISUAL_SAMPLE_SCHEMA_PATH = (
     Path(__file__).resolve().parent
@@ -290,7 +290,15 @@ def compile_visual_sample_plan(
     character_ids = [str(item["character_id"]) for item in character_rows if isinstance(item, Mapping)]
     scale = projection.get("world_scale", {})
     scale_rows = scale.get("relationships", []) if isinstance(scale, Mapping) else []
-    scale_ids = [str(item["relationship_id"]) for item in scale_rows if isinstance(item, Mapping)]
+    # Environment/action references guide scene composition but do not need a
+    # separate cross-character size proof.  Requiring one caused the system to
+    # multiply reference images that could not establish identity continuity.
+    comparable_scale_rows = [
+        item
+        for item in scale_rows
+        if isinstance(item, Mapping) and item.get("qualitative_relation") != "environment_reference"
+    ]
+    scale_ids = [str(item["relationship_id"]) for item in comparable_scale_rows]
     state = projection.get("story_state", {})
     state_rows = state.get("machines", []) if isinstance(state, Mapping) else []
     state_ids = [str(item["machine_id"]) for item in state_rows if isinstance(item, Mapping)]

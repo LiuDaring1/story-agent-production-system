@@ -1,7 +1,7 @@
 {
   "latest_episode": 101,
   "default_story_type": "童话故事",
-  "default_image_style": "自动",
+  "default_image_style": "3D卡通",
   "story_type_options": [
     "寓言故事",
     "成语故事",
@@ -74,7 +74,7 @@
   },
   "video_api": {
     "provider": "toapis_grok",
-    "fallback_provider": "browser",
+    "fallback_provider": "",
     "browser_provider_name": "Flow",
     "submit_all_first": true,
     "max_submit_first": 20,

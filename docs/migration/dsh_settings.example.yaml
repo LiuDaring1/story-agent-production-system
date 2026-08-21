@@ -1,0 +1,24 @@
+# Illustrative only. DeepSeek Harness is in developer preview: inspect the
+# installed version's effective config before copying any row into $DSH_HOME.
+# Never put a literal key in this file.
+
+agent-default-model:
+  provider: deepseek-official
+  model: deepseek-v4-flash
+
+# As of 2026-08-21, DSH documents its built-in DeepSeek chat-completions route
+# as text-only. The newly listed vision experiment therefore belongs behind a
+# custom OpenAI-compatible route unless the installed catalog has caught up.
+llm-pi-ai:
+  providers:
+    deepseek-vision-exp:
+      apiKeyEnv: DEEPSEEK_API_KEY
+      api: openai-completions
+      baseURL: https://api.deepseek.com
+      models:
+        - id: deepseek-v4-flash-vision-exp
+          input: [text, image]
+
+# This file intentionally contains no ToAPIs media route. Image/video models
+# use async media task APIs and must be implemented through Story Agent ports,
+# not misrepresented as chat-completions models.

@@ -110,7 +110,8 @@
   "agent_defaults": {
     "soft_budget_cny": 50.0,
     "hard_budget_cny": 100.0,
-    "deadline_hours": 10.0,
+    "deadline_hours": 0.0,
+    "runtime_deadline_enabled": false,
     "min_free_disk_gb": 10.0,
     "review_pass_score": 85,
     "max_retries": 2,

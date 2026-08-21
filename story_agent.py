@@ -999,6 +999,243 @@ class StoryAgent:
             "product_package",
         }
 
+    def reconcile_state(
+        self,
+        *,
+        archive_stale_story_images: bool = False,
+        legacy_story_image_staging: list[Path] | None = None,
+    ) -> dict[str, Any]:
+        """Normalize recorded stage state against current deterministic gates.
+
+        This maintenance operation is deliberately provider-free. It requires
+        an idle supervisor/job, preserves attempts and prior evidence, archives
+        stale images instead of deleting them, and records a JSON decision in
+        ``99_项目状态``.
+        """
+
+        if self.read_only:
+            raise AgentRuntimeError("只读 StoryAgent 不能整理持久状态")
+        for state_file in (
+            supervisor_state_path(self.context.project_dir),
+            self.context.paths.status / "story_agent_supervisor.json",
+        ):
+            payload = self._read_json_object(state_file)
+            try:
+                pid = int(payload.get("pid") or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            if process_is_alive(pid):
+                raise AgentRuntimeError(f"supervisor 仍在运行，拒绝并发整理状态：pid={pid}")
+
+        normalized_legacy_roots: list[Path] = []
+        for raw in legacy_story_image_staging or []:
+            path = raw.expanduser().resolve()
+            if path.exists() and not path.is_dir():
+                raise AgentRuntimeError(f"旧图片 staging 不是目录：{path}")
+            if path.name != "images" or path.parent.name != "codex_story_images":
+                raise AgentRuntimeError(
+                    f"旧图片 staging 必须是 codex_story_images/images 目录：{path}"
+                )
+            if path not in normalized_legacy_roots:
+                normalized_legacy_roots.append(path)
+
+        with job_lock(self.context.project_dir):
+            manifest_path = self.context.paths.manifest
+            manifest = load_manifest(self.context.paths)
+            if manifest is None:
+                raise AgentRuntimeError(f"项目 manifest 缺失或损坏：{manifest_path}")
+            before_manifest_sha256 = file_sha256(manifest_path)
+            manifest = ensure_manifest_v2(manifest)
+            agent = manifest["agent"]
+            before_status = str(agent.get("status") or "pending")
+            before_stage_statuses = {
+                name: str(agent.get("stages", {}).get(name, {}).get("status") or "pending")
+                for name in STORY_STAGE_SEQUENCE
+            }
+
+            storyboard = self._storyboard_path(manifest)
+            image_dir = self._image_dir()
+            staging_images = self._codex_stage_dir("codex_story_images") / "images"
+            lineage_before = self._story_image_lineage_status(
+                manifest,
+                storyboard=storyboard,
+                image_dir=image_dir,
+                staging_images=staging_images,
+            )
+            archived_story_images = ""
+            if archive_stale_story_images and not lineage_before["stage_gate_complete"]:
+                has_legacy_files = any(
+                    self._expected_named_story_image_count(root, manifest, storyboard) > 0
+                    for root in normalized_legacy_roots
+                )
+                if int(lineage_before["physical_expected_named_count"]) > 0 or has_legacy_files:
+                    archived_story_images = str(
+                        self._invalidate_story_image_derivatives(
+                            staging_images,
+                            additional_staging_images=normalized_legacy_roots,
+                            reason="reconcile_stale_or_unbound_story_images",
+                        )
+                    )
+
+            completed: set[str] = set()
+            predicate_results: dict[str, dict[str, Any]] = {}
+            checks = self._stage_checks()
+            for name, done, _action in checks:
+                error = ""
+                try:
+                    own_gate = bool(done(manifest))
+                except Exception as exc:
+                    own_gate = False
+                    error = f"{type(exc).__name__}: {exc}"
+                dependencies_current = all(
+                    dependency in completed for dependency in STORY_STAGE_DEPENDENCIES[name]
+                )
+                effective_complete = own_gate and dependencies_current
+                if effective_complete:
+                    completed.add(name)
+                predicate_results[name] = {
+                    "own_gate": own_gate,
+                    "dependencies_current": dependencies_current,
+                    "effective_complete": effective_complete,
+                    "error": error,
+                }
+
+            changed_stages: list[dict[str, Any]] = []
+            reconciled_at = now()
+            stages = agent.get("stages", {})
+            for name in STORY_STAGE_SEQUENCE:
+                record = stages[name]
+                previous = str(record.get("status") or "pending")
+                desired = "passed" if name in completed else "pending"
+                if previous == desired:
+                    continue
+                history = record.setdefault("reconciliation_history", [])
+                if not isinstance(history, list):
+                    history = []
+                    record["reconciliation_history"] = history
+                history.append(
+                    {
+                        "time": reconciled_at,
+                        "from": previous,
+                        "to": desired,
+                        "message": str(record.get("message") or ""),
+                        "retry_reason": str(record.get("retry_reason") or ""),
+                        "input_hashes": record.get("input_hashes", {}),
+                        "output_hashes": record.get("output_hashes", {}),
+                    }
+                )
+                record["reconciliation_history"] = history[-20:]
+                record["status"] = desired
+                record["started_at"] = ""
+                if desired == "passed":
+                    record["finished_at"] = reconciled_at
+                    record["message"] = "状态整理：当前产物、哈希与依赖门禁重新核验通过。"
+                    record["retry_reason"] = ""
+                else:
+                    record["finished_at"] = ""
+                    record["retry_reason"] = "状态整理：旧记录不再满足当前产物/哈希/依赖门禁，已安全回到 pending。"
+                changed_stages.append(
+                    {
+                        "stage": name,
+                        "from": previous,
+                        "to": desired,
+                        **predicate_results[name],
+                    }
+                )
+
+            control = update_control(
+                self.context.project_dir,
+                cancel_requested=bool(agent.get("cancel_requested")),
+                increment_epoch=True,
+            )
+            freeze_runtime(agent)
+            agent["control_epoch"] = int(control["run_epoch"])
+            scheduler = agent.get("scheduler", {})
+            scheduler["run_epoch"] = int(control["run_epoch"])
+            scheduler["run_id"] = ""
+            scheduler["running"] = {}
+            agent["branch_blockers"] = {}
+            agent["blocked_reason"] = ""
+            agent["last_checkpoint"] = next(
+                (name for name in reversed(STORY_STAGE_SEQUENCE) if name in completed),
+                "",
+            )
+            all_completed = len(completed) == len(STORY_STAGE_SEQUENCE)
+            if agent.get("cancel_requested"):
+                agent["status"] = "cancelled"
+            elif all_completed:
+                agent["status"] = "completed"
+                agent["finished_at"] = reconciled_at
+            else:
+                agent["status"] = "pending"
+                agent["finished_at"] = ""
+                manifest.pop("completed_at", None)
+            agent["heartbeat_at"] = reconciled_at
+            agent["events"] = [
+                *agent.get("events", []),
+                {
+                    "time": reconciled_at,
+                    "event": "state_reconciled",
+                    "changed_stage_count": len(changed_stages),
+                    "archived_story_images": archived_story_images,
+                },
+            ][-500:]
+
+            from story_project import write_manifest
+
+            write_manifest(self.context.paths, manifest)
+            after_manifest_sha256 = file_sha256(manifest_path)
+            report_dir = (
+                self.context.paths.status
+                / "reconciliation"
+                / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}"
+            )
+            report = {
+                "kind": "story_agent_state_reconciliation_v1",
+                "created_at": reconciled_at,
+                "project_dir": str(self.context.project_dir.resolve()),
+                "job_id": str(agent.get("job_id") or ""),
+                "provider_calls_made": False,
+                "before_manifest_sha256": before_manifest_sha256,
+                "after_manifest_sha256": after_manifest_sha256,
+                "before_agent_status": before_status,
+                "after_agent_status": str(agent.get("status") or ""),
+                "before_stage_statuses": before_stage_statuses,
+                "completed_stages": [name for name in STORY_STAGE_SEQUENCE if name in completed],
+                "ready_stages": self._ready_dag_stages(manifest, completed, set()),
+                "changed_stages": changed_stages,
+                "predicate_results": predicate_results,
+                "story_image_lineage_before": lineage_before,
+                "archived_story_images": archived_story_images,
+                "control_run_epoch": int(control["run_epoch"]),
+            }
+            report_path = report_dir / "state_reconciliation.json"
+            save_json(report_path, report)
+            report["report"] = str(report_path)
+            append_agent_event(
+                self.context.project_dir,
+                event_type="state_reconciled",
+                status=str(agent.get("status") or ""),
+                summary=(
+                    f"状态整理完成：{len(changed_stages)} 个阶段记录更新；"
+                    f"旧图片归档={archived_story_images or '无'}"
+                ),
+                job_id=str(agent.get("job_id") or ""),
+                output_evidence_hashes={str(report_path): file_sha256(report_path)},
+                metadata={"provider_calls_made": False, "control_run_epoch": int(control["run_epoch"])},
+            )
+            emit_notification(
+                self.context.project_dir,
+                category="state_reconciled",
+                severity="info",
+                message=f"状态已按当前产物与哈希重新整理；更新 {len(changed_stages)} 个阶段。",
+                dedupe_key=f"{agent.get('job_id')}:state-reconciled:{after_manifest_sha256}",
+                recovery_mode="none",
+                job_id=str(agent.get("job_id") or ""),
+                sinks=[],
+            )
+            return report
+
     def status_payload(self) -> dict[str, Any]:
         manifest = self._manifest()
         stage_name, _ = self._next_stage(manifest)
@@ -1050,6 +1287,12 @@ class StoryAgent:
         image_dir = self._image_dir()
         safe_project = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.context.slug) or "story"
         staging_images = ROOT / "output" / "story_agent_cli" / safe_project / "codex_story_images" / "images"
+        story_image_lineage = self._story_image_lineage_status(
+            manifest,
+            storyboard=storyboard,
+            image_dir=image_dir,
+            staging_images=staging_images,
+        )
         supervisor: dict[str, Any] = {"running": False}
         supervisor_path = self.context.paths.status / "story_agent_supervisor.json"
         if supervisor_path.exists():
@@ -1108,6 +1351,7 @@ class StoryAgent:
                 "staging_dir": str(staging_images),
                 "image_dir": str(image_dir or ""),
                 "storyboard": str(storyboard or ""),
+                **story_image_lineage,
             },
             "final_delivery": manifest.get("outputs", {}).get("final_delivery_checklist", ""),
             "completed_at": manifest.get("completed_at", ""),
@@ -1123,6 +1367,7 @@ class StoryAgent:
                 storyboard=storyboard,
                 image_dir=image_dir,
                 staging_images=staging_images,
+                story_image_lineage=story_image_lineage,
             )
         )
         return payload
@@ -1166,6 +1411,7 @@ class StoryAgent:
         storyboard: Path | None,
         image_dir: Path | None,
         staging_images: Path,
+        story_image_lineage: dict[str, Any],
     ) -> dict[str, Any]:
         agent = manifest.get("agent", {}) if isinstance(manifest.get("agent"), dict) else {}
         scheduler = agent.get("scheduler", {}) if isinstance(agent.get("scheduler"), dict) else {}
@@ -1254,11 +1500,13 @@ class StoryAgent:
                     }
                 )
 
-        expected_images = self._expected_story_image_count(manifest, storyboard)
-        actual_images = self._expected_named_story_image_count(image_dir, manifest, storyboard)
-        staging_actual = self._expected_named_story_image_count(
-            staging_images, manifest, storyboard
+        expected_images = int(story_image_lineage.get("expected") or 0)
+        valid_images = int(story_image_lineage.get("current_lineage_valid_count") or 0)
+        physical_images = int(story_image_lineage.get("physical_expected_named_count") or 0)
+        physical_staging = int(
+            story_image_lineage.get("physical_staging_expected_named_count") or 0
         )
+        stale_images = int(story_image_lineage.get("stale_or_unbound_count") or 0)
 
         jobs = self._jobs_csv(manifest)
         video_targets: list[str] = []
@@ -1429,13 +1677,22 @@ class StoryAgent:
                 ],
             },
             "artifact_progress": {
-                "故事图片": {
-                    "actual": actual_images,
+                "故事图片（当前有效血缘）": {
+                    "actual": valid_images,
+                    "expected": expected_images,
+                    "detail": (
+                        f"generation_context_current={bool(story_image_lineage.get('generation_context_current'))}; "
+                        f"disk_present={physical_images}; stale_or_unbound={stale_images}; "
+                        f"manifest={story_image_lineage.get('generation_manifest') or ''}"
+                    ),
+                },
+                "故事图片（磁盘现有，含旧版）": {
+                    "actual": physical_images,
                     "expected": expected_images,
                     "detail": str(image_dir or ""),
                 },
-                "图片 staging": {
-                    "actual": staging_actual,
+                "图片 staging（磁盘现有，含旧版）": {
+                    "actual": physical_staging,
                     "expected": expected_images,
                     "detail": str(staging_images),
                 },
@@ -1479,15 +1736,16 @@ class StoryAgent:
         }
 
     def _timing_status(self, agent_data: dict[str, Any]) -> dict[str, Any]:
-        deadline_hours = float(agent_data.get("deadline_hours", 10.0))
         started_text = str(agent_data.get("started_at", ""))
         elapsed_hours = runtime_elapsed_seconds(agent_data) / 3600
         return {
             "started_at": started_text,
             "elapsed_hours": round(elapsed_hours, 3),
             "active_elapsed_seconds": round(runtime_elapsed_seconds(agent_data), 3),
-            "deadline_hours": deadline_hours,
-            "remaining_deadline_hours": round(max(0.0, deadline_hours - elapsed_hours), 3),
+            "runtime_deadline_enabled": False,
+            "deadline_policy": "disabled",
+            "deadline_hours": 0.0,
+            "remaining_deadline_hours": None,
         }
 
     def _recovery_action(self, manifest: dict[str, Any], next_stage: str) -> str:
@@ -4389,7 +4647,8 @@ class StoryAgent:
     def _codex_stage_dir(self, stage: str) -> Path:
         safe_project = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.context.slug) or "story"
         path = ROOT / "output" / "story_agent_cli" / safe_project / stage
-        path.mkdir(parents=True, exist_ok=True)
+        if not self.read_only:
+            path.mkdir(parents=True, exist_ok=True)
         return path
 
     def _sync_story_images_from_staging(self, staging: Path, staging_storyboard: Path, staging_images: Path) -> None:
@@ -4441,18 +4700,36 @@ class StoryAgent:
         storyboard.write_text(expected, encoding="utf-8")
         return bool(current)
 
-    def _invalidate_story_image_derivatives(self, staging_images: Path) -> Path:
-        """Archive scene-specific outputs when the authoritative storyboard changes."""
-        quarantine = self.context.paths.status / "rejected" / "story_images" / time.strftime("%Y%m%d-%H%M%S")
-        quarantine.mkdir(parents=True, exist_ok=True)
+    def _invalidate_story_image_derivatives(
+        self,
+        staging_images: Path,
+        *,
+        additional_staging_images: list[Path] | None = None,
+        reason: str = "authoritative_storyboard_changed",
+    ) -> Path:
+        """Archive stale scene outputs with source/target hashes; never delete them."""
+
+        quarantine_root = self.context.paths.status / "rejected" / "story_images"
+        quarantine = quarantine_root / time.strftime("%Y%m%d-%H%M%S")
+        if quarantine.exists():
+            quarantine = quarantine.with_name(f"{quarantine.name}-{uuid.uuid4().hex[:8]}")
+        quarantine.mkdir(parents=True, exist_ok=False)
         final_images = self.context.paths.images / "images"
         candidates: list[Path] = []
-        for directory in (staging_images, final_images):
+        staging_roots = [staging_images]
+        for raw in additional_staging_images or []:
+            resolved = raw.expanduser().resolve()
+            if all(resolved != existing.expanduser().resolve() for existing in staging_roots):
+                staging_roots.append(resolved)
+        for directory in (*staging_roots, final_images):
             if directory.exists():
                 candidates.extend(directory.glob(f"{self.context.slug}_scene_*.png"))
                 candidates.extend(directory.glob(f"{self.context.slug}_scene_*.jpg"))
                 candidates.extend(directory.glob(f"{self.context.slug}_scene_*.webp"))
-        control_roots = (staging_images, staging_images.parent, self.context.paths.images)
+        control_roots = (
+            *(root for staging_root in staging_roots for root in (staging_root, staging_root.parent)),
+            self.context.paths.images,
+        )
         candidates.extend(
             path
             for root in control_roots
@@ -4464,23 +4741,52 @@ class StoryAgent:
             )
             for path in root.glob(pattern)
         )
-        candidates.extend(staging_images.parent.glob(f"{self.context.slug}_storyboard.md"))
-        candidates.extend(staging_images.parent.glob(f"{self.context.slug}_visual_bible.md"))
-        candidates.extend(staging_images.parent.glob(f"{self.context.slug}_storyboard_plan.json"))
+        for root in staging_roots:
+            candidates.extend(root.parent.glob(f"{self.context.slug}_storyboard.md"))
+            candidates.extend(root.parent.glob(f"{self.context.slug}_visual_bible.md"))
+            candidates.extend(root.parent.glob(f"{self.context.slug}_storyboard_plan.json"))
         candidates.append(self._story_image_generation_manifest_path())
         seen: set[Path] = set()
+        archived: list[dict[str, Any]] = []
         for source in candidates:
             resolved = source.resolve()
             if resolved in seen or not source.exists():
                 continue
             seen.add(resolved)
-            scope = "staging" if staging_images.resolve() in resolved.parents else "final"
+            scope = "final"
+            for index, root in enumerate(staging_roots, start=1):
+                if root.resolve() in resolved.parents or resolved == root.resolve():
+                    scope = "staging" if index == 1 else f"staging_{index:02d}"
+                    break
             target = quarantine / f"{scope}_{source.name}"
             counter = 1
             while target.exists():
                 target = quarantine / f"{scope}_{counter}_{source.name}"
                 counter += 1
+            digest = file_sha256(source) if source.is_file() else ""
+            size = source.stat().st_size if source.is_file() else 0
             shutil.move(str(source), str(target))
+            archived.append(
+                {
+                    "source": str(source),
+                    "target": str(target),
+                    "sha256": digest,
+                    "bytes": size,
+                    "scope": scope,
+                }
+            )
+        save_json(
+            quarantine / "archive_manifest.json",
+            {
+                "kind": "story_image_archive_v1",
+                "created_at": now(),
+                "project_dir": str(self.context.project_dir.resolve()),
+                "slug": self.context.slug,
+                "reason": reason,
+                "destructive_delete_performed": False,
+                "items": archived,
+            },
+        )
         return quarantine
 
     def _story_image_filename(self, index: int) -> str:
@@ -6124,6 +6430,65 @@ class StoryAgent:
         expected = self._expected_story_image_count(manifest, storyboard)
         return sum(1 for index in range(1, expected + 1) if (image_dir / self._story_image_filename(index)).exists())
 
+    def _story_image_lineage_status(
+        self,
+        manifest: dict[str, Any],
+        *,
+        storyboard: Path | None,
+        image_dir: Path | None,
+        staging_images: Path,
+    ) -> dict[str, Any]:
+        """Separate physical files from images bound to current production inputs."""
+
+        expected = self._expected_story_image_count(manifest, storyboard)
+        physical = self._expected_named_story_image_count(image_dir, manifest, storyboard)
+        physical_staging = self._expected_named_story_image_count(
+            staging_images, manifest, storyboard
+        )
+        generation_manifest = self._story_image_generation_manifest_path()
+        context = contract_consumer_path(self.context.project_dir, "storyboard_images")
+        generation_context_current = False
+        valid_count = 0
+        lineage_mode = "sha256_binding"
+
+        if self._legacy_contract_policy(manifest):
+            lineage_mode = "eligible_legacy_contract"
+            stage_gate_complete = self._has_story_images(manifest)
+            if stage_gate_complete:
+                valid_count = physical
+                generation_context_current = True
+        else:
+            stage_gate_complete = False
+            if storyboard is not None and context.is_file() and storyboard.is_file():
+                generation_context_current = self._story_image_generation_context_current(
+                    context, storyboard
+                )
+            if generation_context_current:
+                try:
+                    payload = json.loads(generation_manifest.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    payload = {}
+                images = payload.get("images", {}) if isinstance(payload, dict) else {}
+                if isinstance(images, dict):
+                    valid_count = sum(
+                        1
+                        for index in range(1, expected + 1)
+                        if self._story_image_filename(index) in images
+                    )
+            stage_gate_complete = self._has_story_images(manifest)
+
+        return {
+            "lineage_mode": lineage_mode,
+            "generation_context_current": generation_context_current,
+            "current_lineage_valid_count": valid_count,
+            "physical_expected_named_count": physical,
+            "physical_staging_expected_named_count": physical_staging,
+            "stale_or_unbound_count": max(0, physical - valid_count),
+            "stage_gate_complete": stage_gate_complete,
+            "generation_manifest": str(generation_manifest),
+            "expected": expected,
+        }
+
     def _jobs_csv(self, manifest: dict[str, Any]) -> Path | None:
         return first_existing(manifest.get("outputs", {}).get("jobs_csv"), self.context.paths.video_jobs / f"{self.context.slug}_image_video_jobs.csv")
 
@@ -6423,9 +6788,9 @@ def main() -> None:
     submit.add_argument("--hard-budget", default=100.0, type=float)
     submit.add_argument(
         "--deadline-hours",
-        default=10.0,
+        default=0.0,
         type=float,
-        help="累计运行时限（小时），默认 10",
+        help="已弃用兼容参数；固定运行时限已取消，任何值都不会启用截止门禁",
     )
     submit.add_argument("--force", action="store_true", help="即使同一原片已投喂也创建新任务")
 
@@ -6580,6 +6945,28 @@ def main() -> None:
     notifications.add_argument("--project-dir", type=Path)
     notifications.add_argument("--ack", default="", help="确认一个 notification_id")
     notifications.add_argument("--acknowledged-by", default="user")
+
+    reconcile = subparsers.add_parser(
+        "reconcile",
+        help="按当前产物/哈希/依赖整理持久状态；不调用 provider",
+    )
+    reconcile.add_argument("--job", default="")
+    reconcile.add_argument("--registry", type=Path)
+    reconcile.add_argument("--project-dir", type=Path)
+    reconcile.add_argument("--story-name", default="")
+    reconcile.add_argument("--slug", default="")
+    reconcile.add_argument(
+        "--archive-stale-story-images",
+        action="store_true",
+        help="把无当前血缘绑定的故事图片移入 99_项目状态/rejected，并保存 SHA-256 清单",
+    )
+    reconcile.add_argument(
+        "--legacy-story-image-staging",
+        action="append",
+        default=[],
+        type=Path,
+        help="可重复：旧 worktree 的 codex_story_images/images 目录；仅归档当前故事 slug 的文件",
+    )
 
     for command_name, help_text in (
         ("resume", "清除取消/阻塞标记，允许任务继续"),
@@ -7127,6 +7514,44 @@ def main() -> None:
             print(json.dumps(acknowledgement, ensure_ascii=False, indent=2))
         else:
             print(json.dumps(load_notifications(project_dir, limit=200), ensure_ascii=False, indent=2))
+        return
+    if args.command == "reconcile":
+        project_dir = JobRegistry(args.registry).resolve(args.job) if args.job else args.project_dir
+        if project_dir is None:
+            parser.error("reconcile 需要 --job 或 --project-dir")
+        project_dir = project_dir.expanduser()
+        existing_manifest = load_manifest(project_paths(project_dir)) or {}
+        existing_story = (
+            existing_manifest.get("story", {})
+            if isinstance(existing_manifest.get("story"), dict)
+            else {}
+        )
+        story_name = infer_story_name(
+            None,
+            args.story_name or str(existing_story.get("name") or ""),
+            project_dir,
+        )
+        slug = args.slug.strip() or str(existing_story.get("slug") or "") or slugify(story_name)
+        context = AgentContext(
+            project_dir=project_dir,
+            inbox=None,
+            story_name=story_name,
+            slug=slug,
+            execute=True,
+            update_latest_episode=False,
+            codex_mode="handoff",
+            codex_model="",
+            codex_sandbox="workspace-write",
+            codex_approval="never",
+            codex_path="codex",
+            codex_timeout=30,
+            notification_sinks="project",
+        )
+        report = StoryAgent(context).reconcile_state(
+            archive_stale_story_images=args.archive_stale_story_images,
+            legacy_story_image_staging=args.legacy_story_image_staging,
+        )
+        print(json.dumps(report, ensure_ascii=False, indent=2))
         return
     if args.command in {"resume", "cancel", "report"}:
         project_dir = JobRegistry(args.registry).resolve(args.job) if args.job else args.project_dir

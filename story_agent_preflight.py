@@ -55,12 +55,12 @@ def build_start_preflight_report(
         f"spent={spent:.2f}, reserved={reserved:.2f}, hard_limit={hard_limit:.2f}",
     )
     timing = snapshot.get("timing", {}) if isinstance(snapshot.get("timing"), Mapping) else {}
+    deadline_enabled = bool(timing.get("runtime_deadline_enabled", False))
     deadline = float(timing.get("deadline_hours") or 0.0)
-    remaining = float(timing.get("remaining_deadline_hours") or 0.0)
     check(
-        "runtime_deadline_valid",
-        deadline == 10.0 and remaining > 0,
-        f"deadline_hours={deadline:.2f}, remaining={remaining:.3f}",
+        "fixed_runtime_deadline_disabled",
+        not deadline_enabled and deadline == 0.0,
+        f"runtime_deadline_enabled={deadline_enabled}, deadline_hours={deadline:.2f}",
     )
 
     status_dir = project_dir / "99_项目状态"
@@ -102,6 +102,33 @@ def build_start_preflight_report(
         "target_filename_plans_valid",
         not invalid_progress,
         "、".join(invalid_progress) if invalid_progress else "all parsed targets are exact filenames",
+    )
+
+    stale_stage_rows = [
+        str(row.get("stage") or "")
+        for row in snapshot.get("stage_rows", [])
+        if isinstance(row, Mapping) and row.get("effective_status") == "stale"
+    ]
+    check(
+        "stage_records_reconciled",
+        not stale_stage_rows,
+        "、".join(stale_stage_rows) if stale_stage_rows else "no stale passed stage records",
+    )
+
+    story_images = (
+        snapshot.get("story_images", {})
+        if isinstance(snapshot.get("story_images"), Mapping)
+        else {}
+    )
+    stale_images = int(story_images.get("stale_or_unbound_count") or 0)
+    check(
+        "story_image_lineage_clean",
+        stale_images == 0,
+        (
+            f"current_valid={int(story_images.get('current_lineage_valid_count') or 0)}, "
+            f"disk_present={int(story_images.get('physical_expected_named_count') or 0)}, "
+            f"stale_or_unbound={stale_images}"
+        ),
     )
 
     return {

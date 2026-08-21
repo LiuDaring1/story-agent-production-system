@@ -19,7 +19,7 @@ from story_agent_observability import (
     timestamp,
 )
 from story_agent_preflight import build_start_preflight_report
-from story_project import init_project, project_paths, save_json
+from story_project import init_project, project_paths, save_json, write_manifest
 
 
 class StoryAgentObservabilityTests(unittest.TestCase):
@@ -192,9 +192,16 @@ class StoryAgentObservabilityTests(unittest.TestCase):
                     "control": {"cancel_requested": False, "run_epoch": 4},
                 },
                 "budget": {"spent": 0, "reserved": 0, "hard_limit": 100},
-                "timing": {"deadline_hours": 10, "remaining_deadline_hours": 9},
+                "timing": {
+                    "runtime_deadline_enabled": False,
+                    "deadline_policy": "disabled",
+                    "deadline_hours": 0,
+                    "remaining_deadline_hours": None,
+                },
                 "evidence": {"manifest": str(manifest)},
                 "artifact_progress": {},
+                "story_images": {},
+                "stage_rows": [],
             }
             report = build_start_preflight_report(
                 snapshot,
@@ -206,6 +213,46 @@ class StoryAgentObservabilityTests(unittest.TestCase):
             self.assertFalse(report["provider_calls_made"])
             self.assertFalse(report["start_authorized"])
             self.assertTrue(report["requires_user_confirmation"])
+
+    def test_status_counts_unbound_disk_images_as_stale_not_current(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "故事剪辑：旧图口径"
+            manifest = init_project(project, story_name="旧图口径", slug="old-count")
+            paths = project_paths(project)
+            storyboard_text = paths.inputs / "storyboard.txt"
+            storyboard_text.write_text("第一镜。\n", encoding="utf-8")
+            manifest["inputs"]["storyboard_text"] = str(storyboard_text)
+            image = paths.images / "images" / "old-count_scene_01.png"
+            image.parent.mkdir(parents=True, exist_ok=True)
+            image.write_bytes(b"old-unbound-image")
+            write_manifest(paths, manifest)
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="旧图口径",
+                slug="old-count",
+                execute=False,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            fake_root = root / "read-only-worktree"
+            with patch("story_agent.ROOT", fake_root):
+                payload = StoryAgent(context, read_only=True).status_payload()
+
+            self.assertEqual(payload["story_images"]["physical_expected_named_count"], 1)
+            self.assertEqual(payload["story_images"]["current_lineage_valid_count"], 0)
+            self.assertEqual(payload["story_images"]["stale_or_unbound_count"], 1)
+            self.assertEqual(
+                payload["artifact_progress"]["故事图片（当前有效血缘）"]["actual"],
+                0,
+            )
+            self.assertFalse(fake_root.exists(), "read-only status must not create staging directories")
 
 
 if __name__ == "__main__":

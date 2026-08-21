@@ -370,6 +370,19 @@ class StoryQualificationTests(unittest.TestCase):
             self.assertIsNone(result["cost_cny"])
             self.assertIsNone(result["active_hours"])
 
+    def test_long_valid_runtime_does_not_revoke_qualification(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = self.make_completed_project(Path(directory))
+            paths = project_paths(project)
+            record_human_signoff(project, result="pass", minutes=3)
+            manifest = json.loads(paths.manifest.read_text(encoding="utf-8"))
+            manifest["agent"]["active_elapsed_seconds"] = 48 * 3600
+            write_manifest(paths, manifest)
+
+            result = evaluate_project_for_promotion(project)
+            self.assertTrue(result["qualified"], result["reasons"])
+            self.assertEqual(result["active_hours"], 48.0)
+
     def test_manual_content_inputs_revoke_single_greenscreen_qualification(self) -> None:
         mutations = {
             "story_text": ("manual_story.txt", b"manual story"),

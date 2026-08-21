@@ -18,8 +18,7 @@ python3 story_agent.py submit \
   --video "/absolute/path/to/greenscreen.mp4" \
   --lut "/absolute/path/to/input-look.cube" \
   --soft-budget 50 \
-  --hard-budget 100 \
-  --deadline-hours 10
+  --hard-budget 100
 ```
 
 3. Capture `job_id` and `project_dir` from the JSON response.
@@ -60,7 +59,7 @@ Check durable state:
 python3 story_agent.py status --job "<job_id>"
 ```
 
-Use the returned `remaining_work`, ETA range, `retries_and_failures`, deadline, heartbeat, and `recovery_action`; do not replace these durable fields with guesses from terminal output.
+Use the returned `remaining_work`, ETA range, `retries_and_failures`, cumulative runtime, heartbeat, and `recovery_action`; do not replace these durable fields with guesses from terminal output. There is no fixed runtime deadline.
 For DAG jobs, also inspect `ready_stages`, `branches`, `branch_blockers`, and the critical-path ETA. A CAPTCHA or account issue blocks only its branch while independent branches continue; the overall job becomes blocked only when no runnable branch remains.
 
 If a run stops, read `99_项目状态/agent_morning_report.md` and the newest log before acting. Resume only after resolving the named external state:
@@ -123,4 +122,4 @@ python3 story_agent.py qualification \
   --output "FULL_AUTO_PROMOTION_REPORT.md"
 ```
 
-Only projects that preserve the single-green-screen input contract, were launched through `start`, have every Agent stage passed, contain no reviewed product predating the unattended launch, retain current independent-review hashes, cost no more than ¥50, used no more than 10 active hours, have distinct source-video hashes/story names, and have a passing human final review of at most 10 minutes count toward the 3-story target. Do not make the Agent the default entry until the report says `ready_for_default_entry: true`.
+Only projects that preserve the single-green-screen input contract, were launched through `start`, have every Agent stage passed, contain no reviewed product predating the unattended launch, retain current independent-review hashes, cost no more than ¥50, have a valid cumulative-runtime record, have distinct source-video hashes/story names, and have a passing human final review of at most 10 minutes count toward the 3-story target. Do not make the Agent the default entry until the report says `ready_for_default_entry: true`.

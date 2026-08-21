@@ -29,6 +29,7 @@ NOTIFICATION_CATEGORIES = frozenset(
         "waiting_for_user",
         "heartbeat_timeout",
         "budget_risk",
+        "state_reconciled",
         "supervisor",
         "terminal_bug",
     }

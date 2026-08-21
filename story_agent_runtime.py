@@ -31,7 +31,10 @@ from story_contract_runtime import (
 MANIFEST_VERSION = 2
 DEFAULT_SOFT_BUDGET_CNY = 50.0
 DEFAULT_HARD_BUDGET_CNY = 100.0
-DEFAULT_DEADLINE_HOURS = 10.0
+# Kept as a compatibility value for older callers and manifests. Runtime
+# execution has no fixed wall-clock/active-runtime deadline; cancellation,
+# heartbeat, disk and hard-budget gates remain authoritative.
+DEFAULT_DEADLINE_HOURS = 0.0
 DEFAULT_MIN_FREE_DISK_GB = 10.0
 PASS_SCORE = 85
 _CONTROL_THREAD_LOCKS: dict[str, threading.Lock] = {}
@@ -381,7 +384,12 @@ def ensure_manifest_v2(
     agent.setdefault("heartbeat_at", "")
     agent.setdefault("last_checkpoint", "")
     agent.setdefault("blocked_reason", "")
-    agent.setdefault("deadline_hours", float(deadline_hours))
+    # ``deadline_hours`` existed in manifest v2 and remains readable by old
+    # clients, but a positive legacy value must never re-enable the retired
+    # runtime cutoff. Normalize it on every writable manifest round-trip.
+    del deadline_hours
+    agent["runtime_deadline_enabled"] = False
+    agent["deadline_hours"] = 0.0
     agent.setdefault("min_free_disk_gb", DEFAULT_MIN_FREE_DISK_GB)
     agent.setdefault("started_at", "")
     agent.setdefault("active_elapsed_seconds", 0.0)
@@ -1865,9 +1873,6 @@ def assert_runnable(manifest: dict[str, Any], project_dir: Path | None = None) -
     control_cancelled = bool(load_control(project_dir).get("cancel_requested")) if project_dir is not None else False
     if manifest["agent"].get("cancel_requested") or control_cancelled:
         raise JobCancelled("任务已取消；使用 resume 后才能继续。")
-    elapsed_hours = runtime_elapsed_seconds(manifest["agent"]) / 3600
-    if elapsed_hours > float(manifest["agent"].get("deadline_hours", DEFAULT_DEADLINE_HOURS)):
-        raise AgentRuntimeError(f"任务已超过累计运行时限：{elapsed_hours:.1f} 小时")
     if project_dir is not None:
         usage = shutil.disk_usage(project_dir)
         minimum = float(manifest["agent"].get("min_free_disk_gb", DEFAULT_MIN_FREE_DISK_GB)) * 1024**3
@@ -1905,7 +1910,6 @@ def render_job_report(project_dir: Path) -> Path:
     agent = manifest["agent"]
     budget = agent["budget"]
     elapsed_hours = runtime_elapsed_seconds(agent) / 3600
-    deadline_hours = float(agent.get("deadline_hours", DEFAULT_DEADLINE_HOURS))
     stages = agent.get("stages", {}) if isinstance(agent.get("stages"), dict) else {}
     remaining = [name for name in STORY_STAGE_SEQUENCE if stages.get(name, {}).get("status") != "passed"]
     nominal_minutes = sum(STAGE_ESTIMATES_MINUTES.get(name, 10) for name in remaining)
@@ -1919,7 +1923,7 @@ def render_job_report(project_dir: Path) -> Path:
         f"- 状态：{agent.get('status', 'pending')}",
         f"- 最后检查点：{agent.get('last_checkpoint') or '无'}",
         f"- 心跳：{agent.get('heartbeat_at') or '无'}",
-        f"- 已运行/剩余时限：{elapsed_hours:.2f} / {max(0.0, deadline_hours - elapsed_hours):.2f} 小时",
+        f"- 已运行：{elapsed_hours:.2f} 小时；固定运行时限：已取消（仍受取消、心跳、磁盘和硬预算门禁约束）",
         f"- 成本：¥{float(budget.get('spent', 0)):.2f} / 软上限 ¥{float(budget.get('soft_limit', 0)):.2f} / 硬上限 ¥{float(budget.get('hard_limit', 0)):.2f}",
         f"- 预算预留：¥{float(budget.get('reserved', 0)):.2f}（开放 {len(open_reservations)} 笔）",
         f"- 阻塞原因：{agent.get('blocked_reason') or '无'}",

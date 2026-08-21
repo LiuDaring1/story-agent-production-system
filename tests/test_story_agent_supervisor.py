@@ -95,7 +95,7 @@ def _snapshot(project: Path, stage: str, reason: str, *, heartbeat_age: float = 
         "supervisor": {},
         "locks": {},
         "budget": {"spent": 0, "hard_limit": 100},
-        "timing": {"deadline_hours": 10, "remaining_deadline_hours": 9},
+        "timing": {"runtime_deadline_enabled": False, "deadline_hours": 0, "remaining_deadline_hours": None},
         "artifact_progress": {},
         "provider_receipts": [],
         "events": [],

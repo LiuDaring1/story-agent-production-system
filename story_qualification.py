@@ -413,8 +413,6 @@ def evaluate_project_for_promotion(project_dir: Path) -> dict[str, Any]:
         reasons.append(f"单集成本 ¥{spent:.2f} 超过 ¥50")
     if not math.isfinite(active_hours) or active_hours < 0:
         reasons.append("有效运行时间记录无效")
-    elif active_hours > 10.0:
-        reasons.append(f"有效运行 {active_hours:.2f} 小时超过 10 小时")
     source = agent.get("source", {}) if isinstance(agent.get("source"), dict) else {}
     source_sha256 = str(source.get("sha256") or "")
     if not source_sha256:

@@ -33,7 +33,7 @@ Agent 的职责分三层：
 | import_inbox | local | 投喂区素材复制到 `00_输入素材` |
 | source_edit / source_text_correction / source_edit_review | local/codex_native | 原片、清洁视频/音频、消费者文稿、字幕和可追溯剪辑决定通过独立审核 |
 | setup_project | local | manifest 存在，故事正文/旁白/绿幕被识别 |
-| codex_story_images | codex_native | `01_分镜与图片/images` 或 `02_图生视频/images` 有图片，且分镜文本存在 |
+| codex_story_images | codex_native | 预期命名图片齐全，且生成清单逐张 SHA-256 绑定当前合同请求、视觉小样锁、权威分镜与当前 worktree staging |
 | story_images_review | codex_native | 分镜图片独立视觉审核通过，哈希为当前版本 |
 | prepare_jobs | local | `*_image_video_jobs.csv` 存在 |
 | timing | local | `timings.json` 或 jobs CSV 写入时长信息 |
@@ -82,10 +82,10 @@ Agent 必须以“可续跑”为默认：
 
 `story_agent.py` 已采用“Codex 入口 + 本地持久状态机”结构。工作台不删除，但正常运行不再依赖逐步点击。唯一必需输入是一段横屏绿幕口播原片；系统派生音频、转写、清洁文稿、分镜和字幕。
 
-- 默认软预算 ¥50、硬预算 ¥100、运行时限 10 小时。
+- 默认软预算 ¥50、硬预算 ¥100；不设固定运行时限，持续保留心跳、取消、磁盘与硬预算门禁。
 - 图生视频供应商由 `video_api.adapters` 选择；`toapis_grok` 是当前默认适配器，`qingyun_api` 仅保留旧 CLI 兼容，`mock_local` 用于零费用端到端与故障注入，模型不写死在状态机中。
 - manifest 每阶段记录输入/输出上下文指纹、供应商、实际阶段成本、尝试次数和重试原因。
-- `status` 返回剩余阶段、三档经验 ETA、运行/剩余时限、心跳、预算预留、重试/失败明细和具体恢复动作；ETA 不把外部排队或登录等待伪装成确定承诺。
+- `status` 返回剩余阶段、三档经验 ETA、累计运行时间、固定时限禁用状态、心跳、预算预留、重试/失败明细和具体恢复动作；ETA 不把外部排队或登录等待伪装成确定承诺。
 - 智能/视觉阶段必须有独立审核 JSON：至少 85 分、无关键错误、产物哈希一致。
 - 图片和视频审核失败时保留失败版本并按镜头重排队；发布预览、终片、朗读标注和资料包同样支持限次回退。
 - 发布物料固定为两份账号文案和六张封面（两账号各 3:4、4:3、16:9）。
@@ -143,7 +143,7 @@ python3 story_agent.py qualification --projects-root "auto-project/runs"
 
 `submit` 对原片做 SHA-256 去重并创建 manifest v2；`start` 只有在后台进程创建成功后才原子保存 supervisor 记录，并把记录 SHA-256、启动时间和日志路径绑定到 manifest；`cancel` 不删除任何素材；`report` 生成早晨交付摘要。项目级入口 Skill 位于 `skills/story-full-auto/`。
 
-`signoff` 只能由用户实际看完最终交付后记录，结果会绑定总清单、两条发布视频、六张封面、两份文案和两套资料包的当前 SHA-256，不能由 Agent 自行臆造。`qualification` 扫描真实项目并执行默认入口转正门槛：必须是三个故事名与原片 SHA 均不同的项目，每条都由 `start` 无人值守启动、九项独立审核当前且通过、成本不高于 ¥50、有效运行不超过 10 小时，并在 10 分钟内完成人工终审。未达到 3/3 时不得把全自动 Agent 宣称为默认生产入口。
+`signoff` 只能由用户实际看完最终交付后记录，结果会绑定总清单、两条发布视频、六张封面、两份文案和两套资料包的当前 SHA-256，不能由 Agent 自行臆造。`qualification` 扫描真实项目并执行默认入口转正门槛：必须是三个故事名与原片 SHA 均不同的项目，每条都由 `start` 无人值守启动、九项独立审核当前且通过、成本不高于 ¥50、运行时记录有效，并在 10 分钟内完成人工终审。未达到 3/3 时不得把全自动 Agent 宣称为默认生产入口。
 
 `submit` 同时创建 `agent.input_contract`：唯一用户内容输入只能是一段绿幕原片；LUT 只作为处理配置记录。源剪辑生成的故事文本、清洁绿幕和清洁旁白必须分别绑定原片 SHA-256 与当前剪辑决定 SHA-256。转正核验拒绝后来加入的脚本、旁白、音乐、图片等人工输入，也拒绝未全部通过的 Agent 阶段，以及修改时间早于无人值守启动的预置审核产物。
 

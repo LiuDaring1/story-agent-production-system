@@ -1178,7 +1178,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertFalse(story.exists())
             self.assertTrue((archive / story.name).exists())
 
-    def test_resume_preserves_cumulative_active_runtime_and_deadline(self) -> None:
+    def test_resume_preserves_cumulative_runtime_without_fixed_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：累计时限"
             manifest = init_project(project, story_name="累计时限", slug="cumulative-runtime")
@@ -1194,8 +1194,80 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertGreaterEqual(float(resumed["agent"]["active_elapsed_seconds"]), 3899.0)
             self.assertEqual(resumed["agent"]["started_at"], "")
             resumed["agent"]["active_elapsed_seconds"] = 2.1 * 3600
-            with self.assertRaisesRegex(AgentRuntimeError, "累计运行时限"):
-                assert_runnable(resumed)
+            assert_runnable(resumed)
+            self.assertFalse(resumed["agent"]["runtime_deadline_enabled"])
+            self.assertEqual(resumed["agent"]["deadline_hours"], 0.0)
+
+    def test_reconcile_archives_unbound_story_images_and_normalizes_stale_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "故事剪辑：旧图片整理"
+            manifest = init_project(project, story_name="旧图片整理", slug="stale-images")
+            paths = project_paths(project)
+            source = paths.inputs / "original.mov"
+            source.write_bytes(b"immutable-original")
+            source_sha = file_sha256(source)
+            storyboard_text = paths.inputs / "storyboard.txt"
+            storyboard_text.write_text("第一镜。\n", encoding="utf-8")
+            manifest["inputs"]["storyboard_text"] = str(storyboard_text)
+            manifest["agent"]["status"] = "blocked"
+            manifest["agent"]["deadline_hours"] = 876000.0
+            manifest["agent"]["branch_blockers"] = {
+                "codex_story_images": {"branch": "visual", "message": "旧阻塞"}
+            }
+            mark_stage(manifest, "codex_story_images", "passed", message="旧文件存在")
+            mark_stage(manifest, "story_images_review", "passed", message="旧审核")
+            final_image = paths.images / "images" / "stale-images_scene_01.png"
+            final_image.parent.mkdir(parents=True, exist_ok=True)
+            final_image.write_bytes(b"old-final")
+            legacy_staging = (
+                root
+                / "old-worktree"
+                / "output"
+                / "story_agent_cli"
+                / "stale-images"
+                / "codex_story_images"
+                / "images"
+            )
+            legacy_staging.mkdir(parents=True)
+            (legacy_staging / final_image.name).write_bytes(b"old-staging")
+            write_manifest(paths, manifest)
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="旧图片整理",
+                slug="stale-images",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            with patch("story_agent.ROOT", root / "current-worktree"):
+                report = StoryAgent(context).reconcile_state(
+                    archive_stale_story_images=True,
+                    legacy_story_image_staging=[legacy_staging],
+                )
+
+            self.assertFalse(final_image.exists())
+            self.assertFalse((legacy_staging / final_image.name).exists())
+            self.assertEqual(file_sha256(source), source_sha)
+            self.assertFalse(report["provider_calls_made"])
+            archive = Path(report["archived_story_images"])
+            archive_manifest = json.loads((archive / "archive_manifest.json").read_text(encoding="utf-8"))
+            self.assertEqual(len(archive_manifest["items"]), 2)
+            self.assertTrue(all(len(item["sha256"]) == 64 for item in archive_manifest["items"]))
+            reloaded = load_manifest(paths)
+            assert reloaded is not None
+            self.assertEqual(reloaded["agent"]["status"], "pending")
+            self.assertEqual(reloaded["agent"]["stages"]["codex_story_images"]["status"], "pending")
+            self.assertEqual(reloaded["agent"]["stages"]["story_images_review"]["status"], "pending")
+            self.assertEqual(reloaded["agent"]["branch_blockers"], {})
+            self.assertFalse(reloaded["agent"]["runtime_deadline_enabled"])
+            self.assertEqual(reloaded["agent"]["deadline_hours"], 0.0)
 
     def test_reconcile_marks_interrupted_but_verified_prior_stage_passed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

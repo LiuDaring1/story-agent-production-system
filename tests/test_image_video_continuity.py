@@ -14,6 +14,7 @@ from story_workflow import reset_redo_scenes
 from story_video_synthesizer.image_video import (
     VisualContinuityContractError,
     build_jobs,
+    build_video_prompt,
     continuity_context_from_row,
     inject_visual_continuity_prompt,
     validate_image_video_jobs,
@@ -22,6 +23,19 @@ from story_video_synthesizer.image_video import (
 
 
 class ImageVideoContinuityTests(unittest.TestCase):
+    def test_unrelated_story_specific_prompt_cannot_leak_from_one_shared_word(self) -> None:
+        prompt = build_video_prompt(
+            2,
+            "一只小狗悄悄跟在珍妮身后，一边走一边把串在绳子上的面包圈吃掉。",
+            "",
+            "qisehua_scene_02.png",
+        )
+        self.assertIn("小狗", prompt)
+        self.assertIn("食物", prompt)
+        self.assertNotIn("孙敬", prompt)
+        self.assertNotIn("发髻", prompt)
+        self.assertNotIn("房梁", prompt)
+
     def _fixture(self, root: Path, *, required: str = "保持当前状态", state: str = "state_a") -> tuple[Path, Path, Path, Path]:
         image_dir = root / "images"
         image_dir.mkdir(parents=True)

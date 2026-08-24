@@ -10,7 +10,7 @@ from typing import Any, Mapping, Sequence
 MOTION_REQUEST_SCHEMA = "story-semantic-card-motion-request/v1"
 MOTION_RECEIPT_SCHEMA = "story-semantic-card-motion/v1"
 MOTION_PROMPT_VERSION = "story-semantic-card-motion-prompt/v1"
-MOTION_CLIP_SECONDS = 4.0
+MOTION_CLIP_SECONDS = 6.0
 MOTION_PROVIDER_SAFE_PROMPT_CHARS = 120
 MOTION_PROVIDER_RESOLUTION = "720p"
 
@@ -106,9 +106,9 @@ def write_semantic_card_motion_request(
                 "required_duration_seconds": MOTION_CLIP_SECONDS,
                 "presentation_window_seconds": round(presentation_duration, 3),
                 "requested_ratio": "16:9",
-                # Grok's currently configured production channel is native
-                # 720p. The final release compositor still encodes 1080p; do
-                # not request the unavailable 4-second + 1080p combination.
+                # The configured ToAPIs routes are native 720p. The final
+                # release compositor still encodes 1080p; requesting 1080p
+                # here would fail before generation on the current channels.
                 "requested_resolution": MOTION_PROVIDER_RESOLUTION,
                 "prompt": prompt,
                 "prompt_sha256": prompt_sha256,

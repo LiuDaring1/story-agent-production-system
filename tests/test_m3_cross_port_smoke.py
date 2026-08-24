@@ -331,8 +331,8 @@ class M3CrossPortSmokeTests(unittest.TestCase):
             self.assertIsInstance(adapter, adapter_type)
             self.assertEqual(adapter.identity.port_name, port_name)
             self.assertEqual(adapter.identity.port_version, port_version)
-        self.assertEqual(registry.video_generator().capabilities.provider, "toapis_grok")
-        self.assertEqual(registry.video_generator().capabilities.model_or_tool, "grok-video-1.5")
+        self.assertEqual(registry.video_generator().capabilities.provider, "toapis_grok_1_0")
+        self.assertEqual(registry.video_generator().capabilities.model_or_tool, "grok-video-1.0")
 
     def test_mock_profile_and_execution_mode_survive_subprocess_or_fail_closed(self) -> None:
         env = os.environ.copy()

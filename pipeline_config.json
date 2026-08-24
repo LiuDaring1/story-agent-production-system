@@ -82,8 +82,8 @@
     "story_performance_script_skill": "skills/story-performance-script/SKILL.md"
   },
   "video_api": {
-    "provider": "toapis_grok",
-    "fallback_provider": "toapis_grok_1_0",
+    "provider": "toapis_grok_1_0",
+    "fallback_provider": "toapis_grok",
     "browser_provider_name": "Flow",
     "submit_all_first": true,
     "max_submit_first": 20,

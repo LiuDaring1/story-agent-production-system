@@ -110,6 +110,16 @@ class FullAutoContractTests(unittest.TestCase):
         self.assertEqual(defaults["target_delivery_seconds"], 28800)
         self.assertEqual(defaults["max_full_resolution_encodes"], 1)
 
+    def test_video_provider_defaults_to_grok_10_with_selectable_15_fallback(self) -> None:
+        video_api = load_config()["video_api"]
+        self.assertEqual(video_api["provider"], "toapis_grok_1_0")
+        self.assertEqual(video_api["fallback_provider"], "toapis_grok")
+        self.assertEqual(video_api["adapters"][video_api["provider"]]["model"], "grok-video-1.0")
+        self.assertEqual(
+            video_api["adapters"][video_api["fallback_provider"]]["model"],
+            "grok-video-1.5",
+        )
+
     def test_release_and_product_package_split_after_shared_real_material_preview(self) -> None:
         self.assertLess(STORY_STAGE_SEQUENCE.index("release_preview"), STORY_STAGE_SEQUENCE.index("product_package"))
         self.assertLess(STORY_STAGE_SEQUENCE.index("release_preview"), STORY_STAGE_SEQUENCE.index("package_release"))

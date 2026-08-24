@@ -87,10 +87,11 @@ class SemanticCardMotionTests(unittest.TestCase):
         rows = []
         for index, item in enumerate(request["cards"], start=1):
             output = Path(item["output_video_path"])
+            fixture_duration = float(item["required_duration_seconds"]) + 0.1
             subprocess.run(
                 [
                     "ffmpeg", "-y", "-f", "lavfi", "-i",
-                    f"color=c={'red' if index == 1 else 'blue'}:s=320x180:d=4.1",
+                    f"color=c={'red' if index == 1 else 'blue'}:s=320x180:d={fixture_duration}",
                     "-c:v", "libx264", "-pix_fmt", "yuv420p", str(output),
                 ],
                 check=True,
@@ -139,7 +140,7 @@ class SemanticCardMotionTests(unittest.TestCase):
             artifact_semantic_plan_sha256="a" * 64,
         )
         request = json.loads(request_path.read_text(encoding="utf-8"))
-        self.assertEqual([row["required_duration_seconds"] for row in request["cards"]], [4.0, 4.0])
+        self.assertEqual([row["required_duration_seconds"] for row in request["cards"]], [6.0, 6.0])
         self.assertEqual(
             [row["requested_resolution"] for row in request["cards"]],
             [MOTION_PROVIDER_RESOLUTION] * 2,

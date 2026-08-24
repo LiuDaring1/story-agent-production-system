@@ -1175,6 +1175,10 @@ _PRESERVED_JOB_FIELDS = (
     "needs_slowdown",
     "needs_trim",
     "timing_source",
+    "provider_prompt",
+    "provider_prompt_chars",
+    "provider_prompt_sha256",
+    "provider_request_seconds",
 )
 
 _REFRESHED_JOB_FIELDS = {

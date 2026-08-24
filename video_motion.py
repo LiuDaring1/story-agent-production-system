@@ -20,7 +20,20 @@ SCREEN_DIRECTIONS = {
 }
 VIDEO_SOURCE_KINDS = {
     "provider_generated", "mock_provider", "ffmpeg_still_frame",
-    "static_fallback", "test_fixture",
+    "static_fallback", "editorial_adjacent_extension", "test_fixture",
+}
+VIDEO_REVIEW_POLICY_VERSION = "hard-defects-only-v1"
+VIDEO_REVIEW_HARD_DEFECT_CODES = {
+    "black_or_corrupt_frames",
+    "watermark_or_unwanted_text",
+    "severe_anatomy_deformation",
+    "severe_face_or_limb_topology_failure",
+    "severe_identity_species_or_role_drift",
+    "required_character_missing_or_wrong_character",
+    "character_duplication_fusion_or_disappearance",
+    "severe_twitching_or_unreadable_motion",
+    "severe_physics_break",
+    "essential_story_event_reversed_or_missing",
 }
 
 
@@ -294,7 +307,7 @@ def formal_source_issues(row: Mapping[str, Any], *, production_mode: bool) -> li
     eligible = str(row.get("production_eligible") or "").strip().lower() == "true"
     if not production_mode:
         return []
-    if kind != "provider_generated" or not eligible:
+    if kind not in {"provider_generated", "editorial_adjacent_extension"} or not eligible:
         return [f"non_production_video_source:{kind or 'missing'}"]
     return []
 
@@ -328,6 +341,9 @@ def write_video_receipt(
         "story_contract_sha256": str(row.get("story_contract_sha256") or ""),
         "story_contract_dependency_sha256": str(row.get("story_contract_dependency_sha256") or ""),
         "motion_plan_sha256": str(row.get("motion_plan_sha256") or ""),
+        "provider_prompt_sha256": str(row.get("provider_prompt_sha256") or ""),
+        "provider_prompt_chars": int(str(row.get("provider_prompt_chars") or "0")),
+        "provider_request_seconds": int(str(row.get("provider_request_seconds") or "0")),
     }
     directory = jobs_csv.expanduser().parent / "video_receipts"
     directory.mkdir(parents=True, exist_ok=True)
@@ -354,6 +370,10 @@ def video_receipt_issues(row: Mapping[str, Any], video_path: Path, *, production
     if not video_path.is_file() or receipt.get("video_sha256") != file_sha256(video_path):
         issues.append("video_receipt_video_hash_mismatch")
     integer_bindings = {"scene": "scene", "provider_attempt": "provider_attempt"}
+    if str(row.get("provider_prompt_chars") or ""):
+        integer_bindings["provider_prompt_chars"] = "provider_prompt_chars"
+    if str(row.get("provider_request_seconds") or ""):
+        integer_bindings["provider_request_seconds"] = "provider_request_seconds"
     for receipt_key, row_key in integer_bindings.items():
         try:
             current = int(str(row.get(row_key) or "0"))
@@ -371,6 +391,8 @@ def video_receipt_issues(row: Mapping[str, Any], video_path: Path, *, production
         "task_id": "task_id",
         "client_business_id": "client_business_id",
     }
+    if str(row.get("provider_prompt_sha256") or ""):
+        string_bindings["provider_prompt_sha256"] = "provider_prompt_sha256"
     for receipt_key, row_key in string_bindings.items():
         if receipt.get(receipt_key) != str(row.get(row_key) or ""):
             issues.append(f"video_receipt_{receipt_key}_mismatch")
@@ -380,13 +402,15 @@ def video_receipt_issues(row: Mapping[str, Any], video_path: Path, *, production
     for key in ("story_contract_sha256", "story_contract_dependency_sha256", "motion_plan_sha256"):
         if receipt.get(key) != str(row.get(key) or ""):
             issues.append(f"video_receipt_{key}_mismatch")
-    if production_mode and (receipt.get("source_kind") != "provider_generated" or receipt.get("production_eligible") is not True):
+    production_source_kinds = {"provider_generated", "editorial_adjacent_extension"}
+    if production_mode and (receipt.get("source_kind") not in production_source_kinds or receipt.get("production_eligible") is not True):
         issues.append("video_receipt_not_production_eligible")
     return issues
 
 
 def review_semantic_issues(
     payload: Mapping[str, Any], *, expected_scenes: Sequence[int] | None = None,
+    hard_defects_only: bool = False,
 ) -> list[str]:
     issues: list[str] = []
     reviews = payload.get("per_scene_reviews", [])
@@ -406,14 +430,132 @@ def review_semantic_issues(
             for key in ("story_state_consistent", "adjacent_handoff_consistent"):
                 if not isinstance(row.get(key), bool):
                     issues.append(f"scene_{scene or 'unknown'}:{key}_missing")
-        if row.get("story_state_consistent") is False:
+        if row.get("story_state_consistent") is False and not hard_defects_only:
             issues.append(f"scene_{row.get('scene')}:story_state_conflict")
-        if row.get("adjacent_handoff_consistent") is False:
+        if row.get("adjacent_handoff_consistent") is False and not hard_defects_only:
             issues.append(f"scene_{row.get('scene')}:adjacent_handoff_conflict")
     if expected_scenes is not None:
         missing = sorted(set(expected_scenes) - seen)
         if missing:
             issues.append("per_scene_reviews_incomplete:" + ",".join(map(str, missing)))
+    return issues
+
+
+def video_review_policy_issues(
+    payload: Mapping[str, Any], *, expected_scenes: Sequence[int],
+) -> list[str]:
+    """Fail closed before a paid retry unless review findings use the hard-defect policy."""
+
+    issues = review_semantic_issues(
+        payload, expected_scenes=expected_scenes, hard_defects_only=True,
+    )
+    if payload.get("quality_policy") != VIDEO_REVIEW_POLICY_VERSION:
+        issues.append("video_review_quality_policy_mismatch")
+    expected = set(expected_scenes)
+    retry_values = payload.get("retry_indices", [])
+    if not isinstance(retry_values, list):
+        issues.append("retry_indices_missing")
+        retry_scenes: set[int] = set()
+    else:
+        retry_scenes = set()
+        for value in retry_values:
+            try:
+                scene = int(value)
+            except (TypeError, ValueError):
+                issues.append("retry_index_invalid")
+                continue
+            if scene not in expected:
+                issues.append(f"retry_scene_unknown:{scene}")
+            else:
+                retry_scenes.add(scene)
+
+    hard_defects = payload.get("hard_defects", [])
+    if not isinstance(hard_defects, list):
+        issues.append("hard_defects_missing")
+        hard_defect_scenes: set[int] = set()
+    else:
+        hard_defect_scenes = set()
+        for finding in hard_defects:
+            if not isinstance(finding, dict):
+                issues.append("hard_defect_not_structured")
+                continue
+            try:
+                scene = int(finding.get("scene"))
+            except (TypeError, ValueError):
+                scene = 0
+            code = str(finding.get("hard_defect_code") or "").strip()
+            evidence = str(finding.get("evidence") or "").strip()
+            if scene not in expected:
+                issues.append(f"hard_defect_scene_unknown:{scene}")
+            else:
+                hard_defect_scenes.add(scene)
+            if code not in VIDEO_REVIEW_HARD_DEFECT_CODES:
+                issues.append(f"hard_defect_code_invalid:{scene}:{code or 'missing'}")
+            if not evidence:
+                issues.append(f"hard_defect_evidence_missing:{scene}")
+
+    critical_errors = payload.get("critical_errors", [])
+    if not isinstance(critical_errors, list):
+        issues.append("critical_errors_missing")
+        critical_scenes: set[int] = set()
+    else:
+        critical_scenes = set()
+        for finding in critical_errors:
+            if not isinstance(finding, dict):
+                issues.append("critical_error_not_structured")
+                continue
+            try:
+                scene = int(finding.get("scene"))
+            except (TypeError, ValueError):
+                scene = 0
+            code = str(finding.get("hard_defect_code") or "").strip()
+            if scene in expected:
+                critical_scenes.add(scene)
+            else:
+                issues.append(f"critical_error_scene_unknown:{scene}")
+            if code not in VIDEO_REVIEW_HARD_DEFECT_CODES:
+                issues.append(f"critical_error_code_invalid:{scene}:{code or 'missing'}")
+
+    if retry_scenes != hard_defect_scenes:
+        issues.append("retry_indices_do_not_match_hard_defects")
+    if critical_scenes != hard_defect_scenes:
+        issues.append("critical_errors_do_not_match_hard_defects")
+
+    raw_instructions = payload.get("retry_instructions", [])
+    instruction_rows: list[Mapping[str, Any]] = []
+    if isinstance(raw_instructions, list):
+        instruction_rows = [row for row in raw_instructions if isinstance(row, Mapping)]
+        if len(instruction_rows) != len(raw_instructions):
+            issues.append("retry_instruction_not_structured")
+    elif isinstance(raw_instructions, Mapping):
+        for raw_scene, value in raw_instructions.items():
+            if isinstance(value, Mapping):
+                instruction_rows.append({"scene": raw_scene, **value})
+            else:
+                instruction_rows.append({"scene": raw_scene, "instruction": value, "provider_prompt": value})
+    else:
+        issues.append("retry_instructions_missing")
+    instruction_scenes: set[int] = set()
+    for instruction in instruction_rows:
+        try:
+            scene = int(instruction.get("scene", instruction.get("scene_index")))
+        except (TypeError, ValueError):
+            scene = 0
+        provider_prompt = str(instruction.get("provider_prompt") or "").strip()
+        full_instruction = str(instruction.get("instruction") or "").strip()
+        code = str(instruction.get("hard_defect_code") or "").strip()
+        if scene in expected:
+            instruction_scenes.add(scene)
+        if not full_instruction:
+            issues.append(f"retry_instruction_missing:{scene}")
+        if not provider_prompt:
+            issues.append(f"retry_provider_prompt_missing:{scene}")
+        elif len(provider_prompt.encode("utf-16-le")) // 2 > 120:
+            issues.append(f"retry_provider_prompt_too_long:{scene}")
+        if code not in VIDEO_REVIEW_HARD_DEFECT_CODES:
+            issues.append(f"retry_hard_defect_code_invalid:{scene}:{code or 'missing'}")
+    if instruction_scenes != retry_scenes:
+        issues.append("retry_instructions_do_not_match_retry_indices")
     return issues
 
 

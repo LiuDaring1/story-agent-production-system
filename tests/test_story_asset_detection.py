@@ -40,6 +40,10 @@ class StoryAssetDetectionTests(unittest.TestCase):
             narration.write_bytes(b"audio-placeholder")
             manifest["inputs"]["extracted_narration"] = str(narration)
             manifest["story"]["duration_text"] = ""
+            # Age is deliberately no longer inferred.  Declare it explicitly
+            # so this test continues to isolate narration-duration detection.
+            manifest["story"]["age_range"] = "3-6岁"
+            manifest["story"].setdefault("manual_overrides", {})["age_range"] = True
             write_manifest(paths, manifest)
             with patch("story_project.safe_duration", return_value=179.7):
                 outputs = create_theme_asset_request(root)

@@ -103,7 +103,7 @@ def compile_demo_render_spec(
     context_path: Path | str,
     output_path: Path | str,
     *,
-    official_logo_path: Path | str,
+    official_logo_path: Path | str | None,
 ) -> Path:
     """Compile the minimal deterministic brand/layout input used by Demo.
 
@@ -115,6 +115,42 @@ def compile_demo_render_spec(
     projection = context["contract_projection"]
     brand = projection.get("brand", {})
     layout = projection.get("release_layout", {})
+    include_logo_rule = next(
+        (
+            item for item in brand.get("rules", [])
+            if isinstance(item, Mapping)
+            and str(item.get("rule_id")) in {"brand.include_demo_logo", "brand.include_demo_logo_default"}
+        ),
+        None,
+    )
+    include_logo = include_logo_rule is None or include_logo_rule.get("value") is not False
+    base_payload = {
+        "version": 1,
+        "consumer": "demo",
+        "source_contract_context_path": str(Path(context_path).expanduser().resolve()),
+        "source_contract_context_sha256": hashlib.sha256(Path(context_path).read_bytes()).hexdigest(),
+        **binding(context),
+        "contract_projection_sha256": projection_sha256(context),
+        "logo_enabled": include_logo,
+        "brand_rules": brand.get("rules", []),
+        "layout_rules": layout.get("rules", []),
+    }
+    if not include_logo:
+        return write_json_atomic(
+            output_path,
+            {
+                **base_payload,
+                "official_logo_count": 0,
+                "official_logo_path": None,
+                "official_logo_sha256": None,
+                "official_asset": None,
+                "logo_region": None,
+                "variant_id": None,
+                "aspect_ratio": None,
+            },
+        )
+    if official_logo_path is None:
+        raise ValueError("Demo requires an official logo when brand.include_demo_logo is enabled")
     logo_path = Path(official_logo_path).expanduser().resolve()
     if not logo_path.is_file():
         raise ValueError(f"Demo official logo missing: {logo_path}")
@@ -142,19 +178,12 @@ def compile_demo_render_spec(
         raise ValueError("Demo release_layout must contain exactly one logo region")
     logo_region = dict(logo_regions[0])
     payload = {
-        "version": 1,
-        "consumer": "demo",
-        "source_contract_context_path": str(Path(context_path).expanduser().resolve()),
-        "source_contract_context_sha256": hashlib.sha256(Path(context_path).read_bytes()).hexdigest(),
-        **binding(context),
-        "contract_projection_sha256": projection_sha256(context),
+        **base_payload,
         "official_logo_path": str(logo_path),
         "official_logo_sha256": logo_sha,
         "official_logo_count": 1,
         "official_asset": dict(permitted[0]),
         "logo_region": logo_region,
-        "brand_rules": brand.get("rules", []),
-        "layout_rules": layout.get("rules", []),
         "variant_id": selected.get("variant_id"),
         "aspect_ratio": selected.get("aspect_ratio"),
     }
@@ -162,8 +191,18 @@ def compile_demo_render_spec(
 
 
 def demo_logo_arguments(spec: Mapping[str, Any], width: int, height: int) -> dict[str, Any]:
-    if spec.get("consumer") != "demo" or spec.get("official_logo_count") != 1:
+    if spec.get("consumer") != "demo" or spec.get("official_logo_count") not in {0, 1}:
         raise ValueError("invalid Demo render spec")
+    if spec.get("official_logo_count") == 0:
+        if spec.get("logo_enabled") is not False:
+            raise ValueError("invalid no-logo Demo render spec")
+        return {
+            "logo_path": None,
+            "logo_sha256": None,
+            "logo_x": 0,
+            "logo_y": 0,
+            "logo_width": 1,
+        }
     region = spec.get("logo_region")
     if not isinstance(region, Mapping):
         raise ValueError("Demo render spec missing logo_region")

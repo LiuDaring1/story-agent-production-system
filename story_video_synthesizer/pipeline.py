@@ -24,6 +24,10 @@ from story_module_ports import (
     ModuleUsageEvent,
 )
 from story_module_registry import build_compositor_registry
+from semantic_card_motion import (
+    load_semantic_card_motion_paths,
+    write_semantic_card_motion_request,
+)
 
 
 @dataclass(frozen=True)
@@ -262,8 +266,17 @@ def _synthesize_story_core(config: SynthesisConfig) -> SynthesisResult:
     if semantic_plan is not None:
         card_windows = presentation_windows(subtitle_timings, semantic_plan)
         if card_windows:
+            if config.project_dir is None:
+                raise ValueError("required semantic cards need --project-dir")
             presentation_base = work_dir / "story_semantic_cards.mp4"
-            _overlay_semantic_cards(silent_video, card_windows, presentation_base, work_dir / "semantic_cards", total_duration, config)
+            _overlay_semantic_cards(
+                silent_video,
+                card_windows,
+                presentation_base,
+                config.project_dir / "01_分镜与图片" / "semantic_cards",
+                total_duration,
+                config,
+            )
         semantic_plan_manifest = config.output_dir / "artifact_semantic_plan_manifest.json"
         _write_json_atomic(semantic_plan_manifest, {
             "version": 1,
@@ -621,51 +634,69 @@ def _overlay_semantic_cards(
     card_dir: Path,
     total_duration: float,
     config: SynthesisConfig,
+    *,
+    allow_static_preview: bool = False,
 ) -> None:
-    """Render reviewed text in code and overlay it on a deterministic card.
+    """Overlay provider-motion cards; static cards are explicit short-test only."""
 
-    No generated text/logo is used. The source video remains read-only.
-    """
-
+    receipt_path = card_dir / "semantic_card_generation_receipt.json"
     try:
-        from PIL import Image, ImageDraw, ImageFont
-    except ImportError as exc:
-        raise RuntimeError("没有找到 Pillow，无法渲染确定性语义图卡。") from exc
-    ensure_dir(card_dir)
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("缺少 ImageGen 一体化片头/寓意卡回执，禁止程序后期叠字替代") from exc
+    if receipt.get("schema_version") != "story-semantic-card-generation/v1" or receipt.get("imagegen_native") is not True:
+        raise RuntimeError("片头/寓意卡回执无效：必须由 ImageGen 一体成型")
+    if receipt.get("post_render_text_overlay") is not False:
+        raise RuntimeError("片头/寓意卡禁止程序后期叠字")
+    receipt_cards = receipt.get("cards") if isinstance(receipt.get("cards"), list) else []
+    by_kind = {str(item.get("card_kind") or ""): item for item in receipt_cards if isinstance(item, dict)}
     images = []
-    for index, window in enumerate(windows, start=1):
-        image = Image.new("RGBA", (config.width, config.height), (246, 239, 216, 255))
-        draw = ImageDraw.Draw(image)
-        accent = (205, 158, 73, 255) if window["card_kind"] == "title_card" else (103, 145, 91, 255)
-        margin_x, margin_y = int(config.width * .09), int(config.height * .14)
-        draw.rounded_rectangle(
-            (margin_x, margin_y, config.width - margin_x, config.height - margin_y),
-            radius=max(24, config.height // 28), fill=(255, 252, 241, 255), outline=accent,
-            width=max(4, config.height // 180),
-        )
-        font_size = max(44, config.height // (8 if window["card_kind"] == "title_card" else 11))
-        font = _load_subtitle_font(ImageFont, font_size)
-        lines = []
-        for paragraph in str(window["text"]).splitlines():
-            lines.extend(_wrap_subtitle_text(draw, paragraph, font, int(config.width * .72)))
-        line_height = int(font_size * 1.35)
-        y = (config.height - line_height * len(lines)) // 2
-        for line in lines:
-            x = (config.width - _text_width(draw, line, font)) // 2
-            draw.text((x, y), line, font=font, fill=(78, 57, 34, 255))
-            y += line_height
-        card_path = card_dir / f"semantic_card_{index:02d}.png"
-        image.save(card_path)
+    for window in windows:
+        kind = str(window["card_kind"])
+        item = by_kind.get(kind)
+        if item is None or str(item.get("text") or "") != str(window["text"]):
+            raise RuntimeError(f"ImageGen 语义卡回执未绑定当前 {kind} 文案")
+        card_path = Path(str(item.get("path") or "")).expanduser()
+        if not card_path.is_file() or hashlib.sha256(card_path.read_bytes()).hexdigest() != item.get("sha256"):
+            raise RuntimeError(f"ImageGen 语义卡文件或哈希失效：{kind}")
         images.append(card_path)
+    motion_paths: dict[str, Path] = {}
+    if not allow_static_preview:
+        request_path = card_dir / "semantic_card_motion_request.json"
+        if not request_path.is_file():
+            plan_sha256 = str(receipt.get("artifact_semantic_plan_sha256") or "")
+            if len(plan_sha256) != 64:
+                raise RuntimeError("片头/寓意卡微动缺少当前语义计划哈希")
+            write_semantic_card_motion_request(
+                card_dir=card_dir,
+                windows=windows,
+                artifact_semantic_plan_sha256=plan_sha256,
+            )
+        motion_paths = load_semantic_card_motion_paths(
+            request_path,
+            card_dir / "semantic_card_motion_receipt.json",
+        )
     args = ["ffmpeg", "-y", "-i", str(video_path)]
-    for image_path in images:
-        args.extend(["-loop", "1", "-i", str(image_path)])
+    for window, image_path in zip(windows, images):
+        if allow_static_preview:
+            args.extend(["-loop", "1", "-i", str(image_path)])
+        else:
+            kind = str(window["card_kind"])
+            if kind not in motion_paths:
+                raise RuntimeError(f"片头/寓意卡微动缺少输出：{kind}")
+            args.extend(["-stream_loop", "-1", "-i", str(motion_paths[kind])])
     current = "[0:v]"
     filters = []
     for offset, window in enumerate(windows, start=1):
         output = "[v]" if offset == len(windows) else f"[card{offset}]"
+        card_label = f"[card_image{offset}]"
+        input_timeline = "" if allow_static_preview else "setpts=PTS-STARTPTS,"
         filters.append(
-            f"{current}[{offset}:v]overlay=0:0:enable='between(t,{window['start']:.3f},{window['end']:.3f})'{output}"
+            f"[{offset}:v]{input_timeline}scale={config.width}:{config.height}:force_original_aspect_ratio=increase,"
+            f"crop={config.width}:{config.height},setsar=1{card_label}"
+        )
+        filters.append(
+            f"{current}{card_label}overlay=0:0:enable='between(t,{window['start']:.3f},{window['end']:.3f})'{output}"
         )
         current = output
     args.extend([

@@ -21,6 +21,7 @@ MIN_SECONDS = 1
 MAX_SECONDS = 15
 DEFAULT_RESOLUTION = "720p"
 DEFAULT_RATIO = "16:9"
+MAX_PROMPT_CHARS = 1200
 # Keep the historical default for callers that still explicitly request an
 # older Grok Video model.  The new provider default is eight seconds.
 LEGACY_DEFAULT_SECONDS = "10"
@@ -41,7 +42,7 @@ def build_toapis_task_body(
     requested_seconds = _default_seconds_for_model(model_name) if seconds is None else seconds
     body: dict[str, Any] = {
         "model": model_name,
-        "prompt": prompt.strip(),
+        "prompt": _normalize_prompt(model_name, prompt),
         "images": [image_url],
         "seconds": _normalize_seconds(model_name, requested_seconds),
         "resolution": _normalize_resolution(resolution),
@@ -50,10 +51,30 @@ def build_toapis_task_body(
     if extra_body:
         body.update(extra_body)
     # Validate the final body as well so an explicit extra_body cannot bypass
-    # the provider's documented 1–15 second contract.
+    # provider prompt and duration limits.
+    body["prompt"] = _normalize_prompt(model_name, body.get("prompt"))
     body["seconds"] = _normalize_seconds(model_name, body.get("seconds"))
     body["resolution"] = _normalize_resolution(body.get("resolution", DEFAULT_RESOLUTION))
     return body
+
+
+def _prompt_length(value: str) -> int:
+    """Match the UTF-16 code-unit count enforced by the provider's web input."""
+
+    return len(value.encode("utf-16-le")) // 2
+
+
+def _normalize_prompt(model: str, value: Any) -> str:
+    prompt = str(value or "").strip()
+    if not prompt:
+        raise ValueError("ToAPIs prompt 不能为空")
+    if model.strip().lower() == DEFAULT_MODEL:
+        length = _prompt_length(prompt)
+        if length > MAX_PROMPT_CHARS:
+            raise ValueError(
+                f"grok-video-1.5 的 prompt 不能超过 {MAX_PROMPT_CHARS} 字符，当前 {length} 字符"
+            )
+    return prompt
 
 
 def _default_seconds_for_model(model: str) -> str:

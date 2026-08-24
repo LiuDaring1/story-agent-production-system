@@ -195,6 +195,8 @@ class PersistentSupervisor:
                 self.state["restored_from"] = "manifest+recovery_log+control"
         self.child: subprocess.Popen[Any] | None = None
         self._child_started_clock = 0.0
+        self._last_log_mtime = 0.0
+        self._last_log_progress_clock = 0.0
         self.cycles = 0
 
     def _write_state(self, *, status: str | None = None, **updates: Any) -> None:
@@ -289,6 +291,11 @@ class PersistentSupervisor:
             log_file.close()
         self.child = child
         self._child_started_clock = self.clock()
+        try:
+            self._last_log_mtime = self.config.log_path.stat().st_mtime
+        except OSError:
+            self._last_log_mtime = 0.0
+        self._last_log_progress_clock = self._child_started_clock
         self.state["child"] = {
             "pid": child.pid,
             "started_at": timestamp(),
@@ -308,6 +315,7 @@ class PersistentSupervisor:
     def _monitor_child(self, child: subprocess.Popen[Any]) -> tuple[int, bool]:
         watchdog_triggered = False
         notified_timeout = False
+        hard_timeout = self._hard_liveness_timeout_seconds()
         while child.poll() is None:
             if self._cancel_requested():
                 self._stop_child(reason="cancel requested")
@@ -331,37 +339,110 @@ class PersistentSupervisor:
             watchdog_age = (
                 float(raw_heartbeat_age) if heartbeat_is_current else child_runtime
             )
+            liveness = self._joint_liveness_evidence(snapshot)
             if watchdog_age > self.config.heartbeat_timeout_seconds:
                 if not notified_timeout:
                     self._notify(
                         category="heartbeat_timeout",
-                        severity="error",
+                        severity="warning",
                         message=(
                             f"Agent child PID {child.pid} 已 {round(watchdog_age)} 秒无本次运行的 heartbeat；"
-                            "supervisor 正在执行 watchdog 诊断。"
+                            "进程仍存活，supervisor 将结合进程、日志和外部任务状态继续观察。"
                         ),
                         dedupe_key=f"{self.config.job_id}:heartbeat:{child.pid}",
                         recovery_mode="automatic",
                     )
                     self._event(
                         "heartbeat_timeout",
-                        status="failed",
-                        summary=f"child watchdog heartbeat age {watchdog_age:.1f}s",
+                        status="warning",
+                        summary=f"heartbeat stale but child process alive: {watchdog_age:.1f}s",
                         child_pid=child.pid,
                         raw_agent_heartbeat_age_seconds=raw_heartbeat_age,
                     )
                     notified_timeout = True
-                if watchdog_age > self.config.heartbeat_timeout_seconds * 2:
-                    watchdog_triggered = True
-                    self._stop_child(reason="heartbeat timeout watchdog")
-                    break
+            # A stale 120-second manifest heartbeat is never sufficient to
+            # terminate a live Luna/Sol, provider, or FFmpeg process.  The hard
+            # watchdog is derived from the configured Codex timeout and is only
+            # reached after a much longer absence of every normal completion.
+            if child_runtime > hard_timeout and not any(
+                bool(liveness.get(key))
+                for key in ("recent_log_activity", "nested_worker_alive", "provider_task_active")
+            ):
+                watchdog_triggered = True
+                self._stop_child(reason="joint liveness hard timeout")
+                break
             self.state["child"]["running"] = child.poll() is None
             self.state["child"]["heartbeat_age_seconds"] = raw_heartbeat_age
             self.state["child"]["watchdog_age_seconds"] = round(watchdog_age, 1)
             self.state["child"]["heartbeat_seen_after_launch"] = heartbeat_is_current
+            self.state["child"]["process_alive"] = child.poll() is None
+            self.state["child"]["hard_liveness_timeout_seconds"] = hard_timeout
+            self.state["child"]["liveness_policy"] = "process+manifest+log+provider; heartbeat_alone_nonfatal"
+            self.state["child"]["joint_liveness_evidence"] = liveness
             self._write_state(status="running")
             self.sleep(max(0.1, self.config.heartbeat_interval_seconds))
         return int(child.returncode or 0), watchdog_triggered
+
+    def _hard_liveness_timeout_seconds(self) -> float:
+        codex_timeout = 0.0
+        command = list(self.config.run_command)
+        if "--codex-timeout" in command:
+            try:
+                codex_timeout = float(command[command.index("--codex-timeout") + 1])
+            except (IndexError, TypeError, ValueError):
+                codex_timeout = 0.0
+        return max(
+            float(self.config.heartbeat_timeout_seconds) * 6,
+            codex_timeout * 3 + 600 if codex_timeout > 0 else 0.0,
+        )
+
+    def _joint_liveness_evidence(self, snapshot: Mapping[str, Any]) -> dict[str, Any]:
+        log_age: float | None = None
+        log_progress_age: float | None = None
+        try:
+            current_mtime = self.config.log_path.stat().st_mtime
+            log_age = max(0.0, time.time() - current_mtime)
+            if current_mtime > self._last_log_mtime:
+                self._last_log_mtime = current_mtime
+                self._last_log_progress_clock = self.clock()
+            if self._last_log_progress_clock:
+                log_progress_age = max(0.0, self.clock() - self._last_log_progress_clock)
+        except OSError:
+            pass
+        scheduler = snapshot.get("scheduler") if isinstance(snapshot.get("scheduler"), Mapping) else {}
+        running = scheduler.get("running") if isinstance(scheduler.get("running"), Mapping) else {}
+        nested_worker_alive = False
+        for item in running.values():
+            if not isinstance(item, Mapping):
+                continue
+            try:
+                pid = int(item.get("pid") or 0)
+            except (TypeError, ValueError):
+                pid = 0
+            if pid and process_is_alive(pid):
+                nested_worker_alive = True
+                break
+        receipts = snapshot.get("provider_receipts") if isinstance(snapshot.get("provider_receipts"), list) else []
+        active_statuses = {"queued", "submitted", "running", "processing", "in_progress", "pending"}
+        provider_task_active = any(
+            isinstance(item, Mapping)
+            and str(item.get("status") or item.get("state") or "").lower() in active_statuses
+            for item in receipts
+        )
+        # A log file merely existing is not proof of life. Only a changed
+        # mtime refreshes this clock, which also keeps fake-clock watchdog
+        # tests deterministic.
+        recent_window = max(30.0, float(self.config.heartbeat_timeout_seconds) * 2)
+        return {
+            "process_alive": True,
+            "manifest_heartbeat_current": isinstance(snapshot.get("agent_heartbeat_age_seconds"), (int, float))
+            and float(snapshot["agent_heartbeat_age_seconds"]) <= self.config.heartbeat_timeout_seconds,
+            "log_age_seconds": round(log_age, 1) if log_age is not None else None,
+            "log_progress_age_seconds": round(log_progress_age, 1) if log_progress_age is not None else None,
+            "recent_log_activity": log_progress_age is not None and log_progress_age <= recent_window,
+            "nested_worker_alive": nested_worker_alive,
+            "provider_task_active": provider_task_active,
+        }
 
     def _wait_backoff(self, seconds: int, *, decision: RecoveryDecision) -> str:
         deadline = self.clock() + max(0, seconds)
@@ -435,25 +516,8 @@ class PersistentSupervisor:
             heartbeat_age = snapshot.get("agent_heartbeat_age_seconds")
             self.state["child"]["heartbeat_age_seconds"] = heartbeat_age
             self._write_state(status="monitoring_orphaned_worker")
-            if (
-                isinstance(heartbeat_age, (int, float))
-                and heartbeat_age > self.config.heartbeat_timeout_seconds * 2
-            ):
-                try:
-                    os.killpg(pid, signal.SIGTERM)
-                except OSError:
-                    try:
-                        os.kill(pid, signal.SIGTERM)
-                    except OSError:
-                        pass
-                self._event(
-                    "orphaned_worker_terminated",
-                    status="failed",
-                    summary=f"orphan PID {pid} exceeded heartbeat timeout",
-                    child_pid=pid,
-                )
-            else:
-                self.sleep(max(0.1, self.config.heartbeat_interval_seconds))
+            self.state["child"]["liveness_policy"] = "live orphan process is never killed by heartbeat age alone"
+            self.sleep(max(0.1, self.config.heartbeat_interval_seconds))
             return "monitoring"
         self.state.pop("orphaned_child_pid", None)
         self.state["child"]["running"] = False

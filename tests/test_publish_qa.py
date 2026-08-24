@@ -17,6 +17,7 @@ from cover_quality import (
     cover_review_payload_issues,
     expand_retry_files,
     file_sha256 as cover_file_sha256,
+    integrated_cover_issues,
     required_cover_issues,
 )
 from story_codex_tasks import build_publish_package_agent_prompt
@@ -228,14 +229,54 @@ class PublishQaTests(unittest.TestCase):
         complete["p0_errors"] = ["fake_logo"]
         self.assertTrue(any("P0" in item for item in cover_review_payload_issues(complete, expected)))
 
-    def test_required_prompt_requests_text_free_bases_and_deterministic_branding(self) -> None:
+    def test_required_prompt_requires_integrated_imagegen_typography(self) -> None:
         prompt = build_publish_package_agent_prompt(Path("handoff.md"), Path("project"), required_v1=True)
-        self.assertIn("creative_base_4x3.png", prompt)
-        self.assertIn("严禁任何可读文字", prompt)
-        self.assertIn("正式文字与唯一官方 Logo 由 Runtime 确定性排版", prompt)
-        self.assertIn("cover_creative_lineage.json", prompt)
+        self.assertIn("cover_4x3.png", prompt)
+        self.assertIn("ImageGen 一体成型", prompt)
+        self.assertIn("任何脚本后期叠字", prompt)
+        self.assertIn("official_assets 为空时", prompt)
+        self.assertIn("cover_integrated_generation.json", prompt)
+        self.assertIn("cover_lineage.json", prompt)
         self.assertIn("semantic_artifacts", prompt)
         self.assertIn("visual_style", prompt)
+
+    def test_integrated_imagegen_receipt_binds_six_final_covers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：一体成型封面"
+            make_publish_fixture(project)
+            publish = project_paths(project).publish
+            records = {}
+            for asset_id, parent_id in COVER_GRAPH.items():
+                account, ratio = asset_id.split(":")
+                relative = cover_relative(account, ratio)
+                record = {
+                    "path": relative,
+                    "sha256": cover_file_sha256(publish / relative),
+                    "generation_method": "codex_imagegen",
+                    "title_text": "发布QA",
+                    "parent_asset_id": parent_id,
+                }
+                if parent_id:
+                    pa, pr = parent_id.split(":")
+                    record["parent_sha256"] = cover_file_sha256(publish / cover_relative(pa, pr))
+                records[asset_id] = record
+            receipt = publish / "cover_integrated_generation.json"
+            save_json(receipt, {"version": 1, "mode": "imagegen_integrated", "attempt_count": 1, "covers": records})
+            self.assertEqual(integrated_cover_issues(publish, receipt_path=receipt, expected_title="发布QA"), ([], []))
+            for record in records.values():
+                record["title_text"] = "《发布QA》"
+            save_json(receipt, {"version": 1, "mode": "imagegen_integrated", "attempt_count": 1, "covers": records})
+            self.assertEqual(integrated_cover_issues(publish, receipt_path=receipt, expected_title="发布QA"), ([], []))
+            records["main:4x3"]["generation_method"] = "pillow_overlay"
+            save_json(receipt, {"version": 1, "mode": "imagegen_integrated", "attempt_count": 1, "covers": records})
+            issues, retries = integrated_cover_issues(publish, receipt_path=receipt, expected_title="发布QA")
+            self.assertIn("不是 Codex ImageGen", "\n".join(issues))
+            self.assertIn(cover_relative("main", "4x3"), retries)
+
+            save_json(receipt, {"version": 1, "mode": "imagegen_integrated", "attempt_count": 4, "covers": records})
+            issues, retries = integrated_cover_issues(publish, receipt_path=receipt, expected_title="发布QA")
+            self.assertIn("attempt_count", "\n".join(issues))
+            self.assertEqual(len(retries), 6)
 
     def test_required_cover_renderer_adds_exact_title_logo_and_current_receipts(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -259,6 +300,30 @@ class PublishQaTests(unittest.TestCase):
             self.assertEqual(set(render["covers"]), set(COVER_GRAPH))
             self.assertTrue(all(item["official_logo_count"] == 1 for item in render["covers"].values()))
             self.assertTrue(all(item["title_text"] == "通用故事标题" for item in render["covers"].values()))
+
+    def test_required_cover_renderer_obeys_contract_with_logo_disabled(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "故事剪辑：合同禁用品牌"
+            _logo, compiled_path = make_required_cover_fixture(project, root)
+            compiled = json.loads(compiled_path.read_text(encoding="utf-8"))
+            compiled["official_assets"] = []
+            compiled["variants"] = []
+            compiled["layout_rules"] = [
+                {"rule_id": "layout.precise_variants_require_canvas_receipt", "value": True},
+                {"rule_id": "layout.normalized_regions_require_canvas_receipt", "value": True},
+            ]
+            save_json(compiled_path, compiled)
+            with patch("story_project.load_config", return_value={"brand_assets": {}}):
+                apply_fixed_cover_branding(project, contract_spec=compiled_path)
+            paths = project_paths(project)
+            issues, retries = required_cover_issues(paths.publish, render_manifest_path=paths.publish / "cover_render_manifest.json", lineage_path=paths.publish / "cover_lineage.json", compiled_spec=compiled, expected_title="通用故事标题")
+            self.assertEqual(issues, [])
+            self.assertEqual(retries, [])
+            render = json.loads((paths.publish / "cover_render_manifest.json").read_text(encoding="utf-8"))
+            self.assertIsNone(render["logo_sha256"])
+            self.assertTrue(all(item["official_logo_count"] == 0 for item in render["covers"].values()))
+            self.assertTrue(all(item["logo_bbox"] is None for item in render["covers"].values()))
 
     def test_required_cover_lineage_tamper_and_branch_retry_scope(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

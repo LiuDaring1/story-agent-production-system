@@ -400,8 +400,10 @@ class M3CrossPortSmokeTests(unittest.TestCase):
             for dependency in dependencies:
                 self.assertIn(dependency, positions)
                 self.assertLess(positions[dependency], positions[stage])
-        self.assertIn("product_package_review", STORY_STAGE_DEPENDENCIES["release_preview"])
-        self.assertLess(positions["product_package_review"], positions["release_preview"])
+        self.assertIn("product_annotation_review", STORY_STAGE_DEPENDENCIES["release_preview"])
+        self.assertIn("release_preview", STORY_STAGE_DEPENDENCIES["product_package"])
+        self.assertEqual(STORY_STAGE_DEPENDENCIES["package_release"], ("release_preview",))
+        self.assertNotIn("product_package_review", STORY_STAGE_DEPENDENCIES["package_release"])
 
 
 if __name__ == "__main__":

@@ -27,7 +27,13 @@ from video_motion import (
     video_receipt_issues,
 )
 from keying_quality import write_evidence_assets
+from production_keying import (
+    RVM_ALPHA_CHOKE_CANDIDATES,
+    RVM_ALPHA_CHOKE_PIXELS,
+    render_cached_rvm_foreground_frame,
+)
 from cover_quality import (
+    integrated_cover_issues,
     render_required_covers,
     required_cover_issues,
 )
@@ -35,6 +41,9 @@ from cover_quality import (
 
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "pipeline_config.json"
+MAIN_PACKAGE_REFERENCE_MANIFEST = ROOT / "assets" / "references" / "main_vertical_package_reference.json"
+MAIN_PACKAGE_PROMPT_VERSION = "story-main-package-fixed-prompt/v1"
+MAIN_PACKAGE_PANEL_SIZE = (2304, 888)
 MANIFEST_NAME = "project_manifest.json"
 STATUS_DIR_NAME = "99_项目状态"
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
@@ -57,15 +66,16 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "default_image_style": "3D卡通",
     "story_type_options": ["寓言故事", "成语故事", "童话故事", "民间故事", "神话故事", "红色故事", "历史故事", "科普故事"],
     "age_range_options": ["3-6岁", "4-6岁", "6-8岁", "9-11岁", "12-14岁", "15岁以上"],
-    "default_age_range": "6-8岁",
+    "default_age_range": "",
     "brand_assets": {
         "assets_dir": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材",
-        "logo": "",
-        "watermark_logo": "",
-        "story_logo": "",
-        "antipiracy_logo": "",
+        "logo": "assets/brand/program_logo.png",
+        "watermark_logo": "assets/brand/program_logo.png",
+        "story_logo": "assets/brand/program_logo.png",
+        "antipiracy_logo": "assets/brand/program_logo.png",
         "frame_reference": "",
         "cover_reference": "",
+        "main_package_reference": "assets/references/main_vertical_package_reference.png",
     },
     "release_defaults": {
         "video_box": "0,416,1080,608",
@@ -76,25 +86,33 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "b_windows": "auto",
         "c_windows": "auto",
         "person_height": 1080,
-        "person_x": 260,
+        "person_x": 1280,
         "person_y": 0,
         "person_crop": "",
         "person_grade": "natural",
         "person_beauty": "light",
         "keyer": "colorkey",
+        "preferred_keyer": "rvm",
+        "rvm_input_width": 1920,
+        "rvm_input_height": 1080,
+        "rvm_output_fps": 25,
+        "rvm_downsample_ratio": 0.4,
+        "rvm_alpha_choke_candidates": [0, 1, 2],
+        "rvm_runtime_path": "",
+        "rvm_model_path": "",
         "chroma_color": "0x00FF00",
         "chroma_similarity": 0.095,
         "chroma_blend": 0.04,
-        "watermark_width": 120,
+        "watermark_width": 96,
         "watermark_opacity": 0.62,
-        "watermark_speed": 0.35,
+        "watermark_speed": 0.45,
         "tail_seconds": 0,
         "tail_notice_text": "有需要联系客服，好作品有偿分享！",
         "story_logo_width_a": 150,
         "story_logo_width_b": 175,
         "story_logo_x": 42,
         "story_logo_y": 44,
-        "output_scale": 2,
+        "output_scale": 1,
         "crf": 15,
         "preset": "medium",
         "subtitle_font_size": 52,
@@ -103,7 +121,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "product_defaults": {
         "music_volume": 0.22,
         "narration_volume": 1.0,
-        "include_demo_logo": False,
+        "include_demo_logo": True,
     },
     "external_tools": {
         "suno_story_score_skill": str(Path.home() / "Downloads" / "suno-story-score.skill"),
@@ -147,8 +165,11 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "agent_defaults": {
         "soft_budget_cny": 50.0,
         "hard_budget_cny": 100.0,
-        "deadline_hours": 0.0,
-        "runtime_deadline_enabled": False,
+        "deadline_hours": 8.0,
+        "target_delivery_seconds": 28800,
+        "runtime_deadline_enabled": True,
+        "deadline_behavior": "deliver_best_valid",
+        "max_full_resolution_encodes": 1,
         "review_pass_score": 85,
         "max_retries": 2,
         "max_critical_retries": 3,
@@ -157,6 +178,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "whisper_model": "small",
         "working_video_max_width": 0,
         "proxy_video_max_width": 1280,
+        "commander_model": "gpt-5.6-sol",
+        "commander_reasoning_effort": "medium",
+        "worker_model": "gpt-5.6-luna",
+        "worker_reasoning_effort": "high",
     },
 }
 
@@ -276,7 +301,7 @@ def default_manifest(paths: ProjectPaths, config: dict[str, Any], story_name: st
             "episode": episode,
             "story_type": config.get("default_story_type", "童话故事"),
             "image_style": config.get("default_image_style", "3D卡通"),
-            "age_range": config.get("default_age_range", "6-8岁"),
+            "age_range": config.get("default_age_range", ""),
             "duration_text": "",
             "update_latest_episode_on_delivery": True,
             "does_not_count_episode": False,
@@ -322,8 +347,11 @@ def default_manifest(paths: ProjectPaths, config: dict[str, Any], story_name: st
             "heartbeat_at": "",
             "last_checkpoint": "",
             "blocked_reason": "",
-            "deadline_hours": 0.0,
-            "runtime_deadline_enabled": False,
+            "deadline_hours": float(agent_defaults.get("deadline_hours", 8.0)),
+            "target_delivery_seconds": int(agent_defaults.get("target_delivery_seconds", 28800)),
+            "runtime_deadline_enabled": bool(agent_defaults.get("runtime_deadline_enabled", True)),
+            "deadline_behavior": str(agent_defaults.get("deadline_behavior") or "deliver_best_valid"),
+            "max_full_resolution_encodes": int(agent_defaults.get("max_full_resolution_encodes", 1)),
             "min_free_disk_gb": float(agent_defaults.get("min_free_disk_gb", 10.0)),
             "started_at": "",
             "active_elapsed_seconds": 0.0,
@@ -555,8 +583,8 @@ def infer_story_fields(manifest: dict[str, Any], story_text: Path | None) -> Non
     manual = manifest["story"].setdefault("manual_overrides", {})
     if not manual.get("story_type"):
         manifest["story"]["story_type"] = infer_story_type(text, manifest["story"].get("story_type", "童话故事"))
-    if not manual.get("age_range"):
-        manifest["story"]["age_range"] = infer_age_range(text)
+    # Age is a product declaration, not a reliable semantic inference.  Leave
+    # it unset until the user supplies it at intake or through update-story.
 
 
 def infer_story_type(text: str, default: str) -> str:
@@ -567,15 +595,6 @@ def infer_story_type(text: str, default: str) -> str:
     if any(token in text for token in ("很久以前", "村子", "传说", "民间")):
         return "民间故事"
     return default or "童话故事"
-
-
-def infer_age_range(text: str) -> str:
-    serious_history_hits = sum(token in text for token in ("战争", "牺牲", "战役", "革命", "历史", "将军"))
-    if serious_history_hits >= 2:
-        return "9-11岁"
-    if len(text) > 1200 or any(token in text for token in ("成语", "道理", "智慧")):
-        return "6-8岁"
-    return "3-6岁"
 
 
 def update_story_info(
@@ -1099,6 +1118,86 @@ def generate_theme_assets(project_dir: Path, *, overwrite: bool = True) -> dict[
     )
 
 
+def load_main_package_reference(config: dict[str, Any] | None = None) -> dict[str, Any]:
+    """Load the immutable main-account packaging reference and verify its hash."""
+
+    try:
+        receipt = json.loads(MAIN_PACKAGE_REFERENCE_MANIFEST.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise FileNotFoundError("package_reference_missing: 主账号包装参考资产清单缺失或损坏") from exc
+    configured = str(
+        ((config or load_config()).get("brand_assets", {}) or {}).get("main_package_reference")
+        or receipt.get("asset")
+        or ""
+    ).strip()
+    reference = Path(configured).expanduser()
+    if not reference.is_absolute():
+        reference = (ROOT / reference).resolve()
+    if not reference.is_file():
+        raise FileNotFoundError(f"package_reference_missing: {reference}")
+    actual_sha256 = hashlib.sha256(reference.read_bytes()).hexdigest()
+    if receipt.get("reference_role") != "main_vertical_package" or actual_sha256 != receipt.get("sha256"):
+        raise ValueError("package_reference_invalid: 主账号包装参考图角色或 SHA-256 不匹配")
+    return {**receipt, "asset_path": str(reference), "sha256": actual_sha256}
+
+
+def main_package_fixed_prompt_template() -> str:
+    """Return the stable ImageGen instruction; only named story fields vary."""
+
+    return (
+        "把随请求附上的参考图仅作为主账号竖屏包装的版式、层级和简洁视觉语言基准。"
+        "必须实际查看并使用原图，不能只依据文字摘要重建。分别生成两张 2304×888 位图："
+        "顶部只包含故事类型《{story_type}》和故事名称《{story_title}》；"
+        "底部只包含‘完整版时长：{duration}’、‘适合年龄：{age_range}’和"
+        "‘适用于{use_cases}’。上下图属于同一视觉系统，可随故事类型克制调整配色、字体和少量主题元素。"
+        "参考图里的历史故事、煮酒论英雄、4分50秒、8岁以上及示例人物只用于理解结构，"
+        "不得出现在新图。文字必须原生融入图像，禁止生成空板后再由程序叠字。"
+        "不要生成中间视频区域，不要生成完整竖屏成图，不要添加二维码、平台 UI、陌生 Logo、人物或吉祥物。"
+        "这张参考图不得用于片头卡、寓意卡或六比例营销封面。"
+    )
+
+
+def build_main_package_spec(
+    *,
+    reference: dict[str, Any],
+    story_type: str,
+    story_title: str,
+    duration: str,
+    age_range: str,
+    use_cases: str,
+    top_panel: Path,
+    bottom_panel: Path,
+) -> dict[str, Any]:
+    if not age_range.strip() or age_range.strip() in {"待定", "按本期设定"}:
+        raise ValueError("age_range_user_input_required: 主账号包装适合年龄必须由用户明确指定")
+    template = main_package_fixed_prompt_template()
+    values = {
+        "story_type": story_type,
+        "story_title": story_title,
+        "duration": duration,
+        "age_range": age_range,
+        "use_cases": use_cases,
+    }
+    return {
+        "schema_version": "story-main-package-spec/v1",
+        "reference_asset": reference["asset_path"],
+        "reference_sha256": reference["sha256"],
+        "reference_role": "main_vertical_package",
+        **values,
+        "top_plate": {"path": str(top_panel), "size": list(MAIN_PACKAGE_PANEL_SIZE)},
+        "bottom_plate": {"path": str(bottom_panel), "size": list(MAIN_PACKAGE_PANEL_SIZE)},
+        "text_integration": "imagegen_native",
+        "fixed_prompt_version": MAIN_PACKAGE_PROMPT_VERSION,
+        "fixed_prompt_template_sha256": hashlib.sha256(template.encode("utf-8")).hexdigest(),
+        "fixed_prompt": template.format(**values),
+        "required_imagegen_inputs": ["reference_asset", "fixed_prompt"],
+        "ocr_validation": "required",
+        "reference_content_leak_check": "required",
+        "render_usage_proof": "required_before_release_qa",
+        "excluded_scopes": ["title_card", "moral_card", "marketing_covers"],
+    }
+
+
 def create_theme_asset_request(project_dir: Path) -> dict[str, Path]:
     paths = project_paths(project_dir)
     manifest = detect_project_assets(paths.root, extract_audio=False)
@@ -1106,6 +1205,7 @@ def create_theme_asset_request(project_dir: Path) -> dict[str, Path]:
     assets_dir = paths.release / "theme_assets"
     assets_dir.mkdir(parents=True, exist_ok=True)
     config = load_config()
+    reference = load_main_package_reference(config)
     theme = infer_theme_text(manifest)
     duration_text = str(story.get("duration_text") or "").strip()
     if not duration_text:
@@ -1129,7 +1229,25 @@ def create_theme_asset_request(project_dir: Path) -> dict[str, Path]:
         "main_bg": assets_dir / "main_background_16x9.png",
         "frame_source": assets_dir / "story_frame_source.png",
         "frame_a": assets_dir / "story_frame_a.png",
+        "main_package_spec": assets_dir / "main_package_spec.json",
+        "main_package_receipt": assets_dir / "main_package_generation_receipt.json",
     }
+    usage_text = "朗诵比赛、故事表演、少儿口才、技能比拼"
+    age_range = str(story.get("age_range") or "").strip()
+    manual_overrides = story.get("manual_overrides") if isinstance(story.get("manual_overrides"), dict) else {}
+    if not age_range or manual_overrides.get("age_range") is not True:
+        raise ValueError("age_range_user_input_required: 请先由用户指定适合年龄，再生成主账号包装")
+    package_spec = build_main_package_spec(
+        reference=reference,
+        story_type=str(story.get("story_type") or "儿童故事"),
+        story_title=str(story.get("name") or ""),
+        duration=duration_text,
+        age_range=age_range,
+        use_cases=usage_text,
+        top_panel=output_paths["main_plate_top"],
+        bottom_panel=output_paths["main_plate_bottom"],
+    )
+    save_json(output_paths["main_package_spec"], package_spec)
     request = build_theme_asset_imagegen_request(
         manifest=manifest,
         output_paths=output_paths,
@@ -1151,6 +1269,8 @@ def create_theme_asset_request(project_dir: Path) -> dict[str, Path]:
         if path.exists() or not manifest["outputs"].get(output_key):
             manifest["outputs"][output_key] = str(path)
     manifest["outputs"]["library_release_plate_image"] = str(output_paths["library_plate"])
+    manifest["outputs"]["main_package_spec"] = str(output_paths["main_package_spec"])
+    manifest["outputs"]["main_package_reference"] = str(reference["asset_path"])
     write_manifest(paths, manifest)
     return {"request": request_path, "handoff": handoff_path, **output_paths}
 
@@ -1163,20 +1283,21 @@ def build_theme_asset_handoff(request_path: Path) -> str:
         "请你先读取它，再根据故事主题、参考素材和规则，智能扩写成适合 Codex 原生图像生成能力的具体图像提示词。"
         "生成主题素材后，继续完成绿幕抠像、融合预览、看图调参，并把最终参数写回 keying_preset.json。\n\n"
         "执行要求：\n"
-        "1. 使用当前 Codex 对话/API 的原生图像生成能力，生成/编辑两张 3:4 发布底板、一张 16:9 无框主账号背景、一个统一故事框源图。\n"
+        "1. 使用当前 Codex 对话/API 的原生图像生成能力，生成/编辑四张上下包装板、一张 16:9 无框主账号背景、一个统一故事框源图。\n"
         "2. 不要调用旧的 CLI fallback、scripts/image_gen.py、OPENAI_API_KEY、XAI_API_KEY 或任何外部旧图像 API。\n"
         "3. 生成图像要有高质感儿童节目包装效果，不要用本地代码从零画占位图。\n"
         "4. 两张发布底板必须由 Codex 原生图像生成直接包含任务书列出的全部可见文字信息，"
         "不能先生成空白底板再用 Pillow 或其他本地代码后期添加文字；无文字底板视为失败。\n"
-        "5. 底板必须拆成上半包装图和下半包装图分别生成，中间由程序保留固定 16:9 空挡，"
+        "5. 主账号上下板必须把 main_package_spec.json 的 reference_asset 作为 imagegen 原图输入，"
+        "同时使用其中 fixed_prompt；不得只读文字后丢弃参考图。底板拆成上半包装图和下半包装图分别生成，中间由程序保留固定 16:9 空挡，"
         "不要让 imagegen 直接生成整张 1080x1440 底板。上/下素材里的文字仍必须由 Codex 原生生成。\n"
         "6. 允许用 Pillow 只做后处理：裁切、三段拼接、尺寸整理、透明通道和 QA；不允许用 Pillow 添加、覆盖或修正底板文字。\n"
         "7. 故事框只生成一个统一源图和一个透明 PNG；A/B 景复用同一个框，具体缩放与摆放放到发布视频合成环节处理，"
         "不要在第 12 步生成两套故事框或机械裁坏 B 框。\n"
-        "8. 最终文件必须保存到任务书指定的绝对路径，文件名完全一致。\n"
-        "9. 主题素材通过 QA 后，运行 release-layout-handoff 或等效命令生成候选融合预览，自己读取预览图判断人物大小、位置、抠像边缘、故事框、字幕、Logo 和背景虚化；必须检查开头或手势动作帧，避免只看站定帧导致手部被裁切。\n"
-        "10. 把最终布局和抠像参数写回桌面故事项目的 04_发布视频/keying/keying_preset.json，再运行 preview-release-project 生成最终 preview_contact_sheet.png 给用户确认。\n"
-        "11. 只处理发布视觉定版，不要改分镜、图生视频、配乐、背景成片，也不要编码完整发布视频；完整视频等用户确认后再点工作台 ⑭。"
+        "8. 最终文件必须保存到任务书指定的绝对路径，文件名完全一致；并按任务书写出 main_package_generation_receipt.json，记录参考图、Prompt 与输出哈希、OCR、示例内容泄漏检查和 attempt_count（1–3，首次加最多两轮定向修正）。\n"
+        "9. 主题素材通过 QA 后，只生成抠像候选与站立/大手势短样本，用来确定人物大小、初始 X 轴、抠像边缘和背景融合；不要在本阶段重复运行完整发布预演。\n"
+        "10. 把最终布局和抠像参数写回桌面故事项目的 04_发布视频/keying/keying_preset.json。后续 release_preview 阶段会用完整背景成片、同一正式合成代码和最终 Demo 参数自动抽渲代表帧，并展示到 Dashboard；不要求用户半夜点击批准。\n"
+        "11. 只处理发布视觉定版，不要改分镜、图生视频、配乐、背景成片，也不要编码完整发布视频；自动预检通过后，状态机才允许一次正式全片编码。"
     )
 
 
@@ -1201,6 +1322,7 @@ def build_theme_asset_imagegen_request(
     video_box = release_defaults.get("video_box", "0,416,1080,608")
     story_box = release_defaults.get("story_box", "210,270,910,512")
     b_story_box = release_defaults.get("b_story_box", "356,180,1209,680")
+    package_spec = json.loads(output_paths["main_package_spec"].read_text(encoding="utf-8"))
     return f"""# 《{story_name}》发布素材 Codex/imagegen 任务
 
 ## 工作边界
@@ -1211,15 +1333,31 @@ def build_theme_asset_imagegen_request(
 
 ```text
 主账号最终 3:4 发布底板：{output_paths['main_plate']}
-主账号顶部源图 1080x416：{output_paths['main_plate_top']}
-主账号底部源图 1080x416：{output_paths['main_plate_bottom']}
+主账号顶部源图 2304x888：{output_paths['main_plate_top']}
+主账号底部源图 2304x888：{output_paths['main_plate_bottom']}
 宝库号最终 3:4 发布底板：{output_paths['library_plate']}
-宝库号顶部源图 1080x416：{output_paths['library_plate_top']}
-宝库号底部源图 1080x416：{output_paths['library_plate_bottom']}
+宝库号顶部源图 2304x888：{output_paths['library_plate_top']}
+宝库号底部源图 2304x888：{output_paths['library_plate_bottom']}
 主账号 16:9 无框背景图：{output_paths['main_bg']}
 统一故事框源图：{output_paths['frame_source']}
 统一透明故事框：{output_paths['frame_a']}
+主账号包装合同：{output_paths['main_package_spec']}
+主账号生成回执：{output_paths['main_package_receipt']}
 ```
+
+## 主账号包装的必需双输入
+
+- 必需参考图：`{package_spec['reference_asset']}`
+- 参考图 SHA-256：`{package_spec['reference_sha256']}`
+- 参考图角色：`main_vertical_package`
+- 固定 Prompt 版本：`{package_spec['fixed_prompt_version']}`
+- 固定 Prompt（必须与参考图同时交给 imagegen，不能只转述图片）：
+
+```text
+{package_spec['fixed_prompt']}
+```
+
+如果参考图缺失或 SHA 不符，立即返回 `package_reference_missing`，不得凭空设计新包装。该参考图只用于主账号上下包装板，不得用于片头、寓意卡或六比例营销封面。
 
 ## 本期信息
 
@@ -1246,7 +1384,7 @@ def build_theme_asset_imagegen_request(
 - 类型适配必须克制且明确：童话/动物故事可圆润可爱；民间、成语、神话和历史故事使用清雅中国绘本气质、传统色与少量纹样，禁止通用塑料 3D 装饰或网游仙侠风。
 - 主账号底部只放完整版时长、适合年龄和固定适用说明，避免商品资料清单式堆叠。
 - 底板不得出现绵羊姐姐、羊头、小羊、卡通羊、人偶或任何人物/动物吉祥物形象；除非故事本身需要，避免无关角色或动物进入发布包装。
-- 底板必须拆成顶部源图和底部源图分别生成，再由程序夹入固定 16:9 视频空挡。不要让 imagegen 直接生成完整 1080x1440 底板，因为它容易把安全区画错。Pillow 只负责拼接、裁切和尺寸整理，不负责生成或修正文案。
+- 底板必须拆成 2304x888 顶部源图和 2304x888 底部源图分别生成，再由程序夹入固定 16:9 视频空挡。不要让 imagegen 直接生成完整 1080x1440 底板，因为它容易把安全区画错。Pillow 只负责缩放、拼接、裁切和尺寸整理，不负责生成或修正文案。
 - 不要添加二维码、平台 UI、播放按钮、陌生 logo、水印。
 - 宝库号资料包对外只表达 6 项内容：背景视频、PPT、配乐、文稿、示范视频、朗读标注。不要写“发布物料”，不要再写单独的“标注”。
 - “联系私信客服，好作品有偿分享”只出现在发布视频结尾模糊提示里，不写进底板。
@@ -1263,9 +1401,9 @@ def build_theme_asset_imagegen_request(
 - 底部固定说明：适用于朗诵比赛、故事表演、少儿口才、技能比拼
 
 硬性版式：
-- 顶部源图：1080x416，保存到 `{output_paths['main_plate_top']}`。只呈现“{story_type}”和“《{story_name}》”，标题是主视觉，故事类型作为小标题或牌匾；不要放时长、适龄段、资料清单、品牌字或联系方式。
+- 顶部源图：2304x888，保存到 `{output_paths['main_plate_top']}`。只呈现“{story_type}”和“《{story_name}》”，标题是主视觉，故事类型作为小标题或牌匾；不要放时长、适龄段、资料清单、品牌字或联系方式。
 - 中间视频安全区：1080x608，位置是 x=0, y=416, w=1080, h=608，也就是 y=416 到 y=1024。这里不是创作区，最终拼接时填纯色空白，不要使用 imagegen 生成内容。
-- 底部源图：1080x416，保存到 `{output_paths['main_plate_bottom']}`。做一个简洁信息栏，清楚写“完整版时长：{duration_text}”和“适合年龄：{age_range or '按本期设定'}”；信息栏下方写“适用于朗诵比赛、故事表演、少儿口才、技能比拼”。只允许少量主题点缀。
+- 底部源图：2304x888，保存到 `{output_paths['main_plate_bottom']}`。做一个简洁信息栏，清楚写“完整版时长：{duration_text}”和“适合年龄：{age_range or '按本期设定'}”；信息栏下方写“适用于朗诵比赛、故事表演、少儿口才、技能比拼”。只允许少量主题点缀。
 - 最终整图：把 1080x416 顶部源图 + 1080x608 纯色空白 + 1080x416 底部源图垂直拼接，保存到 `{output_paths['main_plate']}`。最终中间安全区必须一整条横向打穿，没有人物、装饰、边框、插画或文字。
 
 ## 2. 宝库号 3:4 发布底板
@@ -1279,9 +1417,9 @@ def build_theme_asset_imagegen_request(
 - 底部资料包信息两行：背景视频 + PPT + 配乐；文稿 + 示范视频 + 朗读标注
 
 硬性版式：
-- 顶部源图：1080x416，保存到 `{output_paths['library_plate_top']}`。保留相对丰富的商品包装感，可放故事标题、故事类型和时长，排版可比主账号更热闹，但不要压入中间安全区。
+- 顶部源图：2304x888，保存到 `{output_paths['library_plate_top']}`。保留相对丰富的商品包装感，可放故事标题、故事类型和时长，排版可比主账号更热闹，但不要压入中间安全区。
 - 中间视频安全区：1080x608，位置是 x=0, y=416, w=1080, h=608，也就是 y=416 到 y=1024。最终拼接时填纯色空白。
-- 底部源图：1080x416，保存到 `{output_paths['library_plate_bottom']}`。保留较丰富的资料包信息区，重点写“适合年龄 {age_range or '按本期设定'}”“背景视频 + PPT + 配乐”“文稿 + 示范视频 + 朗读标注”；“示范视频”要排在“朗读标注”前面。
+- 底部源图：2304x888，保存到 `{output_paths['library_plate_bottom']}`。保留较丰富的资料包信息区，重点写“适合年龄 {age_range or '按本期设定'}”“背景视频 + PPT + 配乐”“文稿 + 示范视频 + 朗读标注”；“示范视频”要排在“朗读标注”前面。
 - 最终整图保存到 `{output_paths['library_plate']}`，中间安全区必须干净留空。
 
 ## 3. 主账号 16:9 无框背景图
@@ -1319,12 +1457,13 @@ def build_theme_asset_imagegen_request(
 ## 交付检查
 
 保存后请检查：
-- 顶部源图都是 1080x416，底部源图都是 1080x416。
+- 顶部源图都是 2304x888，底部源图都是 2304x888；合成时才缩放到 1080x416。
 - 两张最终底板都是 1080x1440，由 1080x416 顶部 + 1080x608 纯色空白安全区 + 1080x416 底部拼接而成。
 - 中间视频安全区 x=0, y=416, w=1080, h=608 没有文字/装饰/人物，且没有被上/下装饰压入；视频区中心点必须等于整张 3:4 画布中心点。
 - 背景图是 1920x1080，且不能自带故事框。
 - 故事框源图为单一设计；只导出一个 1920x1080 透明 PNG，A/B 在发布视频合成环节复用。
 - 文件已经保存到任务书指定路径。
+- `main_package_generation_receipt.json` 必须声明 imagegen 同时接收了参考图和固定 Prompt，绑定上下图 SHA-256，逐项记录 OCR 观察值并确认示例故事名/时长/年龄/人物没有泄漏；`attempt_count` 为 1–3。
 """
 
 
@@ -1340,6 +1479,74 @@ def infer_theme_text(manifest: dict[str, Any]) -> str:
         if word in story_name or word in text:
             tokens.append(word)
     return "、".join(tokens[:8]) or story_type or "儿童故事主题元素"
+
+
+def main_package_receipt_issues(paths: ProjectPaths) -> list[str]:
+    """Verify ImageGen reference/prompt lineage before packaging can proceed."""
+
+    theme_dir = paths.release / "theme_assets"
+    spec_path = theme_dir / "main_package_spec.json"
+    receipt_path = theme_dir / "main_package_generation_receipt.json"
+    try:
+        spec = json.loads(spec_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ["main_package_spec_missing_or_invalid"]
+    issues: list[str] = []
+    try:
+        reference = load_main_package_reference()
+    except (OSError, ValueError) as exc:
+        return [str(exc)]
+    if spec.get("reference_role") != "main_vertical_package":
+        issues.append("main_package_reference_role_invalid")
+    if spec.get("reference_asset") != reference["asset_path"] or spec.get("reference_sha256") != reference["sha256"]:
+        issues.append("main_package_reference_binding_mismatch")
+    expected_template_sha = hashlib.sha256(main_package_fixed_prompt_template().encode("utf-8")).hexdigest()
+    if spec.get("fixed_prompt_template_sha256") != expected_template_sha:
+        issues.append("main_package_fixed_prompt_stale")
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return [*issues, "main_package_generation_receipt_missing_or_invalid"]
+    if receipt.get("schema_version") != "story-main-package-generation/v1":
+        issues.append("main_package_generation_receipt_schema_invalid")
+    if receipt.get("imagegen_reference_attached") is not True:
+        issues.append("main_package_reference_not_attached_to_imagegen")
+    try:
+        attempt_count = int(receipt.get("attempt_count") or 0)
+    except (TypeError, ValueError):
+        attempt_count = 0
+    if not 1 <= attempt_count <= 3:
+        issues.append("main_package_generation_attempt_count_invalid")
+    for field in ("reference_asset", "reference_sha256", "fixed_prompt_template_sha256"):
+        if receipt.get(field) != spec.get(field):
+            issues.append(f"main_package_receipt_binding_mismatch:{field}")
+    outputs = receipt.get("outputs") if isinstance(receipt.get("outputs"), dict) else {}
+    for key, filename in (
+        ("top_plate", "main_release_plate_top.png"),
+        ("bottom_plate", "main_release_plate_bottom.png"),
+    ):
+        path = theme_dir / filename
+        item = outputs.get(key) if isinstance(outputs.get(key), dict) else {}
+        if not path.is_file():
+            issues.append(f"main_package_output_missing:{key}")
+        elif item.get("path") != str(path) or item.get("sha256") != hashlib.sha256(path.read_bytes()).hexdigest():
+            issues.append(f"main_package_output_binding_mismatch:{key}")
+    ocr = receipt.get("ocr_validation") if isinstance(receipt.get("ocr_validation"), dict) else {}
+    if ocr.get("passed") is not True:
+        issues.append("main_package_ocr_not_passed")
+    expected_text = {
+        "story_type": str(spec.get("story_type") or ""),
+        "story_title": str(spec.get("story_title") or ""),
+        "duration": str(spec.get("duration") or ""),
+        "age_range": str(spec.get("age_range") or ""),
+        "use_cases": str(spec.get("use_cases") or ""),
+    }
+    if ocr.get("expected") != expected_text or ocr.get("observed") != expected_text:
+        issues.append("main_package_ocr_text_mismatch")
+    leak = receipt.get("reference_content_leak_check") if isinstance(receipt.get("reference_content_leak_check"), dict) else {}
+    if leak.get("passed") is not True or leak.get("leaked_items") not in ([], None):
+        issues.append("main_package_reference_content_leak")
+    return sorted(set(issues))
 
 
 def qa_theme_assets(paths: ProjectPaths, assets: list[Path] | None = None, *, strict: bool = False) -> Path:
@@ -1363,11 +1570,11 @@ def qa_theme_assets(paths: ProjectPaths, assets: list[Path] | None = None, *, st
             theme_dir / "story_frame_a.png",
         ]
     expected_sizes = {
-        "main_release_plate_top.png": (1080, 416),
-        "main_release_plate_bottom.png": (1080, 416),
+        "main_release_plate_top.png": MAIN_PACKAGE_PANEL_SIZE,
+        "main_release_plate_bottom.png": MAIN_PACKAGE_PANEL_SIZE,
         "main_release_plate.png": (1080, 1440),
-        "library_release_plate_top.png": (1080, 416),
-        "library_release_plate_bottom.png": (1080, 416),
+        "library_release_plate_top.png": MAIN_PACKAGE_PANEL_SIZE,
+        "library_release_plate_bottom.png": MAIN_PACKAGE_PANEL_SIZE,
         "library_release_plate.png": (1080, 1440),
         "release_plate_placeholder.png": (1080, 1440),
         "main_background_16x9.png": (1920, 1080),
@@ -1377,7 +1584,7 @@ def qa_theme_assets(paths: ProjectPaths, assets: list[Path] | None = None, *, st
         "story_frame_a.png": story_box,
     }
     rows = []
-    issues = []
+    issues = [f"- 主账号包装链路：{issue}" for issue in main_package_receipt_issues(paths)]
     for index, path in enumerate(assets, start=1):
         notes = []
         try:
@@ -1615,19 +1822,39 @@ def qa_main_background_image(image: Image.Image) -> list[str]:
     return notes
 
 
-def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
+def configured_keying_backend() -> str:
+    release_defaults = load_config().get("release_defaults", {})
+    backend = str(release_defaults.get("preferred_keyer") or release_defaults.get("keyer") or "colorkey")
+    if backend not in {"colorkey", "chromakey", "rvm"}:
+        raise ValueError(f"不支持的 preferred_keyer：{backend}")
+    return backend
+
+
+def auto_keying(
+    project_dir: Path,
+    greenscreen: Path | None = None,
+    *,
+    backend: str | None = None,
+    rvm_start_seconds: float = 0.0,
+    rvm_duration_seconds: float | None = None,
+) -> Path:
     paths = project_paths(project_dir)
     manifest = detect_project_assets(paths.root)
     raw_video = greenscreen or manifest["inputs"].get("greenscreen_video")
     video = Path(raw_video).expanduser() if raw_video else Path("__missing_greenscreen__")
     if not video.exists():
         raise FileNotFoundError("未找到绿幕视频，无法自动生成抠像参数。")
+    selected_backend = str(backend or load_config().get("release_defaults", {}).get("keyer") or "colorkey")
+    if selected_backend not in {"colorkey", "chromakey", "rvm"}:
+        raise ValueError(f"不支持的抠像后端：{selected_backend}")
+    release_defaults = load_config().get("release_defaults", {})
     output_dir = paths.release / "keying"
     frames_dir = output_dir / "frames"
     frames_dir.mkdir(parents=True, exist_ok=True)
     duration = safe_duration(video)
+    sample_times = keying_sample_timestamps(duration)
     frames = []
-    for idx, ts in enumerate(keying_sample_timestamps(duration), start=1):
+    for idx, ts in enumerate(sample_times, start=1):
         frame = frames_dir / f"sample_{idx:02d}.jpg"
         subprocess.run(
             ["ffmpeg", "-y", "-ss", f"{ts:.3f}", "-i", str(video), "-frames:v", "1", "-q:v", "2", str(frame)],
@@ -1639,12 +1866,15 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
     color, green_variation = sample_green_across_frames(frames)
     person_crop = detect_person_crop(frames, color)
     standing_frame, gesture_frame = select_keying_representative_frames(frames, color)
+    standing_person_bbox = detect_person_crop([standing_frame], color)
+    standing_frame_seconds = sample_times[frames.index(standing_frame)]
+    gesture_frame_seconds = sample_times[frames.index(gesture_frame)]
     base_similarity = 0.075 if green_variation < 10 else (0.095 if green_variation < 24 else 0.115)
     # Search a bounded conservative neighbourhood around the measured centre.
     # The centre is the default recommendation; any stricter/aggressive value
     # remains available for independent visual review instead of being silently
     # hard-coded into the generated preset.
-    candidates = [
+    color_candidates = [
         {
             "id": f"s{similarity:.3f}_b{blend:.3f}",
             "similarity": round(similarity, 3),
@@ -1653,32 +1883,156 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
         for similarity in (max(0.04, base_similarity - 0.02), base_similarity, min(0.16, base_similarity + 0.02))
         for blend in (0.02, 0.04, 0.06)
     ]
-    recommended = min(
-        candidates,
+    color_recommended = min(
+        color_candidates,
         key=lambda item: abs(item["similarity"] - base_similarity) + abs(item["blend"] - 0.04),
     )
+    candidates = list(color_candidates)
+    recommended = color_recommended
+    rvm_candidates: list[dict[str, Any]] = []
+    if selected_backend == "rvm":
+        downsample_ratio = float(release_defaults.get("rvm_downsample_ratio", 0.4))
+        configured_chokes = tuple(
+            int(value)
+            for value in release_defaults.get(
+                "rvm_alpha_choke_candidates", RVM_ALPHA_CHOKE_CANDIDATES
+            )
+        )
+        if (
+            not configured_chokes
+            or any(value not in RVM_ALPHA_CHOKE_CANDIDATES for value in configured_chokes)
+            or RVM_ALPHA_CHOKE_PIXELS not in configured_chokes
+        ):
+            raise ValueError("rvm_alpha_choke_candidates 必须包含 1，且只能使用 0/1/2")
+        rvm_candidates = [
+            {
+                "id": f"rvm_mobilenetv3_s{downsample_ratio:.3f}_c{choke_pixels}",
+                "backend": "rvm",
+                "downsample_ratio": downsample_ratio,
+                "alpha_choke_pixels": choke_pixels,
+            }
+            for choke_pixels in configured_chokes
+        ]
+        # One pixel is only the conservative starting recommendation learned
+        # from the Canary.  The current source's visual evidence can select
+        # 0/1/2 px before the preset is locked.
+        candidates = rvm_candidates
+        recommended = next(
+            item for item in rvm_candidates
+            if int(item["alpha_choke_pixels"]) == RVM_ALPHA_CHOKE_PIXELS
+        )
     candidate_ids = {str(item["id"]) for item in candidates}
     if str(recommended["id"]) not in candidate_ids:
         raise RuntimeError("自动抠像推荐候选未出现在 keying_search candidates 中")
     candidate_sheet = output_dir / "keying_candidates.jpg"
-    render_keying_candidate_sheet(
-        standing_frame,
-        gesture_frame,
-        color,
-        candidates,
-        candidate_sheet,
-    )
+    if selected_backend == "rvm":
+        render_keying_candidate_sheet(
+            standing_frame,
+            gesture_frame,
+            color,
+            color_candidates,
+            output_dir / "keying_color_fallback_candidates.jpg",
+        )
+    else:
+        render_keying_candidate_sheet(
+            standing_frame,
+            gesture_frame,
+            color,
+            color_candidates,
+            candidate_sheet,
+        )
     candidate_detail_sheet = output_dir / "keying_candidates_detail.jpg"
-    # Keep a separately named evidence artefact for downstream QA/review.  The
-    # candidate renderer itself includes full-resolution and local-zoom panels.
-    shutil.copy2(candidate_sheet, candidate_detail_sheet)
     evidence_dir = output_dir / "evidence" / str(recommended["id"])
     search_path = output_dir / "keying_search.json"
     machine_qa_path = output_dir / "keying_machine_qa.json"
     selected_candidate_file = evidence_dir / "selected_candidate.png"
     evidence_manifest_path = evidence_dir / "evidence_manifest.json"
+    rvm_fields: dict[str, Any] = {}
+    if selected_backend == "rvm":
+        from rvm_keying import (
+            ensure_official_rvm_model,
+            ensure_rvm_foreground_video,
+            file_sha256 as rvm_file_sha256,
+        )
+
+        rvm_width = int(release_defaults.get("rvm_input_width", 1920))
+        rvm_height = int(release_defaults.get("rvm_input_height", 1080))
+        rvm_fps = int(release_defaults.get("rvm_output_fps", 25))
+        configured_model = str(release_defaults.get("rvm_model_path") or "").strip()
+        model_path = Path(configured_model).expanduser() if configured_model else output_dir / "models/rvm_mobilenetv3_fp32.onnx"
+        if not model_path.is_absolute():
+            model_path = (ROOT / model_path).resolve()
+        model_path = ensure_official_rvm_model(model_path)
+        configured_runtime = str(release_defaults.get("rvm_runtime_path") or "").strip()
+        runtime_path = Path(configured_runtime).expanduser() if configured_runtime else None
+        if runtime_path is not None and not runtime_path.is_absolute():
+            runtime_path = (ROOT / runtime_path).resolve()
+        rvm_dir = output_dir / "rvm"
+        rvm_foreground = rvm_dir / "presenter_rvm_alpha.webm"
+        rvm_receipt = rvm_dir / "rvm_keying_receipt.json"
+        ensure_rvm_foreground_video(
+            video,
+            rvm_foreground,
+            rvm_receipt,
+            model_path=model_path,
+            runtime_path=runtime_path,
+            width=rvm_width,
+            height=rvm_height,
+            fps=rvm_fps,
+            downsample_ratio=float(recommended["downsample_ratio"]),
+            start_seconds=rvm_start_seconds,
+            duration_seconds=rvm_duration_seconds,
+        )
+        source_width, source_height = Image.open(frames[0]).size
+
+        def scale_bbox(box: list[int]) -> list[int]:
+            x, y, width, height = box
+            return [
+                round(x * rvm_width / source_width),
+                round(y * rvm_height / source_height),
+                round(width * rvm_width / source_width),
+                round(height * rvm_height / source_height),
+            ]
+
+        person_crop = scale_bbox(person_crop)
+        standing_person_bbox = scale_bbox(standing_person_bbox)
+        rvm_fields = {
+            "rvm_model_path": str(model_path),
+            "rvm_model_sha256": rvm_file_sha256(model_path),
+            "rvm_runtime_path": str(runtime_path) if runtime_path is not None else "",
+            "rvm_foreground_video": str(rvm_foreground),
+            "rvm_foreground_sha256": rvm_file_sha256(rvm_foreground),
+            "rvm_receipt_path": str(rvm_receipt),
+            "rvm_receipt_sha256": rvm_file_sha256(rvm_receipt),
+            "rvm_input_width": rvm_width,
+            "rvm_input_height": rvm_height,
+            "rvm_output_fps": rvm_fps,
+            "rvm_downsample_ratio": float(recommended["downsample_ratio"]),
+            "rvm_alpha_choke_pixels": int(recommended["alpha_choke_pixels"]),
+            "rvm_source_start_seconds": float(rvm_start_seconds),
+        }
+
+        render_rvm_keying_candidate_sheet(
+            rvm_foreground,
+            max(0.0, standing_frame_seconds - rvm_start_seconds),
+            max(0.0, gesture_frame_seconds - rvm_start_seconds),
+            rvm_candidates,
+            candidate_sheet,
+            output_dir / "rvm_candidate_frames",
+            base_settings={
+                "keyer": "rvm",
+                "person_grade": "natural",
+                "person_beauty": "none",
+                **rvm_fields,
+            },
+        )
+
+    # Keep a separately named evidence artefact for downstream QA/review.  The
+    # candidate renderer includes full-frame and edge-detail panels.
+    shutil.copy2(candidate_sheet, candidate_detail_sheet)
+
     search = {
-        "version": 1,
+        "version": 2,
         "source_video": str(video),
         "source_sha256": sha256_file(video),
         "chroma_color": color,
@@ -1693,7 +2047,12 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
         "machine_qa": str(machine_qa_path),
         "evidence_manifest": str(evidence_manifest_path),
         "detected_person_bbox": person_crop,
-        "selection_policy": "背景绿幕波动决定候选中心 similarity；默认保守中心候选（blend=0.04），其余候选只供独立视觉审核比较。人物框不改变示范/C镜原始大小和位置，只用于清除表演安全区外的暗绿幕残边，并为A镜人物版式提供安全裁切。站立与大手势双帧由独立视觉审核最终确认。",
+        "selection_policy": (
+            "每条源素材独立抽取全片站立/大手势代表帧，再用连续帧循环记忆生成一次可复用 RVM Alpha 中间片；"
+            "从该项目自己的中间片比较 0/1/2 像素内收，独立视觉审核选择兼顾发丝保留与色边清理的候选。"
+            if selected_backend == "rvm"
+            else "背景绿幕波动决定候选中心 similarity；默认保守中心候选（blend=0.04），其余候选只供独立视觉审核比较。人物框不改变示范/C镜原始大小和位置，只用于清除表演安全区外的暗绿幕残边，并为A镜人物版式提供安全裁切。站立与大手势双帧由独立视觉审核最终确认。"
+        ),
         "visual_review_required": True,
         "visual_review_status": "pending",
     }
@@ -1702,19 +2061,19 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
     # in the source, full body visible, then placed in the right-side open area.
     preset = {
         "preset_version": "story-keying-preset/v2",
-        "keyer": "colorkey",
+        "keyer": selected_backend,
         "chroma_color": color,
-        "chroma_similarity": recommended["similarity"],
-        "chroma_blend": recommended["blend"],
+        "chroma_similarity": recommended.get("similarity", color_recommended["similarity"]),
+        "chroma_blend": recommended.get("blend", color_recommended["blend"]),
         "person_crop": None,
         # Union bbox from standing + large-gesture samples.  Native layouts use
         # it as an alpha boundary without rescaling/repositioning the performer;
         # A-shot layout may use it as a safe subject crop.
         "detected_person_bbox": person_crop,
         "person_grade": "natural",
-        "person_beauty": "light",
+        "person_beauty": "none" if selected_backend == "rvm" else "light",
         "person_height_ratio": 1.0,
-        "person_x": 260,
+        "person_x": 1280,
         "person_y": 0,
         "bottom_margin": 0,
         "auto_selected": True,
@@ -1723,9 +2082,18 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
         "keying_candidate": recommended["id"],
         "visual_review_required": True,
         "visual_review_status": "pending",
+        "presenter_initial_anchor_frame": str(standing_frame),
+        "presenter_initial_anchor_frame_seconds": round(float(standing_frame_seconds), 3),
+        "presenter_gesture_review_frame": str(gesture_frame),
+        "presenter_gesture_review_frame_seconds": round(float(gesture_frame_seconds), 3),
+        "presenter_initial_subject_bbox": standing_person_bbox,
+        "presenter_initial_anchor_x": None,
+        "dynamic_repositioning": False,
+        "gesture_overlap_policy": "allowed",
         "machine_qa": str(machine_qa_path),
         "evidence_manifest": str(evidence_dir / "evidence_manifest.json"),
         "selected_candidate_file": str(selected_candidate_file),
+        **rvm_fields,
     }
     preset_path = output_dir / "keying_preset.json"
     save_json(preset_path, preset)
@@ -1733,8 +2101,8 @@ def auto_keying(project_dir: Path, greenscreen: Path | None = None) -> Path:
         standing_frame,
         gesture_frame,
         chroma_color=color,
-        similarity=float(recommended["similarity"]),
-        blend=float(recommended["blend"]),
+        similarity=float(recommended.get("similarity", color_recommended["similarity"])),
+        blend=float(recommended.get("blend", color_recommended["blend"])),
         output_dir=evidence_dir,
         candidate_id=str(recommended["id"]),
         machine_qa_path=machine_qa_path,
@@ -1828,6 +2196,105 @@ def select_keying_representative_frames(frames: list[Path], chroma_color: str) -
     standing = min(scored, key=lambda item: (item[0], item[1]))[2]
     gesture = max(scored, key=lambda item: (item[0], item[1]))[2]
     return standing, gesture
+
+
+def render_rvm_keying_candidate_sheet(
+    foreground_video: Path,
+    standing_seconds: float,
+    gesture_seconds: float,
+    candidates: list[dict[str, Any]],
+    output: Path,
+    candidate_frames_dir: Path,
+    *,
+    base_settings: dict[str, Any],
+) -> None:
+    """Compare per-source RVM matte inset candidates using the real cache."""
+
+    if not candidates:
+        raise ValueError("RVM candidate list is empty")
+    candidate_frames_dir.mkdir(parents=True, exist_ok=True)
+    duration = safe_duration(foreground_video)
+    maximum_timestamp = max(0.0, duration - 0.08)
+    pose_times = (
+        ("standing", min(maximum_timestamp, max(0.0, standing_seconds))),
+        ("wide_gesture", min(maximum_timestamp, max(0.0, gesture_seconds))),
+    )
+    tile_width, tile_height = 960, 650
+    full_size = (500, 270)
+    detail_size = (420, 270)
+    tiles: list[Image.Image] = []
+
+    def review_panel(source: Image.Image, size: tuple[int, int]) -> Image.Image:
+        rgba = source.convert("RGBA")
+        rgba.thumbnail(size, Image.Resampling.LANCZOS)
+        panel = Image.new("RGBA", size, (238, 235, 225, 255))
+        draw = ImageDraw.Draw(panel)
+        draw.rectangle((0, 0, size[0] // 2, size[1]), fill=(48, 47, 54, 255))
+        x = (size[0] - rgba.width) // 2
+        y = (size[1] - rgba.height) // 2
+        panel.alpha_composite(rgba, (x, y))
+        return panel.convert("RGB")
+
+    def detail_crop(source: Image.Image, pose: str) -> Image.Image:
+        rgba = source.convert("RGBA")
+        bbox = rgba.getchannel("A").getbbox()
+        if bbox is None:
+            return rgba
+        x1, y1, x2, y2 = bbox
+        width = max(1, x2 - x1)
+        height = max(1, y2 - y1)
+        if pose == "standing":
+            # Hair/head and shoulder boundary, where a too-aggressive inset is
+            # easiest to spot.
+            y2 = min(rgba.height, y1 + max(1, round(height * 0.46)))
+            x1 = max(0, x1 - round(width * 0.12))
+            x2 = min(rgba.width, x2 + round(width * 0.12))
+        else:
+            # Keep the widest gesture span so both hands remain visible.
+            y1 = max(0, y1 - round(height * 0.08))
+            y2 = min(rgba.height, y2 + round(height * 0.08))
+        return rgba.crop((x1, y1, x2, y2))
+
+    for candidate in candidates:
+        settings = {**base_settings, "rvm_alpha_choke_pixels": int(candidate["alpha_choke_pixels"])}
+        tile = Image.new("RGB", (tile_width, tile_height), (34, 32, 42))
+        draw = ImageDraw.Draw(tile)
+        draw.text(
+            (14, 9),
+            f"{candidate['id']}  Alpha 内收={candidate['alpha_choke_pixels']} px",
+            fill=(245, 245, 245),
+            font=load_font(21),
+        )
+        for row, (pose, timestamp) in enumerate(pose_times):
+            rendered = candidate_frames_dir / f"{candidate['id']}_{pose}.png"
+            render_cached_rvm_foreground_frame(
+                foreground_video,
+                timestamp,
+                rendered,
+                settings,
+            )
+            with Image.open(rendered) as image:
+                full = review_panel(image, full_size)
+                detail = review_panel(detail_crop(image, pose), detail_size)
+            y = 48 + row * 296
+            tile.paste(full, (8, y))
+            tile.paste(detail, (526, y))
+            label = "站立帧：整身 / 发丝肩线" if pose == "standing" else "大手势帧：整身 / 双手边缘"
+            draw.text((14, y + 272), label, fill=(231, 219, 151), font=load_font(17))
+        tiles.append(tile)
+
+    sheet = Image.new("RGB", (len(tiles) * tile_width, 54 + tile_height), (238, 236, 232))
+    draw = ImageDraw.Draw(sheet)
+    draw.text(
+        (18, 12),
+        "RVM 当前素材逐案选参：同一时序 Alpha 缓存比较 0/1/2 px 内收；左半深底、右半浅底，兼看色边与发丝/手部保留",
+        fill=(25, 25, 25),
+        font=load_font(24),
+    )
+    for index, tile in enumerate(tiles):
+        sheet.paste(tile, (index * tile_width, 54))
+    output.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output, quality=94)
 
 
 def render_keying_candidate_sheet(
@@ -2493,7 +2960,12 @@ def review_bundle_current_local(bundle: Path) -> bool:
 
 
 def qa_release(project_dir: Path) -> Path:
-    from release_video import build_tail_frame_probe_commands, inspect_tail_image_black_rectangles, release_plate_integrity_issues
+    from release_video import (
+        build_tail_frame_probe_commands,
+        inspect_tail_image_black_rectangles,
+        release_plate_integrity_issues,
+        video_window_black_edge_issues,
+    )
 
     paths = project_paths(project_dir)
     manifest = init_project(paths.root)
@@ -2571,6 +3043,13 @@ def qa_release(project_dir: Path) -> Path:
         )
         for general_frame in general_frames:
             general_issues = release_plate_integrity_issues(general_frame, scaled_video_box)
+            general_issues.extend(
+                video_window_black_edge_issues(
+                    general_frame,
+                    scaled_video_box,
+                    issue_prefix="release_center_video",
+                )
+            )
             if general_issues:
                 notes.extend(f"{general_frame.name}: {issue}" for issue in general_issues)
                 break
@@ -2836,28 +3315,36 @@ def qa_publish(project_dir: Path) -> Path:
     required_v1 = manifest.get("agent", {}).get("story_contract", {}).get("policy") == "required_v1"
     lineage_required = required_v1 or (handoff.is_file() and "cover_lineage.json" in handoff.read_text(encoding="utf-8-sig", errors="ignore"))
     if required_v1:
-        compiled_path = paths.status / "contracts" / "consumers" / "cover.compiled.json"
-        try:
-            compiled = json.loads(compiled_path.read_text(encoding="utf-8"))
-            required_issues, required_retries = required_cover_issues(
+        integrated_receipt = publish_dir / "cover_integrated_generation.json"
+        if integrated_receipt.is_file():
+            required_issues, required_retries = integrated_cover_issues(
                 publish_dir,
-                render_manifest_path=publish_dir / "cover_render_manifest.json",
-                lineage_path=publish_dir / "cover_lineage.json",
-                compiled_spec=compiled,
+                receipt_path=integrated_receipt,
                 expected_title=str(manifest.get("story", {}).get("name") or ""),
             )
-        except (OSError, json.JSONDecodeError) as exc:
-            required_issues = [f"- required_v1 封面编译投影缺失或损坏：{exc}"]
-            required_retries = [
-                f"{account}/covers/cover_{ratio}.png"
-                for account in ("main", "library") for ratio in ("3x4", "4x3", "16x9")
-            ]
-        issues.extend(required_issues)
-        retry_files.extend(required_retries)
-        for name in ("cover_lineage.json", "cover_render_manifest.json", "publish_asset_manifest.json"):
-            path = publish_dir / name
-            if path.is_file():
-                artifacts[name] = {"path": str(path), "sha256": sha256_file(path)}
+            issues.extend(required_issues)
+            retry_files.extend(required_retries)
+            artifacts["cover_integrated_generation.json"] = {"path": str(integrated_receipt), "sha256": sha256_file(integrated_receipt)}
+        else:
+            compiled_path = paths.status / "contracts" / "consumers" / "cover.compiled.json"
+            try:
+                compiled = json.loads(compiled_path.read_text(encoding="utf-8"))
+                required_issues, required_retries = required_cover_issues(
+                    publish_dir,
+                    render_manifest_path=publish_dir / "cover_render_manifest.json",
+                    lineage_path=publish_dir / "cover_lineage.json",
+                    compiled_spec=compiled,
+                    expected_title=str(manifest.get("story", {}).get("name") or ""),
+                )
+            except (OSError, json.JSONDecodeError) as exc:
+                required_issues = [f"- required_v1 封面编译投影缺失或损坏：{exc}"]
+                required_retries = [f"{account}/covers/cover_{ratio}.png" for account in ("main", "library") for ratio in ("3x4", "4x3", "16x9")]
+            issues.extend(required_issues)
+            retry_files.extend(required_retries)
+            for name in ("cover_lineage.json", "cover_render_manifest.json", "publish_asset_manifest.json"):
+                path = publish_dir / name
+                if path.is_file():
+                    artifacts[name] = {"path": str(path), "sha256": sha256_file(path)}
     elif lineage_required:
         lineage_path = publish_dir / "cover_lineage.json"
         lineage_issues, lineage_retries = validate_cover_lineage(publish_dir, lineage_path)
@@ -2922,9 +3409,6 @@ def apply_fixed_cover_branding(project_dir: Path, contract_spec: Path | None = N
     paths = project_paths(project_dir)
     config = load_config()
     brand = config.get("brand_assets", {}) if isinstance(config.get("brand_assets"), dict) else {}
-    logo = first_existing(brand.get("cover_logo"), brand.get("logo"))
-    if logo is None:
-        raise FileNotFoundError("封面定版缺少可读的固定品牌 Logo；禁止让生图模型伪造图标")
     if contract_spec is not None:
         try:
             compiled = json.loads(contract_spec.read_text(encoding="utf-8"))
@@ -2932,6 +3416,10 @@ def apply_fixed_cover_branding(project_dir: Path, contract_spec: Path | None = N
             raise ValueError(f"封面合同编译投影不可读：{contract_spec}") from exc
         if compiled.get("consumer") != "cover":
             raise ValueError("封面合同编译投影 consumer 必须为 cover")
+        official = [item for item in compiled.get("official_assets", []) if isinstance(item, dict)]
+        logo = first_existing(brand.get("cover_logo"), brand.get("logo")) if official else None
+        if official and logo is None:
+            raise FileNotFoundError("封面定版缺少可读的固定品牌 Logo；禁止让生图模型伪造图标")
         manifest = load_manifest(paths) or {}
         receipt, _render, _lineage = render_required_covers(
             paths.publish,
@@ -2943,6 +3431,9 @@ def apply_fixed_cover_branding(project_dir: Path, contract_spec: Path | None = N
         render_payload = json.loads((paths.publish / "cover_render_manifest.json").read_text(encoding="utf-8"))
         save_json(asset_manifest, render_payload)
         return receipt
+    logo = first_existing(brand.get("cover_logo"), brand.get("logo"))
+    if logo is None:
+        raise FileNotFoundError("封面定版缺少可读的固定品牌 Logo；禁止让生图模型伪造图标")
     covers = [
         paths.publish / account / "covers" / f"cover_{ratio}.png"
         for account in ("main", "library")
@@ -3249,6 +3740,10 @@ def first_existing(*values: str | Path | None) -> Path | None:
         path = Path(value).expanduser()
         if path.exists():
             return path
+        if not path.is_absolute():
+            repository_asset = ROOT / path
+            if repository_asset.exists():
+                return repository_asset
     return None
 
 

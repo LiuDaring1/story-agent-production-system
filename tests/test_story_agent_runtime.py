@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import io
 import json
 import os
@@ -17,7 +18,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
-from story_agent import AgentContext, StageResult, StoryAgent, WorkerAttempt, classify_command_failure, main as story_agent_main
+from story_agent import (
+    AgentContext,
+    StageResult,
+    StoryAgent,
+    WorkerAttempt,
+    classify_command_failure,
+    main as story_agent_main,
+    release_render_expected_bindings,
+)
 from story_contract_runtime import contract_paths
 from story_module_registry import (
     MODULE_EXECUTION_MODE_ENV,
@@ -46,11 +55,13 @@ from story_agent_runtime import (
     segment_storyboard_text,
     submit_video_job,
     assert_runnable,
+    accept_current_outputs,
     update_control,
     load_control,
 )
 from story_project import load_manifest, project_paths, save_json, write_manifest
 from story_project import detect_project_assets, final_delivery, init_project, refresh_project_outputs, write_internal_agent_reports
+from video_motion import video_receipt_issues
 
 
 def as_frozen_v3_legacy(manifest: dict) -> dict:
@@ -101,6 +112,88 @@ def make_test_video(path: Path) -> Path:
 
 
 class StoryAgentRuntimeTests(unittest.TestCase):
+    def test_accept_current_freezes_hashes_and_stops_aesthetic_rework(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：接受当前版本"
+            init_project(project, story_name="接受当前版本", slug="accept-current")
+            artifact = project / "03_背景成片" / "story_no_subs_bgm.mp4"
+            artifact.parent.mkdir(parents=True, exist_ok=True)
+            make_test_video(artifact)
+            manifest, receipt_path = accept_current_outputs(
+                project,
+                accepted_by="test-user",
+                notes="当前版本已够用",
+                artifacts=[artifact],
+            )
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(manifest["agent"]["delivery_state"], "user_accepted_with_exceptions")
+            self.assertTrue(receipt["stopped_queued_aesthetic_rework"])
+            self.assertFalse(receipt["final_delivery_or_doctor_invoked"])
+            self.assertEqual(receipt["artifacts"][0]["sha256"], file_sha256(artifact))
+            self.assertTrue(load_control(project)["cancel_requested"])
+
+    def test_accept_current_rejects_missing_or_corrupt_explicit_selection_without_cancelling(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：拒绝损坏交付"
+            init_project(project, story_name="拒绝损坏交付", slug="reject-broken-current")
+            missing = project / "03_背景成片" / "missing.mp4"
+            with self.assertRaisesRegex(AgentRuntimeError, "缺失或为空"):
+                accept_current_outputs(project, artifacts=[missing])
+            self.assertFalse(load_control(project)["cancel_requested"])
+
+            corrupt = project / "03_背景成片" / "corrupt.mp4"
+            corrupt.parent.mkdir(parents=True, exist_ok=True)
+            corrupt.write_bytes(b"not-a-video")
+            with self.assertRaisesRegex(AgentRuntimeError, "损坏或不可读"):
+                accept_current_outputs(project, artifacts=[corrupt])
+            self.assertFalse(load_control(project)["cancel_requested"])
+
+    def test_accept_current_ignores_aesthetic_score_but_honors_verified_safety_blocker(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：用户决定"
+            init_project(project, story_name="用户决定", slug="user-decides")
+            artifact = make_test_video(project / "03_背景成片" / "story_no_subs_bgm.mp4")
+            paths = project_paths(project)
+            manifest = load_manifest(paths)
+            manifest["agent"]["stages"]["release_video_review"] = {
+                "status": "blocked", "message": "内部审美分数不足",
+            }
+            write_manifest(paths, manifest)
+            accepted, _receipt = accept_current_outputs(project, artifacts=[artifact])
+            self.assertEqual(accepted["agent"]["delivery_state"], "user_accepted_with_exceptions")
+
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：真实安全阻断"
+            init_project(project, story_name="真实安全阻断", slug="real-safety-block")
+            artifact = make_test_video(project / "03_背景成片" / "story_no_subs_bgm.mp4")
+            paths = project_paths(project)
+            manifest = load_manifest(paths)
+            manifest["agent"]["verified_safety_blockers"] = ["malware_detected"]
+            write_manifest(paths, manifest)
+            with self.assertRaisesRegex(AgentRuntimeError, "真实安全阻断"):
+                accept_current_outputs(project, artifacts=[artifact])
+            self.assertFalse(load_control(project)["cancel_requested"])
+
+    def test_cross_worktree_path_is_rejected_before_run(self) -> None:
+        manifest: dict = {}
+        ensure_manifest_v2(manifest)
+        manifest.setdefault("outputs", {})["stale"] = "/tmp/.codex/worktrees/another-checkout/output.mp4"
+        with self.assertRaisesRegex(AgentRuntimeError, "cross_worktree_binding_mismatch"):
+            assert_runnable(manifest)
+    def test_library_release_receipt_uses_variant_specific_demo_bindings(self) -> None:
+        common = {
+            "demo_render_manifest_sha256": "a" * 64,
+            "approved_demo_geometry_sha256": "b" * 64,
+            "story_contract_sha256": "c" * 64,
+        }
+        main = release_render_expected_bindings(Path("release_render_manifest_main.json"), common)
+        library = release_render_expected_bindings(Path("release_render_manifest_library.json"), common)
+        self.assertEqual(main, common)
+        self.assertEqual(library["demo_render_manifest_sha256"], "not_applicable:library_variant")
+        self.assertEqual(library["approved_demo_geometry_sha256"], "not_applicable:library_variant")
+        self.assertEqual(library["story_contract_sha256"], common["story_contract_sha256"])
+        self.assertEqual(common["demo_render_manifest_sha256"], "a" * 64)
+
     def test_two_role_model_routing_uses_commander_for_judgment_and_worker_for_execution(self) -> None:
         context = AgentContext(
             project_dir=Path("/private/tmp/two-role-routing"),
@@ -174,6 +267,28 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertTrue(StoryAgent(context)._has_source_edit(manifest))
             Path(manifest["inputs"]["story_text"]).write_text("被篡改", encoding="utf-8")
             self.assertFalse(StoryAgent(context)._has_source_edit(manifest))
+
+    def test_submit_records_user_declared_age_without_inference(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = make_test_video(root / "declared-age.mp4")
+            _job, project, created = submit_video_job(
+                video,
+                projects_root=root / "projects",
+                story_name="显式适龄",
+                slug="declared-age",
+                age_range="4-6岁",
+                registry=JobRegistry(root / "registry.json"),
+            )
+            self.assertTrue(created)
+            manifest = load_manifest(project_paths(project))
+            assert manifest is not None
+            self.assertEqual(manifest["story"]["age_range"], "4-6岁")
+            self.assertIs(manifest["story"]["manual_overrides"]["age_range"], True)
+            self.assertEqual(
+                manifest["agent"]["input_contract"]["user_parameters"]["age_range"],
+                "4-6岁",
+            )
 
     def test_storyboard_text_splits_long_prepared_story_without_changing_characters(self) -> None:
         story = (
@@ -807,7 +922,9 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             (videos / "12_vri.mp4").write_bytes(b"rejected-video")
             (videos / "13_vri.mp4").write_bytes(b"approved-video")
 
-            moved = StoryAgent(context)._quarantine_story_videos([12], jobs, {"12": "保持森林舞台"})
+            moved = StoryAgent(context)._quarantine_story_videos(
+                [12], jobs, {"12": "保持森林舞台"}, count_review_retry=True,
+            )
 
             self.assertEqual(moved, [12])
             with jobs.open(encoding="utf-8-sig", newline="") as file:
@@ -815,7 +932,9 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(row["status"], "todo")
             self.assertEqual(row["task_id"], "")
             self.assertEqual(row["provider_attempt"], "1")
+            self.assertEqual(row["video_review_retry_count"], "1")
             self.assertIn("保持森林舞台", row["prompt"])
+            self.assertEqual(row["provider_retry_prompt"], "保持森林舞台")
             with jobs.open(encoding="utf-8-sig", newline="") as file:
                 kept = list(csv.DictReader(file))[1]
             self.assertEqual(kept["status"], "downloaded")
@@ -824,6 +943,104 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             rejected_jobs = list((paths.status / "rejected" / "story_videos").rglob("scene_12_rejected_job.json"))
             self.assertEqual(len(rejected_jobs), 1)
             self.assertEqual(json.loads(rejected_jobs[0].read_text(encoding="utf-8"))["task_id"], "old-task")
+
+    def test_video_retry_rewrites_strategy_when_reviewer_prompt_is_unchanged(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：相同提示词"
+            init_project(project, story_name="相同提示词", slug="same-prompt")
+            paths = project_paths(project)
+            context = AgentContext(
+                project_dir=project, inbox=None, story_name="相同提示词", slug="same-prompt",
+                execute=True, update_latest_episode=False, codex_mode="handoff", codex_model="",
+                codex_sandbox="workspace-write", codex_approval="never", codex_path="codex", codex_timeout=30,
+            )
+            prompt = "公鸡自然走动。"
+            prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+            jobs = paths.video_jobs / "same-prompt_image_video_jobs.csv"
+            jobs.parent.mkdir(parents=True, exist_ok=True)
+            jobs.write_text(
+                "scene,target_video_filename,status,prompt,provider_prompt_sha256\n"
+                f"1,01_same.mp4,downloaded,旧审计提示,{prompt_sha}\n",
+                encoding="utf-8-sig",
+            )
+            videos = paths.video_jobs / "videos"
+            videos.mkdir(parents=True)
+            video = videos / "01_same.mp4"
+            video.write_bytes(b"keep-me")
+            moved = StoryAgent(context)._quarantine_story_videos(
+                [1], jobs, {"1": {"instruction": "修复硬伤", "provider_prompt": prompt}},
+            )
+            self.assertEqual(moved, [1])
+            self.assertFalse(video.is_file())
+            with jobs.open(encoding="utf-8-sig", newline="") as handle:
+                row = next(csv.DictReader(handle))
+            self.assertNotEqual(row["provider_retry_prompt"], prompt)
+            self.assertIn("动作简化", row["provider_retry_prompt"])
+            archived = list((paths.status / "rejected" / "story_videos").rglob("01_same.mp4"))
+            self.assertEqual(len(archived), 1)
+
+    def test_video_review_and_paid_provider_histories_are_counted_per_scene(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：逐镜重试"
+            init_project(project, story_name="逐镜重试", slug="per-scene-retry")
+            paths = project_paths(project)
+            context = AgentContext(
+                project_dir=project, inbox=None, story_name="逐镜重试", slug="per-scene-retry",
+                execute=True, update_latest_episode=False, codex_mode="handoff", codex_model="",
+                codex_sandbox="workspace-write", codex_approval="never", codex_path="codex", codex_timeout=30,
+            )
+            jobs = paths.video_jobs / "per-scene-retry_image_video_jobs.csv"
+            jobs.parent.mkdir(parents=True, exist_ok=True)
+            jobs.write_text(
+                "scene,target_video_filename,video_review_retry_count,provider_attempt\n"
+                "1,01.mp4,0,0\n"
+                "2,02.mp4,1,1\n"
+                "3,03.mp4,0,0\n"
+                "4,04.mp4,0,1\n",
+                encoding="utf-8-sig",
+            )
+            counts = StoryAgent(context)._video_review_retry_counts([1, 2, 3, 4], jobs)
+            self.assertEqual(counts, {1: 0, 2: 1, 3: 0, 4: 0})
+            paid = StoryAgent(context)._video_provider_attempt_counts([1, 2, 3, 4], jobs)
+            self.assertEqual(paid, {1: 0, 2: 1, 3: 0, 4: 1})
+
+    def test_persistently_broken_video_uses_audited_adjacent_editorial_fallback(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：相邻延展"
+            init_project(project, story_name="相邻延展", slug="adjacent-extension")
+            paths = project_paths(project)
+            context = AgentContext(
+                project_dir=project, inbox=None, story_name="相邻延展", slug="adjacent-extension",
+                execute=True, update_latest_episode=False, codex_mode="handoff", codex_model="",
+                codex_sandbox="workspace-write", codex_approval="never", codex_path="codex", codex_timeout=30,
+            )
+            jobs = paths.video_jobs / "adjacent-extension_image_video_jobs.csv"
+            jobs.parent.mkdir(parents=True, exist_ok=True)
+            jobs.write_text(
+                "scene,target_video_filename,status,prompt,provider_attempt,video_review_retry_count\n"
+                "1,01.mp4,downloaded,前镜,0,0\n"
+                "2,02.mp4,downloaded,坏镜,3,3\n"
+                "3,03.mp4,downloaded,后镜,0,0\n",
+                encoding="utf-8-sig",
+            )
+            videos = paths.video_jobs / "videos"
+            videos.mkdir(parents=True)
+            (videos / "01.mp4").write_bytes(b"usable-adjacent")
+            (videos / "02.mp4").write_bytes(b"broken-provider-output")
+            (videos / "03.mp4").write_bytes(b"other-adjacent")
+            completed = StoryAgent(context)._editorial_fallback_story_videos(
+                [2],
+                jobs,
+                {"2": {"instruction": "持续肢体崩坏", "provider_prompt": "主体保持稳定，只做最小自然动作。"}},
+            )
+            self.assertEqual(completed, [2])
+            self.assertEqual((videos / "02.mp4").read_bytes(), b"usable-adjacent")
+            with jobs.open(encoding="utf-8-sig", newline="") as handle:
+                row = list(csv.DictReader(handle))[1]
+            self.assertEqual(row["video_source_kind"], "editorial_adjacent_extension")
+            self.assertEqual(row["editorial_fallback_source_scene"], "1")
+            self.assertEqual(row["status"], "downloaded")
+            self.assertEqual(video_receipt_issues(row, videos / "02.mp4", production_mode=True), [])
 
     def test_storyboard_change_archives_stale_scene_images_but_keeps_style_anchor(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -914,6 +1131,67 @@ class StoryAgentRuntimeTests(unittest.TestCase):
 
             final_image.write_bytes(b"changed-after-generation")
             self.assertFalse(agent._story_image_generation_context_current(contract_context, storyboard))
+
+    def test_story_image_completion_uses_authoritative_staging_storyboard_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：图片血缘路径"
+            manifest = init_project(project, story_name="图片血缘路径", slug="lineage-path")
+            paths = project_paths(project)
+            story_text = paths.inputs / "lineage-path_source.txt"
+            story_text.write_text("第一镜。\n", encoding="utf-8")
+            manifest["inputs"]["story_text"] = str(story_text)
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="图片血缘路径",
+                slug="lineage-path",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context)
+            contract_context = paths.status / "contracts" / "consumers" / "storyboard_images.json"
+            contract_context.parent.mkdir(parents=True, exist_ok=True)
+            contract_context.write_text('{"binding":"current"}\n', encoding="utf-8")
+            sample_lock = paths.status / "visual_samples" / "visual_sample.lock.json"
+            sample_lock.parent.mkdir(parents=True, exist_ok=True)
+            sample_lock.write_text('{"locked":true}\n', encoding="utf-8")
+            final_storyboard = paths.images / "lineage-path_storyboard_lines.txt"
+            final_storyboard.write_text("第一镜。\n", encoding="utf-8")
+            staging_storyboard = agent._codex_stage_dir("codex_story_images") / final_storyboard.name
+            staging_storyboard.parent.mkdir(parents=True, exist_ok=True)
+            staging_storyboard.write_text("第一镜。\n", encoding="utf-8")
+            final_image = paths.images / "images" / "lineage-path_scene_01.png"
+            staging_image = staging_storyboard.parent / "images" / final_image.name
+            final_image.parent.mkdir(parents=True, exist_ok=True)
+            staging_image.parent.mkdir(parents=True, exist_ok=True)
+            final_image.write_bytes(b"current-image")
+            staging_image.write_bytes(b"current-image")
+            agent._write_story_image_generation_manifest(
+                contract_context, staging_storyboard, ["第一镜。"]
+            )
+
+            self.assertFalse(
+                agent._story_image_generation_context_current(contract_context, final_storyboard)
+            )
+            with patch.object(agent, "_consumer_output_current", return_value=True), patch.object(
+                agent, "_legacy_contract_policy", return_value=False
+            ):
+                self.assertTrue(agent._has_story_images(manifest))
+                lineage = agent._story_image_lineage_status(
+                    manifest,
+                    storyboard=final_storyboard,
+                    image_dir=final_image.parent,
+                    staging_images=staging_image.parent,
+                )
+            self.assertTrue(lineage["generation_context_current"])
+            self.assertEqual(lineage["current_lineage_valid_count"], 1)
+            self.assertTrue(lineage["stage_gate_complete"])
 
     def test_contract_invalidation_archives_final_and_staging_story_images(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1139,6 +1417,43 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertIn("第3镜：不得出现兔妈妈。", prompt)
             self.assertNotIn("第4镜：只保留小兔子。", prompt)
 
+    def test_story_image_review_completion_enforces_product_quality_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：审核结构门禁"
+            manifest = init_project(project, story_name="审核结构门禁", slug="review-schema")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="审核结构门禁",
+                slug="review-schema",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+            )
+            agent = StoryAgent(context)
+            review = project_paths(project).status / "reviews" / "story_images_review_review.json"
+            review.parent.mkdir(parents=True, exist_ok=True)
+            review.write_text('{"approved":true,"score":96}\n', encoding="utf-8")
+
+            with patch.object(agent, "_review_stage_current", return_value=True), patch.object(
+                agent, "_legacy_contract_policy", return_value=False
+            ), patch.object(
+                agent,
+                "_story_image_quality_review_issues",
+                return_value=["product_quality missing: state_readability"],
+            ):
+                self.assertFalse(agent._has_story_images_review(manifest))
+
+            with patch.object(agent, "_review_stage_current", return_value=True), patch.object(
+                agent, "_legacy_contract_policy", return_value=False
+            ), patch.object(agent, "_story_image_quality_review_issues", return_value=[]):
+                self.assertTrue(agent._has_story_images_review(manifest))
+
     def test_text_only_source_archive_preserves_verified_clean_media(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：文字校对归档"
@@ -1178,7 +1493,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertFalse(story.exists())
             self.assertTrue((archive / story.name).exists())
 
-    def test_resume_preserves_cumulative_runtime_without_fixed_deadline(self) -> None:
+    def test_resume_preserves_cumulative_runtime_with_fixed_eight_hour_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：累计时限"
             manifest = init_project(project, story_name="累计时限", slug="cumulative-runtime")
@@ -1195,8 +1510,8 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(resumed["agent"]["started_at"], "")
             resumed["agent"]["active_elapsed_seconds"] = 2.1 * 3600
             assert_runnable(resumed)
-            self.assertFalse(resumed["agent"]["runtime_deadline_enabled"])
-            self.assertEqual(resumed["agent"]["deadline_hours"], 0.0)
+            self.assertTrue(resumed["agent"]["runtime_deadline_enabled"])
+            self.assertEqual(resumed["agent"]["deadline_hours"], 8.0)
 
     def test_reconcile_archives_unbound_story_images_and_normalizes_stale_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1266,8 +1581,8 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(reloaded["agent"]["stages"]["codex_story_images"]["status"], "pending")
             self.assertEqual(reloaded["agent"]["stages"]["story_images_review"]["status"], "pending")
             self.assertEqual(reloaded["agent"]["branch_blockers"], {})
-            self.assertFalse(reloaded["agent"]["runtime_deadline_enabled"])
-            self.assertEqual(reloaded["agent"]["deadline_hours"], 0.0)
+            self.assertTrue(reloaded["agent"]["runtime_deadline_enabled"])
+            self.assertEqual(reloaded["agent"]["deadline_hours"], 8.0)
 
     def test_reconcile_marks_interrupted_but_verified_prior_stage_passed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1456,6 +1771,9 @@ class StoryAgentRuntimeTests(unittest.TestCase):
         class TransientAgent(StoryAgent):
             calls = 0
 
+            def _stage_checks(self):
+                return [("generate_videos", lambda _manifest: self.calls >= 2, lambda _manifest: StageResult("done", "unused"))]
+
             def _next_stage(self, manifest):
                 if manifest["agent"]["stages"]["generate_videos"]["status"] == "passed":
                     return "done", lambda _manifest: StageResult("done", "done")
@@ -1495,6 +1813,9 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_codex_subtask_failure_retries_in_a_new_attempt(self) -> None:
         class CodexFailOnceAgent(StoryAgent):
             calls = 0
+
+            def _stage_checks(self):
+                return [("codex_story_images", lambda _manifest: self.calls >= 2, lambda _manifest: StageResult("done", "unused"))]
 
             def _next_stage(self, manifest):
                 stage = "codex_story_images"
@@ -1784,6 +2105,14 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(record["actual_cost"], 3.25)
             self.assertEqual(record["retry_reason"], "temporary timeout")
             self.assertEqual(record["attempts"], 2)
+            self.assertEqual(record["attempt_count"], 2)
+            self.assertEqual(record["input_artifact_hashes"]["manifest_context"], input_sha)
+            self.assertEqual(record["output_artifact_hashes"][str(artifact)], file_sha256(artifact))
+            self.assertEqual(record["worktree_revision"], manifest["agent"]["code_identity"]["git_revision"])
+            self.assertTrue(record["why_running"])
+            self.assertEqual(record["postconditions"]["evaluated"], False)
+            self.assertEqual(record["retry_scope"], "generate_videos")
+            self.assertGreater(record["estimated_remaining_seconds"], 0)
 
     def test_failure_classifier_blocks_login_but_retries_network_failures(self) -> None:
         self.assertEqual(classify_command_failure("Suno CAPTCHA / login required"), "blocked")

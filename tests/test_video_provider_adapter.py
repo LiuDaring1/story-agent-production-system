@@ -19,17 +19,149 @@ from story_video_synthesizer.toapis_video import (
     DEFAULT_SECONDS as TOAPIS_DEFAULT_SECONDS,
     MAX_SECONDS as TOAPIS_MAX_SECONDS,
     MIN_SECONDS as TOAPIS_MIN_SECONDS,
+    MAX_PROMPT_CHARS as TOAPIS_MAX_PROMPT_CHARS,
     DEFAULT_USER_AGENT,
     ToAPIsVideoClient,
     build_toapis_task_body,
     extract_toapis_video_url,
 )
-from run_image_video_jobs import reset_retryable_failed_row, row_duration_value, row_request_seconds, toapis_extra_body
+from run_image_video_jobs import (
+    TOAPIS_OPERATIONAL_MIN_SECONDS,
+    TOAPIS_SAFE_PROVIDER_PROMPT_CHARS,
+    provider_prompt_for_row,
+    reset_retryable_failed_row,
+    row_duration_value,
+    row_request_seconds,
+    toapis_extra_body,
+)
 import run_image_video_jobs
 from story_video_synthesizer.volcengine_video import CreateTaskResult
 
 
 class VideoProviderAdapterTests(unittest.TestCase):
+    def test_toapis_provider_prompt_strips_internal_audit_context(self) -> None:
+        full = (
+            "公鸡轻轻低头，镜头缓慢推近。\n"
+            "[STORY_CONTRACT_V1]{\"characters\":[\"rooster\"]}\n"
+            "必须保持合同角色身份。\n"
+            "[VIDEO_MOTION_PLAN_V1]{\"camera_motion\":\"push_in\"}"
+        )
+        row = {"scene": "05", "prompt": full}
+        self.assertEqual(
+            provider_prompt_for_row(row, model="grok-video-1.5", is_toapis=True),
+            "公鸡轻轻低头，镜头缓慢推近。",
+        )
+        self.assertEqual(row["prompt"], full)
+
+    def test_grok_video_1_0_uses_same_short_provider_prompt_boundary(self) -> None:
+        full = "公鸡甩头。\n[STORY_CONTRACT_V1]{\"large\":\"internal\"}"
+        row = {"scene": "05", "prompt": full}
+        self.assertEqual(
+            provider_prompt_for_row(row, model="grok-video-1.0", is_toapis=True),
+            "公鸡甩头。",
+        )
+        self.assertEqual(row["prompt"], full)
+
+    def test_toapis_provider_prompt_rejects_oversized_prose_before_submission(self) -> None:
+        with self.assertRaisesRegex(ValueError, "缺少可安全压缩"):
+            provider_prompt_for_row(
+                {"scene": "05", "prompt": "动" * (TOAPIS_MAX_PROMPT_CHARS + 1)},
+                model="grok-video-1.5",
+                is_toapis=True,
+            )
+
+    def test_toapis_provider_prompt_compiles_long_review_text_from_structured_motion(self) -> None:
+        row = {
+            "scene": "08",
+            "prompt": "很长的审核提示。" * 100 + "\n[STORY_CONTRACT_V1]{}",
+            "subject_action": "公鸡短促哼一声，头轻轻撇开，原先抬起的翅膀落下并收拢。",
+            "camera_motion": "镜头轻推近公鸡脸部后停住。",
+            "environment_motion": "花枝和叶片轻微摇动。",
+        }
+        compact = provider_prompt_for_row(row, model="grok-video-1.5", is_toapis=True)
+        self.assertLessEqual(
+            len(compact.encode("utf-16-le")) // 2,
+            TOAPIS_SAFE_PROVIDER_PROMPT_CHARS,
+        )
+        self.assertIn("公鸡短促哼一声", compact)
+        self.assertIn("镜头轻推近", compact)
+        self.assertIn("保持首图角色、物体数量、外观和画风", compact)
+        self.assertIn("[STORY_CONTRACT_V1]", row["prompt"])
+
+    def test_targeted_retry_prompt_reaches_provider_unchanged(self) -> None:
+        retry = "公鸡自然抬起完整羽翼，羽翼始终为羽毛结构，不出现人手。"
+        row = {
+            "scene": "08",
+            "prompt": "旧动作提示。[STORY_CONTRACT_V1]{}",
+            "provider_retry_prompt": retry,
+            "previous_provider_prompt_sha256": "a" * 64,
+        }
+        self.assertEqual(
+            provider_prompt_for_row(row, model="grok-video-1.5", is_toapis=True),
+            retry,
+        )
+
+    def test_identical_retry_provider_prompt_is_blocked_before_submission(self) -> None:
+        retry = "公鸡自然抬起完整羽翼。"
+        row = {
+            "scene": "08",
+            "prompt": "审计提示",
+            "provider_retry_prompt": retry,
+            "previous_provider_prompt_sha256": __import__("hashlib").sha256(retry.encode("utf-8")).hexdigest(),
+        }
+        with self.assertRaisesRegex(ValueError, "完全相同"):
+            provider_prompt_for_row(row, model="grok-video-1.5", is_toapis=True)
+
+    def test_toapis_request_body_rejects_oversized_prompt(self) -> None:
+        with self.assertRaisesRegex(ValueError, "不能超过 1200 字符"):
+            build_toapis_task_body(
+                model="grok-video-1.5",
+                prompt="动" * (TOAPIS_MAX_PROMPT_CHARS + 1),
+                image_url="https://example.com/frame.png",
+            )
+
+    def test_toapis_runner_validates_all_prompt_lengths_before_paid_submission(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            images, videos, jobs = self._write_grok_jobs_fixture(root)
+            with jobs.open(encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+            rows[1]["prompt"] = "动" * (TOAPIS_MAX_PROMPT_CHARS + 1)
+            with jobs.open("w", encoding="utf-8-sig", newline="") as handle:
+                writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+
+            class FakeClient:
+                calls = 0
+
+                def __init__(self, *, api_key: str, base_url: str) -> None:
+                    del api_key, base_url
+
+                def create_task(self, **kwargs):
+                    del kwargs
+                    type(self).calls += 1
+                    return CreateTaskResult(task_id="unexpected", raw={})
+
+            argv = [
+                "run_image_video_jobs.py",
+                "--jobs-csv", str(jobs),
+                "--images-dir", str(images),
+                "--videos-dir", str(videos),
+                "--base-url", "https://toapis.com/v1",
+                "--model", "grok-video-1.5",
+                "--api-key", "test-secret",
+                "--submit-all-first",
+                "--submit-only",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch.object(run_image_video_jobs, "ToAPIsVideoClient", FakeClient),
+                self.assertRaisesRegex(ValueError, "缺少可安全压缩"),
+            ):
+                run_image_video_jobs.main()
+            self.assertEqual(FakeClient.calls, 0)
+
     def test_grok_row_seconds_prioritize_generation_duration_and_clamp_integer_range(self) -> None:
         for row, expected in [
             ({"generation_duration": "5", "duration": "9"}, "5"),
@@ -48,6 +180,27 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 ),
                 expected,
             )
+
+    def test_toapis_runner_applies_user_authorized_four_second_operational_floor(self) -> None:
+        self.assertEqual(TOAPIS_OPERATIONAL_MIN_SECONDS, 4)
+        self.assertEqual(
+            row_request_seconds(
+                {"generation_duration": "2", "target_duration": "2"},
+                model="grok-video-1.5",
+                is_toapis=True,
+                fallback_seconds="8",
+            ),
+            "4",
+        )
+        self.assertEqual(
+            row_request_seconds(
+                {"generation_duration": "7"},
+                model="grok-video-1.5",
+                is_toapis=True,
+                fallback_seconds="8",
+            ),
+            "7",
+        )
 
     def test_legacy_models_keep_global_seconds_fallback(self) -> None:
         row = {"generation_duration": "5", "duration": "9"}

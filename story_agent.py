@@ -6,8 +6,10 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import signal
 import shutil
+import socket
 import subprocess
 import sys
 import time
@@ -35,6 +37,10 @@ from story_module_ports import (
     ModuleFailureCode,
 )
 from story_video_synthesizer.image_video import validate_image_video_jobs
+from semantic_card_motion import (
+    semantic_card_motion_receipt_issues,
+    write_semantic_card_motion_request,
+)
 from story_contract_runtime import (
     CONTRACT_POLICY_LEGACY,
     CONTRACT_POLICY_REQUIRED,
@@ -80,9 +86,13 @@ from visual_sample_gate import (
     write_visual_sample_supplemental_request,
 )
 from video_motion import (
+    VIDEO_REVIEW_HARD_DEFECT_CODES,
+    VIDEO_REVIEW_POLICY_VERSION,
     formal_source_issues,
     review_semantic_issues,
+    video_review_policy_issues,
     video_receipt_issues,
+    write_video_receipt,
 )
 from keying_quality import (
     keying_preset_lock_issues,
@@ -95,6 +105,7 @@ from cover_quality import (
     cover_review_image_paths,
     cover_review_payload_issues,
     expand_retry_files as expand_cover_retry_files,
+    integrated_cover_issues,
     required_cover_issues,
 )
 
@@ -120,6 +131,8 @@ from story_agent_runtime import (
     STORY_STAGE_SEQUENCE,
     STAGE_ESTIMATES_MINUTES,
     assert_runnable,
+    accept_current_outputs,
+    deliver_best_valid_at_deadline,
     ensure_manifest_v2,
     existing_artifact_hashes,
     file_sha256,
@@ -138,6 +151,8 @@ from story_agent_runtime import (
     review_passes,
     freeze_runtime,
     runtime_elapsed_seconds,
+    runtime_deadline_state,
+    normalized_subprocess_environment,
     start_runtime,
     submit_video_job,
     supervisor_start_lock,
@@ -153,17 +168,20 @@ from story_project import (
     first_existing,
     init_project,
     load_config,
+    load_main_package_reference,
     load_manifest,
     project_paths,
     refresh_project_outputs,
     save_json,
     short_slug,
     slugify,
+    write_internal_agent_reports,
 )
 from story_qualification import build_promotion_report, record_human_signoff, record_unattended_launch, render_promotion_markdown
 from story_agent_observability import (
     acknowledge_notification,
     age_seconds,
+    append_ndjson,
     append_agent_event,
     emit_notification,
     event_log_path,
@@ -191,6 +209,7 @@ NATIVE_VISION_REVIEW_STAGES = frozenset(
         "story_images_review",
         "video_prompt_review",
         "video_review",
+        "video_review_bulk_confirmation",
         "release_preview",
         "release_video_review",
         "publish_package_review",
@@ -222,6 +241,22 @@ def resolve_agent_runtime_python() -> str:
             continue
         return str(candidate)
     return sys.executable
+
+
+def release_render_expected_bindings(
+    manifest_path: Path,
+    common_bindings: dict[str, Any],
+) -> dict[str, Any]:
+    """Return the variant-specific bindings expected from a render receipt."""
+    expected = dict(common_bindings)
+    if manifest_path.stem.endswith("_library"):
+        expected.update(
+            {
+                "demo_render_manifest_sha256": "not_applicable:library_variant",
+                "approved_demo_geometry_sha256": "not_applicable:library_variant",
+            }
+        )
+    return expected
 
 
 @dataclass(frozen=True)
@@ -267,6 +302,7 @@ class AgentContext:
             "story_images_review",
             "video_prompt_review",
             "video_review",
+            "video_review_bulk_confirmation",
             "release_preview",
             "release_video_review",
             "product_annotation_review",
@@ -423,6 +459,49 @@ class StoryAgent:
             return self._run_dag(max_steps=max_steps)
         return self._run_linear(max_steps=max_steps)
 
+    def _postcondition_checked_result(self, stage: str, result: StageResult) -> StageResult:
+        if result.status != "done" or not self.context.execute:
+            return result
+        manifest = self._manifest()
+        predicate = next((done for name, done, _action in self._stage_checks() if name == stage), None)
+        if predicate is None:
+            return StageResult("blocked", f"producer_postcondition_failed: 未找到阶段完成条件 {stage}", result.handoff)
+        try:
+            passed = bool(predicate(manifest))
+        except Exception as exc:
+            return StageResult(
+                "blocked",
+                f"producer_postcondition_failed: {stage} 返回 done，但后置条件检查异常：{type(exc).__name__}: {exc}",
+                result.handoff,
+            )
+        if not passed:
+            return StageResult(
+                "blocked",
+                f"producer_postcondition_failed: {stage} 返回 done，但当前产物/哈希后置条件仍为 false；"
+                "已停止同输入热循环，只允许明确的局部修复。",
+                result.handoff,
+            )
+        return result
+
+    def _deadline_exit_if_needed(self, manifest: dict[str, Any]) -> int | None:
+        state = runtime_deadline_state(manifest.get("agent", {}))
+        if not state["reached"]:
+            return None
+        try:
+            _updated, receipt = deliver_best_valid_at_deadline(
+                self.context.project_dir,
+                notes="达到 8 小时目标；停止新增审美返工并冻结当前最佳哈希有效版本。",
+            )
+        except AgentRuntimeError as exc:
+            freeze_runtime(manifest["agent"])
+            manifest["agent"]["status"] = "blocked"
+            manifest["agent"]["blocked_reason"] = f"deadline_reached_without_valid_delivery: {exc}"
+            from story_project import write_manifest
+            write_manifest(self.context.paths, manifest)
+            return 2
+        print(f"DEADLINE: 已冻结最佳有效版本：{receipt}")
+        return 0
+
     def _run_linear(self, max_steps: int) -> int:
         with job_lock(self.context.project_dir):
             manifest = self._manifest()
@@ -438,6 +517,9 @@ class StoryAgent:
             for _ in range(max_steps):
                 manifest = self._manifest()
                 assert_runnable(manifest, self.context.project_dir)
+                deadline_exit = self._deadline_exit_if_needed(manifest)
+                if deadline_exit is not None:
+                    return deadline_exit
                 stage_name, action = self._next_stage(manifest)
                 if self.context.execute:
                     self._reconcile_completed_stage_records(manifest, stage_name)
@@ -472,7 +554,7 @@ class StoryAgent:
                             "message": "线性调度阶段开始",
                         },
                     )
-                result = action(manifest)
+                result = self._postcondition_checked_result(stage_name, action(manifest))
                 if result.status == "failed":
                     critical_stage = stage_name in {
                         "source_edit",
@@ -538,6 +620,9 @@ class StoryAgent:
             while launched_attempts < max_steps:
                 manifest = self._manifest()
                 assert_runnable(manifest, self.context.project_dir)
+                deadline_exit = self._deadline_exit_if_needed(manifest)
+                if deadline_exit is not None:
+                    return deadline_exit
                 self._reconcile_all_completed_stage_records(manifest)
                 manifest = load_manifest(self.context.paths) or manifest
                 completed = self._completed_stage_names(manifest)
@@ -583,6 +668,7 @@ class StoryAgent:
                     merge_error = self._merge_worker_shadow(attempt)
                     if merge_error:
                         result = StageResult("failed", f"worker manifest 合并冲突：{merge_error}", attempt.result_file)
+                    result = self._postcondition_checked_result(attempt.stage, result)
                     self._record_stage(attempt.stage, result, terminal=False)
                     current = load_manifest(self.context.paths) or self._manifest()
                     current["agent"]["scheduler"].setdefault("running", {}).pop(attempt.stage, None)
@@ -846,7 +932,7 @@ class StoryAgent:
                 command.extend(["--codex-reasoning-effort", self.context.codex_reasoning_effort])
             if self.context.codex_worker_reasoning_effort:
                 command.extend(["--codex-worker-reasoning-effort", self.context.codex_worker_reasoning_effort])
-            env = os.environ.copy()
+            env = normalized_subprocess_environment()
             env["STORY_AGENT_MANIFEST_OVERRIDE"] = str(shadow_manifest)
             env["STORY_AGENT_PROJECT_ROOT"] = str(self.context.project_dir.expanduser().resolve())
             env["STORY_AGENT_WORKER_DIR"] = str(work_dir)
@@ -1285,8 +1371,7 @@ class StoryAgent:
         }
         storyboard = self._storyboard_path(manifest)
         image_dir = self._image_dir()
-        safe_project = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.context.slug) or "story"
-        staging_images = ROOT / "output" / "story_agent_cli" / safe_project / "codex_story_images" / "images"
+        staging_images = self._codex_stage_dir("codex_story_images") / "images"
         story_image_lineage = self._story_image_lineage_status(
             manifest,
             storyboard=storyboard,
@@ -1431,7 +1516,7 @@ class StoryAgent:
         heartbeat_limit = int(mutable_supervisor.get("heartbeat_timeout_seconds") or 120)
         recorded_supervisor_status = str(mutable_supervisor.get("status") or "")
         if supervisor_alive and heartbeat_age is not None and heartbeat_age > heartbeat_limit:
-            effective_supervisor_status = "unresponsive"
+            effective_supervisor_status = "running_heartbeat_stale"
         elif supervisor_alive:
             effective_supervisor_status = recorded_supervisor_status or "running"
         elif recorded_supervisor_status in {"completed", "cancelled", "terminal_bug"}:
@@ -1468,6 +1553,7 @@ class StoryAgent:
             effective = "passed" if name in completed else ("stale" if recorded == "passed" else recorded)
             running = name in running_attempts or effective in {"running", "reviewing"}
             attempt = running_attempts.get(name, {}) if isinstance(running_attempts.get(name), dict) else {}
+            review = record.get("review") if isinstance(record.get("review"), dict) else {}
             request_id = str(record.get("request_id") or attempt.get("attempt_id") or "")
             row = {
                 "stage": name,
@@ -1483,8 +1569,21 @@ class StoryAgent:
                 "request_id": request_id,
                 "actual_cost": float(record.get("actual_cost") or 0.0),
                 "message": str(record.get("message") or ""),
+                "why_running": str(
+                    attempt.get("why_running") or record.get("why_running") or record.get("message") or ""
+                ),
+                "retry_scope": str(record.get("retry_scope") or name),
+                "retry_files": list(
+                    record.get("retry_files")
+                    if isinstance(record.get("retry_files"), list)
+                    else review.get("retry_files") if isinstance(review.get("retry_files"), list) else []
+                ),
+                "estimated_remaining_seconds": int(record.get("estimated_remaining_seconds") or 0),
+                "postconditions": record.get("postconditions", {}),
                 "input_hashes": record.get("input_hashes", {}),
                 "output_hashes": record.get("output_hashes", {}),
+                "input_artifact_hashes": record.get("input_artifact_hashes", record.get("input_hashes", {})),
+                "output_artifact_hashes": record.get("output_artifact_hashes", record.get("output_hashes", {})),
                 "artifacts": record.get("artifacts", []),
             }
             stage_rows.append(row)
@@ -1655,6 +1754,50 @@ class StoryAgent:
         )
         if contact_sheets:
             evidence["latest_contact_sheet"] = str(contact_sheets[0])
+        release_preview = self.context.paths.status / "release_preview_frames" / "preview_contact_sheet.png"
+        if release_preview.is_file():
+            evidence["release_preview_contact_sheet"] = str(release_preview)
+        dashboard_state = self._read_json_object(self.context.paths.status / "story_agent_dashboard.json")
+        codex_usage_records = read_ndjson(self.context.paths.status / "codex_usage.ndjson", limit=5000)
+        known_codex_tokens = sum(
+            int(item.get("total_tokens") or 0)
+            for item in codex_usage_records
+            if isinstance(item.get("total_tokens"), int)
+        )
+        provider_cost = sum(float(row.get("actual_cost") or 0.0) for row in stage_rows)
+        render_stages = {
+            "assemble_final", "release_preview", "package_release",
+            "product_preflight", "product_package",
+        }
+        render_time_seconds = sum(
+            int(row.get("duration_seconds") or 0)
+            for row in stage_rows
+            if row.get("stage") in render_stages
+        )
+        formal_encode_time_seconds = sum(
+            int(row.get("duration_seconds") or 0)
+            for row in stage_rows
+            if row.get("stage") == "package_release"
+        )
+        video_generation_cost = sum(
+            float(row.get("actual_cost") or 0.0)
+            for row in stage_rows
+            if row.get("stage") == "generate_videos"
+        )
+        music_cost = sum(
+            float(row.get("actual_cost") or 0.0)
+            for row in stage_rows
+            if row.get("stage") in {"suno_generate", "assemble_music"}
+        )
+        budget = agent.get("budget") if isinstance(agent.get("budget"), dict) else {}
+        current_record = stage_records.get(current_stage) if isinstance(stage_records.get(current_stage), dict) else {}
+        current_attempt = running_attempts.get(current_stage) if isinstance(running_attempts.get(current_stage), dict) else {}
+        why_running = str(
+            current_attempt.get("why_running")
+            or current_record.get("why_running")
+            or current_record.get("message")
+            or (f"正在执行 {current_stage}" if current_stage and current_stage != "done" else "已完成")
+        )
 
         job_lock_path = self.context.paths.status / "story_agent.lock"
         job_lock_payload = self._read_json_object(job_lock_path)
@@ -1716,6 +1859,25 @@ class StoryAgent:
                 },
             },
             "provider_receipts": provider_receipts,
+            "dashboard": dashboard_state,
+            "why_running": why_running,
+            "retry_scope": str(current_record.get("retry_scope") or current_stage or ""),
+            "delivery_state": str(agent.get("delivery_state") or ""),
+            "cost_and_usage": {
+                "provider_cost_cny": round(provider_cost, 4),
+                "budget_spent_cny": round(float(budget.get("spent") or 0.0), 4),
+                "codex_total_tokens_reported": known_codex_tokens,
+                "codex_calls": len(codex_usage_records),
+                "codex_calls_without_cli_usage": sum(1 for item in codex_usage_records if item.get("total_tokens") is None),
+                "video_generation_cost_cny": round(video_generation_cost, 4),
+                "music_cost_cny": round(music_cost, 4) if music_cost else None,
+                "music_cost_status": "reported" if music_cost else "not_reported_by_local_runtime",
+                "imagegen_cost_cny": None,
+                "imagegen_cost_status": "not_reported_by_local_runtime",
+                "render_time_seconds": render_time_seconds,
+                "formal_encode_time_seconds": formal_encode_time_seconds,
+                "render_time_source": "stage_rows.duration_seconds",
+            },
             "notifications": notifications,
             "unacknowledged_notifications": sum(
                 1 for item in notifications if not item.get("acknowledged_at")
@@ -1738,14 +1900,21 @@ class StoryAgent:
     def _timing_status(self, agent_data: dict[str, Any]) -> dict[str, Any]:
         started_text = str(agent_data.get("started_at", ""))
         elapsed_hours = runtime_elapsed_seconds(agent_data) / 3600
+        deadline = runtime_deadline_state(agent_data)
         return {
             "started_at": started_text,
             "elapsed_hours": round(elapsed_hours, 3),
             "active_elapsed_seconds": round(runtime_elapsed_seconds(agent_data), 3),
-            "runtime_deadline_enabled": False,
-            "deadline_policy": "disabled",
-            "deadline_hours": 0.0,
-            "remaining_deadline_hours": None,
+            "runtime_deadline_enabled": deadline["enabled"],
+            "deadline_policy": deadline["deadline_behavior"],
+            "deadline_hours": deadline["deadline_hours"],
+            "target_delivery_seconds": deadline["target_delivery_seconds"],
+            "remaining_deadline_seconds": deadline["remaining_seconds"],
+            "remaining_deadline_hours": (
+                round(float(deadline["remaining_seconds"]) / 3600, 3)
+                if deadline["remaining_seconds"] is not None else None
+            ),
+            "deadline_reached": deadline["reached"],
         }
 
     def _recovery_action(self, manifest: dict[str, Any], next_stage: str) -> str:
@@ -1820,14 +1989,14 @@ class StoryAgent:
             ("product_preflight", self._has_product_preflight, self._stage_product_preflight),
             ("product_annotation", self._has_product_annotation, self._stage_product_annotation),
             ("product_annotation_review", self._has_product_annotation_review, self._stage_product_annotation_review),
-            ("product_package", self._has_product_package, self._stage_product_package),
-            ("product_package_review", self._has_product_package_review, self._stage_product_package_review),
             ("release_preview", self._has_release_preview, self._stage_release_preview),
             ("package_release", self._has_release_videos, self._stage_package_release),
             ("release_qa", self._has_release_qa, self._stage_release_qa),
             ("release_video_review", self._has_release_video_review, self._stage_release_video_review),
             ("publish_package", self._has_publish_package, self._stage_publish_package),
             ("publish_package_review", self._has_publish_package_review, self._stage_publish_package_review),
+            ("product_package", self._has_product_package, self._stage_product_package),
+            ("product_package_review", self._has_product_package_review, self._stage_product_package_review),
             ("final_delivery", self._has_final_delivery, self._stage_final_delivery),
             ("doctor", self._has_doctor_report, self._stage_doctor),
         ]
@@ -2940,6 +3109,20 @@ class StoryAgent:
                 *scene_images,
             ],
         )
+        required_quality_dimensions: list[str] = []
+        if not self._legacy_contract_policy(manifest):
+            try:
+                sample_plan = load_current_visual_sample_plan(
+                    self.context.project_dir,
+                    contract_consumer_path(self.context.project_dir, "storyboard_images"),
+                )
+                required_quality_dimensions = [
+                    str(value)
+                    for value in sample_plan.get("review_profile", {}).get("product_quality", [])
+                    if str(value)
+                ]
+            except (OSError, ValueError, KeyError, TypeError):
+                required_quality_dimensions = []
         result, payload = self._structured_review(
             stage="story_images_review",
             label="故事图片独立审核",
@@ -2955,7 +3138,10 @@ class StoryAgent:
                 "若合同的 storyboard_requirements 指定 required_field，机器可读 storyboard_plan 必须逐镜提供该字段且值必须属于合同 allowed_states；缺失或枚举无效是关键错误。"
                 "审核 JSON 的 evidence_matrix 必须逐镜写明：角色数量、身份/服装、关键物体数量、角色应在场/不应在场及画面证据；不得用“整体正常”代替逐项核对。"
                 "V3.5 required_v1 项目还必须分层写 contract_adherence 和 product_quality，并写 p0_errors。"
-                "product_quality 必须覆盖 audience_fit、composition、color、lighting、style_suitability；有角色时还要覆盖 character_design_fit、identity_coherence、anatomical_coherence。"
+                "contract_adherence 必须包含 passed=true 和非空 evidence。"
+                "product_quality 必须包含 passed=true 和 dimensions 数组；dimensions 每项必须是"
+                "{dimension,passed,score,evidence}，不得改写成以维度名为键的对象。"
+                f"本项目 dimensions 必须逐项覆盖：{', '.join(required_quality_dimensions)}。"
                 f"{ANATOMICAL_COHERENCE_REVIEW_RULE}"
                 "product_quality.style_contract 必须原样逐条审核当前视觉小样计划中的风格 description、required_traits、forbidden_traits；整体判断角色设计与渲染是否真正符合该风格和已通过参考图，不得仅因画面明亮、安全、物种可辨就判定风格通过。"
                 "style_contract 输出 description、description_fit=true、description_evidence，并分别用 required_traits[{trait,passed,evidence}] 和 forbidden_traits[{trait,absent,evidence}] 逐条举证。"
@@ -3051,9 +3237,6 @@ class StoryAgent:
         config = load_config()
         video_api = config.get("video_api", {}) if isinstance(config.get("video_api"), dict) else {}
         provider = self._modules().video_generator()
-        supported = provider.capabilities.supported
-        default_seconds = supported.get("default_duration") or 0
-        estimated_per_clip = provider.estimate_cost(float(default_seconds or 0))
         try:
             with jobs.open(encoding="utf-8-sig", newline="") as file:
                 job_rows = list(csv.DictReader(file))
@@ -3071,6 +3254,29 @@ class StoryAgent:
             if str(row.get("target_video_filename") or "").strip() not in before_targets
             and str(row.get("status") or "").strip() not in {"downloaded", "approved"}
         ]
+        quality_provider_overrides = {
+            str(row.get("video_quality_provider_override") or "").strip()
+            for row in pending_rows
+            if str(row.get("video_quality_provider_override") or "").strip()
+        }
+        if len(quality_provider_overrides) > 1:
+            return StageResult("blocked", "同一生成批次出现多个质量恢复 provider，无法可靠计费和提交。", jobs)
+        quality_provider_override = next(iter(quality_provider_overrides), "")
+        if quality_provider_override and quality_provider_override != provider.identity.adapter_name:
+            try:
+                quality_registry = build_registry_for_profile(
+                    self._modules().selection_profile(),
+                    config,
+                    ROOT,
+                    video_provider_override=quality_provider_override,
+                    execution_mode=self._modules().selection_execution_mode(),
+                )
+                provider = quality_registry.video_generator()
+            except Exception as exc:
+                return StageResult("blocked", f"视频质量恢复 provider 配置不可用：{exc}", jobs)
+        supported = provider.capabilities.supported
+        default_seconds = supported.get("default_duration") or 0
+        estimated_per_clip = provider.estimate_cost(float(default_seconds or 0))
 
         def estimate_row_cost(row: dict[str, str]) -> float:
             seconds = float(provider.resolve_request_seconds(row, default_seconds or 0))
@@ -3086,6 +3292,7 @@ class StoryAgent:
         from story_project import write_manifest
 
         write_manifest(self.context.paths, manifest)
+        write_internal_agent_reports(self.context.project_dir)
         generate_command = [
             "generate",
             "--jobs-csv", str(jobs),
@@ -3094,6 +3301,8 @@ class StoryAgent:
             "--project-dir", str(self.context.project_dir),
             "--execution-mode", "test" if self._modules().selection_profile() == "mock-video" else "production",
         ]
+        if quality_provider_override:
+            generate_command.extend(["--provider", quality_provider_override])
         if bool(video_api.get("submit_all_first", False)):
             generate_command.append("--submit-all-first")
             generate_command.extend(["--max-submit-first", str(int(video_api.get("max_submit_first", 20)))])
@@ -3126,9 +3335,119 @@ class StoryAgent:
         else:
             ledger.release(reservation, reason=result.message)
         write_manifest(self.context.paths, manifest)
+        write_internal_agent_reports(self.context.project_dir)
         if result.status == "done" and self._has_generated_video_files(manifest):
             self._complete_contract_consumer(manifest, "image_video")
-        if result.status != "done" and str(video_api.get("fallback_provider", "")).lower() == "browser":
+        fallback_provider_name = str(video_api.get("fallback_provider", "")).strip()
+        if (
+            result.status != "done"
+            and fallback_provider_name
+            and fallback_provider_name.lower() != "browser"
+            and fallback_provider_name != provider.identity.adapter_name
+        ):
+            try:
+                fallback_registry = build_registry_for_profile(
+                    self._modules().selection_profile(),
+                    config,
+                    ROOT,
+                    video_provider_override=fallback_provider_name,
+                    execution_mode=self._modules().selection_execution_mode(),
+                )
+                fallback_provider = fallback_registry.video_generator()
+            except Exception as exc:
+                return StageResult("blocked", f"图生视频备用 provider 配置不可用：{exc}", jobs)
+
+            try:
+                with jobs.open(encoding="utf-8-sig", newline="") as file:
+                    fallback_rows = list(csv.DictReader(file))
+            except (OSError, csv.Error):
+                fallback_rows = []
+            fallback_before_targets = {
+                str(row.get("target_video_filename") or "").strip()
+                for row in fallback_rows
+                if str(row.get("target_video_filename") or "").strip()
+                and (videos_dir / str(row.get("target_video_filename") or "").strip()).is_file()
+            }
+            remaining_rows = [
+                row
+                for row in fallback_rows
+                if str(row.get("target_video_filename") or "").strip()
+                and str(row.get("target_video_filename") or "").strip() not in fallback_before_targets
+            ]
+            if remaining_rows:
+                fallback_supported = fallback_provider.capabilities.supported
+                fallback_default_seconds = fallback_supported.get("default_duration") or 0
+
+                def estimate_fallback_row_cost(row: dict[str, str]) -> float:
+                    seconds = float(
+                        fallback_provider.resolve_request_seconds(row, fallback_default_seconds or 0)
+                    )
+                    return fallback_provider.estimate_cost(seconds)
+
+                fallback_estimate = round(
+                    sum(estimate_fallback_row_cost(row) for row in remaining_rows), 2
+                )
+                manifest = self._manifest()
+                fallback_ledger = BudgetLedger(manifest)
+                try:
+                    fallback_reservation = fallback_ledger.authorize(
+                        fallback_estimate,
+                        label=f"图生视频备用 {len(remaining_rows)} 个镜头",
+                        critical=True,
+                    )
+                except BudgetExceeded as exc:
+                    return StageResult("blocked", str(exc), jobs)
+                write_manifest(self.context.paths, manifest)
+                write_internal_agent_reports(self.context.project_dir)
+
+                fallback_command = [
+                    *generate_command,
+                    "--provider", fallback_provider_name,
+                ]
+                fallback_result = self._workflow(
+                    fallback_command,
+                    f"主模型失败，切换 {fallback_provider.capabilities.model_or_tool} 生成剩余片段",
+                )
+                manifest = self._manifest()
+                fallback_ledger = BudgetLedger(manifest)
+                try:
+                    with jobs.open(encoding="utf-8-sig", newline="") as file:
+                        fallback_settled_rows = list(csv.DictReader(file))
+                except (OSError, csv.Error):
+                    fallback_settled_rows = []
+                fallback_new_rows = [
+                    row
+                    for row in fallback_settled_rows
+                    if str(row.get("target_video_filename") or "").strip()
+                    and str(row.get("target_video_filename") or "").strip() not in fallback_before_targets
+                    and (videos_dir / str(row.get("target_video_filename") or "").strip()).is_file()
+                ]
+                if fallback_result.status == "done" or fallback_new_rows:
+                    fallback_actual = round(
+                        sum(estimate_fallback_row_cost(row) for row in fallback_new_rows), 2
+                    )
+                    fallback_ledger.settle(
+                        fallback_reservation,
+                        fallback_actual,
+                        provider=(
+                            fallback_provider.capabilities.provider
+                            or fallback_provider.identity.adapter_name
+                        ),
+                    )
+                else:
+                    fallback_ledger.release(fallback_reservation, reason=fallback_result.message)
+                write_manifest(self.context.paths, manifest)
+                write_internal_agent_reports(self.context.project_dir)
+                if fallback_result.status == "done" and self._has_generated_video_files(manifest):
+                    self._complete_contract_consumer(manifest, "image_video")
+                    return StageResult(
+                        "done",
+                        f"主模型未完成，已由 {fallback_provider.capabilities.model_or_tool} 补齐视频。",
+                        jobs,
+                    )
+                result = fallback_result
+
+        if result.status != "done" and fallback_provider_name.lower() == "browser":
             remaining = max(0, self._job_count(jobs) - after)
             provider_name = str(video_api.get("browser_provider_name", "Flow"))
             handoff = self.context.paths.video_jobs / "browser_video_fallback.md"
@@ -3248,9 +3567,34 @@ class StoryAgent:
                 str(row.get("scene")): "；".join(str(item) for item in row.get("issues", []))
                 for row in payload.get("clips", []) if isinstance(row, dict) and row.get("issues")
             }
-            moved = self._quarantine_story_videos(indices, jobs, reasons)
-            if moved:
-                return StageResult("retrying", f"视频运动/来源 QA 未通过，仅排队重做镜头：{', '.join(map(str, moved))}", evidence)
+            attempts = self._video_provider_attempt_counts(indices, jobs)
+            provider_indices = [scene for scene in indices if attempts.get(scene, 0) < 1]
+            editorial_indices = [scene for scene in indices if scene not in provider_indices]
+            instructions = {
+                str(scene): {
+                    "instruction": reasons.get(str(scene)) or "机器 QA 硬伤，仅局部修复该镜头",
+                    "provider_prompt": "保持同一角色和场景，动作简化、结构稳定、无文字水印",
+                    "hard_defect_code": "machine_qa_failure",
+                }
+                for scene in indices
+            }
+            moved = self._quarantine_story_videos(
+                provider_indices,
+                jobs,
+                {str(scene): instructions[str(scene)] for scene in provider_indices},
+            ) if provider_indices else []
+            editorial_done = self._editorial_fallback_story_videos(
+                editorial_indices,
+                jobs,
+                {str(scene): instructions[str(scene)] for scene in editorial_indices},
+            ) if editorial_indices else []
+            if moved or editorial_done:
+                parts = []
+                if moved:
+                    parts.append("仅排队一次付费修复镜头：" + ", ".join(map(str, moved)))
+                if editorial_done:
+                    parts.append("付费额度已用尽，采用相邻镜头延展：" + ", ".join(map(str, editorial_done)))
+                return StageResult("retrying", "视频运动/来源 QA 局部恢复：" + "；".join(parts), evidence)
         return StageResult("blocked", "视频运动/来源 QA 未通过：" + ", ".join(map(str, indices)), evidence)
 
     def _stage_video_review(self, manifest: dict[str, Any]) -> StageResult:
@@ -3261,6 +3605,26 @@ class StoryAgent:
         videos_dir = self.context.paths.video_jobs / "videos"
         if jobs is None or qa_report is None or not frame_paths:
             return StageResult("blocked", "缺少视频任务、QA 报告或多帧抽样，无法独立审核。")
+        try:
+            with jobs.open(encoding="utf-8-sig", newline="") as handle:
+                expected_scenes = [int(row["scene"]) for row in csv.DictReader(handle)]
+        except (OSError, ValueError, KeyError):
+            return StageResult("blocked", "视频 jobs CSV 缺少有效 scene，无法独立审核。", jobs)
+        review_dir = self.context.paths.status / "reviews"
+        policy_path = review_dir / "video_review_policy.json"
+        save_json(policy_path, {
+            "version": VIDEO_REVIEW_POLICY_VERSION,
+            "blocking_hard_defect_codes": sorted(VIDEO_REVIEW_HARD_DEFECT_CODES),
+            "non_blocking_soft_deviations": [
+                "screen_direction_or_gaze_mismatch",
+                "minor_action_order_or_gesture_mismatch",
+                "camera_motion_amount_mismatch",
+                "minor_state_boundary_timing",
+                "small_prop_count_or_persistence_mismatch",
+                "decorative_continuity_or_minor_crop_difference",
+            ],
+            "rule": "软偏差只记录，不得降低到 85 分以下、写入 critical_errors 或触发付费重做。",
+        })
         frame_order = {name: index for index, name in enumerate(("start", "q1", "mid", "q3", "end"))}
         clip_dirs = sorted(path for path in frames_dir.iterdir() if path.is_dir())
         contact_sheets: list[Path] = []
@@ -3289,6 +3653,7 @@ class StoryAgent:
                 self.context.paths.status / "qa_videos_report.json",
                 videos_dir,
                 frames_dir,
+                policy_path,
                 *(path for path in [contract_consumer_path(self.context.project_dir, "image_video")] if path.exists()),
                 *(item for item in [self._visual_continuity_contract_path()] if item is not None),
             ],
@@ -3299,37 +3664,110 @@ class StoryAgent:
             bundle=bundle,
             images=contact_sheets,
             rubric=(
-                "结合逐镜 motion_shot、机器运动证据和首尾/25%/50%/75%抽帧检查动作崩坏、反物理现象、角色漂移、黑帧、文字水印和镜头连续性。"
-                "逐镜判断 subject_action、environment_motion、camera_motion 是否自然协同并符合 expected_motion；安静镜头允许合理低运动，不能把运动越多误当越好。"
-                "逐镜输出 per_scene_reviews，并明确 story_state_consistent 与 adjacent_handoff_consistent；检查 entry_state、exit_state、screen_direction、视线和移动方向，无解释瞬移、反转或状态跳变必须失败。"
-                "逐镜头数清四足动物的腿，检查嘴/五官位置、物种与颜色身份、角色应出现/不应出现状态、信息因果是否正确。"
-                "必须把每个镜头的 start/q1/mid/q3/end 与起始分镜图逐一比较，evidence_matrix 中记录五个时点的角色数量、关键物体数量、形状拓扑（如实心/空心）和依据文件名。"
-                "若 bundle 包含 visual_continuity_contract.json，必须按合同逐镜核对状态、story_boundaries、transitions、required/forbidden 规则；状态越界或转折不成立必须列入 critical_errors 并重做，不能只写“角色一致”。"
-                "如果证据与结论冲突，以画面为准并必须判定不通过；不得在没有逐时点证据时声称“全程一致”。"
-                "输出 retry_indices（需要重新调用视频生成的镜头编号整数数组）。肢体或五官崩坏、主体变形、角色错误在场、关键动作错误属于关键错误。"
+                f"必须遵守 {policy_path}，quality_policy 必须写为 {VIDEO_REVIEW_POLICY_VERSION}。"
+                "交付标准是批量故事视频可看可用，不是逐字逐动作复刻拍摄脚本。只有黑帧/损坏、水印文字、严重肢体五官崩坏、角色融合消失或身份物种错误、抽搐鬼畜、严重反物理，以及核心故事事件被反转或缺失到镜头不可用，才是硬伤。"
+                "左右方向或视线不精确、动作顺序或手势小偏差、镜头运动量差异、状态早晚少量切换、小道具数量或全程可见性、装饰连续性等均为软偏差；软偏差只能写入 issues，不得写入 hard_defects/critical_errors/retry_indices，也不得令可看镜头低于 85 分。"
+                "结合机器证据和 start/q1/mid/q3/end 抽帧逐镜输出 per_scene_reviews；story_state_consistent 和 adjacent_handoff_consistent 仍须给布尔值用于审计，但单独为 false 不构成付费重做理由。"
+                "hard_defects 与 critical_errors 必须是对象数组，每项包含 scene、hard_defect_code、evidence，代码只能取 policy 文件列出的值；retry_indices 必须与硬伤镜头完全一致。"
+                "retry_instructions 必须是对象数组，每项包含 scene、hard_defect_code、instruction、provider_prompt；provider_prompt 是真正提交供应商的完整精简修正版，必须针对硬伤改变原输入、保留镜头核心动作，UTF-16 字符数不超过 120。"
+                "若 jobs/receipt 标记 video_source_kind=editorial_adjacent_extension，这是为保证无人值守完片而采用的相邻镜头延展：应按剪辑后的整体叙事是否仍可理解来审核；原镜头动作未复现本身不是硬伤，只有造成核心故事反转或整段不可理解时才可判硬伤。"
+                "若只是无法确认细节或证据不足，应列为 issues 并放行，不得把推测升级为硬伤。"
             ),
         )
+        if payload:
+            policy_issues = video_review_policy_issues(payload, expected_scenes=expected_scenes)
+            if policy_issues:
+                return StageResult(
+                    "blocked",
+                    "视频审核输出未满足硬伤策略，已禁止付费重做：" + "；".join(policy_issues),
+                    result.handoff,
+                )
         if result.status == "done":
-            try:
-                with jobs.open(encoding="utf-8-sig", newline="") as handle:
-                    expected_scenes = [int(row["scene"]) for row in csv.DictReader(handle)]
-            except (OSError, ValueError, KeyError):
-                expected_scenes = []
-            semantic_issues = review_semantic_issues(
-                payload or {}, expected_scenes=expected_scenes if not self._legacy_contract_policy(manifest) else None,
-            )
-            if semantic_issues:
-                return StageResult("blocked", "视频动作/承接审核结论存在关键冲突：" + "；".join(semantic_issues), result.handoff)
             return result
-        rejected_root = self.context.paths.status / "rejected" / "story_videos"
-        quality_attempts = 1 + len([path for path in rejected_root.iterdir() if path.is_dir()]) if rejected_root.exists() else 1
-        if payload and self._can_retry_stage("video_review", critical=True, attempts_override=quality_attempts):
+        if payload:
             indices = self._review_retry_indices(payload)
             if indices:
-                instructions = payload.get("retry_instructions", {})
-                moved = self._quarantine_story_videos(indices, jobs, instructions if isinstance(instructions, dict) else {})
-                if moved:
-                    return StageResult("retrying", f"视频审核未通过，已保留失败版本并排队重做镜头：{', '.join(map(str, moved))}", result.handoff)
+                defaults = load_config().get("agent_defaults", {})
+                systemic_fraction = float(defaults.get("video_review_systemic_failure_fraction", 1 / 3))
+                systemic_failure = bool(expected_scenes and len(indices) / len(expected_scenes) > systemic_fraction)
+                if systemic_failure:
+                    confirmation_bundle = write_review_bundle(
+                        review_dir / "video_review_bulk_confirmation_bundle.json",
+                        [bundle, result.handoff, policy_path],
+                    )
+                    confirmation_result, confirmation_payload = self._structured_review(
+                        stage="video_review_bulk_confirmation",
+                        label="图生视频大批量硬伤二次独立复核",
+                        bundle=confirmation_bundle,
+                        images=contact_sheets,
+                        rubric=(
+                            f"这是超过全片 {systemic_fraction:.0%} 的系统性硬伤候选，必须从零复核，不得照抄首次审核。"
+                            f"严格遵守 {policy_path}，quality_policy={VIDEO_REVIEW_POLICY_VERSION}。"
+                            "软语义偏差一律放行；只有画面不可用的白名单硬伤才能进入 hard_defects、critical_errors 和 retry_indices。"
+                            "输出完整 per_scene_reviews、hard_defects、critical_errors、retry_indices、retry_instructions 和 evidence_matrix；重试提示必须重写共同的提示词策略，减少并发动作和易畸变描述，并且是不超过120字符的完整供应商提示。"
+                        ),
+                    )
+                    if not confirmation_payload:
+                        return StageResult("blocked", "大批量硬伤二次复核没有形成有效结论，未发起付费重做。", confirmation_bundle)
+                    confirmation_issues = video_review_policy_issues(
+                        confirmation_payload, expected_scenes=expected_scenes,
+                    )
+                    if confirmation_issues:
+                        return StageResult(
+                            "blocked",
+                            "大批量硬伤二次复核不满足硬伤策略，未发起付费重做：" + "；".join(confirmation_issues),
+                            confirmation_result.handoff,
+                        )
+                    payload = confirmation_payload
+                    result = confirmation_result
+                    indices = self._review_retry_indices(payload)
+                    systemic_failure = bool(expected_scenes and len(indices) / len(expected_scenes) > systemic_fraction)
+                    if result.status == "done":
+                        canonical_payload = dict(payload)
+                        canonical_payload["artifact_sha256"] = file_sha256(bundle)
+                        save_json(review_dir / "video_review_review.json", canonical_payload)
+                        return StageResult("done", "大批量硬伤候选经二次独立复核后全部判为软偏差，现有视频通过。", review_dir / "video_review_review.json")
+                retry_counts = self._video_review_retry_counts(indices, jobs)
+                provider_attempts = self._video_provider_attempt_counts(indices, jobs)
+                fallback_after = int(defaults.get("video_review_editorial_fallback_after_retries", 3))
+                editorial_indices = [
+                    scene for scene in indices
+                    if retry_counts.get(scene, 0) >= fallback_after or provider_attempts.get(scene, 0) >= 1
+                ]
+                provider_indices = [scene for scene in indices if scene not in editorial_indices]
+                instructions = self._normalize_video_retry_instructions(payload.get("retry_instructions", []))
+                moved: list[int] = []
+                if provider_indices:
+                    provider_instructions = {
+                        str(scene): instructions[str(scene)] for scene in provider_indices if str(scene) in instructions
+                    }
+                    provider_override = str(load_config().get("video_api", {}).get("fallback_provider") or "").strip()
+                    should_switch_provider = systemic_failure or any(
+                        retry_counts.get(scene, 0) >= 1 for scene in provider_indices
+                    )
+                    moved = self._quarantine_story_videos(
+                        provider_indices,
+                        jobs,
+                        provider_instructions,
+                        count_review_retry=True,
+                        provider_override=provider_override if should_switch_provider else "",
+                    )
+                editorial_done: list[int] = []
+                if editorial_indices:
+                    editorial_instructions = {
+                        str(scene): instructions[str(scene)] for scene in editorial_indices if str(scene) in instructions
+                    }
+                    editorial_done = self._editorial_fallback_story_videos(
+                        editorial_indices, jobs, editorial_instructions,
+                    )
+                if moved or editorial_done:
+                    parts = []
+                    if moved:
+                        parts.append("已改写提示并切换备用模型重做：" + ", ".join(map(str, moved)))
+                    if editorial_done:
+                        parts.append("已用相邻镜头延展完成无人值守剪辑降级：" + ", ".join(map(str, editorial_done)))
+                    return StageResult("retrying", "视频硬伤自动恢复：" + "；".join(parts), result.handoff)
+                return StageResult("blocked", "视频硬伤重试没有形成可证明变化的供应商提示词，未移动文件、未发起付费调用。", result.handoff)
         return result
 
     def _stage_apply_review(self, manifest: dict[str, Any]) -> StageResult:
@@ -3525,9 +3963,12 @@ class StoryAgent:
             if source is None:
                 return StageResult("blocked", "缺少语义源，不能验证逐产物语义呈现计划。")
             try:
-                load_current_artifact_semantic_plan(self.context.project_dir, source)
+                semantic_plan = load_current_artifact_semantic_plan(self.context.project_dir, source)
             except (OSError, ValueError, KeyError, TypeError) as exc:
                 return StageResult("blocked", f"逐产物语义呈现计划缺失或过期，禁止最终合成：{exc}")
+            semantic_cards = self._ensure_semantic_card_assets(semantic_plan)
+            if semantic_cards.status != "done":
+                return semantic_cards
             command.extend([
                 "--project-dir", str(self.context.project_dir),
                 "--artifact-semantic-plan", str(self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"),
@@ -3543,6 +3984,140 @@ class StoryAgent:
             # script, aligned independently by the existing synthesizer.
             command.extend(["--subtitle-script", str(confirmed_subtitles)])
         return self._workflow(command, "合成背景成片")
+
+    def _semantic_card_receipt_issues(self, plan: dict[str, Any]) -> list[str]:
+        card_dir = self.context.paths.images / "semantic_cards"
+        receipt_path = card_dir / "semantic_card_generation_receipt.json"
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return ["semantic_card_generation_receipt_missing_or_invalid"]
+        issues: list[str] = []
+        plan_path = semantic_plan_path(self.context.project_dir)
+        if receipt.get("schema_version") != "story-semantic-card-generation/v1":
+            issues.append("semantic_card_receipt_schema_invalid")
+        if receipt.get("artifact_semantic_plan_sha256") != file_sha256(plan_path):
+            issues.append("semantic_card_plan_binding_mismatch")
+        if receipt.get("imagegen_native") is not True:
+            issues.append("semantic_cards_not_imagegen_native")
+        if receipt.get("post_render_text_overlay") is not False:
+            issues.append("semantic_cards_use_post_render_text_overlay")
+        try:
+            attempt_count = int(receipt.get("attempt_count") or 0)
+        except (TypeError, ValueError):
+            attempt_count = 0
+        if not 1 <= attempt_count <= 3:
+            issues.append("semantic_card_generation_attempt_count_invalid")
+        items = receipt.get("cards") if isinstance(receipt.get("cards"), list) else []
+        by_kind = {str(item.get("card_kind") or ""): item for item in items if isinstance(item, dict)}
+        expected = {
+            str(card["card_kind"]): card
+            for card in plan.get("visual_cards", [])
+            if isinstance(card, dict)
+        }
+        for kind, card in expected.items():
+            item = by_kind.get(kind)
+            if item is None or str(item.get("text") or "") != str(card.get("text") or ""):
+                issues.append(f"semantic_card_text_binding_mismatch:{kind}")
+                continue
+            path = Path(str(item.get("path") or "")).expanduser().resolve()
+            try:
+                path.relative_to(card_dir.resolve())
+            except ValueError:
+                issues.append(f"semantic_card_path_outside_project:{kind}")
+                continue
+            if not path.is_file() or item.get("sha256") != file_sha256(path):
+                issues.append(f"semantic_card_file_binding_mismatch:{kind}")
+                continue
+            try:
+                with Image.open(path) as image:
+                    if image.size != (1920, 1080):
+                        issues.append(f"semantic_card_size_invalid:{kind}")
+            except OSError:
+                issues.append(f"semantic_card_unreadable:{kind}")
+            if item.get("ocr_passed") is not True:
+                issues.append(f"semantic_card_ocr_not_passed:{kind}")
+        if set(by_kind) != set(expected):
+            issues.append("semantic_card_set_mismatch")
+        return sorted(set(issues))
+
+    def _ensure_semantic_card_assets(self, plan: dict[str, Any]) -> StageResult:
+        cards = [card for card in plan.get("visual_cards", []) if isinstance(card, dict)]
+        if not cards:
+            return StageResult("done", "当前语义计划不需要片头/寓意卡。")
+        issues = self._semantic_card_receipt_issues(plan)
+        if issues and not self.context.execute:
+            return StageResult("done", "dry-run：将生成 ImageGen 一体化片头/寓意卡。")
+        card_dir = self.context.paths.images / "semantic_cards"
+        card_dir.mkdir(parents=True, exist_ok=True)
+        if issues:
+            handoff = card_dir / "semantic_cards_imagegen_handoff.md"
+            card_rows = []
+            for card in cards:
+                path = card_dir / f"{card['card_kind']}.png"
+                card_rows.append({
+                    "card_kind": card["card_kind"],
+                    "semantic_kind": card["semantic_kind"],
+                    "text": card["text"],
+                    "source_line_numbers": card["source_line_numbers"],
+                    "output": str(path),
+                })
+            handoff.write_text(
+                "\n".join([
+                    "# ImageGen 一体化片头与寓意卡",
+                    "",
+                    "必须直接调用原生 ImageGen 生成下列 1920×1080 最终图卡。准确中文文字、画面与装饰必须在同一次生成/编辑结果中一体成型；禁止 Pillow、Canvas、HTML、SVG、FFmpeg drawtext 或任何程序后期叠字。",
+                    "主账号竖屏包装参考图不适用于这些图卡，禁止引用或混用。视觉应依据本故事与已审核视觉合同自行设计。",
+                    "OCR 错字时只重生成对应图卡，最多两轮定向修正。",
+                    "",
+                    "```json",
+                    json.dumps(card_rows, ensure_ascii=False, indent=2),
+                    "```",
+                    "",
+                    f"完成后写 `{card_dir / 'semantic_card_generation_receipt.json'}`，schema_version=story-semantic-card-generation/v1，artifact_semantic_plan_sha256={file_sha256(semantic_plan_path(self.context.project_dir))}，imagegen_native=true，post_render_text_overlay=false，attempt_count 记录实际生成轮次（1–3，即首次加最多两轮定向修正）。cards 逐项记录 card_kind、text、path、sha256、ocr_passed=true。",
+                ]) + "\n",
+                encoding="utf-8",
+            )
+            result = self._codex_task(
+                stage="semantic_cards",
+                label="ImageGen 一体化片头/寓意卡生成",
+                handoff=handoff,
+                prompt="严格执行 handoff，直接生成并保存最终图卡与哈希/OCR 回执；不要只总结。",
+            )
+            if result.status != "done":
+                return result
+            remaining = self._semantic_card_receipt_issues(plan)
+            if remaining:
+                return StageResult("blocked", "ImageGen 片头/寓意卡未通过机器绑定：" + "；".join(remaining), handoff)
+
+        # Static ImageGen cards are only the first half of the production
+        # contract.  Formal assembly requires short, loopable provider clips
+        # whose native text has passed first/middle/last-frame stability QA.
+        motion_windows = [
+            {**card, "start": 0.0, "end": 4.0}
+            for card in cards
+        ]
+        motion_request = write_semantic_card_motion_request(
+            card_dir=card_dir,
+            windows=motion_windows,
+            artifact_semantic_plan_sha256=file_sha256(semantic_plan_path(self.context.project_dir)),
+        )
+        motion_receipt = card_dir / "semantic_card_motion_receipt.json"
+        motion_issues = semantic_card_motion_receipt_issues(motion_request, motion_receipt)
+        if not motion_issues:
+            return StageResult(
+                "done",
+                "ImageGen 片头/寓意卡及文字锁定微动版已绑定当前语义计划。",
+                motion_receipt,
+            )
+        if not self.context.execute:
+            return StageResult("done", "dry-run：将生成文字锁定的片头/寓意卡微动版。", motion_request)
+        return StageResult(
+            "blocked",
+            "正式合成不接受静态片头/寓意卡；需先执行当前图生视频请求并通过文字稳定性抽检："
+            + "；".join(motion_issues),
+            card_dir / "semantic_card_motion_handoff.md",
+        )
 
     def _stage_release_assets(self, manifest: dict[str, Any]) -> StageResult:
         if not self._legacy_contract_policy(manifest):
@@ -3560,11 +4135,19 @@ class StoryAgent:
         handoff = self.context.paths.release / "theme_assets" / "theme_assets_codex_handoff.txt"
         if contract_context is not None and handoff.exists():
             self._append_contract_handoff(handoff, contract_context, "品牌、发布布局、真人与故事画面安全区")
+        reference_images: list[Path] = []
+        if not self._legacy_contract_policy(manifest):
+            try:
+                reference = load_main_package_reference()
+            except (OSError, ValueError) as exc:
+                return StageResult("blocked", f"package_reference_missing: {exc}", handoff)
+            reference_images = [Path(str(reference["asset_path"]))]
         result = self._codex_task(
             stage="release_assets",
             label="Codex 原生发布视觉素材生成",
             handoff=handoff if handoff.exists() else None,
             prompt=build_release_assets_agent_prompt(handoff),
+            images=reference_images,
         )
         if result.status == "done" and not self._has_release_assets(self._manifest()):
             return StageResult("blocked", "Codex CLI 子任务已返回，但发布视觉素材/keying 参数没有完整落盘。", handoff if handoff.exists() else None)
@@ -3576,6 +4159,36 @@ class StoryAgent:
             refresh_keying_quality_from_preset(preset)
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
             return StageResult("blocked", f"无法为当前抠像 candidate 生成分区机器证据：{exc}", preset)
+        if not self._legacy_contract_policy(manifest):
+            # The annotation pass may have finalized crop/alignment parameters
+            # after the first product preflight. Re-render only the short Demo
+            # evidence here so Release and the later full Demo share the same
+            # real source, transform and keying inputs without making Release
+            # depend on the complete product package.
+            product_context = contract_consumer_path(self.context.project_dir, "product_package")
+            if not product_context.is_file():
+                return StageResult("blocked", "缺少 product_package 合同上下文，无法刷新共用 Demo 短预演。")
+            demo_preview_command = [
+                "product-package-preflight-project",
+                "--project-dir", str(self.context.project_dir),
+                "--story-contract-context", str(product_context),
+            ]
+            demo_params = self.context.paths.status / "product_package_work" / "demo_params.json"
+            if demo_params.is_file():
+                try:
+                    data = json.loads(demo_params.read_text(encoding="utf-8"))
+                    for key, flag in (
+                        ("demo_person_crop_mode", "--demo-person-crop-mode"),
+                        ("demo_person_vertical_align", "--demo-person-vertical-align"),
+                        ("demo_person_crop_bottom_ratio", "--demo-person-crop-bottom-ratio"),
+                    ):
+                        if key in data:
+                            demo_preview_command.extend([flag, str(data[key])])
+                except (OSError, ValueError, TypeError, json.JSONDecodeError) as exc:
+                    return StageResult("blocked", f"Demo 最终布局参数损坏：{exc}", demo_params)
+            demo_preview = self._workflow(demo_preview_command, "按最终参数刷新 Demo/发布共用短预演")
+            if demo_preview.status != "done":
+                return demo_preview
         command = ["preview-release-project", "--project-dir", str(self.context.project_dir)]
         if not self._legacy_contract_policy(manifest):
             command.extend([
@@ -3616,13 +4229,17 @@ class StoryAgent:
             bundle=bundle,
             images=images,
             rubric=(
-                "先比较 keying_candidates.jpg 中站立帧与大手势帧的 3×3 参数候选，并逐项引用 evidence 下的"
+                "先比较 keying_candidates.jpg：RVM 项目比较当前素材同一时序 Alpha 的 0/1/2 像素内收候选，"
+                "颜色键项目比较站立帧与大手势帧的 3×3 参数候选；并逐项引用 evidence 下的"
                 "head_hair、左右 shoulder_forearm_hand、garment_outline、适用时的 hem/legs、full_body 和 high_contrast_edges 证据。"
                 "检查发丝自然度、肩膀/手臂/手部边缘、衣服与下摆完整性、绿色溢出、灰黑/亮色 halo、锯齿、透明孔洞、背景透漏，"
                 "以及人物是否像贴纸、人物与背景光感是否割裂。再检查主账号和宝库号预览中的人物比例与位置、故事框覆盖、"
                 "字幕安全区以及 A（人物+故事框）、B（故事框）、C（人物+主题背景）三种构图。人物必须保留拍摄原构图和原始大小，禁止因自动检测框被缩小或切手。"
+                "A 镜只在人物首次出现、手臂自然放下的校准帧检查基础 X 轴：躯干主体应落在故事框右侧留白，不得居中大面积压框。"
+                "后续伸手、转身等自然动作与框相交允许，不得因此判失败；只有基础位置跳动或异常重定位才是错误。"
+                "必须核对主账号上下包装图实际被引用、与稳定参考图的简洁层级一致，且没有泄漏参考图中的“历史故事/煮酒论英雄/4分50秒/8岁以上”。"
                 "同时检查 LUT 是否只应用一次、肤色是否自然、画面是否灰暗或过饱和，以及模糊背景是否有人眼可见的矩形拼接块。"
-                "抠像截断、主体内部误透明、明显 spill/halo、人物被框遮挡、框体露缝、明显矩形背景块均属于 P0/Critical，不能被总分抵消。"
+                "抠像截断、主体内部误透明、明显 spill/halo、初始躯干因错误锚点大面积压框、框体露缝、明显矩形背景块均属于 P0/Critical，不能被总分抵消；后续手势的自然相交不属于 P0。"
                 "失败时在 retry_instructions 中明确给出候选 id 或可执行的 keying_preset 参数修订建议。"
             ),
         )
@@ -3650,7 +4267,8 @@ class StoryAgent:
                     f"候选对照图：`{keying_candidates}`",
                     f"独立审核：`{review_path}`",
                     f"预览说明：`{handoff}`",
-                    "优先从候选中选择最能兼顾头发、手部和大手势的 similarity/blend，并同步写入 keying_candidate；"
+                    "如果 keyer=rvm，必须从当前素材的 0/1/2 像素内收候选中选择最能兼顾发丝/手部保留与色边清理的候选，"
+                    "同步写入 keying_candidate 与 rvm_alpha_choke_pixels；如果是颜色键，才调整 similarity/blend。"
                     "只修改参数文件，不得伪造批准文件；完成后下一轮会重新渲染并由新上下文审核。",
                 ]
             )
@@ -3732,7 +4350,12 @@ class StoryAgent:
                 target = frame_dir / video.stem / f"frame_{index:02d}_{timestamp:.1f}s.jpg"
                 target.parent.mkdir(parents=True, exist_ok=True)
                 command = ["ffmpeg", "-y", "-v", "error", "-ss", f"{timestamp:.3f}", "-i", str(video), "-frames:v", "1", "-q:v", "2", str(target)]
-                process = subprocess.run(command, text=True, capture_output=True)
+                process = subprocess.run(
+                    command,
+                    text=True,
+                    capture_output=True,
+                    env=normalized_subprocess_environment(),
+                )
                 if process.returncode == 0 and target.exists():
                     frames.append(target)
             video_tail_frames = sorted((frame_dir / video.stem).glob("*.jpg"))[-14:]
@@ -3782,30 +4405,13 @@ class StoryAgent:
         )
         if result.status == "done":
             return result
-        preset = self.context.paths.release / "keying" / "keying_preset.json"
-        if payload and preset.exists() and self._can_retry_stage("release_video_review", critical=True):
-            previous_sha = file_sha256(preset)
-            review_path = self.context.paths.status / "reviews" / "release_video_review_review.json"
-            revision = self._codex_task(
-                stage=f"release_video_revision_{int(self._manifest().get('agent', {}).get('stages', {}).get('release_video_review', {}).get('attempts', 1))}",
-                label="发布终片参数自动修订",
-                handoff=review_path,
-                prompt=(
-                    f"根据独立审核 `{review_path}` 和终片抽帧修改 `{preset}` 中最小必要的抠像/布局参数。"
-                    "不要伪造批准；修改后系统会重新走预览审核和终片审核。"
-                ),
-                images=[contact_sheet],
-            )
-            if revision.status != "done":
-                return revision
-            if file_sha256(preset) == previous_sha:
-                return StageResult("blocked", "终片审核未通过，但参数修订器没有产生可验证修改。", review_path)
-            archive = self.context.paths.status / "rejected" / "release_videos" / time.strftime("%Y%m%d-%H%M%S")
-            archive.mkdir(parents=True, exist_ok=True)
-            for video in videos:
-                shutil.move(str(video), str(archive / video.name))
-            return StageResult("retrying", "终片审核未通过，已保留失败成片并回到预览/渲染链重做。", review_path)
-        return result
+        review_path = self.context.paths.status / "reviews" / "release_video_review_review.json"
+        return StageResult(
+            "blocked",
+            "正式编码后独立视觉审核未通过；现有正式视频和已锁定参数均已保留，"
+            "不会自动修改抠像/布局，也不会触发整片重编码。可执行局部技术修复，或由用户接受当前版本。",
+            review_path if review_path.exists() else result.handoff,
+        )
 
     def _stage_publish_package(self, manifest: dict[str, Any]) -> StageResult:
         contract_context = self._prepare_contract_consumer(manifest, "cover")
@@ -3819,8 +4425,8 @@ class StoryAgent:
             self._append_contract_handoff(handoff, contract_context, "品牌、角色身份与封面布局安全区")
             payload = json.loads(contract_context.read_text(encoding="utf-8"))
             with handoff.open("a", encoding="utf-8") as handle:
-                handle.write("\n## required_v1 封面创意底图生产覆盖指令\n\n")
-                handle.write("本节覆盖 handoff 中所有 legacy `cover_*.png`、生图文字和生图 Logo 指令。只生成 `creative_base_*.png` 与 `cover_creative_lineage.json`；正式文字和官方 Logo 由 Runtime 确定性渲染。\n\n")
+                handle.write("\n## required_v1 ImageGen 一体成型封面覆盖指令\n\n")
+                handle.write("本节覆盖 handoff 中所有无字底图、Runtime 叠字和后期 Logo 指令。最终六张 `cover_*.png` 的画面、准确中文标题、信息和装饰必须由 Codex ImageGen 一体成型；禁止任何本地脚本后期叠字。\n\n")
                 handle.write("以下已审核投影必须完整进入最终 ImageGen handoff，不得丢弃或自行扩展身份锚点：\n\n```json\n")
                 handle.write(json.dumps(payload.get("contract_projection", {}), ensure_ascii=False, sort_keys=True, indent=2))
                 handle.write("\n```\n")
@@ -3835,25 +4441,29 @@ class StoryAgent:
                     required_v1=contract_context is not None,
                 ),
             )
-            if result.status == "done" and contract_context is not None and not self._has_publish_creative_bases():
-                return StageResult("blocked", "Codex CLI 子任务已返回，但 required_v1 六张无字创意底图或创意血缘没有完整落盘。", handoff)
             if result.status == "done" and contract_context is None and not self._has_publish_package_files():
                 return StageResult("blocked", "Codex CLI 子任务已返回，但主账号/宝库号封面没有完整落盘。", handoff)
             if result.status == "done":
+                if contract_context is not None:
+                    receipt = self.context.paths.publish / "cover_integrated_generation.json"
+                    issues, _ = integrated_cover_issues(
+                        self.context.paths.publish,
+                        receipt_path=receipt,
+                        expected_title=str(manifest.get("story", {}).get("name") or ""),
+                    )
+                    if issues:
+                        return StageResult("blocked", "一体成型 ImageGen 封面收据未通过：" + "；".join(issues), handoff)
+                    if not self._has_publish_package_files():
+                        return StageResult("blocked", "ImageGen 已返回，但六张最终封面或文案不完整。", receipt)
+                    self._complete_contract_consumer(manifest, "cover")
+                    return StageResult("done", "六张最终封面已由 Codex ImageGen 一体成型生成。", receipt)
                 try:
-                    cover_spec = None
-                    if contract_context is not None:
-                        cover_spec = compile_cover_spec(
-                            contract_context,
-                            self.context.paths.status / "contracts" / "consumers" / "cover.compiled.json",
-                        )
-                    receipt = apply_fixed_cover_branding(self.context.project_dir, contract_spec=cover_spec)
+                    receipt = apply_fixed_cover_branding(self.context.project_dir)
                 except (OSError, ValueError) as exc:
-                    return StageResult("blocked", f"封面确定性文字/品牌定版失败：{exc}", handoff)
+                    return StageResult("blocked", f"封面品牌定版失败：{exc}", handoff)
                 if not self._has_publish_package_files():
-                    return StageResult("blocked", "封面确定性定版结束，但六张最终封面或文案不完整。", receipt)
-                self._complete_contract_consumer(manifest, "cover")
-                return StageResult("done", "已从六张创意底图确定性排版标题、信息与唯一官方 Logo。", receipt)
+                    return StageResult("blocked", "封面定版结束，但六张最终封面或文案不完整。", receipt)
+                return StageResult("done", "legacy 六张封面已完成。", receipt)
             return result
         return result
 
@@ -3888,7 +4498,7 @@ class StoryAgent:
             self.context.paths.status / "reviews" / "publish_package_bundle.json",
             [
                 *review_images, *copy_files, qa_report, qa_json, lineage,
-                self.context.paths.status / "publish_cover_branding.json",
+                publish / "cover_integrated_generation.json",
                 publish / "cover_render_manifest.json",
                 publish / "cover_creative_lineage.json",
                 publish / "publish_asset_manifest.json",
@@ -3905,7 +4515,7 @@ class StoryAgent:
                 "比例构图和安全区。结合 cover_lineage.json 检查：主账号 4:3 是唯一主母版，主账号另外两比例由它编辑衍生；"
                 "宝库号 4:3 由主母版移除真人得到，另两比例由宝库号母版衍生。六张必须保持同一故事角色、服装、字体、色彩和装饰语言，不能像六次随机生成，也不能只是机械裁切。"
                 "版式应遵循历史样例的扁平简洁信息层级，标题与时长/年龄集中，底部适用说明克制，不能自创复杂木框、嵌套框或多层装饰。"
-                "必须对照 publish_cover_branding.json 确认六张封面使用同一个原始 Logo SHA-256 的确定性叠加；生成的花朵/仿写字样不得冒充品牌 Logo。"
+                "必须对照 cover.compiled.json 与 cover_integrated_generation.json 确认六张最终封面均由 Codex ImageGen 一体成型生成，标题、信息、装饰和画面属于同一次生成/编辑结果，不得使用 Pillow、Canvas、HTML 或脚本后期叠字。official_assets 为空时保持零 Logo，生成的花朵/仿写字样不得冒充品牌 Logo。"
                 "必须逐张审核六个实际高分辨率文件（contact sheet 只能辅助总览），evidence_matrix 为六张逐一写结论，"
                 "并使用 main/covers/cover_*.png 或 library/covers/cover_*.png 的发布目录相对路径标识，不能只写同名文件名。"
                 + (
@@ -3916,7 +4526,7 @@ class StoryAgent:
                     if required_v1 else ""
                 )
                 + "产品质量使用风格中性的 audience_fit、style_suitability、composition、color、lighting、character_design_fit、identity_coherence、anatomical_coherence；"
-                "不得把可爱度作为所有故事默认标准。以下任一项必须列入 p0_errors/critical_errors，不能被总分抵消：标题错误或缺失、底图残留假文字、Logo 缺失/重复/伪造、"
+                "不得把可爱度作为所有故事默认标准。以下任一项必须列入 p0_errors/critical_errors，不能被总分抵消：标题错误或缺失、底图残留假文字、Logo 数量不符合合同/重复/伪造、"
                 "关键角色或真人被裁切、角色身份漂移、母版血缘失效、比例/安全区/受保护区域碰撞。"
                 "失败时输出 retry_files，使用相对发布物料目录的路径；Runtime 会只扩展真正的 lineage 后代。"
             ),
@@ -4040,7 +4650,7 @@ class StoryAgent:
                 "marked_text 必须逐字忠实，不得改代词、对白、形容词或句尾。重音、停连、语气和动作提示应适合儿童表演。结合预览检查示范视频裁切参数是否会截断手部或身体。"
                 "notes 必须像有经验的幼儿园故事老师当面提醒朗读者：温和、自然、短句，先给角色当下的心情或画面，再落到声音/目光/上半身动作；出现‘内容重点、节奏落点、情绪层次、完成收束’等干硬分析术语必须退回。"
                 "长段落的重音必须覆盖动作、情绪、反差和转折，只有一两个重音或只标人物名词必须退回。示范视频应保留原片构图、自然停顿、拟声词和完整句尾。"
-                "示范视频是原主持人的表演参考，允许原声和字幕保留‘我是绵羊姐姐’，但不得叠加额外品牌 Logo；不要把这一点误判为对外文稿泄漏。"
+                "示范视频是原主持人的表演参考，允许原声和字幕保留‘我是绵羊姐姐’，并应保留一个经品牌合同批准的原 Logo；不得删除、伪造或重复叠加 Logo。不要把主持人口播误判为对外文稿泄漏。"
                 "漏掉 consumer_manuscript 中的故事正文、错重音导致语义改变属于关键错误。"
                 "required_v1 审核必须逐 block 写 evidence_matrix，每项必须包含 source_line_indices、original_text、fidelity、emotion_fit、"
                 "pause_emphasis_quality、performance_guidance_quality 和 passed=true/false。"
@@ -4133,7 +4743,7 @@ class StoryAgent:
                 "核对基础版必须包含故事文稿、朗读标注、音乐、示范视频、背景图片；进阶版必须包含故事文稿、朗读标注、音乐、"
                 "示范视频、背景图片、含/无字幕 PPT、含/无字幕背景视频、A镜无人物背景视频。检查文件名、重复/缺失、对外禁用口吻和 QA 报告。"
                 "06_资料包 对外层只能包含基础版与进阶版两个客户目录，内部过程文件必须位于 99_项目状态。缺少任一必备文件属于关键错误。"
-                "逐张检查含字幕/无字幕 PPT 的首张、中间、末张、最长字幕和边界证据；字幕需精确、单行或最多两行、黑条不越界，无字幕版不得残留字幕。"
+                "逐张检查含字幕/无字幕 PPT 的首张、中间、末张、最长字幕和边界证据；字幕默认使用小字号单行，只有合同明确记录的例外才允许两行；黑条不得越界，无字幕版不得残留字幕。"
                 "核对客户文稿与朗读标注只包含各自 semantic plan 选择的正文，标题唯一，无主持人自我介绍、占位符、内部路径或 Agent/Codex 痕迹。"
                 "required_v1 必须写 p0_errors 和 evidence_matrix；每张传入的 PPT 证据必须用相对 ppt_evidence 目录的路径逐项引用。"
                 "缺页、重复页、字幕污染/越界、图片拉伸、旧 BGM、漏/增/改客户正文、伪造 source_line_indices 属于 P0，不得被总分抵消。"
@@ -4200,9 +4810,7 @@ class StoryAgent:
         log_dir = self.context.paths.status / "agent_logs"
         log_dir.mkdir(parents=True, exist_ok=True)
         log_path = log_dir / f"{int(started)}_{log_name}.log"
-        env = os.environ.copy()
-        if env_overrides:
-            env.update(env_overrides)
+        env = normalized_subprocess_environment(overrides=env_overrides)
         process = subprocess.Popen(
             command,
             cwd=str(ROOT),
@@ -4582,8 +5190,7 @@ class StoryAgent:
                 command.extend(["--image", str(image)])
         display_command = list(command)
         display_command[display_command.index(prompt_text)] = "<prompt>"
-        env = os.environ.copy()
-        env.update(self._module_subprocess_env())
+        env = normalized_subprocess_environment(overrides=self._module_subprocess_env())
         process = subprocess.Popen(
             command,
             cwd=str(ROOT),
@@ -4639,14 +5246,51 @@ class StoryAgent:
             + (stderr or ""),
             encoding="utf-8",
         )
+        self._record_codex_usage(
+            stage=stage,
+            model=selected_model,
+            reasoning_effort=selected_reasoning,
+            stdout=stdout,
+            stderr=stderr,
+            return_code=int(process.returncode or 0),
+        )
         if process.returncode != 0:
             status = classify_command_failure((stdout or "") + "\n" + (stderr or ""))
             return StageResult(status, f"Codex CLI 子任务失败：{log_path}", log_path)
         return StageResult("done", str(log_path), output_path)
 
+    def _record_codex_usage(
+        self,
+        *,
+        stage: str,
+        model: str,
+        reasoning_effort: str,
+        stdout: str,
+        stderr: str,
+        return_code: int,
+    ) -> None:
+        combined = (stdout or "") + "\n" + (stderr or "")
+        matches = re.findall(r"(?i)tokens?\s+used\s*[:：]?\s*([0-9][0-9,]*)", combined)
+        total_tokens = int(matches[-1].replace(",", "")) if matches else None
+        append_ndjson(
+            self.context.paths.status / "codex_usage.ndjson",
+            {
+                "kind": "story_codex_usage_v1",
+                "timestamp": now(),
+                "stage": stage,
+                "model": model,
+                "reasoning_effort": reasoning_effort,
+                "total_tokens": total_tokens,
+                "usage_status": "reported" if total_tokens is not None else "not_reported_by_cli",
+                "return_code": return_code,
+            },
+        )
+
     def _codex_stage_dir(self, stage: str) -> Path:
-        safe_project = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.context.slug) or "story"
-        path = ROOT / "output" / "story_agent_cli" / safe_project / stage
+        # Staging is project-local so a changed Codex worktree can never make
+        # completed story assets appear missing or bind a manifest to another
+        # checkout. Historical ROOT/output staging remains untouched evidence.
+        path = self.context.paths.status / "agent_work" / stage
         if not self.read_only:
             path.mkdir(parents=True, exist_ok=True)
         return path
@@ -4836,7 +5480,8 @@ class StoryAgent:
                 "",
                 "这是全自动 Agent 模式，不需要向用户确认分镜。状态机已经写好并锁定分镜文本；必须只读使用该文件，绝对不得改写、合并、删减或重排任何一行。",
                 "可以创建或更新视觉圣经和图生视频提示词文件，然后连续生成图片；镜头编号必须逐行对应锁定分镜。",
-                f"必须先写入机器可读分镜计划：`{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}`。每镜包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description；story_text 必须逐行等于锁定分镜。",
+                f"必须先写入机器可读分镜计划：`{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}`。每镜包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description、speaker、listener、narrative_focus、emotion、shot_intent、transition_reason；story_text 必须逐行等于锁定分镜。无说话者/听话者时写 none。",
+                "镜头选择必须依据人物关系、说话者/听话者、情绪变化和叙事重点；不机械地逢对白就正反打，也不得让整段对白始终保持同一多人全景。",
                 "机器可读分镜计划的顶层还必须原样记录合同请求清单中的 contract_schema_version、story_contract_sha256、story_contract_dependency_sha256 和 contract_projection，并把逐镜列表放在 shots 字段；contract_projection 不得删减、改写或用模型推断覆盖。",
                 "机器可读分镜计划还必须原样记录当前逐产物语义呈现计划的 artifact_semantic_plan_sha256、artifact_semantic_plan_schema_version、artifact_semantic_plan_dependency_sha256；缺失或旧绑定将被 Runtime 拒绝。",
                 "机器可读分镜计划还必须原样记录 visual_sample_schema_version、visual_sample_plan_sha256、visual_sample_review_bundle_sha256、visual_sample_lock_sha256；旧小样或旧审核绑定将被 Runtime 拒绝。",
@@ -4937,6 +5582,21 @@ class StoryAgent:
     def _story_image_generation_manifest_path(self) -> Path:
         return self.context.paths.status / "story_images_generation_manifest.json"
 
+    def _story_image_binding_storyboard(self, fallback: Path | None = None) -> Path | None:
+        """Return the authoritative storyboard path used by image-generation receipts.
+
+        Production writes the lineage receipt against the immutable staging storyboard,
+        then copies that storyboard into the project.  Completion/status checks must use
+        the same authoritative path; comparing the receipt to the copied destination path
+        makes an otherwise identical batch permanently stale and causes a DAG hot loop.
+        """
+
+        staging_storyboard = (
+            self._codex_stage_dir("codex_story_images")
+            / f"{self.context.slug}_storyboard_lines.txt"
+        )
+        return staging_storyboard if staging_storyboard.is_file() else fallback
+
     def _story_image_generation_binding(self, context: Path, storyboard: Path) -> dict[str, Any]:
         sample_lock = visual_sample_paths(self.context.project_dir)["lock"]
         if not context.is_file() or not storyboard.is_file() or not sample_lock.is_file():
@@ -5034,8 +5694,7 @@ class StoryAgent:
         return [1] if not self._has_story_visual_control() else []
 
     def _has_story_visual_control(self) -> bool:
-        safe_project = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in self.context.slug) or "story"
-        staging = ROOT / "output" / "story_agent_cli" / safe_project / "codex_story_images"
+        staging = self._codex_stage_dir("codex_story_images")
         plan = staging / f"{self.context.slug}_storyboard_plan.json"
         storyboard = staging / f"{self.context.slug}_storyboard_lines.txt"
         return (
@@ -5107,6 +5766,9 @@ class StoryAgent:
             "visible_characters", "excluded_characters", "continuity_group", "appearance_ids", "visual_description",
             "scale_basis", "current_story_state", "visual_state_evidence",
         }
+        director_required = {
+            "speaker", "listener", "narrative_focus", "emotion", "shot_intent", "transition_reason",
+        }
         motion_required = {
             "subject_action", "environment_motion", "camera_motion", "entry_state", "exit_state",
             "screen_direction", "adjacent_handoff", "expected_motion",
@@ -5123,7 +5785,9 @@ class StoryAgent:
             if not str(row["shot_size"]).strip() or not str(row["focal_character"]).strip():
                 return False
             if not self._legacy_contract_policy(self._manifest()):
-                if not motion_required.issubset(row):
+                if not motion_required.issubset(row) or not director_required.issubset(row):
+                    return False
+                if any(not str(row.get(key) or "").strip() for key in director_required):
                     return False
                 scale_basis = row.get("scale_basis")
                 if not isinstance(scale_basis, dict) or not isinstance(scale_basis.get("applicable"), bool):
@@ -5268,6 +5932,7 @@ class StoryAgent:
             ["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "default=nw=1:nk=1", str(path)],
             text=True,
             capture_output=True,
+            env=normalized_subprocess_environment(),
         )
         try:
             duration = float(process.stdout.strip())
@@ -5304,7 +5969,11 @@ class StoryAgent:
         try:
             existing = json.loads(review_path.read_text(encoding="utf-8"))
             if isinstance(existing, dict) and existing.get("artifact_sha256") == bundle_sha:
-                payload = existing
+                reusable = True
+                if stage == "story_images_review" and not self._legacy_contract_policy(self._manifest()):
+                    reusable = not self._story_image_quality_review_issues(existing)
+                if reusable:
+                    payload = existing
         except (OSError, json.JSONDecodeError):
             pass
         if payload is None:
@@ -5348,6 +6017,76 @@ class StoryAgent:
             if number > 0 and number not in result:
                 result.append(number)
         return result
+
+    def _normalize_video_retry_instructions(self, raw: Any) -> dict[str, dict[str, str]]:
+        """Accept legacy mappings and current structured rows without dropping corrections."""
+
+        normalized: dict[str, dict[str, str]] = {}
+        values: list[tuple[Any, Any]] = []
+        if isinstance(raw, list):
+            values = [(item.get("scene", item.get("scene_index")), item) for item in raw if isinstance(item, dict)]
+        elif isinstance(raw, dict):
+            values = list(raw.items())
+        for raw_scene, value in values:
+            try:
+                scene = str(int(raw_scene))
+            except (TypeError, ValueError):
+                continue
+            if isinstance(value, dict):
+                instruction = str(value.get("instruction") or value.get("reason") or "").strip()
+                provider_prompt = str(value.get("provider_prompt") or "").strip()
+                hard_defect_code = str(value.get("hard_defect_code") or "").strip()
+            else:
+                instruction = str(value or "").strip()
+                provider_prompt = instruction
+                hard_defect_code = ""
+            if instruction and provider_prompt:
+                normalized[scene] = {
+                    "instruction": instruction,
+                    "provider_prompt": provider_prompt,
+                    "hard_defect_code": hard_defect_code,
+                }
+        return normalized
+
+    def _video_review_retry_counts(self, indices: list[int], jobs: Path) -> dict[int, int]:
+        """Return per-scene quality recovery history without imposing an artificial stop."""
+
+        try:
+            with jobs.open(encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        except (OSError, csv.Error):
+            return {scene: 0 for scene in indices}
+        selected = set(indices)
+        counts: dict[int, int] = {}
+        for row in rows:
+            try:
+                scene = int(row.get("scene") or 0)
+                count = int(row.get("video_review_retry_count") or 0)
+            except (TypeError, ValueError):
+                continue
+            if scene in selected:
+                counts[scene] = count
+        return {scene: counts.get(scene, 0) for scene in indices}
+
+    def _video_provider_attempt_counts(self, indices: list[int], jobs: Path) -> dict[int, int]:
+        """Return paid regeneration counts so all QA paths share one spend cap."""
+
+        try:
+            with jobs.open(encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        except (OSError, csv.Error):
+            return {scene: 0 for scene in indices}
+        selected = set(indices)
+        counts: dict[int, int] = {}
+        for row in rows:
+            try:
+                scene = int(row.get("scene") or 0)
+                count = int(row.get("provider_attempt") or 0)
+            except (TypeError, ValueError):
+                continue
+            if scene in selected:
+                counts[scene] = max(0, count)
+        return {scene: counts.get(scene, 0) for scene in indices}
 
     def _can_retry_stage(
         self,
@@ -5425,17 +6164,91 @@ class StoryAgent:
         indices: list[int],
         jobs: Path,
         retry_instructions: dict[str, Any] | None = None,
+        *,
+        count_review_retry: bool = False,
+        provider_override: str = "",
+        allow_exhausted_provider_for_local_fallback: bool = False,
     ) -> list[int]:
         with jobs.open(encoding="utf-8-sig", newline="") as file:
             reader = csv.DictReader(file)
             rows = list(reader)
             fieldnames = list(reader.fieldnames or [])
+        selected = set(indices)
+        normalized = self._normalize_video_retry_instructions(retry_instructions or {})
+        prompt_changes: dict[str, dict[str, str]] = {}
+        selected_rows: dict[int, dict[str, str]] = {}
+        for row in rows:
+            try:
+                scene = int(row.get("scene", "0"))
+            except ValueError:
+                continue
+            if scene in selected:
+                selected_rows[scene] = row
+        if set(selected_rows) != selected or set(map(int, normalized)) != selected:
+            return []
+        # Each paid source clip gets at most one automatic provider
+        # regeneration. Further recovery must be local/editorial or explicitly
+        # user-authorized; it may not silently spend again.
+        for row in selected_rows.values():
+            try:
+                if (
+                    int(row.get("provider_attempt") or 0) >= 1
+                    and not allow_exhausted_provider_for_local_fallback
+                ):
+                    return []
+            except (TypeError, ValueError):
+                return []
+        for scene in sorted(selected):
+            instruction = normalized[str(scene)]
+            provider_prompt = instruction["provider_prompt"].strip()
+            prompt_chars = len(provider_prompt.encode("utf-16-le")) // 2
+            if not instruction["instruction"].strip() or not provider_prompt or prompt_chars > 120:
+                return []
+            previous_sha = str(selected_rows[scene].get("provider_prompt_sha256") or "").strip()
+            updated_sha = hashlib.sha256(provider_prompt.encode("utf-8")).hexdigest()
+            try:
+                recovery_cycle = int(selected_rows[scene].get("video_review_retry_count") or 0) + 1
+            except ValueError:
+                recovery_cycle = 1
+            strategies = (
+                "动作简化，只保留一个核心行为，避免并发动作。",
+                "固定镜头并减慢主体动作，避免快速肢体变化。",
+                "主体保持稳定，只做最小自然动作，优先保证结构完整。",
+            )
+            strategy = ""
+            if previous_sha and previous_sha == updated_sha:
+                strategy = strategies[min(recovery_cycle - 1, len(strategies) - 1)]
+            elif count_review_retry and recovery_cycle >= 2:
+                strategy = strategies[min(recovery_cycle - 2, len(strategies) - 1)]
+            if strategy:
+                candidate = strategy + provider_prompt
+                if len(candidate.encode("utf-16-le")) // 2 > 120:
+                    candidate = strategy + instruction["instruction"].strip()
+                if len(candidate.encode("utf-16-le")) // 2 > 120:
+                    candidate = strategy
+                provider_prompt = candidate
+                normalized[str(scene)]["provider_prompt"] = provider_prompt
+                prompt_chars = len(provider_prompt.encode("utf-16-le")) // 2
+                updated_sha = hashlib.sha256(provider_prompt.encode("utf-8")).hexdigest()
+            prompt_changes[str(scene)] = {
+                "previous_provider_prompt_sha256": previous_sha,
+                "updated_provider_prompt_sha256": updated_sha,
+                "provider_prompt_chars": str(prompt_chars),
+                "provider_override": provider_override,
+            }
+
         quarantine = self.context.paths.status / "rejected" / "story_videos" / time.strftime("%Y%m%d-%H%M%S")
         quarantine.mkdir(parents=True, exist_ok=True)
         moved: list[int] = []
-        selected = set(indices)
-        if "provider_attempt" not in fieldnames:
-            fieldnames.append("provider_attempt")
+        retry_fields = (
+            "provider_attempt", "provider_retry_prompt", "previous_provider_prompt_sha256",
+            "retry_hard_defect_code", "video_quality_provider_override", "previous_video_model",
+        )
+        if count_review_retry:
+            retry_fields = (*retry_fields, "video_review_retry_count")
+        for key in retry_fields:
+            if key not in fieldnames:
+                fieldnames.append(key)
         for row in rows:
             try:
                 scene = int(row.get("scene", "0"))
@@ -5454,10 +6267,14 @@ class StoryAgent:
             # client_business_id even if an independent prompt review later
             # normalizes the retry prompt back to the previous wording.
             save_json(quarantine / f"scene_{scene:02d}_rejected_job.json", row)
+            previous_provider_sha = str(row.get("provider_prompt_sha256") or "").strip()
+            previous_video_model = str(row.get("video_model") or "").strip()
             for key in (
                 "task_id", "video_url", "error", "api_response", "query_response",
                 "video_source_kind", "video_provider", "video_model", "video_execution_mode",
                 "production_eligible", "video_receipt_path", "video_receipt_sha256",
+                "provider_prompt", "provider_prompt_chars", "provider_prompt_sha256",
+                "provider_request_seconds", "client_business_id",
             ):
                 if key in row:
                     row[key] = ""
@@ -5466,9 +6283,20 @@ class StoryAgent:
             except ValueError:
                 provider_attempt = 0
             row["provider_attempt"] = str(provider_attempt + 1)
-            instruction = str((retry_instructions or {}).get(str(scene)) or "").strip()
-            if instruction and instruction not in row.get("prompt", ""):
-                row["prompt"] = row.get("prompt", "").rstrip() + " 严格重试约束：" + instruction
+            instruction = normalized[str(scene)]
+            if instruction["instruction"] not in row.get("prompt", ""):
+                row["prompt"] = row.get("prompt", "").rstrip() + " 硬伤定向修复：" + instruction["instruction"]
+            row["provider_retry_prompt"] = instruction["provider_prompt"]
+            row["previous_provider_prompt_sha256"] = previous_provider_sha
+            row["retry_hard_defect_code"] = instruction["hard_defect_code"]
+            row["video_quality_provider_override"] = provider_override
+            row["previous_video_model"] = previous_video_model
+            if count_review_retry:
+                try:
+                    review_retry_count = int(row.get("video_review_retry_count") or "0")
+                except ValueError:
+                    review_retry_count = 0
+                row["video_review_retry_count"] = str(review_retry_count + 1)
             row["status"] = "todo"
             moved.append(scene)
         with jobs.open("w", encoding="utf-8-sig", newline="") as file:
@@ -5482,15 +6310,137 @@ class StoryAgent:
         if qa_json.exists():
             shutil.move(str(qa_json), str(quarantine / qa_json.name))
         save_json(quarantine / "retry_manifest.json", {
-            "version": 1,
+            "version": 2,
             "retry_indices": moved,
-            "retry_instructions": retry_instructions or {},
+            "retry_instructions": normalized,
+            "prompt_changes": prompt_changes,
             "jobs_csv": str(jobs),
         })
         frames_dir = self.context.paths.status / "video_review_frames"
         if frames_dir.exists():
             shutil.move(str(frames_dir), str(quarantine / frames_dir.name))
         return moved
+
+    def _editorial_fallback_story_videos(
+        self,
+        indices: list[int],
+        jobs: Path,
+        retry_instructions: dict[str, Any],
+    ) -> list[int]:
+        """Replace persistently broken shots with an audited adjacent-shot extension.
+
+        The rejected provider result is still preserved by the normal quarantine
+        path.  This is an editorial omission fallback, not a claim that the local
+        copy came from a paid provider.
+        """
+
+        try:
+            with jobs.open(encoding="utf-8-sig", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        except (OSError, csv.Error):
+            return []
+        by_scene = {
+            int(row["scene"]): row for row in rows
+            if str(row.get("scene") or "").isdigit()
+        }
+        selected = set(indices)
+        videos_dir = self.context.paths.video_jobs / "videos"
+        source_archive = (
+            self.context.paths.status / "editorial_fallback_sources" / time.strftime("%Y%m%d-%H%M%S")
+        )
+        source_archive.mkdir(parents=True, exist_ok=True)
+        sources: dict[int, tuple[int, Path]] = {}
+        for scene in indices:
+            candidates = sorted(
+                (candidate for candidate in by_scene if candidate != scene and candidate not in selected),
+                key=lambda candidate: (abs(candidate - scene), candidate),
+            )
+            if not candidates:
+                candidates = sorted(
+                    (candidate for candidate in by_scene if candidate != scene),
+                    key=lambda candidate: (abs(candidate - scene), candidate),
+                )
+            for source_scene in candidates:
+                source_row = by_scene[source_scene]
+                source = videos_dir / str(source_row.get("target_video_filename") or "")
+                if not source.is_file():
+                    continue
+                archived = source_archive / f"scene_{scene:02d}_from_{source_scene:02d}{source.suffix}"
+                shutil.copy2(source, archived)
+                sources[scene] = (source_scene, archived)
+                break
+        if set(sources) != selected:
+            return []
+
+        moved = self._quarantine_story_videos(
+            indices,
+            jobs,
+            retry_instructions,
+            count_review_retry=True,
+            allow_exhausted_provider_for_local_fallback=True,
+        )
+        if set(moved) != selected:
+            return []
+        with jobs.open(encoding="utf-8-sig", newline="") as handle:
+            reader = csv.DictReader(handle)
+            updated_rows = list(reader)
+            fieldnames = list(reader.fieldnames or [])
+        for field in (
+            "editorial_fallback_source_scene", "video_source_kind", "video_provider",
+            "video_model", "video_execution_mode", "production_eligible",
+            "video_receipt_path", "video_receipt_sha256", "task_id", "client_business_id",
+        ):
+            if field not in fieldnames:
+                fieldnames.append(field)
+        completed: list[int] = []
+        for row in updated_rows:
+            try:
+                scene = int(row.get("scene") or 0)
+            except ValueError:
+                continue
+            if scene not in selected:
+                continue
+            source_scene, archived = sources[scene]
+            target = videos_dir / str(row.get("target_video_filename") or "")
+            target.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(archived, target)
+            row["status"] = "downloaded"
+            row["editorial_fallback_source_scene"] = str(source_scene)
+            row["video_source_kind"] = "editorial_adjacent_extension"
+            row["video_provider"] = "local_editorial"
+            row["video_model"] = "adjacent-extension-v1"
+            row["video_execution_mode"] = "production"
+            row["production_eligible"] = "true"
+            row["task_id"] = f"editorial-{uuid.uuid4().hex}"
+            row["client_business_id"] = f"story-editorial-{uuid.uuid4().hex}"
+            receipt, receipt_sha = write_video_receipt(
+                jobs,
+                row,
+                target,
+                provider="local_editorial",
+                model="adjacent-extension-v1",
+                source_kind="editorial_adjacent_extension",
+                execution_mode="production",
+                production_eligible=True,
+            )
+            row["video_receipt_path"] = str(receipt)
+            row["video_receipt_sha256"] = receipt_sha
+            completed.append(scene)
+        with jobs.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(updated_rows)
+        save_json(source_archive / "editorial_fallback_manifest.json", {
+            "version": 1,
+            "scenes": completed,
+            "sources": {
+                str(scene): {"source_scene": sources[scene][0], "archived_source": str(sources[scene][1])}
+                for scene in completed
+            },
+            "jobs_csv": str(jobs),
+            "reason": "provider retries exhausted; adjacent visual extended to preserve unattended completion",
+        })
+        return completed
 
     def _quarantine_publish_files(self, relative_files: list[str]) -> list[Path]:
         publish = self.context.paths.publish.resolve()
@@ -5743,7 +6693,7 @@ class StoryAgent:
         if self._legacy_contract_policy(manifest):
             return True
         context = contract_consumer_path(self.context.project_dir, "storyboard_images")
-        storyboard = self._storyboard_path(manifest)
+        storyboard = self._story_image_binding_storyboard(self._storyboard_path(manifest))
         return storyboard is not None and self._story_image_generation_complete(manifest, context, storyboard)
 
     def _has_story_image_files(self, manifest: dict[str, Any]) -> bool:
@@ -5755,7 +6705,16 @@ class StoryAgent:
         return expected > 0 and all((image_dir / self._story_image_filename(index)).exists() for index in range(1, expected + 1))
 
     def _has_story_images_review(self, manifest: dict[str, Any]) -> bool:
-        return self._review_stage_current("story_images_review")
+        if not self._review_stage_current("story_images_review"):
+            return False
+        if self._legacy_contract_policy(manifest):
+            return True
+        review = self.context.paths.status / "reviews" / "story_images_review_review.json"
+        try:
+            payload = json.loads(review.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        return not self._story_image_quality_review_issues(payload)
 
     def _has_jobs_csv(self, manifest: dict[str, Any]) -> bool:
         return self._consumer_request_current(manifest, "image_video") and self._jobs_csv(manifest) is not None
@@ -5992,8 +6951,21 @@ class StoryAgent:
             return False
 
     def _has_release_assets(self, manifest: dict[str, Any]) -> bool:
+        from story_project import main_package_receipt_issues
+
         theme = self.context.paths.release / "theme_assets"
-        return self._consumer_request_current(manifest, "release_video") and all((theme / name).exists() for name in ("main_release_plate.png", "library_release_plate.png", "main_background_16x9.png", "story_frame_a.png")) and (self.context.paths.release / "keying" / "keying_preset.json").exists()
+        required = (
+            "main_release_plate_top.png", "main_release_plate_bottom.png",
+            "library_release_plate_top.png", "library_release_plate_bottom.png",
+            "main_package_spec.json", "main_package_generation_receipt.json",
+            "main_background_16x9.png", "story_frame_a.png",
+        )
+        return (
+            self._consumer_request_current(manifest, "release_video")
+            and all((theme / name).exists() for name in required)
+            and not main_package_receipt_issues(self.context.paths)
+            and (self.context.paths.release / "keying" / "keying_preset.json").exists()
+        )
 
     def _has_release_preview(self, manifest: dict[str, Any]) -> bool:
         if not self._review_stage_current("release_preview"):
@@ -6012,7 +6984,7 @@ class StoryAgent:
         if self._legacy_contract_policy(manifest):
             return True
         try:
-            from demo_quality import load_current_final_demo_geometry
+            from demo_quality import load_preview_demo_geometry_for_release_review
             from release_geometry import canonical_sha256, file_sha256 as geometry_file_sha256, release_render_manifest_issues
 
             spec_path = self.context.paths.status / "contracts" / "consumers" / "release_video.compiled.json"
@@ -6024,8 +6996,8 @@ class StoryAgent:
             if source is None:
                 return False
             plan = load_current_artifact_semantic_plan(self.context.project_dir, source)
-            demo_manifest_path = self.context.paths.status / "product_package_work" / "demo_render_manifest.json"
-            _demo_manifest, demo_geometry = load_current_final_demo_geometry(
+            demo_manifest_path = self.context.paths.status / "product_package_work" / "demo_preview_manifest.json"
+            _demo_manifest, demo_geometry = load_preview_demo_geometry_for_release_review(
                 demo_manifest_path, self.context.project_dir,
             )
             expected = {
@@ -6046,14 +7018,15 @@ class StoryAgent:
             candidates = sorted(self.context.paths.release.glob("release_render_manifest*.json"))
             if not candidates:
                 return False
-            return all(
-                not release_render_manifest_issues(
+            for path in candidates:
+                candidate_expected = release_render_expected_bindings(path, expected)
+                if release_render_manifest_issues(
                     json.loads(path.read_text(encoding="utf-8")),
-                    expected_bindings=expected,
+                    expected_bindings=candidate_expected,
                     verify_outputs=True,
-                )
-                for path in candidates
-            )
+                ):
+                    return False
+            return True
         except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
             return False
 
@@ -6069,6 +7042,14 @@ class StoryAgent:
         if self._legacy_contract_policy(manifest):
             return True
         try:
+            integrated_receipt = self.context.paths.publish / "cover_integrated_generation.json"
+            if integrated_receipt.is_file():
+                issues, _ = integrated_cover_issues(
+                    self.context.paths.publish,
+                    receipt_path=integrated_receipt,
+                    expected_title=str(manifest.get("story", {}).get("name") or ""),
+                )
+                return not issues
             compiled = json.loads((self.context.paths.status / "contracts" / "consumers" / "cover.compiled.json").read_text(encoding="utf-8"))
             issues, _ = required_cover_issues(
                 self.context.paths.publish,
@@ -6460,8 +7441,9 @@ class StoryAgent:
         else:
             stage_gate_complete = False
             if storyboard is not None and context.is_file() and storyboard.is_file():
+                binding_storyboard = self._story_image_binding_storyboard(storyboard)
                 generation_context_current = self._story_image_generation_context_current(
-                    context, storyboard
+                    context, binding_storyboard or storyboard
                 )
             if generation_context_current:
                 try:
@@ -6598,6 +7580,12 @@ class StoryAgent:
             retry_reason=result.message if runtime_status == "retrying" else "",
             review=review,
         )
+        if runtime_status == "passed" and stage == "package_release":
+            manifest["agent"]["delivery_state"] = "production_complete"
+        elif runtime_status == "passed" and stage == "release_video_review":
+            package_record = manifest["agent"].get("stages", {}).get("package_release", {})
+            if isinstance(package_record, dict) and package_record.get("status") == "passed":
+                manifest["agent"]["delivery_state"] = "internal_qa_passed"
         if terminal and runtime_status in {"blocked", "failed", "cancelled"}:
             freeze_runtime(manifest["agent"])
             manifest["agent"]["status"] = runtime_status
@@ -6766,6 +7754,67 @@ def now() -> str:
     return time.strftime("%Y-%m-%d %H:%M:%S")
 
 
+def ensure_background_dashboard(project_dir: Path) -> dict[str, Any]:
+    """Start one scoped local dashboard and return its visible URL."""
+
+    paths = project_paths(project_dir)
+    state_path = paths.status / "story_agent_dashboard.json"
+    if state_path.is_file():
+        try:
+            existing = json.loads(state_path.read_text(encoding="utf-8"))
+            if process_is_alive(int(existing.get("pid") or 0)):
+                return existing
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    port = 8765
+    while port < 8785:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            try:
+                probe.bind(("127.0.0.1", port))
+                break
+            except OSError:
+                port += 1
+    if port >= 8785:
+        state = {
+            "kind": "story_agent_dashboard_v1",
+            "pid": 0,
+            "url": "",
+            "project_dir": str(project_dir.expanduser().resolve()),
+            "started_at": now(),
+            "status": "unavailable",
+            "reason": "本机端口 8765-8784 均不可用；生产未被看板阻断。",
+        }
+        save_json(state_path, state)
+        return state
+    log_path = paths.status / "story_agent_dashboard.log"
+    command = [
+        resolve_agent_runtime_python(), str(Path(__file__).resolve()), "dashboard",
+        "--project-dir", str(project_dir.expanduser().resolve()),
+        "--host", "127.0.0.1", "--port", str(port),
+    ]
+    with log_path.open("a", encoding="utf-8") as log_file:
+        process = subprocess.Popen(
+            command,
+            cwd=str(ROOT),
+            env=normalized_subprocess_environment(),
+            stdin=subprocess.DEVNULL,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,
+            close_fds=True,
+        )
+    state = {
+        "kind": "story_agent_dashboard_v1",
+        "pid": process.pid,
+        "url": f"http://127.0.0.1:{port}",
+        "project_dir": str(project_dir.expanduser().resolve()),
+        "started_at": now(),
+        "log": str(log_path),
+    }
+    save_json(state_path, state)
+    return state
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Codex 故事生产 Agent：状态机 + 现有脚本 + Codex 原生动作交接")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -6783,14 +7832,15 @@ def main() -> None:
     submit.add_argument("--projects-root", default=Path.home() / "Desktop", type=Path)
     submit.add_argument("--story-name", default="")
     submit.add_argument("--slug", default="")
+    submit.add_argument("--age-range", required=True, help="用户指定的适合年龄；系统不再根据故事内容猜测")
     submit.add_argument("--registry", type=Path)
     submit.add_argument("--soft-budget", default=50.0, type=float)
     submit.add_argument("--hard-budget", default=100.0, type=float)
     submit.add_argument(
         "--deadline-hours",
-        default=0.0,
+        default=8.0,
         type=float,
-        help="已弃用兼容参数；固定运行时限已取消，任何值都不会启用截止门禁",
+        help="自主生产目标时限；默认 8 小时，届时冻结最佳有效版本并停止新增审美返工",
     )
     submit.add_argument("--force", action="store_true", help="即使同一原片已投喂也创建新任务")
 
@@ -6853,10 +7903,11 @@ def main() -> None:
         "--module-execution-mode", choices=sorted(ALLOWED_MODULE_EXECUTION_MODES), default=""
     )
     start.add_argument("--heartbeat-interval", default=5.0, type=float)
-    start.add_argument("--heartbeat-timeout", default=120, type=int)
+    start.add_argument("--heartbeat-timeout", default=600, type=int)
     start.add_argument("--initial-backoff", default=10, type=int)
     start.add_argument("--max-backoff", default=600, type=int)
     start.add_argument("--notification-sinks", default="project,codex,desktop")
+    start.add_argument("--no-dashboard", action="store_true", help="不自动启动本机只读 Dashboard")
     start.add_argument(
         "--disable-codex-recovery",
         action="store_true",
@@ -6879,7 +7930,7 @@ def main() -> None:
         "--module-execution-mode", choices=sorted(ALLOWED_MODULE_EXECUTION_MODES), default=""
     )
     supervise.add_argument("--heartbeat-interval", default=5.0, type=float)
-    supervise.add_argument("--heartbeat-timeout", default=120, type=int)
+    supervise.add_argument("--heartbeat-timeout", default=600, type=int)
     supervise.add_argument("--initial-backoff", default=10, type=int)
     supervise.add_argument("--max-backoff", default=600, type=int)
     supervise.add_argument("--notification-sinks", default="project,codex,desktop")
@@ -6977,6 +8028,17 @@ def main() -> None:
         command.add_argument("--job", default="")
         command.add_argument("--registry", type=Path)
         command.add_argument("--project-dir", type=Path)
+
+    accept_current = subparsers.add_parser(
+        "accept-current",
+        help="接受并冻结当前版本，立即停止排队中的审美返工并生成轻量交付清单",
+    )
+    accept_current.add_argument("--job", default="")
+    accept_current.add_argument("--registry", type=Path)
+    accept_current.add_argument("--project-dir", type=Path)
+    accept_current.add_argument("--accepted-by", default="user")
+    accept_current.add_argument("--notes", default="")
+    accept_current.add_argument("--artifact", action="append", default=[], type=Path)
 
     probe = subparsers.add_parser("probe-codex", help="测试 codex exec 子任务是否可用")
     probe.add_argument("--project-dir", default=Path("/private/tmp/story-agent-codex-probe"), type=Path)
@@ -7092,13 +8154,14 @@ def main() -> None:
             projects_root=args.projects_root,
             story_name=args.story_name,
             slug=args.slug,
+            age_range=args.age_range,
             registry=registry,
             force=args.force,
             soft_budget_cny=args.soft_budget,
             hard_budget_cny=args.hard_budget,
             deadline_hours=args.deadline_hours,
         )
-        print(json.dumps({"job_id": job_id, "project_dir": str(project_dir), "created": created, "input_mode": args.input_mode}, ensure_ascii=False, indent=2))
+        print(json.dumps({"job_id": job_id, "project_dir": str(project_dir), "created": created, "input_mode": args.input_mode, "age_range": args.age_range}, ensure_ascii=False, indent=2))
         return
     if args.command == "refresh-prepared-inputs":
         manifest = refresh_prepared_inputs(
@@ -7132,6 +8195,7 @@ def main() -> None:
         project_dir = registry.resolve(args.job)
         status_dir = project_paths(project_dir).status
         status_dir.mkdir(parents=True, exist_ok=True)
+        dashboard_state = {} if args.no_dashboard else ensure_background_dashboard(project_dir)
         supervisor_path = status_dir / "story_agent_supervisor.json"
         with supervisor_start_lock(project_dir):
             if supervisor_path.exists():
@@ -7140,7 +8204,7 @@ def main() -> None:
                     existing_pid = int(existing.get("pid", 0))
                     if process_is_alive(existing_pid):
                         record_unattended_launch(project_dir, supervisor_record=supervisor_path)
-                        print(json.dumps({"job_id": args.job, "project_dir": str(project_dir), "pid": existing_pid, "started": False, "message": "supervisor 已在运行"}, ensure_ascii=False, indent=2))
+                        print(json.dumps({"job_id": args.job, "project_dir": str(project_dir), "pid": existing_pid, "started": False, "message": "supervisor 已在运行", "dashboard": dashboard_state.get("url", "")}, ensure_ascii=False, indent=2))
                         return
                 except (ValueError, json.JSONDecodeError):
                     pass
@@ -7191,7 +8255,7 @@ def main() -> None:
                 process = subprocess.Popen(
                     command,
                     cwd=str(ROOT),
-                    env={**os.environ, **module_env},
+                    env=normalized_subprocess_environment(overrides=module_env),
                     stdin=subprocess.DEVNULL,
                     stdout=log_file,
                     stderr=subprocess.STDOUT,
@@ -7212,10 +8276,11 @@ def main() -> None:
                     "max_parallel": max(1, args.max_parallel),
                     "supervisor_mode": "persistent_v1",
                     "state": str(supervisor_state_path(project_dir)),
+                    "dashboard": dashboard_state.get("url", ""),
                 },
             )
         record_unattended_launch(project_dir, supervisor_record=supervisor_path)
-        print(json.dumps({"job_id": args.job, "project_dir": str(project_dir), "pid": process.pid, "started": True, "log": str(log_path)}, ensure_ascii=False, indent=2))
+        print(json.dumps({"job_id": args.job, "project_dir": str(project_dir), "pid": process.pid, "started": True, "log": str(log_path), "dashboard": dashboard_state.get("url", "")}, ensure_ascii=False, indent=2))
         return
     if args.command == "supervise":
         from story_agent_supervisor import PersistentSupervisor, SupervisorConfig
@@ -7344,6 +8409,22 @@ def main() -> None:
             recovery_runner=None if args.disable_codex_recovery else recovery_runner,
         )
         raise SystemExit(supervisor.run())
+    if args.command == "accept-current":
+        project_dir = JobRegistry(args.registry).resolve(args.job) if args.job else args.project_dir
+        if project_dir is None:
+            parser.error("accept-current 需要 --job 或 --project-dir")
+        manifest, target = accept_current_outputs(
+            project_dir.expanduser(),
+            accepted_by=args.accepted_by,
+            notes=args.notes,
+            artifacts=args.artifact or None,
+        )
+        print(json.dumps({
+            "project_dir": str(project_dir.expanduser().resolve()),
+            "delivery_state": manifest.get("agent", {}).get("delivery_state", ""),
+            "acceptance": str(target),
+        }, ensure_ascii=False, indent=2))
+        return
     if args.command == "signoff":
         project_dir = JobRegistry(args.registry).resolve(args.job) if args.job else args.project_dir
         if project_dir is None:

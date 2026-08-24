@@ -9,7 +9,13 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from release_video import ReleaseConfig, package_release_videos, render_release_previews
+from release_video import (
+    ReleaseConfig,
+    _execute_release_layout,
+    package_release_videos,
+    render_bottom_panel,
+    render_release_previews,
+)
 from story_module_adapters import LocalReleaseLayoutAdapter, MockReleaseLayoutAdapter
 from story_module_ports import (
     ModuleCapabilities,
@@ -167,6 +173,63 @@ class ProtocolOnlyFake:
 
 
 class ReleaseLayoutPortTests(unittest.TestCase):
+    def test_operation_receipt_reuses_intact_render_but_repairs_corrupt_output(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "source.bin"
+            source.write_bytes(b"input")
+            output = root / "output.mp4"
+            fake = ProtocolOnlyFake()
+            calls: list[int] = []
+
+            def render() -> None:
+                calls.append(len(calls) + 1)
+                output.write_bytes(f"render-{len(calls)}".encode())
+
+            kwargs = {
+                "artifact_id": "release-main-wide:test",
+                "operation": "main_wide_render",
+                "input_artifacts": ({
+                    "role": "source", "path": str(source), "sha256": sha256(source),
+                },),
+                "layout_binding": {"geometry_sha256": "a" * 64},
+                "output_target": output,
+                "attempt_id": "attempt-1",
+                "executor": render,
+            }
+            _execute_release_layout(fake, **kwargs)
+            _execute_release_layout(fake, **{**kwargs, "attempt_id": "attempt-2"})
+            self.assertEqual(calls, [1])
+            self.assertEqual(len(fake.requests), 1)
+            output.write_bytes(b"corrupt")
+            _execute_release_layout(fake, **{**kwargs, "attempt_id": "technical-repair"})
+            self.assertEqual(calls, [1, 2])
+            self.assertEqual(output.read_bytes(), b"render-2")
+
+    def test_default_bottom_panel_copy_fits_reviewed_safe_area(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "bottom.png"
+            result = render_bottom_panel(
+                output,
+                [
+                    "完整版时长：3分25秒",
+                    "适合年龄：3-6岁",
+                    "适用于朗诵比赛、故事表演、少儿口才、技能比拼",
+                ],
+                accent=(67, 143, 62),
+            )
+            self.assertEqual(result, output)
+            self.assertTrue(output.is_file())
+
+    def test_bottom_panel_still_rejects_copy_that_cannot_fit(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaisesRegex(ValueError, "审核安全区"):
+                render_bottom_panel(
+                    Path(directory) / "bottom.png",
+                    ["过长内容" * 200],
+                    accent=(67, 143, 62),
+                )
+
     def test_schema_and_python_validator_have_parity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             request = request_fixture(Path(directory))
@@ -255,7 +318,7 @@ class ReleaseLayoutPortTests(unittest.TestCase):
 
             def library(*args, **kwargs):
                 library_calls.append((*args, kwargs))
-                Path(args[2]).write_bytes(b"library")
+                Path(args[3]).write_bytes(b"library")
 
             with patch("release_video.validate_config"), \
                  patch("release_video.compile_release_geometry", return_value=geometry), \

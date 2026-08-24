@@ -63,6 +63,9 @@ def render_dashboard_html(*, poll_seconds: float = 2.0) -> str:
     code {{ color:#c7eaff; word-break:break-all; }}
     a {{ color:#8edcff; text-decoration:none; }} a:hover {{ text-decoration:underline; }}
     .error {{ white-space:pre-wrap; color:var(--bad); }}
+    button {{ border:1px solid var(--accent); border-radius:10px; padding:9px 13px;
+      color:var(--text); background:#173049; cursor:pointer; font-weight:700; }}
+    button:hover {{ background:#214767; }} button:disabled {{ opacity:.45; cursor:wait; }}
     @media (max-width:900px) {{ .grid {{ grid-template-columns:1fr 1fr; }} .half {{ grid-column:1/-1; }} }}
     @media (max-width:560px) {{ .grid {{ grid-template-columns:1fr; }} .wide,.half {{ grid-column:1; }} }}
   </style>
@@ -70,7 +73,8 @@ def render_dashboard_html(*, poll_seconds: float = 2.0) -> str:
 <body>
 <main>
   <header><div><h1>Story Agent 实时看板</h1><div id="project" class="muted"></div></div>
-    <div class="muted">只读 · <span id="updated">等待数据</span></div></header>
+    <div><button id="acceptCurrent" type="button">接受当前版本</button>
+      <div class="muted"><span id="updated">等待数据</span></div></div></header>
   <section id="error" class="panel error" hidden></section>
   <section class="grid">
     <article class="panel"><div class="muted">Agent</div><div id="agent" class="metric">—</div><div id="stage"></div></article>
@@ -78,9 +82,10 @@ def render_dashboard_html(*, poll_seconds: float = 2.0) -> str:
     <article class="panel"><div class="muted">预算</div><div id="budget" class="metric">—</div><progress id="budgetBar" max="100" value="0"></progress></article>
     <article class="panel"><div class="muted">剩余关键路径</div><div id="eta" class="metric">—</div><div class="muted">外部排队不计入</div></article>
     <article id="banner" class="panel wide banner" hidden></article>
+    <article class="panel wide"><h2>运行原因与交付状态</h2><div id="runReason" class="timeline"></div></article>
     <article class="panel wide"><h2>精确产物进度</h2><div id="progress" class="grid"></div></article>
     <article class="panel wide"><h2>DAG 与 attempt</h2><div class="scroll"><table>
-      <thead><tr><th>分支</th><th>阶段</th><th>依赖</th><th>有效状态</th><th>attempt</th><th>耗时</th><th>provider / receipt</th><th>成本</th><th>说明 / 产物</th></tr></thead>
+      <thead><tr><th>分支</th><th>阶段</th><th>依赖</th><th>有效状态</th><th>attempt</th><th>耗时/ETA</th><th>provider / receipt</th><th>成本</th><th>原因 / 重跑范围 / 产物</th></tr></thead>
       <tbody id="stages"></tbody></table></div></article>
     <article class="panel half"><h2>通知</h2><div id="notifications" class="timeline scroll"></div></article>
     <article class="panel half"><h2>事件时间线</h2><div id="events" class="timeline scroll"></div></article>
@@ -116,6 +121,19 @@ function render(snapshot) {{
   document.getElementById("budget").textContent = "¥" + spent.toFixed(2) + " / ¥" + hard.toFixed(2);
   document.getElementById("budgetBar").value = hard > 0 ? Math.min(100, spent / hard * 100) : 0;
   document.getElementById("eta").textContent = ((snapshot.estimated_remaining_minutes || {{}}).nominal || 0) + " 分钟";
+  const timing = snapshot.timing || {{}}, delivery = snapshot.delivery_state || "";
+  const usage = snapshot.cost_and_usage || {{}};
+  document.getElementById("runReason").innerHTML = [
+    '<div class="item"><strong>为什么正在运行</strong><div>'+esc(snapshot.why_running || snapshot.blocked_reason || "等待下一阶段")+'</div></div>',
+    '<div class="item"><strong>8 小时时限</strong><div>已用 '+esc(timing.active_elapsed_seconds == null ? "—" : Math.round(timing.active_elapsed_seconds)+"秒")+
+      ' · 剩余 '+esc(timing.remaining_deadline_hours == null ? "—" : timing.remaining_deadline_hours+"小时")+'</div></div>',
+    '<div class="item"><strong>交付</strong><div>'+esc(delivery || snapshot.agent_status || "—")+'</div></div>',
+    '<div class="item"><strong>模型/成本</strong><div>Codex '+esc(usage.codex_calls || 0)+' 次 · '+esc(usage.codex_total_tokens_reported || 0)+
+      ' tokens · 供应商费用 ¥'+Number(usage.provider_cost_cny || 0).toFixed(2)+'</div></div>',
+    '<div class="item"><strong>渲染与未上报费用</strong><div>正式编码 '+esc(usage.formal_encode_time_seconds || 0)+' 秒 · 总渲染 '+
+      esc(usage.render_time_seconds || 0)+' 秒 · ImageGen '+esc(usage.imagegen_cost_status || "未上报")+
+      ' · 音乐 '+esc(usage.music_cost_status || "未上报")+'</div></div>'
+  ].join("");
   const recovery = snapshot.recovery || {{}}, banner = document.getElementById("banner");
   if (snapshot.blocked_reason || recovery.action) {{
     banner.hidden = false;
@@ -131,8 +149,11 @@ function render(snapshot) {{
   (((snapshot.dag || {{}}).edges) || []).forEach(edge => (dependencies[edge.to] ||= []).push(edge.from));
   document.getElementById("stages").innerHTML = rows.map(row => '<tr><td>'+esc(row.branch)+'</td><td>'+esc(row.stage)+
     '</td><td>'+esc((dependencies[row.stage] || []).join(", ") || "—")+'</td><td>'+badge(row.effective_status)+'</td><td>'+esc(row.attempts)+' (I'+esc(row.infrastructure_attempts || 0)+'/Q'+esc(row.quality_attempts || 0)+')</td><td>'+esc(row.duration_seconds == null ? "—" : row.duration_seconds+"s")+
+    ' / '+esc(row.estimated_remaining_seconds == null ? "—" : row.estimated_remaining_seconds+"s")+
     '</td><td>'+esc(row.provider || "—")+(row.request_id ? '<br><code>'+esc(row.request_id)+'</code>' : "")+
-    '</td><td>¥'+Number(row.actual_cost || 0).toFixed(2)+'</td><td>'+esc(row.message || "")+
+    '</td><td>¥'+Number(row.actual_cost || 0).toFixed(2)+'</td><td><strong>'+esc(row.why_running || row.message || "")+'</strong>'+
+    '<br><span class="muted">retry_scope: '+esc(row.retry_scope || "—")+
+    (((row.retry_files || []).length) ? ' · '+esc(row.retry_files.join(", ")) : "")+'</span>'+
     ((row.artifacts || []).length ? '<br>'+artifact(row.artifacts[0]) : "")+'</td></tr>').join("");
   document.getElementById("notifications").innerHTML = (snapshot.notifications || []).slice().reverse().map(item =>
     '<div class="item '+esc(item.severity)+'"><strong>'+esc(item.category)+'</strong> '+badge(item.recovery_mode || item.severity)+
@@ -154,6 +175,17 @@ async function refresh() {{
     const target = document.getElementById("error"); target.hidden = false; target.textContent = String(error);
   }}
 }}
+document.getElementById("acceptCurrent").addEventListener("click", async event => {{
+  if (!confirm("接受当前版本将冻结现有有效文件、停止排队中的审美返工并生成轻量交付清单。继续吗？")) return;
+  const button = event.currentTarget; button.disabled = true;
+  try {{
+    const response = await fetch("/api/accept-current", {{method:"POST", headers:{{"Content-Type":"application/json"}}, body:"{{}}"}});
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.error || "接受失败");
+    alert("已接受当前版本：" + (payload.receipt || ""));
+    await refresh();
+  }} catch (error) {{ alert(String(error)); }} finally {{ button.disabled = false; }}
+}});
 refresh(); setInterval(refresh, {poll_ms});
 </script>
 </body></html>"""
@@ -258,6 +290,25 @@ def build_dashboard_server(
                 self._send_json({"error": "not found"}, 404)
             except Exception as exc:
                 self._send_json({"error": redact_text(f"{type(exc).__name__}: {exc}")}, 500)
+
+        def do_POST(self) -> None:  # noqa: N802 - BaseHTTPRequestHandler API
+            parsed = urlparse(self.path)
+            try:
+                if parsed.path != "/api/accept-current":
+                    self._send_json({"error": "not found"}, 404)
+                    return
+                # This explicit local user action freezes existing files. It
+                # never starts final_delivery, doctor, or a production render.
+                from story_agent_runtime import accept_current_outputs
+
+                _manifest, receipt = accept_current_outputs(
+                    project_root,
+                    accepted_by="dashboard_user",
+                    notes="用户从 Story Agent Dashboard 接受当前版本",
+                )
+                self._send_json({"ok": True, "receipt": str(receipt)})
+            except Exception as exc:
+                self._send_json({"error": redact_text(f"{type(exc).__name__}: {exc}")}, 409)
 
         def log_message(self, format: str, *args: Any) -> None:
             del format, args

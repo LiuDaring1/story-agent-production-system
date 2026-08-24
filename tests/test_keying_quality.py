@@ -16,6 +16,7 @@ from keying_quality import (
     keying_preset_lock_issues,
     keying_review_images,
     lock_keying_preset,
+    refresh_keying_quality_from_preset,
     representative_evidence_images,
     write_evidence_assets,
 )
@@ -25,7 +26,11 @@ from production_keying import (
     production_keying_filter_chain,
     production_keying_fingerprint,
 )
-from demo_quality import demo_render_manifest_issues, write_demo_render_manifest
+from demo_quality import (
+    demo_render_manifest_issues,
+    load_preview_demo_geometry_for_release_review,
+    write_demo_render_manifest,
+)
 from release_geometry import compile_demo_presenter_geometry
 from story_agent_runtime import write_review_bundle
 
@@ -42,7 +47,7 @@ def _silhouette(*, color=(186, 145, 116, 255)) -> Image.Image:
     return image
 
 
-def _locked_fixture(root: Path) -> tuple[Path, Path, Path, Path, Path]:
+def _locked_fixture(root: Path, *, keyer: str = "colorkey") -> tuple[Path, Path, Path, Path, Path]:
     root.mkdir(parents=True, exist_ok=True)
     source = root / "original.mp4"
     source.write_bytes(b"read-only-green-source")
@@ -58,14 +63,16 @@ def _locked_fixture(root: Path) -> tuple[Path, Path, Path, Path, Path]:
     preset_payload = {
         "preset_version": "story-keying-preset/v2", "keying_candidate": "balanced",
         "keying_search": str(search), "machine_qa": str(qa), "evidence_manifest": str(evidence),
-        "keyer": "colorkey", "chroma_color": "0x00FF00", "chroma_similarity": 0.1,
+        "keyer": keyer, "chroma_color": "0x00FF00", "chroma_similarity": 0.1,
         "chroma_blend": 0.0, "person_grade": "natural", "person_beauty": "light",
         "person_crop": None,
     }
+    if keyer == "rvm":
+        preset_payload["rvm_alpha_choke_pixels"] = 1
     preset.write_text(json.dumps(preset_payload), encoding="utf-8")
     fingerprint = production_keying_fingerprint(preset_payload)
     renderer = {
-        "renderer_kind": "production_ffmpeg",
+        "renderer_kind": "production_rvm_onnx" if keyer == "rvm" else "production_ffmpeg",
         "filter_version": PRODUCTION_KEYING_FILTER_VERSION,
         "filter_fingerprint": fingerprint,
         "filter_contract": production_keying_contract(preset_payload),
@@ -114,6 +121,126 @@ def _demo_geometry(preset: Path, source: Path, *, source_native: bool = True) ->
 
 
 class KeyingQualityTests(unittest.TestCase):
+    def test_release_review_can_inherit_preview_geometry_after_evidence_only_preset_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            manifest = root / "demo_preview_manifest.json"
+            manifest.write_text(json.dumps({
+                "mode": "preview",
+                "presenter_geometry": {"geometry_sha256": "a" * 64, "x": 120},
+            }), encoding="utf-8")
+            with patch(
+                "demo_quality.demo_render_manifest_issues",
+                return_value=["demo_render_binding_mismatch:keying_preset"],
+            ):
+                _payload, geometry = load_preview_demo_geometry_for_release_review(manifest, root)
+            self.assertEqual(geometry["x"], 120)
+            with patch(
+                "demo_quality.demo_render_manifest_issues",
+                return_value=["demo_production_keying_filter_fingerprint_mismatch"],
+            ):
+                with self.assertRaisesRegex(ValueError, "fingerprint"):
+                    load_preview_demo_geometry_for_release_review(manifest, root)
+
+    def test_evidence_regions_ignore_low_alpha_canvas_edge_residue(self) -> None:
+        from keying_quality import evidence_regions
+
+        alpha = Image.new("L", (400, 220), 0)
+        draw = ImageDraw.Draw(alpha)
+        draw.rectangle((90, 20, 300, 215), fill=255)
+        draw.rectangle((350, 0, 399, 219), fill=64)
+        regions = evidence_regions(alpha)
+        self.assertLessEqual(regions["full_body"][2], 301)
+        self.assertLessEqual(regions["right_shoulder_forearm_hand"][2], 301)
+
+    def test_refresh_synchronizes_selected_evidence_before_hash_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preset = root / "keying_preset.json"
+            search = root / "keying_search.json"
+            stale = root / "evidence" / "old"
+            selected = "s0.095_b0.040"
+            search.write_text(json.dumps({
+                "standing_frame": str(root / "standing.png"),
+                "gesture_frame": str(root / "gesture.png"),
+                "chroma_color": "0x00FF00",
+                "candidates": [{"id": selected, "similarity": 0.095, "blend": 0.04}],
+            }), encoding="utf-8")
+            preset.write_text(json.dumps({
+                "keying_candidate": selected,
+                "keying_search": str(search),
+                "chroma_similarity": 0.075,
+                "chroma_blend": 0.04,
+                "evidence_manifest": str(stale / "evidence_manifest.json"),
+                "selected_candidate_file": str(stale / "selected_candidate.png"),
+            }), encoding="utf-8")
+
+            def fake_evidence(*_args, **kwargs):
+                synced = json.loads(preset.read_text(encoding="utf-8"))
+                output_dir = Path(kwargs["output_dir"])
+                output_dir.mkdir(parents=True)
+                candidate = output_dir / "selected_candidate.png"
+                Image.new("RGBA", (2, 2), (255, 255, 255, 255)).save(candidate)
+                manifest = output_dir / "evidence_manifest.json"
+                manifest.write_text(json.dumps({"artifacts": []}), encoding="utf-8")
+                qa = Path(kwargs["machine_qa_path"])
+                qa.write_text(json.dumps({"passed": True}), encoding="utf-8")
+                self.assertEqual(synced["chroma_similarity"], 0.095)
+                self.assertEqual(synced["evidence_manifest"], str(manifest))
+                self.assertEqual(synced["selected_candidate_file"], str(candidate))
+                return candidate, qa, {"artifacts": []}
+
+            with patch("keying_quality.write_evidence_assets", side_effect=fake_evidence):
+                qa, manifest = refresh_keying_quality_from_preset(preset)
+            refreshed = json.loads(preset.read_text(encoding="utf-8"))
+            self.assertEqual(manifest, Path(refreshed["evidence_manifest"]))
+            self.assertEqual(qa, root / "keying_machine_qa.json")
+
+    def test_refresh_applies_selected_rvm_choke_from_current_source_search(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            preset = root / "keying_preset.json"
+            search = root / "keying_search.json"
+            selected = "rvm_mobilenetv3_s0.400_c2"
+            search.write_text(json.dumps({
+                "standing_frame": str(root / "standing.png"),
+                "gesture_frame": str(root / "gesture.png"),
+                "chroma_color": "0x00FF00",
+                "candidates": [{
+                    "id": selected,
+                    "backend": "rvm",
+                    "downsample_ratio": 0.4,
+                    "alpha_choke_pixels": 2,
+                }],
+            }), encoding="utf-8")
+            preset.write_text(json.dumps({
+                "keyer": "rvm",
+                "keying_candidate": selected,
+                "keying_search": str(search),
+                "rvm_alpha_choke_pixels": 1,
+                "rvm_downsample_ratio": 0.4,
+            }), encoding="utf-8")
+
+            def fake_evidence(*_args, **kwargs):
+                synced = json.loads(preset.read_text(encoding="utf-8"))
+                self.assertEqual(synced["rvm_alpha_choke_pixels"], 2)
+                output_dir = Path(kwargs["output_dir"])
+                output_dir.mkdir(parents=True)
+                candidate = output_dir / "selected_candidate.png"
+                Image.new("RGBA", (2, 2), (255, 255, 255, 255)).save(candidate)
+                manifest = output_dir / "evidence_manifest.json"
+                manifest.write_text(json.dumps({"artifacts": []}), encoding="utf-8")
+                qa = Path(kwargs["machine_qa_path"])
+                qa.write_text(json.dumps({"passed": True}), encoding="utf-8")
+                return candidate, qa, {"artifacts": []}
+
+            with patch("keying_quality.write_evidence_assets", side_effect=fake_evidence):
+                refresh_keying_quality_from_preset(preset)
+            self.assertEqual(
+                json.loads(preset.read_text(encoding="utf-8"))["rvm_alpha_choke_pixels"],
+                2,
+            )
+
     def test_demo_release_and_evidence_share_one_production_filter_builder(self) -> None:
         from product_package import KeyingPreset, keying_filter_chain
         from release_video import person_key_filters
@@ -206,6 +333,17 @@ class KeyingQualityTests(unittest.TestCase):
             review = preset.with_name("keying_review_review.json")
             review.write_bytes(review.read_bytes() + b" ")
             self.assertTrue(any("review" in issue for issue in keying_preset_lock_issues(preset)))
+
+    def test_rvm_preset_lock_records_and_revalidates_rvm_renderer(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            preset, lock, _candidate, _evidence_asset, _source = _locked_fixture(
+                Path(directory), keyer="rvm"
+            )
+            self.assertEqual(
+                json.loads(lock.read_text(encoding="utf-8"))["renderer_kind"],
+                "production_rvm_onnx",
+            )
+            self.assertEqual(keying_preset_lock_issues(preset), [])
 
     def test_filter_contract_change_invalidates_old_evidence_and_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

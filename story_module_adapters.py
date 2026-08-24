@@ -1535,7 +1535,15 @@ class ProductionKeyerAdapter:
         external=False,
         paid=False,
         deterministic=True,
-        supported={"colorkey": True, "chromakey": True, "crop": True, "grade": True, "beauty": True},
+        supported={
+            "colorkey": True,
+            "chromakey": True,
+            "rvm": True,
+            "temporal_recurrence": True,
+            "crop": True,
+            "grade": True,
+            "beauty": True,
+        },
     )
 
     def compile_contract(self, settings: Any) -> dict[str, Any]:

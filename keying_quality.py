@@ -10,7 +10,7 @@ from typing import Any
 
 from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageStat
 
-from production_keying import PRODUCTION_KEYING_FILTER_VERSION
+from production_keying import PRODUCTION_KEYING_FILTER_VERSION, render_cached_rvm_foreground_frame
 from story_module_ports import KeyerPort, KeyerRequest
 from story_module_registry import build_keyer_registry
 
@@ -94,7 +94,12 @@ def evidence_regions(alpha: Image.Image) -> dict[str, tuple[int, int, int, int]]
     lower-body regions are omitted when the detected foreground does not extend
     far enough down the frame.
     """
-    mask = alpha.convert("L").point(lambda value: 255 if value >= 24 else 0)
+    # Use the opaque subject core to locate the silhouette.  A low-alpha
+    # residue can legitimately survive at the far edge of a green-screen
+    # frame; treating that residue as part of the person stretches the bbox to
+    # the canvas edge and produces empty arm/hand evidence crops.  The crops
+    # themselves still retain the original soft alpha around that core.
+    mask = alpha.convert("L").point(lambda value: 255 if value >= 128 else 0)
     bbox = mask.getbbox()
     if bbox is None:
         return {"full_body": (0, 0, alpha.width, alpha.height)}
@@ -301,6 +306,11 @@ def write_evidence_assets(
     preset_sha256 = file_sha256(preset_path) if preset_path is not None else ""
     render_contract = production_keying_contract(settings, keyer_port=keyer_port)
     render_fingerprint = production_keying_fingerprint(settings, keyer_port=keyer_port)
+    renderer_kind = (
+        "production_rvm_onnx"
+        if str(settings.get("keyer") if isinstance(settings, dict) else getattr(settings, "keyer", "")) == "rvm"
+        else "production_ffmpeg"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     artifacts: list[dict[str, str]] = []
     qa_by_pose: dict[str, Any] = {}
@@ -308,7 +318,25 @@ def write_evidence_assets(
     panels: list[Image.Image] = []
     for pose, source_path in (("standing", standing_frame), ("wide_gesture", gesture_frame)):
         pose_path = output_dir / f"{pose}_foreground.png"
-        if keyer_port is None:
+        if (
+            keyer_port is None
+            and str(settings.get("keyer") or "") == "rvm"
+            and str(settings.get("rvm_foreground_video") or "").strip()
+        ):
+            timestamp_field = (
+                "presenter_initial_anchor_frame_seconds"
+                if pose == "standing"
+                else "presenter_gesture_review_frame_seconds"
+            )
+            source_start = float(settings.get("rvm_source_start_seconds", 0.0))
+            timestamp = max(0.0, float(settings.get(timestamp_field, 0.0)) - source_start)
+            render_cached_rvm_foreground_frame(
+                Path(str(settings["rvm_foreground_video"])).expanduser(),
+                timestamp,
+                pose_path,
+                settings,
+            )
+        elif keyer_port is None:
             # Preserve the historical positional call shape for integrations
             # that patch this rendering seam.
             render_production_keyed_foreground(source_path, pose_path, settings)
@@ -336,7 +364,7 @@ def write_evidence_assets(
     canvas.save(candidate_file)
     manifest_payload = {
         "version": 2,
-        "renderer_kind": "production_ffmpeg",
+        "renderer_kind": renderer_kind,
         "filter_version": PRODUCTION_KEYING_FILTER_VERSION,
         "filter_fingerprint": render_fingerprint,
         "filter_contract": render_contract,
@@ -351,7 +379,7 @@ def write_evidence_assets(
         {
             "schema_version": QA_SCHEMA_VERSION,
             "keying_candidate": candidate_id,
-            "renderer_kind": "production_ffmpeg",
+            "renderer_kind": renderer_kind,
             "filter_version": PRODUCTION_KEYING_FILTER_VERSION,
             "filter_fingerprint": render_fingerprint,
             "filter_contract": render_contract,
@@ -425,15 +453,36 @@ def refresh_keying_quality_from_preset(preset_path: Path) -> tuple[Path, Path]:
         raise ValueError("keying preset 选择的 candidate 不在搜索记录中")
     candidate = candidates[selected]
     evidence_dir = preset_path.parent / "evidence" / selected
+    candidate_file_path = evidence_dir / "selected_candidate.png"
+    qa_path_expected = preset_path.parent / "keying_machine_qa.json"
+    evidence_manifest_path = evidence_dir / "evidence_manifest.json"
+    # Derived evidence paths and numeric parameters are part of the preset's
+    # review contract.  Synchronize them before rendering so the manifest can
+    # bind the final preset SHA-256 instead of a stale, previously selected
+    # candidate.  All paths are deterministic, so this introduces no hash
+    # cycle.
+    if "similarity" in candidate:
+        preset["chroma_similarity"] = float(candidate["similarity"])
+    if "blend" in candidate:
+        preset["chroma_blend"] = float(candidate["blend"])
+    if str(preset.get("keyer") or "") == "rvm":
+        if str(candidate.get("backend") or "") != "rvm":
+            raise ValueError("RVM preset 不能选择颜色键候选")
+        preset["rvm_alpha_choke_pixels"] = int(candidate["alpha_choke_pixels"])
+        preset["rvm_downsample_ratio"] = float(candidate["downsample_ratio"])
+    preset["machine_qa"] = str(qa_path_expected)
+    preset["evidence_manifest"] = str(evidence_manifest_path)
+    preset["selected_candidate_file"] = str(candidate_file_path)
+    write_json_atomic(preset_path, preset)
     candidate_file, qa_path, _manifest = write_evidence_assets(
         Path(str(search["standing_frame"])),
         Path(str(search["gesture_frame"])),
         chroma_color=str(search["chroma_color"]),
-        similarity=float(candidate["similarity"]),
-        blend=float(candidate["blend"]),
+        similarity=float(candidate.get("similarity", preset.get("chroma_similarity", 0.095))),
+        blend=float(candidate.get("blend", preset.get("chroma_blend", 0.04))),
         output_dir=evidence_dir,
         candidate_id=selected,
-        machine_qa_path=preset_path.parent / "keying_machine_qa.json",
+        machine_qa_path=qa_path_expected,
         preset=preset,
         preset_path=preset_path,
     )
@@ -442,7 +491,7 @@ def refresh_keying_quality_from_preset(preset_path: Path) -> tuple[Path, Path]:
     search["machine_qa"] = str(qa_path)
     search["evidence_manifest"] = str(evidence_dir / "evidence_manifest.json")
     write_json_atomic(search_path, search)
-    return qa_path, evidence_dir / "evidence_manifest.json"
+    return qa_path, evidence_manifest_path
 
 
 def lock_keying_preset(
@@ -465,8 +514,9 @@ def lock_keying_preset(
         raise ValueError("keying machine QA 未绑定当前 candidate")
     expected_fingerprint = production_keying_fingerprint(preset)
     expected_contract = production_keying_contract(preset)
-    if qa.get("renderer_kind") != "production_ffmpeg":
-        raise ValueError("keying machine QA 不是正式生产 FFmpeg chain 的证据")
+    expected_renderer_kind = "production_rvm_onnx" if str(preset.get("keyer")) == "rvm" else "production_ffmpeg"
+    if qa.get("renderer_kind") != expected_renderer_kind:
+        raise ValueError("keying machine QA 不是当前正式生产 keyer 的证据")
     if qa.get("preset_sha256") != file_sha256(preset_path):
         raise ValueError("keying machine QA 未绑定当前 preset")
     if qa.get("filter_fingerprint") != expected_fingerprint:
@@ -474,8 +524,8 @@ def lock_keying_preset(
     if qa.get("filter_contract") != expected_contract:
         raise ValueError("keying machine QA 的生产 filter contract 不一致")
     evidence_payload = json.loads(evidence_manifest_path.read_text(encoding="utf-8"))
-    if evidence_payload.get("renderer_kind") != "production_ffmpeg":
-        raise ValueError("keying evidence 不是正式生产 FFmpeg chain 的证据")
+    if evidence_payload.get("renderer_kind") != expected_renderer_kind:
+        raise ValueError("keying evidence 不是当前正式生产 keyer 的证据")
     if evidence_payload.get("preset_sha256") != file_sha256(preset_path):
         raise ValueError("keying evidence 未绑定当前 preset")
     if evidence_payload.get("filter_fingerprint") != expected_fingerprint:
@@ -512,9 +562,12 @@ def lock_keying_preset(
         "review_bundle_sha256": file_sha256(review_bundle_path),
         "review_path": str(review_path),
         "review_sha256": file_sha256(review_path),
-        "renderer_kind": "production_ffmpeg",
+        "renderer_kind": expected_renderer_kind,
         "filter_version": PRODUCTION_KEYING_FILTER_VERSION,
         "filter_fingerprint": expected_fingerprint,
+        "visual_review_status": "approved",
+        "visual_review_source_status": str(preset.get("visual_review_status") or "pending"),
+        "visual_review_approved_by": str(review.get("reviewer") or review.get("model") or "independent_review"),
     }
     return write_json_atomic(target, payload)
 
@@ -531,11 +584,14 @@ def keying_preset_lock_issues(preset_path: Path, lock_path: Path | None = None) 
         "evidence_manifest_path", "evidence_manifest_sha256", "review_bundle_path", "review_bundle_sha256",
         "review_path", "review_sha256",
         "renderer_kind", "filter_version", "filter_fingerprint",
+        "visual_review_status", "visual_review_approved_by",
     }
     if required - set(lock):
         return ["keying_preset_lock_fields_missing"]
     if lock.get("schema_version") != LOCK_SCHEMA_VERSION or lock.get("status") != "locked":
         return ["keying_preset_lock_schema_or_status_invalid"]
+    if lock.get("visual_review_status") != "approved":
+        return ["keying_visual_review_not_approved"]
     issues: list[str] = []
     bindings = {
         "preset": (preset_path, lock.get("preset_sha256")),
@@ -570,8 +626,9 @@ def keying_preset_lock_issues(preset_path: Path, lock_path: Path | None = None) 
             issues.append("keying_machine_qa_evidence_binding_mismatch")
         expected_fingerprint = production_keying_fingerprint(preset)
         expected_contract = production_keying_contract(preset)
-        if lock.get("renderer_kind") != "production_ffmpeg" or qa.get("renderer_kind") != "production_ffmpeg":
-            issues.append("keying_renderer_not_production_ffmpeg")
+        expected_renderer_kind = "production_rvm_onnx" if str(preset.get("keyer")) == "rvm" else "production_ffmpeg"
+        if lock.get("renderer_kind") != expected_renderer_kind or qa.get("renderer_kind") != expected_renderer_kind:
+            issues.append("keying_renderer_not_current_production_backend")
         if lock.get("filter_version") != PRODUCTION_KEYING_FILTER_VERSION:
             issues.append("keying_filter_version_stale")
         if lock.get("filter_fingerprint") != expected_fingerprint:
@@ -582,7 +639,7 @@ def keying_preset_lock_issues(preset_path: Path, lock_path: Path | None = None) 
             issues.append("keying_machine_qa_filter_contract_mismatch")
         if qa.get("preset_sha256") != lock.get("preset_sha256"):
             issues.append("keying_machine_qa_preset_binding_mismatch")
-        if evidence.get("renderer_kind") != "production_ffmpeg":
+        if evidence.get("renderer_kind") != expected_renderer_kind:
             issues.append("keying_evidence_renderer_invalid")
         if evidence.get("filter_version") != PRODUCTION_KEYING_FILTER_VERSION or evidence.get("filter_fingerprint") != expected_fingerprint:
             issues.append("keying_evidence_filter_stale")

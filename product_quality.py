@@ -648,8 +648,12 @@ def ppt_render_manifest_issues(manifest_path: Path) -> list[str]:
             for row, slide_name in zip(rows, slide_names):
                 texts = "".join(_ppt_xml_texts(archive, slide_name))
                 expected = str(row.get("subtitle_text") or "")
-                if bool(payload.get("with_subtitles")) and _normalise_public(texts) != _normalise_public(expected):
-                    issues.append(f"ppt_subtitle_text_mismatch:{row.get('slide_index')}")
+                if bool(payload.get("with_subtitles")):
+                    if row.get("subtitle_expected"):
+                        if _normalise_public(texts) != _normalise_public(expected):
+                            issues.append(f"ppt_subtitle_text_mismatch:{row.get('slide_index')}")
+                    elif texts.strip():
+                        issues.append(f"ppt_semantic_card_contains_post_text:{row.get('slide_index')}")
                 if not bool(payload.get("with_subtitles")) and texts.strip():
                     issues.append(f"ppt_clean_variant_contains_subtitle:{row.get('slide_index')}")
                 root = etree.fromstring(archive.read(slide_name))
@@ -690,7 +694,7 @@ def ppt_render_manifest_issues(manifest_path: Path) -> list[str]:
                             issues.append(f"ppt_image_geometry_invalid:{row.get('slide_index')}")
                 else:
                     issues.append(f"ppt_image_geometry_missing:{row.get('slide_index')}")
-                if bool(payload.get("with_subtitles")):
+                if bool(payload.get("with_subtitles")) and row.get("subtitle_expected"):
                     text_shapes = root.xpath(
                         "//*[local-name()='sp'][.//*[local-name()='txBody']]"
                         "/*[local-name()='spPr']/*[local-name()='xfrm']"
@@ -718,6 +722,12 @@ def ppt_render_manifest_issues(manifest_path: Path) -> list[str]:
                                 issues.append(f"ppt_subtitle_geometry_mismatch:{row.get('slide_index')}")
                             if not _bbox_inside(actual_bbox, row.get("subtitle_safe_region")):
                                 issues.append(f"ppt_actual_subtitle_outside_safe_region:{row.get('slide_index')}")
+                elif bool(payload.get("with_subtitles")):
+                    text_shapes = root.xpath(
+                        "//*[local-name()='sp'][.//*[local-name()='txBody']]"
+                    )
+                    if text_shapes:
+                        issues.append(f"ppt_semantic_card_subtitle_shape_present:{row.get('slide_index')}")
                 advance = root.xpath("//*[local-name()='transition']/@advTm")
                 if advance:
                     actual_duration = float(advance[0]) / 1000.0
@@ -926,7 +936,7 @@ def product_package_manifest_issues(manifest_path: Path) -> list[str]:
             return [
                 {key: row.get(key) for key in (
                     "slide_index", "source_line_index", "source_text", "image_sha256",
-                    "timing_start", "timing_end", "duration", "layout_mode",
+                    "timing_start", "timing_end", "duration",
                 )}
                 for row in value.get("slides", []) if isinstance(row, dict)
             ]
@@ -953,7 +963,7 @@ def product_package_review_payload_issues(
     for item in matrix:
         if not isinstance(item, dict):
             continue
-        for key in ("relative_path", "path", "file", "artifact_path"):
+        for key in ("relative_path", "path", "file", "artifact_path", "evidence"):
             value = str(item.get(key) or "").strip()
             if value:
                 cited.add(value.replace("\\", "/"))

@@ -149,6 +149,66 @@ def creative_lineage_issues(publish_dir: Path, lineage_path: Path) -> tuple[list
     return issues, expand_retry_files(retries)
 
 
+
+def integrated_cover_issues(
+    publish_dir: Path,
+    *,
+    receipt_path: Path,
+    expected_title: str,
+) -> tuple[list[str], list[str]]:
+    """Validate one-piece Codex/ImageGen cover outputs and their edit lineage."""
+    try:
+        payload = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        return [f"- 一体成型封面 ImageGen 收据缺失或损坏：{exc}"], [cover_relative(*key.split(":")) for key in COVER_GRAPH]
+    if payload.get("mode") != "imagegen_integrated":
+        return ["- 封面收据不是 imagegen_integrated 一体成型模式"], [cover_relative(*key.split(":")) for key in COVER_GRAPH]
+    attempt_count = payload.get("attempt_count")
+    if (
+        isinstance(attempt_count, bool)
+        or not isinstance(attempt_count, int)
+        or not 1 <= attempt_count <= 3
+    ):
+        return ["- 封面 ImageGen attempt_count 必须为 1-3（首轮加最多两轮定向修正）"], [
+            cover_relative(*key.split(":")) for key in COVER_GRAPH
+        ]
+    records = payload.get("covers") if isinstance(payload.get("covers"), Mapping) else {}
+    issues: list[str] = []
+    retries: list[str] = []
+    for asset_id, parent_id in COVER_GRAPH.items():
+        account, ratio = asset_id.split(":")
+        relative = cover_relative(account, ratio)
+        output = publish_dir / relative
+        record = records.get(asset_id) if isinstance(records.get(asset_id), Mapping) else None
+        local: list[str] = []
+        if not output.is_file() or record is None:
+            local.append("最终封面或 ImageGen 记录缺失")
+        else:
+            if str(record.get("path") or "").replace("\\", "/") != relative:
+                local.append("目标路径绑定错误")
+            if record.get("sha256") != file_sha256(output):
+                local.append("最终封面哈希失效")
+            if record.get("generation_method") != "codex_imagegen":
+                local.append("最终封面不是 Codex ImageGen 一体成型产物")
+            receipt_title = str(record.get("title_text") or "").strip()
+            # ImageGen may render the exact story title with conventional Chinese
+            # book-title marks. They are punctuation, not a different title.
+            if receipt_title.startswith("《") and receipt_title.endswith("》"):
+                receipt_title = receipt_title[1:-1].strip()
+            if receipt_title != expected_title.strip():
+                local.append("封面标题收据不准确")
+            if record.get("parent_asset_id") != parent_id:
+                local.append("母版编辑血缘错误")
+            if parent_id:
+                pa, pr = parent_id.split(":")
+                parent = publish_dir / cover_relative(pa, pr)
+                if not parent.is_file() or record.get("parent_sha256") != file_sha256(parent):
+                    local.append("父封面哈希失效")
+        if local:
+            issues.append(f"- {asset_id}：{chr(65307).join(local)}")
+            retries.append(relative)
+    return issues, sorted(set(retries))
+
 def expand_retry_files(retry_files: list[str]) -> list[str]:
     """Expand only lineage descendants of failed cover assets."""
     by_final = {cover_relative(*key.split(":")): key for key in COVER_GRAPH}
@@ -260,10 +320,19 @@ def _draw_centered_lines(
 
 
 def _variant(compiled: Mapping[str, Any], ratio_name: str) -> Mapping[str, Any]:
-    candidates = [item for item in compiled.get("variants", []) if isinstance(item, Mapping) and item.get("aspect_ratio") == ratio_name]
-    if len(candidates) != 1:
-        raise ValueError(f"封面合同必须为 {ratio_name} 提供唯一布局 variant")
-    return candidates[0]
+    variants = [item for item in compiled.get("variants", []) if isinstance(item, Mapping)]
+    candidates = [item for item in variants if item.get("aspect_ratio") == ratio_name]
+    if len(candidates) == 1:
+        return candidates[0]
+    rules = {str(item.get("rule_id")): item.get("value") for item in compiled.get("layout_rules", []) if isinstance(item, Mapping)}
+    deferred = (
+        not variants
+        and rules.get("layout.precise_variants_require_canvas_receipt") is True
+        and rules.get("layout.normalized_regions_require_canvas_receipt") is True
+    )
+    if deferred:
+        return {"variant_id": f"runtime-safe-default-{ratio_name}", "aspect_ratio": ratio_name, "regions": []}
+    raise ValueError(f"封面合同必须为 {ratio_name} 提供唯一布局 variant")
 
 
 def _brand_projection_sha256(compiled: Mapping[str, Any]) -> str:
@@ -338,7 +407,7 @@ def _render_final_cover_execution(
     title: str,
     secondary: str,
     usage: str,
-    logo: Image.Image,
+    logo: Image.Image | None,
 ) -> dict[str, Any]:
     with Image.open(base_path) as source:
         canvas = source.convert("RGBA")
@@ -349,17 +418,20 @@ def _render_final_cover_execution(
         for item in variant.get("regions", [])
         if isinstance(item, Mapping) and item.get("role")
     }
-    if not (regions.get("title_safe") or regions.get("title")):
+    runtime_safe_default = str(variant.get("variant_id") or "").startswith("runtime-safe-default-")
+    if not runtime_safe_default and not (regions.get("title_safe") or regions.get("title")):
         raise ValueError(f"封面合同 {ratio_name} 缺少标题安全区")
-    if not (regions.get("logo") or regions.get("brand_logo")):
+    if logo is not None and not (regions.get("logo") or regions.get("brand_logo")):
         raise ValueError(f"封面合同 {ratio_name} 缺少官方 Logo 安全区")
     title_safe = _pixel_box(regions.get("title_safe") or regions.get("title"), canvas.width, canvas.height, (.16, .08, .68, .24))
     secondary_safe = _pixel_box(regions.get("secondary_info") or regions.get("metadata"), canvas.width, canvas.height, (.20, .32, .60, .09))
-    logo_safe = _pixel_box(regions.get("logo") or regions.get("brand_logo"), canvas.width, canvas.height, (.38, .015, .24, .07))
+    logo_safe = _pixel_box(regions.get("logo") or regions.get("brand_logo"), canvas.width, canvas.height, (.38, .015, .24, .07)) if logo is not None else None
     usage_safe = _pixel_box(regions.get("usage_info") or regions.get("footer"), canvas.width, canvas.height, (.08, .88, .84, .08))
     person_safe = _pixel_box(regions.get("person") or regions.get("host"), canvas.width, canvas.height, (0, 0, 0, 0)) if (regions.get("person") or regions.get("host")) else None
     story_safe = _pixel_box(regions.get("story_character") or regions.get("story_media"), canvas.width, canvas.height, (0, 0, 0, 0)) if (regions.get("story_character") or regions.get("story_media")) else None
     for label, box in (("title", title_safe), ("secondary", secondary_safe), ("logo", logo_safe), ("usage", usage_safe)):
+        if box is None:
+            continue
         if not _contains([0, 0, canvas.width, canvas.height], box):
             raise ValueError(f"封面 {asset_id} 的 {label} 安全区越界")
     if any(_overlap(title_safe, protected) for protected in (person_safe, story_safe) if protected):
@@ -374,17 +446,22 @@ def _render_final_cover_execution(
         secondary_bbox = _draw_centered_lines(draw, secondary_lines, secondary_font, secondary_safe, fill=(255, 255, 255), stroke_fill=(91, 74, 34))
     usage_font, usage_lines, _ = _fit_text(draw, usage, usage_safe, max_lines=1)
     usage_bbox = _draw_centered_lines(draw, usage_lines, usage_font, usage_safe, fill=(255, 255, 255), stroke_fill=(70, 93, 31))
-    logo_scale = min(logo_safe[2] / logo.width, logo_safe[3] / logo.height)
-    rendered_logo = logo.resize((max(1, round(logo.width * logo_scale)), max(1, round(logo.height * logo_scale))), Image.Resampling.LANCZOS)
-    logo_x = logo_safe[0] + (logo_safe[2] - rendered_logo.width) // 2
-    logo_y = logo_safe[1] + (logo_safe[3] - rendered_logo.height) // 2
-    logo_bbox = [logo_x, logo_y, rendered_logo.width, rendered_logo.height]
+    rendered_logo = None
+    logo_bbox = None
+    logo_x = logo_y = 0
+    if logo is not None and logo_safe is not None:
+        logo_scale = min(logo_safe[2] / logo.width, logo_safe[3] / logo.height)
+        rendered_logo = logo.resize((max(1, round(logo.width * logo_scale)), max(1, round(logo.height * logo_scale))), Image.Resampling.LANCZOS)
+        logo_x = logo_safe[0] + (logo_safe[2] - rendered_logo.width) // 2
+        logo_y = logo_safe[1] + (logo_safe[3] - rendered_logo.height) // 2
+        logo_bbox = [logo_x, logo_y, rendered_logo.width, rendered_logo.height]
     occupied = [title_bbox, secondary_bbox, usage_bbox, logo_bbox]
     if any(_overlap(left, right) for index, left in enumerate(occupied) if left for right in occupied[index + 1:] if right):
         raise ValueError(f"封面 {asset_id} 的确定性文字或 Logo 发生碰撞")
     if any(_overlap(item, protected) for item in occupied if item for protected in (person_safe, story_safe) if protected):
         raise ValueError(f"封面 {asset_id} 的确定性信息与受保护主体区域冲突")
-    canvas.alpha_composite(rendered_logo, (logo_x, logo_y))
+    if rendered_logo is not None:
+        canvas.alpha_composite(rendered_logo, (logo_x, logo_y))
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary = output_path.with_name(f".{output_path.name}.tmp.png")
     canvas.convert("RGB").save(temporary, format="PNG", optimize=True)
@@ -408,7 +485,7 @@ def render_required_covers(
     publish_dir: Path,
     *,
     compiled_spec: Mapping[str, Any],
-    logo_path: Path,
+    logo_path: Path | None,
     story: Mapping[str, Any],
     publish_asset_port: PublishAssetPort | None = None,
 ) -> tuple[Path, Path, Path]:
@@ -427,10 +504,13 @@ def render_required_covers(
         raise ValueError("封面合同投影缺少绑定字段")
     spec_sha = canonical_sha256(compiled_spec)
     brand_projection_sha = _brand_projection_sha256(compiled_spec)
-    logo_sha = file_sha256(logo_path)
     official = [item for item in compiled_spec.get("official_assets", []) if isinstance(item, Mapping)]
-    if not any(item.get("sha256") == logo_sha and int(item.get("max_per_frame", 0)) == 1 for item in official):
+    expected_logo_count = 1 if official else 0
+    logo_sha = file_sha256(logo_path) if logo_path is not None else None
+    if expected_logo_count and (logo_path is None or not any(item.get("sha256") == logo_sha and int(item.get("max_per_frame", 0)) == 1 for item in official)):
         raise ValueError("官方 Logo 与已审核封面品牌投影不匹配，或 max_per_frame 不是 1")
+    if not expected_logo_count and logo_path is not None:
+        raise ValueError("封面品牌投影未启用官方 Logo，不得擅自叠加")
     title = str(story.get("name") or "").strip()
     if not title:
         raise ValueError("封面确定性排版缺少故事标题")
@@ -440,12 +520,14 @@ def render_required_covers(
         str(story.get("age_range") or "").strip(),
     ) if item)
     usage = "背景视频 · PPT · 配乐 · 文稿 · 朗读标注 · 示范视频"
-    with Image.open(logo_path) as source:
-        logo = source.convert("RGBA")
-        bbox = logo.getbbox()
-        if bbox is None:
-            raise ValueError("官方 Logo 全透明")
-        logo = logo.crop(bbox)
+    logo = None
+    if logo_path is not None:
+        with Image.open(logo_path) as source:
+            logo = source.convert("RGBA")
+            bbox = logo.getbbox()
+            if bbox is None:
+                raise ValueError("官方 Logo 全透明")
+            logo = logo.crop(bbox)
     port = publish_asset_port or build_publish_asset_registry().publish_asset()
 
     render_records: dict[str, Any] = {}
@@ -476,11 +558,11 @@ def render_required_covers(
         _execute_publish_asset(
             port,
             artifact_id=f"publish-final-cover:{asset_id}",
-            input_artifacts=(
+            input_artifacts=tuple(filter(None, (
                 {"role": "creative_base", "path": str(base_path), "sha256": file_sha256(base_path)},
-                {"role": "official_logo", "path": str(logo_path), "sha256": logo_sha},
+                {"role": "official_logo", "path": str(logo_path), "sha256": logo_sha} if logo_path is not None else None,
                 {"role": "creative_lineage", "path": str(creative_lineage_path), "sha256": file_sha256(creative_lineage_path)},
-            ),
+            ))),
             execution_binding={
                 "asset_id": asset_id,
                 "ratio": ratio_name,
@@ -529,11 +611,11 @@ def render_required_covers(
             "logo_bbox": logo_bbox,
             "logo_safe_region": logo_safe,
             "logo_sha256": logo_sha,
-            "official_logo_count": 1,
+            "official_logo_count": expected_logo_count,
             "protected_regions": {key: value for key, value in (("presenter", person_safe), ("story_character", story_safe)) if value},
             "margins": {
                 "title": [title_bbox[0], title_bbox[1], canvas_width - title_bbox[0] - title_bbox[2], canvas_height - title_bbox[1] - title_bbox[3]],
-                "logo": [logo_bbox[0], logo_bbox[1], canvas_width - logo_bbox[0] - logo_bbox[2], canvas_height - logo_bbox[1] - logo_bbox[3]],
+                "logo": [logo_bbox[0], logo_bbox[1], canvas_width - logo_bbox[0] - logo_bbox[2], canvas_height - logo_bbox[1] - logo_bbox[3]] if logo_bbox else None,
             },
             "layout_variant_id": variant.get("variant_id"),
             "render_version": COVER_RENDER_VERSION,
@@ -624,6 +706,7 @@ def required_cover_issues(
         retries.extend(cover_relative(*key.split(":")) for key in COVER_GRAPH)
     entries = {str(item.get("asset_id")): item for item in lineage.get("covers", []) if isinstance(item, Mapping)}
     records = render.get("covers", {}) if isinstance(render.get("covers"), Mapping) else {}
+    expected_logo_count = 1 if [item for item in compiled_spec.get("official_assets", []) if isinstance(item, Mapping)] else 0
     for asset_id, parent_id in COVER_GRAPH.items():
         account, ratio = asset_id.split(":")
         relative = cover_relative(account, ratio)
@@ -655,8 +738,8 @@ def required_cover_issues(
                 local.append("确定性标题不准确")
             if record.get("brand_projection_sha256") != brand_projection_sha or entry.get("brand_projection_sha256") != brand_projection_sha:
                 local.append("品牌投影指纹失效")
-            if record.get("official_logo_count") != 1:
-                local.append("官方 Logo 数量不是 1")
+            if record.get("official_logo_count") != expected_logo_count:
+                local.append(f"官方 Logo 数量不是合同要求的 {expected_logo_count}")
             canvas = record.get("canvas")
             if not isinstance(canvas, list) or len(canvas) != 2:
                 local.append("画布 geometry 缺失")
@@ -673,6 +756,10 @@ def required_cover_issues(
                     bbox = record.get(f"{name}_bbox")
                     safe = record.get(f"{name}_safe_region")
                     if name == "secondary" and not record.get("secondary_text"):
+                        continue
+                    if name == "logo" and expected_logo_count == 0:
+                        if bbox is not None or safe is not None:
+                            local.append("合同禁用 Logo 但仍存在 Logo 几何")
                         continue
                     if not isinstance(bbox, list) or not isinstance(safe, list) or not _contains(whole, bbox) or not _contains(safe, bbox):
                         local.append(f"{name} 几何不在安全区")

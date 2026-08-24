@@ -16,6 +16,7 @@ from product_package import (
     render_annotation_blocks_docx,
     render_story_docx,
     load_or_build_timings,
+    semantic_card_ppt_overrides,
     validate_annotation_coverage,
 )
 from product_quality import (
@@ -424,6 +425,92 @@ class ProductQualityTests(unittest.TestCase):
         self.images[0].write_bytes(b"changed")
         self.assertTrue(any("source_image_stale" in issue for issue in ppt_render_manifest_issues(manifest)))
 
+    def test_ppt_uses_title_for_full_opening_window_and_moral_for_ending(self) -> None:
+        lines = ["大家好。", "今天讲爱比美的公鸡。", "公鸡走进树林。", "不要只注重外表。"]
+        timings = [timing(index + 1, text, float(index)) for index, text in enumerate(lines)]
+        plan = {
+            "semantic_source": {"line_count": 4},
+            "artifacts": {
+                "background_visual": {
+                    "decisions": [
+                        {"semantic_kind": "title", "source_line_numbers": [2]},
+                        {"semantic_kind": "story_body", "source_line_numbers": [3]},
+                        {"semantic_kind": "moral", "source_line_numbers": [4]},
+                    ]
+                }
+            },
+            "visual_cards": [
+                {
+                    "card_kind": "title_card", "semantic_kind": "title",
+                    "text": "爱比美的公鸡", "source_line_numbers": [2],
+                },
+                {
+                    "card_kind": "moral_card", "semantic_kind": "moral",
+                    "text": "不要只注重外表。", "source_line_numbers": [4],
+                },
+            ],
+        }
+        card_dir = self.root / "semantic_cards"
+        card_dir.mkdir()
+        receipt_cards = []
+        for kind, text, color in (
+            ("title_card", "爱比美的公鸡", (220, 170, 100)),
+            ("moral_card", "不要只注重外表。", (100, 170, 120)),
+        ):
+            path = card_dir / f"{kind}.png"
+            Image.new("RGB", (320, 180), color).save(path)
+            receipt_cards.append(
+                {
+                    "card_kind": kind,
+                    "text": text,
+                    "path": str(path),
+                    "sha256": file_sha256(path),
+                }
+            )
+        (card_dir / "semantic_card_generation_receipt.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": "story-semantic-card-generation/v1",
+                    "imagegen_native": True,
+                    "post_render_text_overlay": False,
+                    "cards": receipt_cards,
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+        overrides = semantic_card_ppt_overrides(
+            ppt_indices=[0, 1, 2, 3],
+            all_timings=timings,
+            semantic_plan=plan,
+            card_dir=card_dir,
+        )
+        self.assertEqual(set(overrides), {0, 1, 3})
+        self.assertEqual(overrides[0][1], "title_card")
+        self.assertEqual(overrides[1][1], "title_card")
+        self.assertEqual(overrides[3][1], "moral_card")
+
+        ppt_images = [self.images[0], self.images[0], self.images[1], self.images[1]]
+        positions = {}
+        for source_index, (path, kind) in overrides.items():
+            ppt_images[source_index] = path
+            positions[source_index] = kind
+        music = self.root / "semantic-music.mp3"
+        music.write_bytes(b"offline-music-fixture")
+        pptx = self.root / "semantic-cards.pptx"
+        build_story_ppt(
+            "爱比美的公鸡", ppt_images, lines, timings, music, pptx, True, 4.0,
+            semantic_card_positions=positions,
+        )
+        rows = build_ppt_manifest_rows(
+            ppt_images, lines, timings, [0, 1, 2, 3], 4.0,
+            with_subtitles=True, semantic_card_positions=positions,
+        )
+        self.assertFalse(rows[0]["subtitle_expected"])
+        self.assertFalse(rows[1]["subtitle_expected"])
+        self.assertTrue(rows[2]["subtitle_expected"])
+        self.assertFalse(rows[3]["subtitle_expected"])
+
     def test_timings_change_stales_content_and_dependent_ppt(self) -> None:
         content = self.make_content_manifest()
         music = self.root / "timing-music.mp3"
@@ -518,16 +605,40 @@ class ProductQualityTests(unittest.TestCase):
                 target.write_bytes(source.read_bytes())
                 source_map[f"{package}:{name}"] = source
         dependency = self.make_content_manifest()
+        dependencies = self.make_package_dependencies(dependency)
+        ppt_core = {
+            "slide_index": 1,
+            "source_line_index": 0,
+            "source_text": self.lines[0],
+            "image_sha256": file_sha256(self.images[0]),
+            "timing_start": 0.0,
+            "timing_end": 1.0,
+            "duration": 1.0,
+        }
+        with_subtitles_manifest = dependencies["ppt_with_subtitles_render_manifest"]
+        without_subtitles_manifest = dependencies["ppt_without_subtitles_render_manifest"]
+        with_subtitles_manifest.write_text(json.dumps({
+            "slides": [{**ppt_core, "layout_mode": "full_bleed_with_bottom_subtitle"}],
+        }), encoding="utf-8")
+        without_subtitles_manifest.write_text(json.dumps({
+            "slides": [{**ppt_core, "layout_mode": "full_bleed_clean"}],
+        }), encoding="utf-8")
         manifest = self.root / "package.json"
         write_product_package_manifest(
             manifest,
             product_root=root,
             base_dir=base,
             advanced_dir=advanced,
-            dependencies=self.make_package_dependencies(dependency),
+            dependencies=dependencies,
             source_map=source_map,
         )
         self.assertEqual(product_package_manifest_issues(manifest), [])
+        clean_without_subtitles = without_subtitles_manifest.read_bytes()
+        without_subtitles_manifest.write_text(json.dumps({
+            "slides": [{**ppt_core, "source_line_index": 1, "layout_mode": "full_bleed_clean"}],
+        }), encoding="utf-8")
+        self.assertIn("product_ppt_core_lineage_mismatch", product_package_manifest_issues(manifest))
+        without_subtitles_manifest.write_bytes(clean_without_subtitles)
         timing_rows = json.loads(self.timings_source.read_text(encoding="utf-8"))
         timing_rows[0]["timeline_end"] = 1.5
         self.timings_source.write_text(json.dumps(timing_rows, ensure_ascii=False), encoding="utf-8")
@@ -602,6 +713,31 @@ class ProductQualityTests(unittest.TestCase):
         self.assertIn(
             "product_package_review_has_p0",
             product_package_review_payload_issues(p0, evidence_root=root, required_evidence=[first, second]),
+        )
+
+    def test_product_review_accepts_required_v1_evidence_field(self) -> None:
+        root = self.root / "ppt_evidence"
+        image = root / "with_subtitles" / "first_slide_001.png"
+        image.parent.mkdir(parents=True)
+        Image.new("RGB", (32, 18), "white").save(image)
+        payload = {
+            "critical_errors": [],
+            "p0_errors": [],
+            "evidence_matrix": [
+                {
+                    "artifact": "story_with_subtitles.pptx",
+                    "evidence": "with_subtitles/first_slide_001.png",
+                    "result": "pass",
+                }
+            ],
+        }
+        self.assertEqual(
+            product_package_review_payload_issues(
+                payload,
+                evidence_root=root,
+                required_evidence=[image],
+            ),
+            [],
         )
 
     def test_product_package_review_passes_ppt_evidence_as_native_images(self) -> None:

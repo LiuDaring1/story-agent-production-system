@@ -11,7 +11,7 @@
   ],
   "properties": {
     "schema_version": {"const": "1.0"},
-    "compiler_version": {"const": "1"},
+    "compiler_version": {"const": "3"},
     "story_contract_sha256": {"$ref": "#/$defs/sha256"},
     "contract_schema_version": {"type": "string", "minLength": 1},
     "story_contract_dependency_sha256": {"$ref": "#/$defs/sha256"},

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import hashlib
 import json
 import re
 import shutil
@@ -37,6 +38,7 @@ from artifact_semantic_plan import load_current_artifact_semantic_plan, semantic
 
 from story_project import (
     auto_keying,
+    configured_keying_backend,
     create_theme_asset_request,
     detect_project_assets,
     doctor_project,
@@ -45,6 +47,7 @@ from story_project import (
     final_delivery,
     init_project,
     load_config,
+    main_package_receipt_issues,
     maybe_update_latest_episode,
     project_paths,
     qa_images,
@@ -57,6 +60,7 @@ from story_project import (
     qa_videos,
     register_manual_output,
     refresh_project_outputs,
+    save_json,
     semi_auto_status,
     update_story_info,
     write_manifest,
@@ -145,6 +149,12 @@ def main() -> None:
     keying_cmd = subparsers.add_parser("auto-keying", help="自动采样绿幕并生成 keying_preset.json")
     keying_cmd.add_argument("--project-dir", required=True, type=Path)
     keying_cmd.add_argument("--greenscreen", type=Path)
+    keying_cmd.add_argument(
+        "--backend",
+        choices=["auto", "colorkey", "chromakey", "rvm"],
+        default="auto",
+        help="auto 使用 pipeline_config.release_defaults.preferred_keyer",
+    )
 
     release_assets_cmd = subparsers.add_parser("prepare-release-assets-project", help="生成第 12 步 Codex 发布视觉定版任务书并尝试自动抠像")
     release_assets_cmd.add_argument("--project-dir", required=True, type=Path)
@@ -198,7 +208,11 @@ def main() -> None:
     product_preflight = subparsers.add_parser("product-package-preflight-project", help="第 16 步先生成 Codex 前置审查材料和示范视频预览帧")
     product_preflight.add_argument("--project-dir", required=True, type=Path)
     product_preflight.add_argument("--preview-times", default="0.8,1.5,2.5,37,92")
-    product_preflight.add_argument("--demo-person-crop-mode", choices=["preset", "full-width"], default="full-width")
+    product_preflight.add_argument(
+        "--demo-person-crop-mode",
+        choices=["source-native", "preset", "full-width"],
+        default="source-native",
+    )
     product_preflight.add_argument("--demo-person-vertical-align", choices=["center", "bottom"], default="bottom")
     product_preflight.add_argument("--demo-person-crop-bottom-ratio", default=0.0, type=float)
     product_preflight.add_argument("--story-contract-context", type=Path)
@@ -208,7 +222,11 @@ def main() -> None:
     product_project.add_argument("--annotation-docx", type=Path)
     product_project.add_argument("--annotation-json", type=Path)
     product_project.add_argument("--allow-draft-annotation", action="store_true", default=False)
-    product_project.add_argument("--demo-person-crop-mode", choices=["preset", "full-width"], default="full-width")
+    product_project.add_argument(
+        "--demo-person-crop-mode",
+        choices=["source-native", "preset", "full-width"],
+        default="source-native",
+    )
     product_project.add_argument("--demo-person-vertical-align", choices=["center", "bottom"], default="bottom")
     product_project.add_argument("--demo-person-crop-bottom-ratio", default=0.0, type=float)
     product_project.add_argument("--story-contract-context", type=Path)
@@ -344,9 +362,9 @@ def main() -> None:
     release.add_argument("--antipiracy-logo", type=Path)
     release.add_argument("--plate-image", type=Path)
     release.add_argument("--video-box", default="0,416,1080,608")
-    release.add_argument("--watermark-width", default=190, type=int)
+    release.add_argument("--watermark-width", default=96, type=int)
     release.add_argument("--watermark-opacity", default=0.78, type=float)
-    release.add_argument("--watermark-speed", default=1.0, type=float)
+    release.add_argument("--watermark-speed", default=0.45, type=float)
     release.add_argument("--frame-image", type=Path)
     release.add_argument("--frame-image-b", type=Path)
     release.add_argument("--story-box", default="170,250,990,557")
@@ -452,7 +470,11 @@ def main() -> None:
     product.add_argument("--demo-crf", default=20, type=int)
     product.add_argument("--demo-preset", default="veryfast")
     product.add_argument("--demo-person-crop-bottom-ratio", default=0.0, type=float)
-    product.add_argument("--demo-person-crop-mode", choices=["preset", "full-width"], default="preset")
+    product.add_argument(
+        "--demo-person-crop-mode",
+        choices=["source-native", "preset", "full-width"],
+        default="source-native",
+    )
     product.add_argument("--demo-person-vertical-align", choices=["center", "bottom"], default="center")
     product.add_argument("--preview-only", action="store_true")
     product.add_argument("--preview-times", default="0.8,1.5,2.5,37,92")
@@ -541,14 +563,15 @@ def main() -> None:
         for label, path in outputs.items():
             print(f"{label}: {path}")
     elif args.command == "auto-keying":
-        preset = auto_keying(args.project_dir, args.greenscreen)
+        backend = configured_keying_backend() if args.backend == "auto" else args.backend
+        preset = auto_keying(args.project_dir, args.greenscreen, backend=backend)
         print(f"已生成自动抠像参数：{preset}")
     elif args.command == "prepare-release-assets-project":
         outputs = create_theme_asset_request(args.project_dir)
         for label, path in outputs.items():
             print(f"{label}: {path}")
         try:
-            preset = auto_keying(args.project_dir)
+            preset = auto_keying(args.project_dir, backend=configured_keying_backend())
             print(f"已生成自动抠像参数：{preset}")
         except Exception as exc:
             print(f"[warning] 暂未生成抠像参数：{exc}")
@@ -1167,6 +1190,71 @@ def build_abc_scene_windows(duration: float, subtitle_srt: Path | None = None) -
     return ",".join(b_windows), ",".join(c_windows)
 
 
+def preview_times_with_b_coverage(value: str, b_windows: str) -> str:
+    """Add one deterministic review frame inside every B interval."""
+    raw_times = [part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
+    times = [max(0.0, float(part)) for part in raw_times]
+    occupied_filenames = {int(round(item)) for item in times}
+    for raw_window in b_windows.replace("，", ",").split(","):
+        raw_window = raw_window.strip()
+        if not raw_window:
+            continue
+        raw_start, raw_end = raw_window.split("-", 1)
+        start, end = float(raw_start), float(raw_end)
+        midpoint = (start + end) / 2
+        if int(round(midpoint)) not in occupied_filenames:
+            times.append(midpoint)
+            occupied_filenames.add(int(round(midpoint)))
+    return ",".join(f"{item:.3f}" for item in times)
+
+
+def preview_times_with_keying_coverage(value: str, preset_path: Path | None) -> str:
+    """Include the real neutral anchor and large-gesture frames in short preview."""
+
+    times = [max(0.0, float(part.strip())) for part in value.replace("，", ",").split(",") if part.strip()]
+    if preset_path is not None and preset_path.is_file():
+        try:
+            preset = json.loads(preset_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            preset = {}
+        for field in ("presenter_initial_anchor_frame_seconds", "presenter_gesture_review_frame_seconds"):
+            raw = preset.get(field)
+            if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+                value_seconds = max(0.0, float(raw))
+                if int(round(value_seconds)) not in {int(round(item)) for item in times}:
+                    times.append(value_seconds)
+    return ",".join(f"{item:.3f}" for item in times)
+
+
+def release_encode_guard_action(
+    previous: dict[str, Any],
+    *,
+    binding_fingerprint: str,
+    output_is_current: bool,
+    max_technical_repairs: int = 1,
+) -> str:
+    """Choose reuse/start/technical-repair without reopening aesthetic loops."""
+
+    if not previous:
+        return "start"
+    same_binding = previous.get("binding_fingerprint") == binding_fingerprint
+    if (
+        same_binding
+        and output_is_current
+        and previous.get("status") in {"completed", "adopted_existing"}
+    ):
+        return "reuse"
+    if not same_binding:
+        return "block_binding_change"
+    repairs = int(previous.get("technical_repair_count") or 0)
+    if repairs < max_technical_repairs and previous.get("status") in {
+        "running", "running_technical_repair", "failed_or_interrupted",
+        "completed", "adopted_existing",
+    }:
+        return "technical_repair"
+    return "block_repair_limit"
+
+
 def run_package_release_project(
     project_dir: Path,
     variant: str,
@@ -1207,22 +1295,33 @@ def run_package_release_project(
     story = manifest["story"]
     outputs = manifest["outputs"]
     inputs = manifest["inputs"]
-    main_bg_video = first_existing(
+    age_range = str(story.get("age_range") or "").strip()
+    manual_overrides = story.get("manual_overrides") if isinstance(story.get("manual_overrides"), dict) else {}
+    if story_contract_context is not None and (not age_range or manual_overrides.get("age_range") is not True):
+        raise ValueError("age_range_user_input_required: 请先由用户指定适合年龄，再生成发布包装")
+    no_sub_bg_video = first_existing(
         outputs.get("background_video_no_sub"),
         paths.assembly / "story_no_subs_bgm.mp4",
-        outputs.get("background_video_with_sub"),
-        paths.assembly / "story_sales_subs_bgm.mp4",
-        outputs.get("demo_voice_bgm"),
-        paths.assembly / "story_demo_voice_bgm.mp4",
     )
-    library_bg_video = first_existing(
-        outputs.get("background_video_no_sub"),
-        paths.assembly / "story_no_subs_bgm.mp4",
-        outputs.get("demo_voice_bgm"),
-        paths.assembly / "story_demo_voice_bgm.mp4",
-        outputs.get("background_video_with_sub"),
-        paths.assembly / "story_sales_subs_bgm.mp4",
-    )
+    if story_contract_context is not None:
+        # Required-v1 composites exactly one subtitle layer.  A burned-in
+        # fallback plus subtitle_srt produced the double subtitles seen in the
+        # first real short test.
+        main_bg_video = no_sub_bg_video
+        library_bg_video = no_sub_bg_video
+    else:
+        main_bg_video = no_sub_bg_video or first_existing(
+            outputs.get("background_video_with_sub"),
+            paths.assembly / "story_sales_subs_bgm.mp4",
+            outputs.get("demo_voice_bgm"),
+            paths.assembly / "story_demo_voice_bgm.mp4",
+        )
+        library_bg_video = no_sub_bg_video or first_existing(
+            outputs.get("demo_voice_bgm"),
+            paths.assembly / "story_demo_voice_bgm.mp4",
+            outputs.get("background_video_with_sub"),
+            paths.assembly / "story_sales_subs_bgm.mp4",
+        )
     if main_bg_video is None and library_bg_video is None:
         raise FileNotFoundError("缺少背景成片：请先完成 ⑪ 合成背景成片。")
     audio_mix = first_existing(outputs.get("demo_voice_bgm"), paths.assembly / "story_demo_voice_bgm.mp4", inputs.get("narration"))
@@ -1235,6 +1334,12 @@ def run_package_release_project(
         pass
     main_plate = first_release_asset(theme_dir / "main_release_plate.png", theme_dir / "release_plate.png", outputs.get("release_plate_image"))
     library_plate = first_release_asset(theme_dir / "library_release_plate.png", outputs.get("library_release_plate_image"))
+    main_top_panel = first_existing(theme_dir / "main_release_plate_top.png")
+    main_bottom_panel = first_existing(theme_dir / "main_release_plate_bottom.png")
+    library_top_panel = first_existing(theme_dir / "library_release_plate_top.png")
+    library_bottom_panel = first_existing(theme_dir / "library_release_plate_bottom.png")
+    main_package_spec = first_existing(outputs.get("main_package_spec"), theme_dir / "main_package_spec.json")
+    main_package_receipt = first_existing(theme_dir / "main_package_generation_receipt.json")
     bg_image = first_existing(outputs.get("main_background_image"), theme_dir / "main_background_16x9.png")
     frame_a = first_existing(outputs.get("story_frame_a"), theme_dir / "story_frame_a.png")
     frame_b = frame_a
@@ -1246,6 +1351,7 @@ def run_package_release_project(
     )
     release_defaults = config.get("release_defaults", {})
     release_contract_spec: Path | None = None
+    release_contract_payload: dict | None = None
     release_contract_args: dict[str, object] = {}
     release_semantic_plan: dict | None = None
     if story_contract_context is not None:
@@ -1253,11 +1359,15 @@ def run_package_release_project(
             story_contract_context,
             paths.status / "contracts" / "consumers" / "release_video.compiled.json",
         )
-        release_contract_args = release_argument_overrides(
-            json.loads(release_contract_spec.read_text(encoding="utf-8")), "main"
+        release_contract_payload = json.loads(
+            release_contract_spec.read_text(encoding="utf-8")
         )
-        # Required-v1 packaging renders all text and brand elements
-        # deterministically.  Historical AI plate assets remain legacy-only.
+        release_contract_args = release_argument_overrides(
+            release_contract_payload, "main"
+        )
+        # Required-v1 uses the reviewed ImageGen-native top/bottom panels.
+        # Whole-canvas plates remain legacy-only because they can hide or
+        # distort the real center video aperture.
         main_plate = None
         library_plate = None
         release_semantic_plan = load_current_artifact_semantic_plan(paths.root)
@@ -1268,7 +1378,7 @@ def run_package_release_project(
         watermark_logo = None
     antipiracy_logo = first_existing(brand_assets.get("antipiracy_logo"), brand_assets.get("logo"))
     if (
-        story_contract_context is not None
+        story_contract_context is None
         and antipiracy_logo is not None
         and story_logo is not None
         and antipiracy_logo.resolve() == story_logo.resolve()
@@ -1277,10 +1387,17 @@ def run_package_release_project(
         # element.  Do not reuse it as the moving anti-piracy watermark and
         # accidentally show the same official mark twice in one frame.
         antipiracy_logo = None
+    if release_contract_payload is not None:
+        story_logo, watermark_logo, antipiracy_logo = contract_release_brand_paths(
+            release_contract_payload,
+            story_logo,
+            watermark_logo,
+            antipiracy_logo,
+        )
     keying_preset = first_existing(outputs.get("keying_preset"), paths.release / "keying" / "keying_preset.json")
     if keying_preset is None and greenscreen is not None:
         try:
-            keying_preset = auto_keying(paths.root)
+            keying_preset = auto_keying(paths.root, backend=configured_keying_backend())
         except Exception as exc:
             print(f"[warning] 自动抠像参数暂不可用：{exc}")
 
@@ -1299,13 +1416,28 @@ def run_package_release_project(
         ):
             if value is None:
                 missing.append(label)
+        for label, value in (
+            ("主账号 ImageGen 顶部包装板 main_release_plate_top.png", main_top_panel),
+            ("主账号 ImageGen 底部包装板 main_release_plate_bottom.png", main_bottom_panel),
+            ("主账号包装参考合同 main_package_spec.json", main_package_spec),
+            ("主账号包装生成回执 main_package_generation_receipt.json", main_package_receipt),
+        ):
+            if story_contract_context is not None and value is None:
+                missing.append(label)
         if release_defaults.get("b_windows") and frame_a is None:
             missing.append("统一透明故事框 story_frame_a.png")
     if requested_variant in {"both", "library"}:
         if library_bg_video is None:
-            missing.append("宝库号有人声有字幕版本 story_demo_voice_bgm.mp4")
+            missing.append("宝库号无字幕背景视频 story_no_subs_bgm.mp4")
         if library_plate is None and story_contract_context is None:
             missing.append("宝库号底板 library_release_plate.png")
+        if story_contract_context is not None:
+            if library_top_panel is None:
+                missing.append("宝库号 ImageGen 顶部包装板 library_release_plate_top.png")
+            if library_bottom_panel is None:
+                missing.append("宝库号 ImageGen 底部包装板 library_release_plate_bottom.png")
+    if story_contract_context is not None:
+        missing.extend(f"主账号包装链路 {issue}" for issue in main_package_receipt_issues(paths))
     if missing:
         request = create_theme_asset_request(paths.root)["request"]
         raise FileNotFoundError(
@@ -1330,6 +1462,8 @@ def run_package_release_project(
             story.get("name", ""),
             "--duration-text",
             story.get("duration_text") or "待定",
+            "--age-text",
+            age_range,
             "--bg-video",
             bg_video,
             "--output-dir",
@@ -1351,7 +1485,7 @@ def run_package_release_project(
             "--preset",
             release_defaults.get("preset", "medium"),
             "--output-scale",
-            str(release_defaults.get("output_scale", 2)),
+            str(release_defaults.get("output_scale", 1)),
             "--person-height",
             str(effective.get("person_height", 900)),
             "--person-x",
@@ -1369,11 +1503,11 @@ def run_package_release_project(
             "--person-grade",
             release_defaults.get("person_grade", "log-soft"),
             "--watermark-width",
-            str(release_defaults.get("watermark_width", 190)),
+            str(release_defaults.get("watermark_width", 96)),
             "--watermark-opacity",
             str(release_defaults.get("watermark_opacity", 0.78)),
             "--watermark-speed",
-            str(release_defaults.get("watermark_speed", 1.0)),
+            str(release_defaults.get("watermark_speed", 0.45)),
             "--tail-seconds",
             str(release_defaults.get("tail_seconds", 3.0)),
             "--tail-notice-text",
@@ -1392,11 +1526,20 @@ def run_package_release_project(
             str(effective.get("subtitle_margin_v", 72)),
         ]
         if release_contract_spec is not None:
+            # Both short preview and formal Release inherit the same reviewed
+            # real-material Demo geometry. The full customer Demo remains an
+            # independent downstream artifact and no longer gates Release.
+            demo_manifest_name = "demo_preview_manifest.json"
             command.extend([
                 "--contract-render-spec", release_contract_spec,
                 "--artifact-semantic-plan", semantic_plan_path(paths.root),
-                "--demo-render-manifest", paths.status / "product_package_work" / "demo_render_manifest.json",
+                "--demo-render-manifest", paths.status / "product_package_work" / demo_manifest_name,
             ])
+            if not is_preview:
+                command.extend([
+                    "--approved-preview-geometry",
+                    paths.status / "release_preview_frames" / f"release_geometry_manifest_{selected_variant}.json",
+                ])
         release_subtitle_srt = subtitle_srt
         if release_semantic_plan is not None and subtitle_srt is not None:
             artifact = "demo_subtitles" if selected_variant == "main" else "background_subtitles"
@@ -1405,9 +1548,19 @@ def run_package_release_project(
                 release_semantic_plan,
                 artifact,
                 paths.status / "release_semantics" / f"{selected_variant}_{artifact}.srt",
+                semantic_source=(
+                    paths.root
+                    / str(release_semantic_plan["semantic_source"]["project_relative_path"])
+                ),
             )
         optional: list[tuple[str, object | None]] = [
             ("--plate-image", plate_image),
+            ("--main-top-panel", main_top_panel),
+            ("--main-bottom-panel", main_bottom_panel),
+            ("--library-top-panel", library_top_panel),
+            ("--library-bottom-panel", library_bottom_panel),
+            ("--main-package-spec", main_package_spec),
+            ("--main-package-receipt", main_package_receipt),
             ("--watermark-logo", watermark_logo),
             ("--antipiracy-logo", antipiracy_logo),
             ("--story-logo", story_logo),
@@ -1440,7 +1593,11 @@ def run_package_release_project(
                 ]
             )
         if preview_times is not None:
-            command.extend(["--preview-dir", preview_dir, "--preview-times", preview_times])
+            effective_preview_times = preview_times_with_keying_coverage(preview_times, keying_preset)
+            if selected_variant == "main":
+                b_windows, _c_windows = resolve_scene_windows(bg_video)
+                effective_preview_times = preview_times_with_b_coverage(preview_times, b_windows)
+            command.extend(["--preview-dir", preview_dir, "--preview-times", effective_preview_times])
             if selected_variant == "main" and preview_person_layouts:
                 command.extend(["--preview-person-layouts", preview_person_layouts])
         for flag, value in optional:
@@ -1448,12 +1605,134 @@ def run_package_release_project(
                 command.extend([flag, value])
         return command
 
+    def sha256_file(path: Path) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def run_release_variant(selected_variant: str, bg_video: Path, plate_image: Path | None) -> None:
+        command = release_command(selected_variant, bg_video, plate_image)
+        if is_preview:
+            run_script("release_video.py", *command)
+            return
+        output = paths.release / ("主账号发布视频.mp4" if selected_variant == "main" else "宝库号发布视频.mp4")
+        file_bindings: dict[str, str] = {}
+        for value in command:
+            candidate = Path(str(value)).expanduser()
+            if candidate.is_file():
+                file_bindings[str(candidate.resolve())] = sha256_file(candidate)
+        fingerprint = hashlib.sha256(json.dumps({
+            "variant": selected_variant,
+            "command": [str(value) for value in command],
+            "input_artifact_hashes": file_bindings,
+        }, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
+        guard_dir = paths.status / "release_encode_guards"
+        guard_dir.mkdir(parents=True, exist_ok=True)
+        guard = guard_dir / f"{selected_variant}.json"
+        try:
+            previous = json.loads(guard.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            previous = {}
+        recorded_sha = str(previous.get("output_sha256") or "")
+        output_is_current = bool(
+            output.is_file()
+            and output.stat().st_size > 0
+            and recorded_sha
+            and recorded_sha == sha256_file(output)
+        )
+        guard_action = release_encode_guard_action(
+            previous,
+            binding_fingerprint=fingerprint,
+            output_is_current=output_is_current,
+        )
+        if guard_action == "reuse":
+            print(f"复用已绑定的 {selected_variant} 正式发布视频：{output}", flush=True)
+            return
+        if guard_action.startswith("block_"):
+            detail = (
+                "正式预演绑定已变化，禁止把审美改动伪装成技术修复"
+                if guard_action == "block_binding_change"
+                else "同一绑定的一次技术修复额度已用完"
+            )
+            raise RuntimeError(
+                f"max_full_resolution_encodes_reached:{selected_variant}; {detail}；"
+                "请保留当前成片、执行局部修复或由用户接受当前版本。"
+            )
+        if output.is_file() and not previous:
+            save_json(guard, {
+                "schema_version": "story-release-encode-guard/v1",
+                "variant": selected_variant,
+                "status": "adopted_existing",
+                "attempt_count": 1,
+                "binding_fingerprint": fingerprint,
+                "input_artifact_hashes": file_bindings,
+                "output": str(output),
+                "output_sha256": sha256_file(output),
+                "note": "保护性接管实施前已有成片，未覆盖重编码。",
+            })
+            print(f"保留并接管已有 {selected_variant} 正式发布视频：{output}", flush=True)
+            return
+        technical_repair = guard_action == "technical_repair"
+        technical_repair_count = int(previous.get("technical_repair_count") or 0) + int(technical_repair)
+        started_at = datetime.now().isoformat(timespec="seconds")
+        save_json(guard, {
+            "schema_version": "story-release-encode-guard/v1",
+            "variant": selected_variant,
+            "status": "running_technical_repair" if technical_repair else "running",
+            "attempt_count": 1,
+            "technical_repair_count": technical_repair_count,
+            "max_technical_repairs": 1,
+            "max_full_resolution_encodes": 1,
+            "binding_fingerprint": fingerprint,
+            "input_artifact_hashes": file_bindings,
+            "output": str(output),
+            "started_at": started_at,
+        })
+        try:
+            run_script("release_video.py", *command)
+        except BaseException as exc:
+            save_json(guard, {
+                "schema_version": "story-release-encode-guard/v1",
+                "variant": selected_variant,
+                "status": "failed_or_interrupted",
+                "attempt_count": 1,
+                "technical_repair_count": technical_repair_count,
+                "max_technical_repairs": 1,
+                "max_full_resolution_encodes": 1,
+                "binding_fingerprint": fingerprint,
+                "input_artifact_hashes": file_bindings,
+                "output": str(output),
+                "started_at": started_at,
+                "finished_at": datetime.now().isoformat(timespec="seconds"),
+                "error": f"{type(exc).__name__}: {exc}",
+            })
+            raise
+        if not output.is_file() or output.stat().st_size <= 0:
+            raise RuntimeError(f"正式编码返回但未产生有效输出：{output}")
+        save_json(guard, {
+            "schema_version": "story-release-encode-guard/v1",
+            "variant": selected_variant,
+            "status": "completed",
+            "attempt_count": 1,
+            "technical_repair_count": technical_repair_count,
+            "max_technical_repairs": 1,
+            "max_full_resolution_encodes": 1,
+            "binding_fingerprint": fingerprint,
+            "input_artifact_hashes": file_bindings,
+            "output": str(output),
+            "output_sha256": sha256_file(output),
+            "started_at": started_at,
+            "finished_at": datetime.now().isoformat(timespec="seconds"),
+        })
+
     if requested_variant in {"both", "main"}:
         assert main_bg_video is not None
-        run_script("release_video.py", *release_command("main", main_bg_video, main_plate))
+        run_release_variant("main", main_bg_video, main_plate)
     if requested_variant in {"both", "library"}:
         assert library_bg_video is not None
-        run_script("release_video.py", *release_command("library", library_bg_video, library_plate))
+        run_release_variant("library", library_bg_video, library_plate)
     if is_preview:
         sheet = render_release_preview_contact_sheet(preview_dir, run_id)
         handoff = write_release_preview_index(preview_dir, sheet, run_id)
@@ -1679,7 +1958,7 @@ def run_publish_package_project(
         "--story-type",
         story.get("story_type", "童话故事"),
         "--age-range",
-        story.get("age_range", "6-8岁"),
+        story.get("age_range", ""),
     ]
     if person_reference is not None:
         command.extend(["--person-reference", person_reference])
@@ -1913,7 +2192,7 @@ def run_product_package_project(
     existing_keying = first_existing(manifest["outputs"].get("keying_preset"), paths.release / "keying" / "keying_preset.json")
     if existing_keying is None:
         try:
-            auto_keying(paths.root)
+            auto_keying(paths.root, backend=configured_keying_backend())
         except Exception as exc:
             print(f"[warning] 自动抠像参数暂不可用：{exc}")
         manifest = refresh_project_outputs(paths.root)
@@ -2034,8 +2313,6 @@ def run_product_package_project(
             "--project-dir", paths.root,
             "--artifact-semantic-plan", semantic_plan_path(paths.root),
         ])
-        if demo_logo is None:
-            raise RuntimeError("required_v1 Demo 必须配置与合同品牌资产哈希一致的官方 Logo")
         release_context = paths.status / "contracts" / "consumers" / "release_video.json"
         demo_brand_spec_path = compile_demo_render_spec(
             release_context,
@@ -2044,13 +2321,14 @@ def run_product_package_project(
         )
         demo_brand_spec = json.loads(demo_brand_spec_path.read_text(encoding="utf-8"))
         logo_args = demo_logo_arguments(demo_brand_spec, 1920, 1080)
-        command.extend([
-            "--demo-brand-spec", demo_brand_spec_path,
-            "--demo-logo", logo_args["logo_path"],
-            "--demo-logo-width", str(logo_args["logo_width"]),
-            "--demo-logo-x", str(logo_args["logo_x"]),
-            "--demo-logo-y", str(logo_args["logo_y"]),
-        ])
+        command.extend(["--demo-brand-spec", demo_brand_spec_path])
+        if logo_args["logo_path"] is not None:
+            command.extend([
+                "--demo-logo", logo_args["logo_path"],
+                "--demo-logo-width", str(logo_args["logo_width"]),
+                "--demo-logo-x", str(logo_args["logo_x"]),
+                "--demo-logo-y", str(logo_args["logo_y"]),
+            ])
     annotation_skill_path = (
         annotation_skill_path_from_config()
     )
@@ -2228,8 +2506,23 @@ def parse_simple_srt(path: Path) -> list[tuple[float, float, str]]:
     return cues
 
 
-def compile_release_subtitle_srt(source: Path, plan: dict, artifact: str, target: Path) -> Path:
-    """Project the reviewed per-artifact semantics onto an existing timeline."""
+def compile_release_subtitle_srt(
+    source: Path,
+    plan: dict,
+    artifact: str,
+    target: Path,
+    *,
+    semantic_source: Path | None = None,
+) -> Path:
+    """Project reviewed source-line semantics onto an existing SRT timeline.
+
+    Semantic plans are deliberately compiled against stable story-source lines,
+    while display subtitles may split each source line into several short cues.
+    The equal-count path remains exact and backwards compatible.  When cue
+    counts differ, the current hash-bound semantic source is aligned to the
+    normalized subtitle text and whole cues inherit the decision of the source
+    line(s) they cover.
+    """
     text = source.read_text(encoding="utf-8-sig", errors="strict")
     blocks = [block for block in re.split(r"\n\s*\n", text.strip()) if block.strip()]
     lines: list[str] = []
@@ -2239,11 +2532,149 @@ def compile_release_subtitle_srt(source: Path, plan: dict, artifact: str, target
         if len(parts) >= 3 and "-->" in parts[1]:
             valid_blocks.append(block.strip())
             lines.append("，".join(parts[2:]).strip())
-    indices = selected_line_indices(lines, plan, artifact)
+    expected_count = int(plan["semantic_source"]["line_count"])
+    if len(lines) == expected_count:
+        indices = selected_line_indices(lines, plan, artifact)
+    else:
+        if semantic_source is None:
+            raise ValueError(
+                "semantic artifact source line count mismatch: "
+                f"expected {expected_count}, got {len(lines)}; "
+                "semantic_source is required to project split subtitle cues"
+            )
+        semantic_source = semantic_source.resolve()
+        if not semantic_source.is_file():
+            raise ValueError(f"semantic source missing: {semantic_source}")
+        recorded_sha256 = str(plan["semantic_source"].get("sha256") or "")
+        actual_sha256 = hashlib.sha256(semantic_source.read_bytes()).hexdigest()
+        if recorded_sha256 and actual_sha256 != recorded_sha256:
+            raise ValueError("semantic source SHA-256 does not match the current plan")
+        semantic_lines = [
+            line.strip()
+            for line in semantic_source.read_text(
+                encoding="utf-8-sig", errors="strict"
+            ).splitlines()
+            if line.strip()
+        ]
+        if len(semantic_lines) != expected_count:
+            raise ValueError(
+                "semantic source line count does not match the current plan: "
+                f"expected {expected_count}, got {len(semantic_lines)}"
+            )
+        selected_source_indices = selected_line_indices(
+            semantic_lines, plan, artifact
+        )
+        indices = project_semantic_lines_to_subtitle_cues(
+            semantic_lines,
+            lines,
+            selected_source_indices,
+        )
     target.parent.mkdir(parents=True, exist_ok=True)
     selected = [valid_blocks[index] for index in indices]
     target.write_text("\n\n".join(selected) + ("\n" if selected else ""), encoding="utf-8")
     return target
+
+
+def contract_release_brand_paths(
+    spec: dict,
+    story_logo: Path | None,
+    watermark_logo: Path | None,
+    antipiracy_logo: Path | None,
+) -> tuple[Path | None, Path | None, Path | None]:
+    """Keep only the reviewed official mark for each release placement.
+
+    ``official_assets`` is the only allowlist for deterministic release
+    branding.  The release renderer validates a configured story logo against
+    that allowlist.  Main rendering consumes ``story_logo`` as its one fixed
+    mark; library rendering consumes ``antipiracy_logo`` as its one moving
+    mark.  They may intentionally be the same official PNG because the two
+    renderers never place both roles in one output frame.
+    """
+
+    official_assets = [
+        item for item in spec.get("official_assets", []) if isinstance(item, dict)
+    ]
+    reviewed_story_logo = story_logo if official_assets else None
+    reviewed_antipiracy_logo = antipiracy_logo if official_assets else None
+    return reviewed_story_logo, None, reviewed_antipiracy_logo
+
+
+def project_semantic_lines_to_subtitle_cues(
+    semantic_lines: Sequence[str],
+    subtitle_lines: Sequence[str],
+    selected_source_indices: Sequence[int],
+) -> list[int]:
+    """Map source-line selections onto shorter subtitle cues without guessing.
+
+    A cue crossing a selected/unselected source boundary is rejected because
+    keeping or dropping it would silently change the locked semantic policy.
+    """
+
+    normalized_source = [
+        normalize_story_text_for_alignment(line) for line in semantic_lines
+    ]
+    normalized_cues = [
+        normalize_story_text_for_alignment(line) for line in subtitle_lines
+    ]
+    if any(not line for line in normalized_source):
+        raise ValueError("semantic source contains an empty normalized line")
+    if any(not line for line in normalized_cues):
+        raise ValueError("subtitle SRT contains an empty normalized cue")
+
+    source_stream = "".join(normalized_source)
+    cue_stream = "".join(normalized_cues)
+    occurrences = [
+        offset
+        for offset in range(0, len(cue_stream) - len(source_stream) + 1)
+        if cue_stream.startswith(source_stream, offset)
+    ]
+    if len(occurrences) != 1:
+        raise ValueError(
+            "semantic source cannot be uniquely aligned to subtitle cues: "
+            f"matches={len(occurrences)}"
+        )
+    source_offset = occurrences[0]
+
+    source_spans: list[tuple[int, int, int]] = []
+    cursor = source_offset
+    for source_index, text in enumerate(normalized_source):
+        end = cursor + len(text)
+        source_spans.append((cursor, end, source_index))
+        cursor = end
+
+    selected_set = set(int(index) for index in selected_source_indices)
+    cue_indices: list[int] = []
+    cue_spans: list[tuple[int, int]] = []
+    cue_cursor = 0
+    for cue_index, cue_text in enumerate(normalized_cues):
+        cue_end = cue_cursor + len(cue_text)
+        cue_spans.append((cue_cursor, cue_end))
+        overlapping = {
+            source_index
+            for start, end, source_index in source_spans
+            if cue_cursor < end and cue_end > start
+        }
+        if overlapping:
+            selected_overlap = overlapping & selected_set
+            if selected_overlap and selected_overlap != overlapping:
+                raise ValueError(
+                    "subtitle cue crosses a selected/unselected semantic line "
+                    f"boundary: cue={cue_index + 1}"
+                )
+            if selected_overlap:
+                cue_indices.append(cue_index)
+        cue_cursor = cue_end
+
+    covered = {
+        source_index
+        for cue_index in cue_indices
+        for start, end, source_index in source_spans
+        if cue_spans[cue_index][0] < end and cue_spans[cue_index][1] > start
+    }
+    if not selected_set.issubset(covered):
+        missing = sorted(selected_set - covered)
+        raise ValueError(f"selected semantic lines have no subtitle cues: {missing}")
+    return cue_indices
 
 
 def parse_srt_timestamp(value: str) -> float:

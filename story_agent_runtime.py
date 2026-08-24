@@ -31,10 +31,12 @@ from story_contract_runtime import (
 MANIFEST_VERSION = 2
 DEFAULT_SOFT_BUDGET_CNY = 50.0
 DEFAULT_HARD_BUDGET_CNY = 100.0
-# Kept as a compatibility value for older callers and manifests. Runtime
-# execution has no fixed wall-clock/active-runtime deadline; cancellation,
-# heartbeat, disk and hard-budget gates remain authoritative.
-DEFAULT_DEADLINE_HOURS = 0.0
+# V3.6 targets an overnight run.  At the deadline the scheduler freezes new
+# aesthetic retries and exposes the best hash-valid output; it does not launch
+# final_delivery/doctor or restart the full DAG.
+DEFAULT_DEADLINE_HOURS = 8.0
+DEFAULT_TARGET_DELIVERY_SECONDS = 8 * 60 * 60
+DEFAULT_DEADLINE_BEHAVIOR = "deliver_best_valid"
 DEFAULT_MIN_FREE_DISK_GB = 10.0
 PASS_SCORE = 85
 _CONTROL_THREAD_LOCKS: dict[str, threading.Lock] = {}
@@ -69,17 +71,84 @@ STORY_STAGE_SEQUENCE = (
     "product_preflight",
     "product_annotation",
     "product_annotation_review",
-    "product_package",
-    "product_package_review",
     "release_preview",
     "package_release",
     "release_qa",
     "release_video_review",
     "publish_package",
     "publish_package_review",
+    "product_package",
+    "product_package_review",
     "final_delivery",
     "doctor",
 )
+
+
+def runtime_code_identity() -> dict[str, str]:
+    code_root = Path(__file__).resolve().parent
+    revision = ""
+    # Worktree HEAD is normally a detached commit. Reading it directly avoids
+    # coupling identity checks to a mocked/blocked subprocess implementation.
+    try:
+        marker = code_root / ".git"
+        if marker.is_file():
+            raw = marker.read_text(encoding="utf-8").strip()
+            git_dir = Path(raw.split("gitdir:", 1)[1].strip()) if raw.startswith("gitdir:") else marker
+            if not git_dir.is_absolute():
+                git_dir = (code_root / git_dir).resolve()
+        else:
+            git_dir = marker
+        head = (git_dir / "HEAD").read_text(encoding="utf-8").strip()
+        if re.fullmatch(r"[0-9a-fA-F]{40}", head):
+            revision = head.lower()
+        elif head.startswith("ref:"):
+            ref = head.split(":", 1)[1].strip()
+            candidate = git_dir / ref
+            if not candidate.is_file() and (git_dir / "commondir").is_file():
+                common = (git_dir / (git_dir / "commondir").read_text(encoding="utf-8").strip()).resolve()
+                candidate = common / ref
+            revision = candidate.read_text(encoding="utf-8").strip().lower()
+    except (OSError, IndexError, ValueError):
+        revision = ""
+    if revision:
+        return {"code_root": str(code_root), "git_revision": revision}
+    try:
+        process = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=code_root,
+            text=True,
+            capture_output=True,
+            timeout=5,
+            check=False,
+        )
+        revision = process.stdout.strip() if process.returncode == 0 else ""
+    except (OSError, subprocess.TimeoutExpired):
+        revision = ""
+    return {"code_root": str(code_root), "git_revision": revision}
+
+
+def worktree_binding_issues(payload: Any, expected_root: Path | None = None) -> list[str]:
+    """Reject stale Codex worktree paths without naming a historical checkout."""
+
+    root = (expected_root or Path(__file__).resolve().parent).resolve()
+    issues: list[str] = []
+
+    def visit(value: Any, field: str) -> None:
+        if isinstance(value, dict):
+            for key, item in value.items():
+                visit(item, f"{field}.{key}" if field else str(key))
+        elif isinstance(value, list):
+            for index, item in enumerate(value):
+                visit(item, f"{field}[{index}]")
+        elif isinstance(value, str) and "/.codex/worktrees/" in value:
+            path = Path(value).expanduser()
+            try:
+                path.resolve(strict=False).relative_to(root)
+            except ValueError:
+                issues.append(f"cross_worktree_path:{field}")
+
+    visit(payload, "")
+    return sorted(set(issues))
 STAGE_ESTIMATES_MINUTES = {
     "import_inbox": 1,
     "source_edit": 25,
@@ -149,16 +218,15 @@ STORY_STAGE_DEPENDENCIES: dict[str, tuple[str, ...]] = {
     "music_qa": ("assemble_music",),
     "assemble_final": ("apply_review", "music_qa"),
     "release_assets": ("artifact_semantic_plan",),
-    # The final Demo is rendered and independently reviewed by the existing
-    # product-package chain.  Required-v1 Release must inherit that actual,
-    # approved presenter geometry receipt instead of recomputing a theoretical
-    # source-native layout, so the existing product stages precede Release.
+    # Product preflight produces the real-material Demo sample used by Release
+    # preview.  Once that shared geometry is reviewed and keying is locked,
+    # full Release and the complete customer package are independent branches.
     "product_preflight": ("assemble_final", "release_assets"),
     "product_annotation": ("product_preflight",),
     "product_annotation_review": ("product_annotation",),
-    "product_package": ("product_annotation_review",),
+    "product_package": ("product_annotation_review", "release_preview"),
     "product_package_review": ("product_package",),
-    "release_preview": ("assemble_final", "release_assets", "product_package_review"),
+    "release_preview": ("assemble_final", "release_assets", "product_annotation_review"),
     "package_release": ("release_preview",),
     "release_qa": ("package_release",),
     "release_video_review": ("release_qa",),
@@ -287,6 +355,52 @@ def runtime_elapsed_seconds(agent: dict[str, Any], *, include_current: bool = Tr
     return elapsed
 
 
+def runtime_deadline_state(agent: dict[str, Any]) -> dict[str, Any]:
+    enabled = bool(agent.get("runtime_deadline_enabled"))
+    hours = max(0.0, float(agent.get("deadline_hours") or 0.0))
+    elapsed = runtime_elapsed_seconds(agent)
+    configured_seconds = agent.get("target_delivery_seconds")
+    target_seconds = (
+        max(0.0, float(configured_seconds))
+        if isinstance(configured_seconds, (int, float)) and not isinstance(configured_seconds, bool)
+        else hours * 3600
+    )
+    reached = enabled and target_seconds > 0 and elapsed >= target_seconds
+    return {
+        "enabled": enabled,
+        "deadline_hours": hours,
+        "target_delivery_seconds": round(target_seconds, 3),
+        "deadline_behavior": str(agent.get("deadline_behavior") or DEFAULT_DEADLINE_BEHAVIOR),
+        "elapsed_seconds": round(elapsed, 3),
+        "target_seconds": round(target_seconds, 3),
+        "remaining_seconds": max(0.0, round(target_seconds - elapsed, 3)) if enabled else None,
+        "reached": reached,
+    }
+
+
+def normalized_subprocess_environment(
+    base: dict[str, str] | None = None,
+    overrides: dict[str, str] | None = None,
+) -> dict[str, str]:
+    """Preserve ffmpeg/ffprobe discovery in Desktop-launched subprocesses."""
+
+    environment = dict(base or os.environ)
+    path_parts = [part for part in environment.get("PATH", "").split(os.pathsep) if part]
+    for tool in ("ffmpeg", "ffprobe"):
+        resolved = shutil.which(tool, path=environment.get("PATH")) or shutil.which(tool)
+        if resolved:
+            directory = str(Path(resolved).resolve().parent)
+            if directory not in path_parts:
+                path_parts.insert(0, directory)
+    for directory in ("/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"):
+        if directory not in path_parts:
+            path_parts.append(directory)
+    environment["PATH"] = os.pathsep.join(path_parts)
+    if overrides:
+        environment.update(overrides)
+    return environment
+
+
 def start_runtime(agent: dict[str, Any]) -> None:
     agent.setdefault("active_elapsed_seconds", 0.0)
     if not agent.get("started_at"):
@@ -327,6 +441,7 @@ def probe_source_video(path: Path) -> dict[str, Any]:
         ],
         text=True,
         capture_output=True,
+        env=normalized_subprocess_environment(),
     )
     if process.returncode != 0:
         raise ValueError(f"无法读取绿幕视频编码信息：{process.stderr.strip() or path}")
@@ -384,12 +499,14 @@ def ensure_manifest_v2(
     agent.setdefault("heartbeat_at", "")
     agent.setdefault("last_checkpoint", "")
     agent.setdefault("blocked_reason", "")
-    # ``deadline_hours`` existed in manifest v2 and remains readable by old
-    # clients, but a positive legacy value must never re-enable the retired
-    # runtime cutoff. Normalize it on every writable manifest round-trip.
-    del deadline_hours
-    agent["runtime_deadline_enabled"] = False
-    agent["deadline_hours"] = 0.0
+    # V3.6 has one project-wide autonomous target: deliver the best valid
+    # version at eight hours instead of continuing an unbounded retry loop.
+    configured_deadline = DEFAULT_DEADLINE_HOURS
+    agent["runtime_deadline_enabled"] = True
+    agent["deadline_hours"] = configured_deadline
+    agent["target_delivery_seconds"] = DEFAULT_TARGET_DELIVERY_SECONDS
+    agent["deadline_behavior"] = DEFAULT_DEADLINE_BEHAVIOR
+    agent["max_full_resolution_encodes"] = 1
     agent.setdefault("min_free_disk_gb", DEFAULT_MIN_FREE_DISK_GB)
     agent.setdefault("started_at", "")
     agent.setdefault("active_elapsed_seconds", 0.0)
@@ -448,6 +565,8 @@ def ensure_manifest_v2(
         ):
             record.setdefault(key, default)
     agent.setdefault("events", [])
+    agent.setdefault("code_identity", runtime_code_identity())
+    agent.setdefault("delivery_state", "")
     return manifest
 
 
@@ -471,6 +590,14 @@ def stage_record(manifest: dict[str, Any], stage: str) -> dict[str, Any]:
             "actual_cost": 0.0,
             "retry_reason": "",
             "review": {},
+            "worktree_revision": "",
+            "input_artifact_hashes": {},
+            "output_artifact_hashes": {},
+            "postconditions": {},
+            "retry_scope": "",
+            "attempt_count": 0,
+            "why_running": "",
+            "estimated_remaining_seconds": int(STAGE_ESTIMATES_MINUTES.get(stage, 0) * 60),
         },
     )
     for key, default in (
@@ -482,6 +609,14 @@ def stage_record(manifest: dict[str, Any], stage: str) -> dict[str, Any]:
         ("request_id", ""),
         ("actual_cost", 0.0),
         ("retry_reason", ""),
+        ("worktree_revision", ""),
+        ("input_artifact_hashes", {}),
+        ("output_artifact_hashes", {}),
+        ("postconditions", {}),
+        ("retry_scope", ""),
+        ("attempt_count", 0),
+        ("why_running", ""),
+        ("estimated_remaining_seconds", int(STAGE_ESTIMATES_MINUTES.get(stage, 0) * 60)),
     ):
         record.setdefault(key, default)
     return record
@@ -518,8 +653,10 @@ def mark_stage(
         record["artifacts"] = [str(Path(item)) for item in artifacts]
     if input_hashes is not None:
         record["input_hashes"] = dict(input_hashes)
+        record["input_artifact_hashes"] = dict(input_hashes)
     if output_hashes is not None:
         record["output_hashes"] = dict(output_hashes)
+        record["output_artifact_hashes"] = dict(output_hashes)
     if provider is not None:
         record["provider"] = provider
     if request_id is not None:
@@ -531,6 +668,31 @@ def mark_stage(
     if review is not None:
         record["review"] = review
     agent = manifest["agent"]
+    identity = agent.get("code_identity") if isinstance(agent.get("code_identity"), dict) else {}
+    record["worktree_revision"] = str(identity.get("git_revision") or "")
+    record["attempt_count"] = int(record.get("attempts") or 0)
+    if status in {"running", "reviewing", "retrying"}:
+        record["why_running"] = (
+            message
+            or str(retry_reason or record.get("retry_reason") or "").strip()
+            or f"执行阶段：{stage}"
+        )
+    else:
+        record["why_running"] = ""
+    if status == "retrying":
+        record["retry_scope"] = stage
+    elif status == "running" and previous == "retrying":
+        record["retry_scope"] = str(record.get("retry_scope") or stage)
+    elif status == "running" and int(record.get("attempts") or 0) <= 1:
+        record["retry_scope"] = ""
+    record["postconditions"] = {
+        "evaluated": status in {"passed", "blocked", "failed", "cancelled"},
+        "passed": status == "passed",
+        "message": message,
+    }
+    record["estimated_remaining_seconds"] = 0 if status == "passed" else int(
+        STAGE_ESTIMATES_MINUTES.get(stage, 0) * 60
+    )
     agent["heartbeat_at"] = now()
     branch = STAGE_BRANCHES.get(stage, "other")
     branch_blockers = agent.setdefault("branch_blockers", {})
@@ -1251,6 +1413,7 @@ def submit_video_job(
     projects_root: Path,
     story_name: str = "",
     slug: str = "",
+    age_range: str = "",
     registry: JobRegistry | None = None,
     force: bool = False,
     soft_budget_cny: float = DEFAULT_SOFT_BUDGET_CNY,
@@ -1278,6 +1441,11 @@ def submit_video_job(
     if source.suffix.lower() not in {".mp4", ".mov", ".mkv", ".m4v"}:
         raise ValueError(f"不支持的视频格式：{source.suffix}")
     fingerprint = media_fingerprint(source)
+    declared_age_range = age_range.strip()
+    if declared_age_range:
+        fingerprint = hashlib.sha256(
+            f"{fingerprint}:age_range:{declared_age_range}".encode("utf-8")
+        ).hexdigest()
     confirmed_source: Path | None = None
     confirmed_body = ""
     if confirmed_text is not None:
@@ -1322,6 +1490,9 @@ def submit_video_job(
     if force and project_dir.exists():
         project_dir = projects_root.expanduser() / f"故事剪辑：{inferred_name}-{job_id[-8:]}"
     manifest = init_project(project_dir, story_name=inferred_name, slug=safe_slug)
+    if declared_age_range:
+        manifest["story"]["age_range"] = declared_age_range
+        manifest["story"].setdefault("manual_overrides", {})["age_range"] = True
     paths = project_paths(project_dir)
     video_stem = "prepared_greenscreen_source" if normalized_mode == "prepared" else "greenscreen_source"
     target = paths.inputs / f"{safe_slug}_{video_stem}{source.suffix.lower()}"
@@ -1538,6 +1709,8 @@ def submit_video_job(
                 "bytes": lut_target.stat().st_size,
             }
         )
+    if declared_age_range:
+        manifest["agent"]["input_contract"].setdefault("user_parameters", {})["age_range"] = declared_age_range
     manifest["agent"]["status"] = "pending"
     write_manifest(paths, manifest)
     registry.register(job_id, project_dir, fingerprint)
@@ -1858,6 +2031,7 @@ def resume_job(project_dir: Path) -> dict[str, Any]:
     manifest["agent"]["cancel_requested"] = False
     manifest["agent"]["control_epoch"] = control["run_epoch"]
     manifest["agent"]["status"] = "pending"
+    manifest["agent"]["delivery_state"] = ""
     manifest["agent"]["blocked_reason"] = ""
     manifest["agent"]["branch_blockers"] = {}
     for record in manifest["agent"].get("stages", {}).values():
@@ -1868,8 +2042,273 @@ def resume_job(project_dir: Path) -> dict[str, Any]:
     return manifest
 
 
+def _candidate_delivery_paths(
+    project_dir: Path,
+    manifest: dict[str, Any],
+    requested: list[Path] | None = None,
+) -> list[Path]:
+    root = project_dir.expanduser().resolve()
+    candidates: list[Path] = list(requested or [])
+
+    def collect(value: Any) -> None:
+        if isinstance(value, dict):
+            for item in value.values():
+                collect(item)
+        elif isinstance(value, list):
+            for item in value:
+                collect(item)
+        elif isinstance(value, str) and value.strip():
+            candidates.append(Path(value).expanduser())
+
+    if requested is None:
+        collect(manifest.get("outputs", {}))
+        candidates.extend(
+            root / relative
+            for relative in (
+                "04_发布视频/主账号发布视频.mp4",
+                "04_发布视频/宝库号发布视频.mp4",
+                "03_背景成片/story_no_subs_bgm.mp4",
+                "03_背景成片/story_sales_subs_bgm.mp4",
+                "03_背景成片/story_demo_voice_bgm.mp4",
+            )
+        )
+    valid: list[Path] = []
+    seen: set[str] = set()
+    for raw in candidates:
+        path = raw if raw.is_absolute() else root / raw
+        path = path.resolve(strict=False)
+        try:
+            path.relative_to(root)
+        except ValueError:
+            if requested is not None:
+                raise AgentRuntimeError(f"接受当前版本的文件不在项目目录内：{path}")
+            continue
+        key = str(path)
+        if key in seen:
+            continue
+        if not path.is_file() or path.stat().st_size <= 0:
+            if requested is not None:
+                raise AgentRuntimeError(f"接受当前版本指定的文件缺失或为空：{path}")
+            continue
+        try:
+            _validate_delivery_artifact(path)
+        except (OSError, ValueError, json.JSONDecodeError, zipfile.BadZipFile) as exc:
+            if requested is not None:
+                raise AgentRuntimeError(f"接受当前版本指定的文件已损坏或不可读：{path}（{exc}）") from exc
+            continue
+        seen.add(key)
+        valid.append(path)
+    return sorted(valid, key=lambda path: str(path.relative_to(root)))
+
+
+def _validate_delivery_artifact(path: Path) -> None:
+    """Reject genuinely damaged selected files without imposing aesthetic QA."""
+
+    suffix = path.suffix.lower()
+    if suffix in {".mp4", ".mov", ".m4v", ".mkv", ".webm", ".mp3", ".m4a", ".wav", ".aac"}:
+        process = subprocess.run(
+            [
+                "ffprobe", "-v", "error", "-show_entries", "format=duration",
+                "-show_entries", "stream=codec_type,width,height", "-of", "json", str(path),
+            ],
+            text=True,
+            capture_output=True,
+            env=normalized_subprocess_environment(),
+        )
+        if process.returncode != 0:
+            raise ValueError(process.stderr.strip() or "ffprobe_failed")
+        payload = json.loads(process.stdout)
+        streams = payload.get("streams") if isinstance(payload.get("streams"), list) else []
+        required_type = "audio" if suffix in {".mp3", ".m4a", ".wav", ".aac"} else "video"
+        if not any(item.get("codec_type") == required_type for item in streams if isinstance(item, dict)):
+            raise ValueError(f"missing_{required_type}_stream")
+        try:
+            duration = float((payload.get("format") or {}).get("duration") or 0.0)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("invalid_media_duration") from exc
+        if not math.isfinite(duration) or duration <= 0:
+            raise ValueError("invalid_media_duration")
+        return
+    if suffix in {".docx", ".pptx", ".xlsx", ".zip"}:
+        with zipfile.ZipFile(path) as archive:
+            damaged = archive.testzip()
+            if damaged:
+                raise ValueError(f"damaged_zip_member:{damaged}")
+        return
+    if suffix == ".json":
+        json.loads(path.read_text(encoding="utf-8"))
+        return
+    if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            image.verify()
+        return
+    with path.open("rb") as source:
+        if not source.read(1):
+            raise ValueError("empty_artifact")
+
+
+def _freeze_best_valid_delivery(
+    project_dir: Path,
+    *,
+    actor: str,
+    notes: str,
+    requested: list[Path] | None,
+    user_initiated: bool,
+) -> tuple[dict[str, Any], Path]:
+    paths = project_paths(project_dir)
+    resolved_root = paths.root.resolve(strict=False)
+    manifest = ensure_manifest_v2(load_manifest(paths) or init_project(project_dir))
+    verified_safety_blockers = manifest.get("agent", {}).get("verified_safety_blockers", [])
+    if verified_safety_blockers:
+        raise AgentRuntimeError(
+            "存在已确认的真实安全阻断项，不能冻结交付：" + str(verified_safety_blockers)
+        )
+    artifacts = _candidate_delivery_paths(project_dir, manifest, requested)
+    if not artifacts:
+        raise AgentRuntimeError("当前没有可冻结的有效文件，不能接受或交付空版本。")
+    release_outputs = {
+        paths.release / "主账号发布视频.mp4",
+        paths.release / "宝库号发布视频.mp4",
+    }
+    release_complete = all(path.resolve() in {item.resolve() for item in artifacts} for path in release_outputs)
+    qa_path = paths.status / "qa_release_report.json"
+    try:
+        qa_payload = json.loads(qa_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        qa_payload = {}
+    internal_qa_passed = release_complete and qa_payload.get("passed") is True
+    delivery_state = (
+        ("user_accepted" if internal_qa_passed else "user_accepted_with_exceptions")
+        if user_initiated
+        else "production_complete"
+    )
+    frozen = [
+        {
+            "path": str(path),
+            # macOS exposes /var through /private/var.  Compare canonical paths
+            # so a project-scoped artifact cannot be rejected merely because
+            # the caller used the non-canonical spelling.
+            "project_relative_path": str(path.resolve(strict=False).relative_to(resolved_root)),
+            "sha256": file_sha256(path),
+            "bytes": path.stat().st_size,
+        }
+        for path in artifacts
+    ]
+    receipt = {
+        "schema_version": "story-current-version-acceptance/v1",
+        "created_at": now(),
+        "actor": actor,
+        "notes": notes,
+        "user_initiated": user_initiated,
+        "delivery_state": delivery_state,
+        "production_complete": release_complete,
+        "internal_qa_passed": internal_qa_passed,
+        "accepted_with_exceptions": not internal_qa_passed,
+        "artifacts": frozen,
+        "stopped_queued_aesthetic_rework": True,
+        "final_delivery_or_doctor_invoked": False,
+    }
+    target = paths.status / (
+        "user_acceptance.json" if user_initiated else "deadline_best_valid_delivery.json"
+    )
+    save_json(target, receipt)
+    summary = paths.status / (
+        "接受当前版本交付清单.md" if user_initiated else "8小时最佳有效版本交付清单.md"
+    )
+    summary.write_text(
+        "\n".join([
+            f"# {delivery_state}",
+            "",
+            f"- 冻结时间：{receipt['created_at']}",
+            f"- 操作者：{actor}",
+            f"- 内部 QA：{'通过' if internal_qa_passed else '未通过或未完成（按例外交付）'}",
+            f"- 备注：{notes or '无'}",
+            "",
+            "## 已冻结文件",
+            *[f"- `{item['project_relative_path']}`  `{item['sha256']}`" for item in frozen],
+            "",
+            "内部审美返工已停止；未调用 final_delivery 或 doctor。",
+        ]) + "\n",
+        encoding="utf-8",
+    )
+    agent = manifest["agent"]
+    freeze_runtime(agent)
+    agent["status"] = "completed"
+    agent["delivery_state"] = delivery_state
+    agent["finished_at"] = now()
+    agent["cancel_requested"] = False
+    acceptance = {**receipt, "receipt": str(target), "summary": str(summary)}
+    if user_initiated:
+        agent["user_acceptance"] = acceptance
+    else:
+        agent["deadline_delivery"] = acceptance
+    agent["events"].append({
+        "time": now(),
+        "event": "user_accepted_current_version" if user_initiated else "deadline_deliver_best_valid",
+        "delivery_state": delivery_state,
+        "artifact_count": len(frozen),
+    })
+    manifest["completed_at"] = now()
+    write_manifest(paths, manifest)
+    return manifest, target
+
+
+def accept_current_outputs(
+    project_dir: Path,
+    *,
+    accepted_by: str = "user",
+    notes: str = "",
+    artifacts: list[Path] | None = None,
+) -> tuple[dict[str, Any], Path]:
+    # Validate an explicit user selection before cancelling a healthy run.  A
+    # typo or corrupt file must not silently cancel production or be ignored.
+    manifest = ensure_manifest_v2(load_manifest(project_paths(project_dir)) or init_project(project_dir))
+    if manifest.get("agent", {}).get("verified_safety_blockers", []):
+        raise AgentRuntimeError(
+            "存在已确认的真实安全阻断项，不能冻结交付："
+            + str(manifest["agent"]["verified_safety_blockers"])
+        )
+    if artifacts is not None:
+        _candidate_delivery_paths(project_dir, manifest, artifacts)
+    update_control(project_dir, cancel_requested=True, increment_epoch=True)
+    with job_lock(project_dir):
+        return _freeze_best_valid_delivery(
+            project_dir,
+            actor=accepted_by,
+            notes=notes,
+            requested=artifacts,
+            user_initiated=True,
+        )
+
+
+def deliver_best_valid_at_deadline(project_dir: Path, *, notes: str = "") -> tuple[dict[str, Any], Path]:
+    update_control(project_dir, cancel_requested=True, increment_epoch=True)
+    return _freeze_best_valid_delivery(
+        project_dir,
+        actor="story_agent_deadline",
+        notes=notes,
+        requested=None,
+        user_initiated=False,
+    )
+
+
 def assert_runnable(manifest: dict[str, Any], project_dir: Path | None = None) -> None:
     ensure_manifest_v2(manifest)
+    expected_identity = runtime_code_identity()
+    bound_identity = manifest["agent"].get("code_identity", {})
+    if not isinstance(bound_identity, dict) or any(
+        str(bound_identity.get(field) or "") != str(expected_identity.get(field) or "")
+        for field in ("code_root", "git_revision")
+    ):
+        raise AgentRuntimeError(
+            "cross_worktree_binding_mismatch: 当前代码工作树/提交与任务绑定不一致；"
+            "请在正确工作树显式迁移状态，禁止跨工作树静默恢复。"
+        )
+    stale_paths = worktree_binding_issues(manifest, Path(expected_identity["code_root"]))
+    if stale_paths:
+        raise AgentRuntimeError("cross_worktree_binding_mismatch: " + "；".join(stale_paths[:12]))
     control_cancelled = bool(load_control(project_dir).get("cancel_requested")) if project_dir is not None else False
     if manifest["agent"].get("cancel_requested") or control_cancelled:
         raise JobCancelled("任务已取消；使用 resume 后才能继续。")

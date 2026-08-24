@@ -526,6 +526,8 @@ class VisualSampleGateTests(unittest.TestCase):
                 "visible_characters": ["protagonist"], "excluded_characters": [],
                 "continuity_group": "opening", "appearance_ids": ["protagonist_default"],
                 "visual_description": "The protagonist starts the journey.",
+                "speaker": "none", "listener": "none", "narrative_focus": "journey begins",
+                "emotion": "anticipation", "shot_intent": "establish direction", "transition_reason": "opening setup",
                 "scale_basis": {
                     "applicable": True, "relationship_ids": ["hero_vs_guide"],
                     "evidence": "The protagonist is visibly much smaller than the guide.",

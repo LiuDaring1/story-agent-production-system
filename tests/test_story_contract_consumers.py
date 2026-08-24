@@ -47,6 +47,31 @@ def _context(path: Path, consumer: str, projection: dict) -> dict:
 
 
 class StoryContractConsumerTests(unittest.TestCase):
+    def test_demo_spec_honors_reviewed_no_logo_contract(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            projection = {
+                "brand": {
+                    "assets": [],
+                    "rules": [{"rule_id": "brand.include_demo_logo", "value": False}],
+                },
+                "release_layout": {"rules": [], "variants": []},
+            }
+            context = root / "release.json"
+            _context(context, "release_video", projection)
+            spec_path = compile_demo_render_spec(
+                context,
+                root / "demo.compiled.json",
+                official_logo_path=None,
+            )
+            spec = json.loads(spec_path.read_text(encoding="utf-8"))
+            self.assertFalse(spec["logo_enabled"])
+            self.assertEqual(spec["official_logo_count"], 0)
+            self.assertIsNone(spec["official_logo_path"])
+            loaded, arguments = load_demo_brand_spec(spec_path)
+            self.assertEqual(loaded["official_logo_count"], 0)
+            self.assertIsNone(arguments["logo_path"])
+
     def test_demo_spec_uses_one_reviewed_official_logo_and_layout_region(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -111,6 +136,8 @@ class StoryContractConsumerTests(unittest.TestCase):
                 "shot_size": "wide", "focal_character": "主角", "visible_characters": ["主角"],
                 "excluded_characters": [], "continuity_group": "opening", "appearance_ids": [],
                 "visual_description": "主角出发",
+                "speaker": "none", "listener": "none", "narrative_focus": "主角出发",
+                "emotion": "期待", "shot_intent": "建立行动方向", "transition_reason": "开场建立镜头",
                 "scale_basis": {"applicable": False, "relationship_ids": [], "reason": "合同没有尺度关系"},
                 "current_story_state": {}, "visual_state_evidence": {},
                 "subject_action": "主角自然出发",

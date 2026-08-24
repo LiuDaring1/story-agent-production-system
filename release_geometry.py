@@ -7,13 +7,30 @@ from typing import Any, Mapping, Sequence
 
 
 RELEASE_GEOMETRY_SCHEMA_VERSION = "story-release-geometry/v1"
-RELEASE_GEOMETRY_COMPILER_VERSION = "1.1.0"
+RELEASE_GEOMETRY_COMPILER_VERSION = "1.4.0"
 DEMO_PRESENTER_GEOMETRY_SCHEMA_VERSION = "story-demo-presenter-geometry/v1"
 
 
 def canonical_sha256(value: Any) -> str:
     raw = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return hashlib.sha256(raw).hexdigest()
+
+
+def preview_formal_binding_sha256(payload: Mapping[str, Any]) -> str:
+    """Hash every visual input/parameter shared by preview and formal render.
+
+    The keying lock is created *after* preview approval, so that lifecycle-only
+    hash is excluded.  The preset hash/filter fingerprint, package assets,
+    geometry, semantics, Demo receipt and every other render parameter remain.
+    """
+
+    normalized = json.loads(json.dumps(payload, ensure_ascii=False))
+    for field in ("geometry_sha256", "formal_render_binding_sha256"):
+        normalized.pop(field, None)
+    bindings = normalized.get("bindings")
+    if isinstance(bindings, dict):
+        bindings.pop("keying_lock_sha256", None)
+    return canonical_sha256(normalized)
 
 
 def file_sha256(path: Path | str) -> str:
@@ -129,12 +146,17 @@ def compile_demo_presenter_geometry(
 
     source_native = crop_mode == "source-native" or person_crop is None
     if source_native:
+        # Source-native means exactly that: keep the whole acquired frame and
+        # its original composition.  A sampled subject bbox is useful
+        # diagnostic evidence, but using it as a crop can cut a later gesture
+        # that was wider than the sampled frames.  RVM already makes the
+        # surrounding green transparent, so no cleanup crop is needed here.
         geometry = approved_demo_geometry(
             source_width,
             source_height,
             canvas_width,
             canvas_height,
-            detected_bbox,
+            None,
         )
         # Bottom cropping and vertical-align are not applied on the native
         # path.  Recording the resolved values prevents a requested-but-unused
@@ -274,6 +296,10 @@ def release_a_geometry(
     person_region: Mapping[str, Any],
     canvas_width: int,
     canvas_height: int,
+    *,
+    right_blank_region: Mapping[str, Any] | None = None,
+    initial_subject_bbox: Sequence[int] | None = None,
+    initial_anchor_x: int | None = None,
 ) -> dict[str, Any]:
     """Place an approved presenter by horizontal translation only.
 
@@ -285,14 +311,55 @@ def release_a_geometry(
     width = int(demo["rendered_width"])
     height = int(demo["rendered_height"])
     y = int(demo["y"])
-    if width > safe["width"]:
-        raise ValueError("release person safe region requires presenter rescale; blocking instead of fit-to-box")
-    if y < safe["y"] or y + height > safe["y"] + safe["height"]:
+    crop = demo.get("source_crop")
+    scale = float(demo.get("scale") or 0.0)
+    visible_y = y
+    visible_height = height
+    if (
+        isinstance(initial_subject_bbox, Sequence)
+        and not isinstance(initial_subject_bbox, (str, bytes))
+        and len(initial_subject_bbox) == 4
+        and isinstance(crop, Sequence)
+        and len(crop) == 4
+        and scale > 0
+    ):
+        _subject_x, subject_y, _subject_width, subject_height = (
+            int(value) for value in initial_subject_bbox
+        )
+        visible_y = round(y + (subject_y - int(crop[1])) * scale)
+        visible_height = max(1, round(subject_height * scale))
+    if visible_y < safe["y"] or visible_y + visible_height > safe["y"] + safe["height"]:
         raise ValueError("release person vertical safe region requires scale/vertical change; blocking")
     original_x = int(demo["x"])
-    minimum_x = safe["x"]
-    maximum_x = safe["x"] + safe["width"] - width
-    x = min(max(original_x, minimum_x), maximum_x)
+    blank: dict[str, int] | None = None
+    anchor_basis = "approved_demo_x"
+    if right_blank_region is not None:
+        blank = _box(right_blank_region, canvas_width, canvas_height)
+        x = int(initial_anchor_x) if initial_anchor_x is not None else original_x
+        anchor_basis = "reviewed_initial_anchor_x" if initial_anchor_x is not None else anchor_basis
+        if (
+            initial_anchor_x is None
+            and isinstance(initial_subject_bbox, Sequence)
+            and not isinstance(initial_subject_bbox, (str, bytes))
+            and len(initial_subject_bbox) == 4
+            and isinstance(crop, Sequence)
+            and len(crop) == 4
+            and scale > 0
+        ):
+            subject_x, _subject_y, subject_width, _subject_height = (int(value) for value in initial_subject_bbox)
+            crop_x = int(crop[0])
+            subject_center_offset = (subject_x + subject_width / 2 - crop_x) * scale
+            x = round(blank["x"] + blank["width"] / 2 - subject_center_offset)
+            anchor_basis = "initial_subject_center_in_right_blank"
+        # Initial calibration may crop gesture extremities outside the canvas;
+        # it must never rescale or dynamically chase later hand movement.
+        x = min(max(x, -width + 1), canvas_width - 1)
+    else:
+        if width > safe["width"]:
+            raise ValueError("release person safe region requires presenter rescale; blocking instead of fit-to-box")
+        minimum_x = safe["x"]
+        maximum_x = safe["x"] + safe["width"] - width
+        x = min(max(original_x, minimum_x), maximum_x)
     correction = x - original_x
     return {
         **dict(demo),
@@ -305,6 +372,16 @@ def release_a_geometry(
             else "none"
         ),
         "person_safe_region": safe,
+        "presenter_initial_anchor_x": x,
+        "presenter_initial_y": y,
+        "presenter_initial_scale": float(demo["scale"]),
+        "presenter_initial_visible_subject_y": visible_y,
+        "presenter_initial_visible_subject_height": visible_height,
+        "presenter_right_blank_region": blank,
+        "initial_anchor_basis": anchor_basis,
+        "dynamic_repositioning": False,
+        "gesture_overlap_policy": "allowed",
+        "full_duration_zero_intersection_required": False,
     }
 
 
@@ -451,6 +528,36 @@ def geometry_manifest_issues(
             )
     if not isinstance(payload.get("main"), Mapping) or not isinstance(payload.get("library"), Mapping):
         issues.append("release_geometry_variant_geometry_missing")
+    if not str(payload.get("formal_render_binding_sha256") or ""):
+        issues.append("release_geometry_formal_render_binding_missing")
+    compositing = payload.get("video_compositing")
+    required_compositing_fields = {
+        "canvas_background_rect", "frame_outer_rect", "frame_aperture_mask",
+        "story_video_transform", "story_video_focus_point", "aperture_coverage",
+        "edge_gap_pixels",
+    }
+    if not isinstance(compositing, Mapping):
+        issues.append("release_geometry_video_compositing_missing")
+    else:
+        issues.extend(
+            f"release_geometry_video_compositing_field_missing:{field}"
+            for field in sorted(required_compositing_fields)
+            if field not in compositing
+        )
+    presenter = payload.get("presenter")
+    presenter_a = presenter.get("a") if isinstance(presenter, Mapping) else None
+    if isinstance(presenter_a, Mapping) and "x" in presenter_a:
+        for field in (
+            "presenter_initial_anchor_x", "presenter_initial_y",
+            "presenter_initial_scale", "presenter_right_blank_region",
+            "dynamic_repositioning", "gesture_overlap_policy",
+        ):
+            if field not in presenter_a:
+                issues.append(f"release_geometry_presenter_a_field_missing:{field}")
+        if presenter_a.get("dynamic_repositioning") is not False:
+            issues.append("release_geometry_presenter_dynamic_repositioning_must_be_false")
+        if presenter_a.get("gesture_overlap_policy") != "allowed":
+            issues.append("release_geometry_presenter_gesture_overlap_policy_invalid")
     stored_hash = str(payload.get("geometry_sha256") or "")
     unsigned = dict(payload)
     unsigned.pop("geometry_sha256", None)
@@ -503,6 +610,6 @@ __all__ = [
     "approved_demo_geometry", "binding_payload", "canonical_sha256",
     "compile_demo_presenter_geometry", "demo_presenter_geometry_issues",
     "compile_text_group", "file_sha256", "regions_for_variant",
-    "geometry_manifest_issues", "release_a_geometry", "release_render_manifest_issues",
+    "geometry_manifest_issues", "preview_formal_binding_sha256", "release_a_geometry", "release_render_manifest_issues",
     "text_group_issues",
 ]

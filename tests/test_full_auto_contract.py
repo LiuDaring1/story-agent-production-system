@@ -5,19 +5,115 @@ import shutil
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from PIL import Image
 
-from story_agent import canonical_video_prompt_rows, video_prompt_review_matches_current
+from story_agent import StageResult, StoryAgent, canonical_video_prompt_rows, video_prompt_review_matches_current
 from story_agent_runtime import STORY_STAGE_SEQUENCE, file_sha256, write_review_bundle
-from story_project import final_delivery, init_project, load_manifest, project_paths, sha256_file, write_manifest
+from story_project import final_delivery, init_project, load_config, load_manifest, project_paths, sha256_file, write_manifest
+from story_workflow import release_encode_guard_action
 from tests.test_release_qa import make_vertical_video
 
 
 class FullAutoContractTests(unittest.TestCase):
-    def test_final_demo_is_reviewed_before_release_and_publish_claims(self) -> None:
-        self.assertLess(STORY_STAGE_SEQUENCE.index("product_package_review"), STORY_STAGE_SEQUENCE.index("publish_package_review"))
-        self.assertLess(STORY_STAGE_SEQUENCE.index("product_package_review"), STORY_STAGE_SEQUENCE.index("release_preview"))
+    def test_failed_post_encode_visual_review_preserves_videos_and_locked_preset(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            release = root / "04_发布视频"
+            status = root / "99_项目状态"
+            (release / "keying").mkdir(parents=True)
+            status.mkdir(parents=True)
+            videos = [release / "主账号发布视频.mp4", release / "宝库号发布视频.mp4"]
+            for index, video in enumerate(videos):
+                video.write_bytes(f"formal-video-{index}".encode())
+            preset = release / "keying" / "keying_preset.json"
+            preset.write_text('{"locked":true}\n', encoding="utf-8")
+            original_video_bytes = [path.read_bytes() for path in videos]
+            original_preset = preset.read_bytes()
+
+            agent = StoryAgent.__new__(StoryAgent)
+            agent.context = SimpleNamespace(
+                project_dir=root,
+                paths=SimpleNamespace(release=release, status=status),
+            )
+            agent._probe_duration = lambda _path: 120.0
+            agent._release_preview_images = lambda: []
+
+            def fake_ffmpeg(command, **_kwargs):
+                target = Path(command[-1])
+                target.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (32, 32), "white").save(target)
+                return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+            def fake_sheet(_sources, target, **_kwargs):
+                target.parent.mkdir(parents=True, exist_ok=True)
+                Image.new("RGB", (32, 32), "white").save(target)
+                return target
+
+            agent._make_contact_sheet = fake_sheet
+            agent._structured_review = lambda **_kwargs: (
+                StageResult("blocked", "视觉不满意", status / "reviews" / "release_video_review_review.json"),
+                {"approved": False, "issues": ["aesthetic"]},
+            )
+            with patch("story_agent.subprocess.run", side_effect=fake_ffmpeg), patch(
+                "story_agent.write_review_bundle", return_value=status / "reviews" / "release_video_bundle.json"
+            ), patch.object(agent, "_codex_task") as codex_revision:
+                result = agent._stage_release_video_review({})
+
+            self.assertEqual(result.status, "blocked")
+            self.assertIn("不会自动修改", result.message)
+            self.assertEqual([path.read_bytes() for path in videos], original_video_bytes)
+            self.assertEqual(preset.read_bytes(), original_preset)
+            self.assertFalse((status / "rejected" / "release_videos").exists())
+            codex_revision.assert_not_called()
+
+    def test_formal_encode_guard_allows_only_same_binding_bounded_technical_repair(self) -> None:
+        fingerprint = "a" * 64
+        self.assertEqual(
+            release_encode_guard_action({}, binding_fingerprint=fingerprint, output_is_current=False),
+            "start",
+        )
+        completed = {
+            "status": "completed", "attempt_count": 1,
+            "technical_repair_count": 0, "binding_fingerprint": fingerprint,
+        }
+        self.assertEqual(
+            release_encode_guard_action(completed, binding_fingerprint=fingerprint, output_is_current=True),
+            "reuse",
+        )
+        self.assertEqual(
+            release_encode_guard_action(completed, binding_fingerprint=fingerprint, output_is_current=False),
+            "technical_repair",
+        )
+        self.assertEqual(
+            release_encode_guard_action(completed, binding_fingerprint="b" * 64, output_is_current=False),
+            "block_binding_change",
+        )
+        exhausted = {**completed, "status": "failed_or_interrupted", "technical_repair_count": 1}
+        self.assertEqual(
+            release_encode_guard_action(exhausted, binding_fingerprint=fingerprint, output_is_current=False),
+            "block_repair_limit",
+        )
+
+    def test_future_projects_keep_the_official_demo_logo_by_default(self) -> None:
+        self.assertTrue(load_config()["product_defaults"]["include_demo_logo"])
+
+    def test_default_model_routing_avoids_max_and_xhigh(self) -> None:
+        defaults = load_config()["agent_defaults"]
+        self.assertEqual(defaults["commander_model"], "gpt-5.6-sol")
+        self.assertEqual(defaults["worker_model"], "gpt-5.6-luna")
+        self.assertIn(defaults["commander_reasoning_effort"], {"medium", "high"})
+        self.assertEqual(defaults["worker_reasoning_effort"], "high")
+        self.assertEqual(load_config()["release_defaults"]["output_scale"], 1)
+        self.assertEqual(defaults["target_delivery_seconds"], 28800)
+        self.assertEqual(defaults["max_full_resolution_encodes"], 1)
+
+    def test_release_and_product_package_split_after_shared_real_material_preview(self) -> None:
+        self.assertLess(STORY_STAGE_SEQUENCE.index("release_preview"), STORY_STAGE_SEQUENCE.index("product_package"))
+        self.assertLess(STORY_STAGE_SEQUENCE.index("release_preview"), STORY_STAGE_SEQUENCE.index("package_release"))
+        self.assertLess(STORY_STAGE_SEQUENCE.index("package_release"), STORY_STAGE_SEQUENCE.index("product_package"))
         self.assertLess(STORY_STAGE_SEQUENCE.index("release_video_review"), STORY_STAGE_SEQUENCE.index("publish_package"))
 
     def test_video_prompt_review_snapshot_survives_status_writeback_but_rejects_content_drift(self) -> None:

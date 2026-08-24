@@ -123,7 +123,12 @@ class StoryAgentObservabilityTests(unittest.TestCase):
             self.assertIn("DAG 与 attempt", html)
             self.assertIn("退避剩余", html)
             self.assertIn("<th>依赖</th>", html)
-            self.assertNotIn("<button", html.lower())
+            self.assertIn("接受当前版本", html)
+            self.assertIn("/api/accept-current", html)
+            self.assertIn("为什么正在运行", html)
+            self.assertIn("原因 / 重跑范围 / 产物", html)
+            self.assertIn("正式编码", html)
+            self.assertIn("ImageGen", html)
 
     def test_status_dashboard_and_real_pid_share_one_effective_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

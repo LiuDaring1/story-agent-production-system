@@ -169,8 +169,9 @@ def build_children_story_image_request(
    - 分镜表每一镜增加“在场角色 / 明确不在场角色 / 本镜头已知信息”三项。对白里提到某角色，不等于该角色物理在场；角色尚未听到的信息不得提前表演。
    - 为每个反复出现的角色建立稳定 `appearance_id`，只固定原文/用户明确或小样已通过审核的脸部特征、花纹、服装主色/款式和饰品；后续镜头必须复用同一 id 和最近一张已通过参考图，不得重新随机捏角色。
    - 未指定的外观不要写成硬性设计规格；让图像模型按已选整体风格完成角色设计，并由独立视觉审核整体判断是否美观、适合受众。
-   - 把机器可读分镜计划写入 `{image_dir.parent / (slug + '_storyboard_plan.json')}`。每镜必须包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description；story_text 与锁定分镜逐行一致。
+   - 把机器可读分镜计划写入 `{image_dir.parent / (slug + '_storyboard_plan.json')}`。每镜必须包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description，以及 speaker、listener、narrative_focus、emotion、shot_intent、transition_reason；story_text 与锁定分镜逐行一致。无说话者/听话者时明确写 `none`，不要写死某个故事角色。
    - 先检查叙事覆盖：每个唱歌/发言/关键动作/受挫反应角色都要有焦点镜头；同一场比赛要有全景建立、表演者中近景、评委反应、受挫者反应等合理景别变化，不能所有角色都和主角挤在同一种双人中景。
+   - 镜头依据说话者、听话者、情绪变化和叙事重点选择特写、反应镜头、正反打、全景或景别变化。不要机械地逢对白就正反打，也不允许整段对白因缺少导演设计而始终使用相同多人全景。
 4. 出图不要人为限制总张数，也不要把“每批 8 张以内”当作业务规则。确认后应按完整分镜连续生成到本故事全部镜头完成；如果工具、网络或工程中断，再根据目标目录里已经存在的 `{slug}_scene_XX.png` 从断点继续。
 5. 不要一次性生成多宫格/联系表作为最终图片。如果模型先生成了联系表，只能把它当作风格母版或审查参考，最终仍然必须整理出一张张独立的 16:9 图片。
 6. 不要生成无关文字、水印、字幕、UI 或二维码。但如果分镜表明确要求画面中出现中文标题、匾额、书页、卷轴文字或结尾文字，必须把这些中文作为画面内容由图像模型直接生成出来。禁止用本地脚本、Pillow、HTML/SVG、截图、局部贴片、后期覆盖文字或任何非生图方式补字；那不算合格成片。生成后要核对指定文字是否自然融入书页/卷轴/牌匾等画面材质、是否出现、是否位置正确；如果缺字、错字、乱码、留白或像后期贴片，丢弃该图，用 Codex 图像生成重新生成该镜头。
@@ -284,18 +285,20 @@ def build_release_preview_agent_prompt(handoff: Path, approval_path: Path) -> st
 
 def build_publish_package_agent_prompt(handoff: Path, project_dir: Path, *, required_v1: bool = False) -> str:
     contract_mode = """
-本项目是 V3.5 required_v1。ImageGen 只生成六张无字、无 Logo 的创意底图，文件名必须为：
-- `main/covers/creative_base_4x3.png`（唯一根母版）
-- `main/covers/creative_base_3x4.png`、`creative_base_16x9.png`（由主账号 4:3 编辑衍生）
-- `library/covers/creative_base_4x3.png`（由主账号 4:3 移除真人并重排）
-- `library/covers/creative_base_3x4.png`、`creative_base_16x9.png`（由宝库号 4:3 编辑衍生）
-创意底图严禁任何可读文字、标题、时长、年龄、资料项、品牌字样、Logo 或仿 Logo；必须为合同标题区、信息区和官方 Logo 区保留干净安全空间。正式文字与唯一官方 Logo 由 Runtime 确定性排版。
-生成 `cover_creative_lineage.json`，六项逐一记录 asset_id（main:4x3 等）、parent_asset_id、generation_mode（root_master/branch_master/edit_derived）、reference_files、creative_base_sha256、parent_sha256。不得先生成六张互不相关图片后伪造血缘。
-读取 handoff 中的 cover 合同投影，把 semantic_artifacts、visual_style、characters、brand tone、required/forbidden 和各比例 composition role 完整用于最终生图指令；不得丢弃、覆盖或自行扩展身份锚点。
-不要生成 `cover_*.png` 最终图；主 Agent 会从创意底图确定性生成它们。
+本项目是 V3.5 required_v1。六张最终 `cover_*.png` 必须全部由 Codex 原生 ImageGen 一体成型生成或编辑衍生：画面、中文标题、信息文字与装饰版式必须属于 ImageGen 最终像素，严禁用 Pillow、Canvas、HTML/CSS、SVG、脚本或命令行工具后期叠字。
+目标文件：
+- `main/covers/cover_4x3.png`（唯一根母版）
+- `main/covers/cover_3x4.png`、`cover_16x9.png`（由主账号 4:3 通过 ImageGen 编辑衍生）
+- `library/covers/cover_4x3.png`（由主账号 4:3 通过 ImageGen 移除真人并整体重排）
+- `library/covers/cover_3x4.png`、`cover_16x9.png`（由宝库号 4:3 通过 ImageGen 编辑衍生）
+现有 `creative_base_*.png` 只能作为构图、人物和故事角色参考，不能直接加字后冒充最终封面。标题必须逐字准确使用项目 manifest 的 story.name；故事类型、时长、年龄和适用信息读取 handoff/manifest，保持简洁且与画面一体设计。每张生成后必须用图像理解逐字检查中文，错字、假字、乱码或漏字必须重新生成。
+合同 official_assets 为空时不得出现 Logo、仿 Logo 或品牌字样；非空时只能使用已审核官方资产规则，不得让模型伪造。
+生成 `cover_integrated_generation.json`：mode 固定为 `imagegen_integrated`；顶层 `attempt_count` 记录实际轮次，允许 1-3（首轮加最多两轮定向修正），不得继续无限生成；covers 为按 asset_id 索引的六项，每项记录 path（发布目录相对路径）、sha256、generation_method=`codex_imagegen`、title_text、parent_asset_id、parent_sha256。所有哈希必须对应最终实际文件。
+同时生成 `cover_lineage.json`，记录六张最终封面的 master/edit-derived 血缘；不得先生成六张互不相关图片后伪造血缘。
+读取 handoff 中的 cover 合同投影，把 semantic_artifacts、visual_style、characters、brand tone、required/forbidden 用于最终 ImageGen 指令；不得丢弃或自行扩展身份锚点。
 """ if required_v1 else ""
-    cover_names = "六张 `creative_base_*.png` 无字创意底图" if required_v1 else "六张 `cover_*.png` 最终封面"
-    lineage_name = "cover_creative_lineage.json" if required_v1 else "cover_lineage.json"
+    cover_names = "六张 `cover_*.png` ImageGen 一体成型最终封面" if required_v1 else "六张 `cover_*.png` 最终封面"
+    lineage_name = "cover_lineage.json"
     return f"""请使用第 15 步交接中的候选帧和参考素材，生成完整发布物料：
 `{handoff}`
 
@@ -305,15 +308,15 @@ def build_publish_package_agent_prompt(handoff: Path, project_dir: Path, *, requ
 执行原则：
 - 逐项读取候选帧索引、真人参考、故事参考和旧 4:3 设计任务。
 - 生成发布文案：`main/copy.md`、`library/copy.md`。每份包含标题、正文、话题建议；两个账号定位不同，不能机械复制。
-- 封面必须按“母版 → 参考图编辑衍生”顺序完成，禁止六次互不相干的随机生成。required_v1 使用上方列出的 `creative_base_*.png` 名称；legacy 才使用 `cover_*.png`：
+- 封面必须按“母版 → 参考图编辑衍生”顺序完成，禁止六次互不相干的随机生成。required_v1 与 legacy 都使用 `cover_*.png`，但 required_v1 必须遵守上方 ImageGen 一体成型规则：
   1. 用本期真人帧、本期故事代表帧、历史已确认封面样例三张参考图生成主账号 4:3 母版；样例只约束版式层级，不能带入旧故事人物或标题。
   2. 把主账号 4:3 母版作为必选参考图，通过图像编辑/扩图分别衍生主账号 3:4、16:9；保持同一真人、同一故事角色、同一色彩和装饰语言。
   3. 以主账号 4:3 母版为参考图编辑，移除真人并重排空位，得到宝库号 4:3；不得从文字重新生成另一个版本。
   4. 再以宝库号 4:3 母版为必选参考图编辑衍生宝库号 3:4、16:9。
 - 两个账号交付 {cover_names}。衍生是重新组织构图，不是机械裁切、拉伸或补边。
 - 把生成血缘写入两个账号 covers 目录共同上级的 `{lineage_name}`；所有衍生项的 parent 哈希必须与实际文件一致。
-- 六张创意底图必须使用 Codex 原生生图能力生成或衍生；禁止用 Pillow/HTML/CSS/截图拼接冒充创意底图。required_v1 的最终文字与 Logo 由 Runtime 确定性渲染。
-- 品牌 Logo 不得由生图模型临摹或改造。六张图的上方中间预留干净安全区，不要自行生成花朵/图标/品牌字样；生产任务返回后主 Agent 会把配置中的原始 Logo PNG 原样叠加并记录哈希。这是唯一允许的确定性后期。
+- 六张最终封面必须使用 Codex 原生 ImageGen 生成或编辑衍生；标题和信息必须在 ImageGen 最终像素中一体成型，禁止 Pillow/HTML/CSS/Canvas/SVG/截图拼接或任何脚本后期叠字。
+- 品牌 Logo 不得由生图模型临摹或改造；合同 official_assets 为空时六张最终封面保持零 Logo。不得预留给 Runtime 后期补 Logo，也不得把花朵或装饰伪装成品牌标记。
 - 如果还没有参考帧，主账号优先使用第 13 步确认的发布预览帧；宝库号查看候选帧索引并选择故事动作/冲突帧，然后运行：
   `python3 story_workflow.py publish-package-project --project-dir "{project_dir}" --generate-covers --library-frame <编号>`
   之后继续执行新生成的 handoff 和封面任务。

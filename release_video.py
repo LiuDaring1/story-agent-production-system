@@ -13,7 +13,7 @@ from PIL import Image, ImageDraw, ImageFilter, ImageFont, ImageOps
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
 from story_contract_consumers import BINDING_FIELDS, release_argument_overrides, write_json_atomic
 from artifact_semantic_plan import load_current_artifact_semantic_plan, plan_binding as semantic_plan_binding
-from demo_quality import load_current_final_demo_geometry
+from demo_quality import load_preview_demo_geometry_for_release_review
 from keying_quality import keying_preset_lock_issues
 from production_keying import (
     person_beauty_filter as shared_person_beauty_filter,
@@ -36,6 +36,7 @@ from release_geometry import (
     canonical_sha256,
     compile_text_group,
     geometry_manifest_issues,
+    preview_formal_binding_sha256,
     release_render_manifest_issues,
     regions_for_variant as release_regions_for_variant,
     release_a_geometry,
@@ -64,9 +65,14 @@ def production_keying_filter_parts(source_label, settings, crop_filter=""):
 
 FINAL_WIDTH = 1080
 FINAL_HEIGHT = 1440
-TOP_HEIGHT = 320
+TOP_HEIGHT = 416
 CENTER_HEIGHT = 608
 BOTTOM_HEIGHT = FINAL_HEIGHT - TOP_HEIGHT - CENTER_HEIGHT
+PACKAGE_PANEL_NATIVE_SIZE = (2304, 888)
+APERTURE_OVERSCAN_PIXELS = 2
+LIBRARY_EDGE_OVERSCAN_RATIO = 1.02
+STORY_CONTENT_OVERSCAN_RATIO = 1.02
+RELEASE_PREVIEW_SAMPLE_SECONDS = 0.4
 DEFAULT_VIDEO_BOX = (0, 416, 1080, 608)
 
 WIDE_WIDTH = 1920
@@ -75,9 +81,18 @@ STORY_BOX_X = 170
 STORY_BOX_Y = 250
 STORY_BOX_W = 990
 STORY_BOX_H = 557
+
+
+def sha256_path(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as source:
+        for chunk in iter(lambda: source.read(chunk_size), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 PERSON_HEIGHT = 940
 PERSON_X = 1190
 PERSON_Y = 100
+PERSON_GRADES = ("none", "natural", "log-soft", "log-strong")
 
 
 @dataclass(frozen=True)
@@ -139,6 +154,32 @@ class ReleaseConfig:
     age_text: str = "3-6岁"
     usage_text: str = "适用于朗诵比赛、故事表演、少儿口才、技能比拼"
     story_type: str = "儿童故事"
+    main_top_panel: Path | None = None
+    main_bottom_panel: Path | None = None
+    library_top_panel: Path | None = None
+    library_bottom_panel: Path | None = None
+    main_package_spec: Path | None = None
+    main_package_receipt: Path | None = None
+    approved_preview_geometry: Path | None = None
+    rvm_model_path: str = ""
+    rvm_model_sha256: str = ""
+    rvm_runtime_path: str = ""
+    rvm_foreground_sha256: str = ""
+    rvm_receipt_path: str = ""
+    rvm_receipt_sha256: str = ""
+    rvm_input_width: int = 1920
+    rvm_input_height: int = 1080
+    rvm_downsample_ratio: float = 0.4
+    rvm_alpha_choke_pixels: int = 1
+
+
+def validate_person_grade(value: str) -> str:
+    if value not in PERSON_GRADES:
+        raise ValueError(
+            "keying_preset.json 中 person_grade 只能是 "
+            + "/".join(PERSON_GRADES)
+        )
+    return value
 
 
 def main() -> None:
@@ -154,10 +195,17 @@ def main() -> None:
     parser.add_argument("--watermark-logo", type=Path, help="品牌水印 PNG/JPG")
     parser.add_argument("--antipiracy-logo", type=Path, help="宝库号中间视频区域飘动防盗 PNG；不传则使用文字水印")
     parser.add_argument("--plate-image", type=Path, help="AI 生成的 3:4 完整底板图；传入后视频会嵌进 --video-box")
+    parser.add_argument("--main-top-panel", type=Path, help="ImageGen 原生主账号顶部包装板（2304x888）")
+    parser.add_argument("--main-bottom-panel", type=Path, help="ImageGen 原生主账号底部包装板（2304x888）")
+    parser.add_argument("--library-top-panel", type=Path, help="ImageGen 原生资料号顶部包装板（2304x888）")
+    parser.add_argument("--library-bottom-panel", type=Path, help="ImageGen 原生资料号底部包装板（2304x888）")
+    parser.add_argument("--main-package-spec", type=Path, help="参考图+固定 Prompt 主账号包装合同")
+    parser.add_argument("--main-package-receipt", type=Path, help="ImageGen 包装生成与 OCR/泄漏检查回执")
+    parser.add_argument("--approved-preview-geometry", type=Path, help="独立审核通过的同素材/同参数短预演几何清单")
     parser.add_argument("--video-box", default="0,416,1080,608", help="视频嵌入窗口：x,y,w,h，基于 1080x1440")
-    parser.add_argument("--watermark-width", default=120, type=int, help="防盗 PNG 在中间视频里的显示宽度")
+    parser.add_argument("--watermark-width", default=96, type=int, help="防盗 PNG 在中间视频里的显示宽度")
     parser.add_argument("--watermark-opacity", default=0.62, type=float, help="防盗 PNG 不透明度，0-1")
-    parser.add_argument("--watermark-speed", default=0.35, type=float, help="防盗水印移动速度倍率，默认使用缓慢完整移动")
+    parser.add_argument("--watermark-speed", default=0.45, type=float, help="防盗水印移动速度倍率，默认使用缓慢完整移动")
     parser.add_argument("--frame-image", type=Path, help="可选透明 PNG 框模板；不传则使用默认框")
     parser.add_argument("--story-box", default=f"{STORY_BOX_X},{STORY_BOX_Y},{STORY_BOX_W},{STORY_BOX_H}", help="A 画面故事视频窗口：x,y,w,h，基于 1920x1080")
     parser.add_argument("--story-bleed", default=0, type=int, help="故事视频开口遮罩扩展像素；默认由框内开口遮罩控制，不直接铺矩形")
@@ -183,35 +231,35 @@ def main() -> None:
     parser.add_argument("--chroma-color", default="0x00FF00", help="绿幕颜色，默认 0x00FF00")
     parser.add_argument("--chroma-similarity", default=0.16, type=float)
     parser.add_argument("--chroma-blend", default=0.08, type=float)
-    parser.add_argument("--keyer", choices=["chromakey", "colorkey"], default="chromakey")
+    parser.add_argument("--keyer", choices=["chromakey", "colorkey", "rvm"], default="chromakey")
     parser.add_argument("--keying-preset-json", type=Path, help="自动抠像生成的 keying_preset.json；传入后覆盖抠像相关参数")
     parser.add_argument("--person-crop", default="", help="可选人像裁剪：x,y,w,h，例如 0,0,1080,1440")
-    parser.add_argument("--person-grade", choices=["none", "natural", "log-soft", "log-strong"], default="natural")
+    parser.add_argument("--person-grade", choices=PERSON_GRADES, default="natural")
     parser.add_argument("--person-beauty", choices=["none", "light"], default="light", help="本地可复现轻度磨皮；不依赖剪映")
     parser.add_argument("--library-watermark-text", default="绵羊姐姐原创故事资源")
     parser.add_argument("--tail-seconds", default=0.0, type=float, help="宝库号结尾模糊提示时长；0 表示按总时长自动估算")
     parser.add_argument("--tail-notice-text", default="有需要联系客服，好作品有偿分享！")
     parser.add_argument("--crf", default=15, type=int)
     parser.add_argument("--preset", default="medium")
-    parser.add_argument("--output-scale", default=2, type=int, help="主账号输出倍率：1=1080x1440，2=2160x2880；宝库号固定 1080x1440")
+    parser.add_argument("--output-scale", default=1, type=int, help="主账号输出倍率：1=1080x1440（默认），2=2160x2880；宝库号固定 1080x1440")
     parser.add_argument("--preview-dir", type=Path, help="只生成发布合成预览帧 PNG，不编码完整视频")
     parser.add_argument("--preview-times", default="1,2,37,92", help="预览帧时间点，秒，用逗号分隔；默认包含开头动作帧以检查手部裁切")
     parser.add_argument("--preview-person-layouts", default="", help="预览人像布局候选；auto 或 height,x,y;label:height,x,y")
     parser.add_argument("--contract-render-spec", type=Path, help="已审核合同编译出的发布渲染规格")
     parser.add_argument("--artifact-semantic-plan", type=Path, help="当前锁定合同编译出的逐产物语义计划")
     parser.add_argument("--demo-render-manifest", type=Path, help="已审核 final Demo 的实际人物 geometry receipt")
-    parser.add_argument("--age-text", default="3-6岁", help="发布信息栏年龄文案")
+    parser.add_argument("--age-text", required=True, help="用户指定的发布信息栏年龄文案；禁止模型猜测")
     parser.add_argument("--usage-text", default="适用于朗诵比赛、故事表演、少儿口才、技能比拼", help="发布信息栏固定用途文案")
     parser.add_argument("--story-type", default="儿童故事", help="发布上条带故事/栏目类型")
     args = parser.parse_args()
 
     keying = load_keying_preset(args.keying_preset_json.expanduser()) if args.keying_preset_json else {}
     keyer = str(keying.get("keyer", args.keyer))
-    if keyer not in {"chromakey", "colorkey"}:
-        raise ValueError("keying_preset.json 中 keyer 只能是 chromakey 或 colorkey")
-    person_grade = str(keying.get("person_grade", args.person_grade))
-    if person_grade not in {"none", "log-soft", "log-strong"}:
-        raise ValueError("keying_preset.json 中 person_grade 只能是 none/log-soft/log-strong")
+    if keyer not in {"chromakey", "colorkey", "rvm"}:
+        raise ValueError("keying_preset.json 中 keyer 只能是 chromakey、colorkey 或 rvm")
+    person_grade = validate_person_grade(
+        str(keying.get("person_grade", args.person_grade))
+    )
     person_beauty = str(keying.get("person_beauty", args.person_beauty))
     if person_beauty not in {"none", "light"}:
         raise ValueError("keying_preset.json 中 person_beauty 只能是 none/light")
@@ -237,6 +285,9 @@ def main() -> None:
     story_bleed = int(float(keying.get("story_bleed", args.story_bleed)))
     background_blur = int(float(keying.get("background_blur", args.background_blur)))
 
+    person_video_path = args.person_greenscreen.expanduser() if args.person_greenscreen else None
+    if keyer == "rvm":
+        person_video_path = Path(str(keying["rvm_foreground_video"]))
     config = ReleaseConfig(
         story_name=args.story_name,
         duration_text=args.duration_text,
@@ -244,7 +295,7 @@ def main() -> None:
         output_dir=args.output_dir.expanduser(),
         variant=args.variant,
         bg_image=args.bg_image.expanduser() if args.bg_image else None,
-        person_greenscreen=args.person_greenscreen.expanduser() if args.person_greenscreen else None,
+        person_greenscreen=person_video_path,
         audio_mix=args.audio_mix.expanduser() if args.audio_mix else None,
         watermark_logo=args.watermark_logo.expanduser() if args.watermark_logo else None,
         antipiracy_logo=args.antipiracy_logo.expanduser() if args.antipiracy_logo else None,
@@ -295,8 +346,33 @@ def main() -> None:
         age_text=args.age_text,
         usage_text=args.usage_text,
         story_type=args.story_type,
+        main_top_panel=args.main_top_panel.expanduser() if args.main_top_panel else None,
+        main_bottom_panel=args.main_bottom_panel.expanduser() if args.main_bottom_panel else None,
+        library_top_panel=args.library_top_panel.expanduser() if args.library_top_panel else None,
+        library_bottom_panel=args.library_bottom_panel.expanduser() if args.library_bottom_panel else None,
+        main_package_spec=args.main_package_spec.expanduser() if args.main_package_spec else None,
+        main_package_receipt=args.main_package_receipt.expanduser() if args.main_package_receipt else None,
+        approved_preview_geometry=(
+            args.approved_preview_geometry.expanduser() if args.approved_preview_geometry else None
+        ),
+        rvm_model_path=str(keying.get("rvm_model_path") or ""),
+        rvm_model_sha256=str(keying.get("rvm_model_sha256") or ""),
+        rvm_runtime_path=str(keying.get("rvm_runtime_path") or ""),
+        rvm_foreground_sha256=str(keying.get("rvm_foreground_sha256") or ""),
+        rvm_receipt_path=str(keying.get("rvm_receipt_path") or ""),
+        rvm_receipt_sha256=str(keying.get("rvm_receipt_sha256") or ""),
+        rvm_input_width=int(keying.get("rvm_input_width", 1920)),
+        rvm_input_height=int(keying.get("rvm_input_height", 1080)),
+        rvm_downsample_ratio=float(keying.get("rvm_downsample_ratio", 0.4)),
+        rvm_alpha_choke_pixels=int(keying.get("rvm_alpha_choke_pixels", 1)),
     )
     contract_spec = load_release_contract_spec(args.contract_render_spec) if args.contract_render_spec else None
+    if (
+        contract_spec is not None
+        and args.preview_dir is None
+        and config.approved_preview_geometry is None
+    ):
+        parser.error("required_v1 正式编码必须提供 --approved-preview-geometry")
     if contract_spec is not None and config.variant in {"main", "both"}:
         config = apply_release_contract_spec(config, contract_spec)
     if args.preview_dir is not None:
@@ -332,17 +408,126 @@ def apply_release_contract_spec(config: ReleaseConfig, spec: dict) -> ReleaseCon
     return replace(config, **values)
 
 
-def compile_release_geometry(config: ReleaseConfig, spec: dict) -> dict:
+def required_package_asset_binding(config: ReleaseConfig) -> dict[str, object]:
+    """Validate native ImageGen panels and their reference/prompt lineage."""
+
+    required: list[tuple[str, Path | None]] = []
+    if config.variant in {"both", "main"}:
+        required.extend((
+            ("main_top_panel", config.main_top_panel),
+            ("main_bottom_panel", config.main_bottom_panel),
+        ))
+    if config.variant in {"both", "library"}:
+        required.extend((
+            ("library_top_panel", config.library_top_panel),
+            ("library_bottom_panel", config.library_bottom_panel),
+        ))
+    missing = [name for name, path in required if path is None or not path.is_file()]
+    if missing:
+        raise ValueError("required_v1 ImageGen 包装板缺失：" + "、".join(missing))
+    for name, path in required:
+        assert path is not None
+        with Image.open(path) as image:
+            if image.size != PACKAGE_PANEL_NATIVE_SIZE:
+                raise ValueError(
+                    f"required_v1 {name} 尺寸必须为 "
+                    f"{PACKAGE_PANEL_NATIVE_SIZE[0]}x{PACKAGE_PANEL_NATIVE_SIZE[1]}"
+                )
+    if config.main_package_spec is None or not config.main_package_spec.is_file():
+        raise ValueError("package_reference_missing: main_package_spec.json")
+    if config.main_package_receipt is None or not config.main_package_receipt.is_file():
+        raise ValueError("required_v1 main_package_generation_receipt.json 缺失")
+    try:
+        package_spec = json.loads(config.main_package_spec.read_text(encoding="utf-8"))
+        receipt = json.loads(config.main_package_receipt.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise ValueError("required_v1 主账号包装合同或回执损坏") from exc
+    if package_spec.get("reference_role") != "main_vertical_package":
+        raise ValueError("required_v1 主账号包装参考图角色无效")
+    from story_project import load_main_package_reference, main_package_fixed_prompt_template
+
+    stable_reference = load_main_package_reference()
+    reference_path = Path(str(package_spec.get("reference_asset") or "")).expanduser()
+    if not reference_path.is_file():
+        raise ValueError("package_reference_missing: 主账号包装参考图不存在")
+    reference_sha = sha256_path(reference_path)
+    if reference_sha != package_spec.get("reference_sha256"):
+        raise ValueError("required_v1 主账号包装参考图 SHA-256 不匹配")
+    if (
+        reference_path.resolve() != Path(str(stable_reference["asset_path"])).resolve()
+        or reference_sha != stable_reference["sha256"]
+    ):
+        raise ValueError("required_v1 主账号包装未绑定稳定参考资产")
+    expected_template_sha = hashlib.sha256(main_package_fixed_prompt_template().encode("utf-8")).hexdigest()
+    if package_spec.get("fixed_prompt_template_sha256") != expected_template_sha:
+        raise ValueError("required_v1 主账号包装固定 Prompt 已失效")
+    if receipt.get("schema_version") != "story-main-package-generation/v1":
+        raise ValueError("required_v1 主账号包装生成回执 schema 无效")
+    try:
+        attempt_count = int(receipt.get("attempt_count") or 0)
+    except (TypeError, ValueError):
+        attempt_count = 0
+    if not 1 <= attempt_count <= 3:
+        raise ValueError("required_v1 主账号包装生成超过两轮定向修正")
+    for field in ("reference_asset", "reference_sha256", "fixed_prompt_template_sha256"):
+        if receipt.get(field) != package_spec.get(field):
+            raise ValueError(f"required_v1 主账号包装回执绑定不匹配：{field}")
+    if receipt.get("imagegen_reference_attached") is not True:
+        raise ValueError("required_v1 ImageGen 未实际附带主账号包装参考图")
+    if not isinstance(receipt.get("ocr_validation"), dict) or receipt["ocr_validation"].get("passed") is not True:
+        raise ValueError("required_v1 主账号包装 OCR 未通过")
+    expected_text = {
+        "story_type": str(package_spec.get("story_type") or ""),
+        "story_title": str(package_spec.get("story_title") or ""),
+        "duration": str(package_spec.get("duration") or ""),
+        "age_range": str(package_spec.get("age_range") or ""),
+        "use_cases": str(package_spec.get("use_cases") or ""),
+    }
+    if (
+        receipt["ocr_validation"].get("expected") != expected_text
+        or receipt["ocr_validation"].get("observed") != expected_text
+    ):
+        raise ValueError("required_v1 主账号包装 OCR 文本与本期合同不一致")
+    leak = receipt.get("reference_content_leak_check")
+    if not isinstance(leak, dict) or leak.get("passed") is not True or leak.get("leaked_items") not in ([], None):
+        raise ValueError("required_v1 主账号包装发生参考图示例内容泄漏")
+    receipt_outputs = receipt.get("outputs") if isinstance(receipt.get("outputs"), dict) else {}
+    for key, path in (("top_plate", config.main_top_panel), ("bottom_plate", config.main_bottom_panel)):
+        if path is None:
+            continue
+        item = receipt_outputs.get(key) if isinstance(receipt_outputs.get(key), dict) else {}
+        if item.get("path") != str(path) or item.get("sha256") != sha256_path(path):
+            raise ValueError(f"required_v1 主账号包装回执未绑定实际输出：{key}")
+    return {
+        "reference_asset": str(reference_path),
+        "reference_sha256": reference_sha,
+        "reference_role": "main_vertical_package",
+        "main_package_spec_sha256": sha256_path(config.main_package_spec),
+        "main_package_receipt_sha256": sha256_path(config.main_package_receipt),
+        "panel_sha256": {
+            name: sha256_path(path)
+            for name, path in required
+            if path is not None
+        },
+        "text_integration": "imagegen_native",
+        "render_usage_proof": True,
+    }
+
+
+def compile_release_geometry(config: ReleaseConfig, spec: dict, *, preview: bool = False) -> dict:
     if config.artifact_semantic_plan is None:
         raise ValueError("required_v1 发布渲染缺少 artifact_semantic_plan")
     project_root = config.artifact_semantic_plan.resolve().parents[2]
     semantic_plan = load_current_artifact_semantic_plan(project_root)
     if config.keying_preset_path is None:
         raise ValueError("required_v1 发布渲染缺少审核锁定的 keying preset")
-    lock_issues = keying_preset_lock_issues(config.keying_preset_path)
-    if lock_issues:
-        raise ValueError("required_v1 keying preset lock invalid: " + "; ".join(lock_issues))
+    if not preview:
+        lock_issues = keying_preset_lock_issues(config.keying_preset_path)
+        if lock_issues:
+            raise ValueError("required_v1 keying preset lock invalid: " + "; ".join(lock_issues))
     preset = json.loads(config.keying_preset_path.read_text(encoding="utf-8"))
+    package_assets = required_package_asset_binding(config)
+    compositing_geometry = compiled_video_compositing_geometry(config)
     demo: dict | None = None
     presenter_a: dict | None = None
     demo_manifest_sha = "not_applicable:library_variant"
@@ -351,21 +536,60 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict) -> dict:
         if config.person_greenscreen is None:
             raise ValueError("required_v1 主账号发布渲染缺少人物源视频")
         if config.demo_render_manifest is None:
-            raise ValueError("required_v1 Release 缺少 final Demo presenter geometry receipt")
-        demo_manifest, demo = load_current_final_demo_geometry(
+            raise ValueError("required_v1 Release 缺少已审核的真实素材 Demo 短预演几何回执")
+        demo_manifest, demo = load_preview_demo_geometry_for_release_review(
             config.demo_render_manifest, project_root,
         )
-        if hashlib.sha256(config.person_greenscreen.read_bytes()).hexdigest() != demo.get("source_greenscreen_sha256"):
-            raise ValueError("required_v1 Release 人物源与 final Demo geometry receipt 不匹配")
-        if hashlib.sha256(config.keying_preset_path.read_bytes()).hexdigest() != demo.get("keying_preset_sha256"):
-            raise ValueError("required_v1 Release keying preset 与 final Demo geometry receipt 不匹配")
-        demo_manifest_sha = hashlib.sha256(config.demo_render_manifest.read_bytes()).hexdigest()
+        if sha256_path(config.person_greenscreen) != demo.get("source_greenscreen_sha256"):
+            raise ValueError("required_v1 Release 人物源与 Demo 短预演几何回执不匹配")
+        if not preview and sha256_path(config.keying_preset_path) != demo.get("keying_preset_sha256"):
+            raise ValueError("required_v1 Release keying preset 与 Demo 短预演几何回执不匹配")
+        if preview and production_keying_fingerprint(preset) != demo.get("production_keying_filter_fingerprint"):
+            raise ValueError("required_v1 Release preview keying filter 与 Demo geometry receipt 不匹配")
+        demo_manifest_sha = sha256_path(config.demo_render_manifest)
         approved_demo_geometry_sha = str(demo.get("geometry_sha256") or "")
         regions = release_regions_for_variant(spec, "main", "16:9")
         person_region = regions.get("person") or regions.get("host")
         if not isinstance(person_region, dict):
-            raise ValueError("required_v1 release_layout lacks presenter safe region")
-        presenter_a = release_a_geometry(demo, person_region, WIDE_WIDTH, WIDE_HEIGHT)
+            person_region = deferred_presenter_safe_region(spec, demo)
+        frame_outer = compositing_geometry["frame_outer_rect"]
+        story_right = max(0, min(WIDE_WIDTH - 1, int(frame_outer[0]) + int(frame_outer[2])))
+        right_blank_region = {
+            "role": "presenter_initial_right_blank",
+            "x": story_right / WIDE_WIDTH,
+            "y": 0.0,
+            "width": (WIDE_WIDTH - story_right) / WIDE_WIDTH,
+            "height": 1.0,
+        }
+        anchor_bbox = (
+            preset.get("presenter_initial_subject_bbox")
+            or preset.get("detected_person_bbox")
+        )
+        # The CLI/config detection fallback describes the uncropped source and
+        # is safe to reuse only when Demo kept that source-native canvas.  A
+        # non-native reviewed Demo has its own crop transform; applying an
+        # unrelated source bbox after that crop can fabricate a vertical
+        # overflow and reject an otherwise approved composition.
+        if (
+            anchor_bbox is None
+            and bool(demo.get("source_native"))
+            and config.detected_person_bbox is not None
+        ):
+            anchor_bbox = list(config.detected_person_bbox)
+        configured_anchor = preset.get("presenter_initial_anchor_x")
+        presenter_a = release_a_geometry(
+            demo,
+            person_region,
+            WIDE_WIDTH,
+            WIDE_HEIGHT,
+            right_blank_region=right_blank_region,
+            initial_subject_bbox=anchor_bbox if isinstance(anchor_bbox, list) else None,
+            initial_anchor_x=(int(configured_anchor) if configured_anchor is not None else None),
+        )
+        presenter_a["presenter_initial_anchor_frame"] = preset.get("presenter_initial_anchor_frame")
+        presenter_a["presenter_initial_anchor_frame_seconds"] = preset.get(
+            "presenter_initial_anchor_frame_seconds"
+        )
     compiled_spec_sha = canonical_sha256(spec)
     bindings = release_binding_payload(
         spec,
@@ -374,6 +598,15 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict) -> dict:
         keying_preset_path=config.keying_preset_path,
         keying_filter_fingerprint=production_keying_fingerprint(preset),
     )
+    if preview and not str(bindings.get("keying_lock_sha256") or ""):
+        # Release preview is the evidence used by the subsequent independent
+        # keying/layout review, so it necessarily exists before the final
+        # keying lock.  Record that lifecycle state explicitly instead of
+        # fabricating a lock hash.  Full rendering still requires and binds the
+        # real lock above.
+        bindings["keying_lock_sha256"] = (
+            "not_applicable:preview_before_independent_keying_lock"
+        )
     bindings.update(semantic_plan_binding(config.artifact_semantic_plan, semantic_plan))
     bindings.update({
         "demo_render_manifest_sha256": demo_manifest_sha,
@@ -385,7 +618,7 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict) -> dict:
         raise ValueError("required_v1 主账号只允许一个审核通过的官方 Logo，禁止叠加额外 watermark_logo")
     logo_region: list[int] | None = None
     if config.story_logo is not None:
-        logo_sha = hashlib.sha256(config.story_logo.read_bytes()).hexdigest()
+        logo_sha = sha256_path(config.story_logo)
         matches = [
             item for item in official_assets
             if str(item.get("sha256") or "") == logo_sha
@@ -425,10 +658,14 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict) -> dict:
             "b": {"visible": False, "story_region": list(config.b_story_box)},
             "c": ({**demo, "position_correction": {"x": 0, "y": 0}, "scale_changed": False}
                   if demo is not None else {"visible": False, "applicable": False, "reason": "library_variant"}),
+            "initial_anchor_frame": preset.get("presenter_initial_anchor_frame"),
+            "initial_anchor_frame_seconds": preset.get("presenter_initial_anchor_frame_seconds"),
+            "dynamic_repositioning": False,
+            "gesture_overlap_policy": "allowed",
         },
         "main": {
-            "upper_strip": {**upper, "content": ["story_type", "story_name"], "renderer": "deterministic_text"},
-            "lower_strip": {**lower, "content": ["duration", "age", "approved_usage"], "renderer": "deterministic_text"},
+            "upper_strip": {**upper, "content": ["story_type", "story_name"], "renderer": "imagegen_native_reference"},
+            "lower_strip": {**lower, "content": ["duration", "age", "approved_usage"], "renderer": "imagegen_native_reference"},
             "story_region_a": list(config.story_box),
             "story_region_b": list(config.b_story_box),
             "logo_region": logo_region,
@@ -454,12 +691,149 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict) -> dict:
             "library": "background_subtitles",
         },
         "official_logo": logo_binding,
+        "main_package_spec": package_assets,
+        "video_compositing": {
+            **compositing_geometry,
+            "background_source": "high_resolution_story_video_then_blur",
+            "story_video_fit": "cover",
+            "overscan_pixels": APERTURE_OVERSCAN_PIXELS,
+            "preview_renderer": "formal_ffmpeg_filter_graph_sample",
+            "formal_renderer": "formal_ffmpeg_filter_graph",
+            "preview_sample_seconds": RELEASE_PREVIEW_SAMPLE_SECONDS,
+        },
     }
+    payload["formal_render_binding_sha256"] = preview_formal_binding_sha256(payload)
+    if not preview and config.approved_preview_geometry is not None:
+        try:
+            approved_preview = json.loads(
+                config.approved_preview_geometry.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise ValueError("required_v1 已审核短预演几何清单缺失或损坏") from exc
+        if (
+            approved_preview.get("formal_render_binding_sha256")
+            != payload["formal_render_binding_sha256"]
+        ):
+            raise ValueError(
+                "required_v1 preview_formal_binding_mismatch: 预演后素材或合成参数已变化，"
+                "必须仅重新抽渲对应样本并复审"
+            )
     payload["geometry_sha256"] = canonical_sha256(payload)
     issues = geometry_manifest_issues(payload)
     if issues:
         raise ValueError("release geometry compilation invalid: " + "; ".join(issues))
     return payload
+
+
+def compiled_video_compositing_geometry(config: ReleaseConfig) -> dict[str, object]:
+    """Describe the exact A-scene layer geometry used by preview and release.
+
+    The decorative frame's *outer* alpha bounds, rather than merely the story
+    aperture, define where the presenter's right-side blank area begins.  This
+    prevents the initial anchor from being calibrated on top of frame artwork.
+    """
+
+    story_box = tuple(int(value) for value in config.story_box)
+    margin_x, margin_y = 112, 116
+    frame_outer = (
+        max(0, story_box[0] - margin_x),
+        max(0, story_box[1] - margin_y),
+        min(WIDE_WIDTH, story_box[0] + story_box[2] + margin_x),
+        min(WIDE_HEIGHT, story_box[1] + story_box[3] + margin_y),
+    )
+    aperture_rect = story_box
+    frame_source_sha256: str | None = None
+    if config.frame_image is not None and config.frame_image.is_file():
+        with Image.open(config.frame_image) as source:
+            frame = source.convert("RGBA")
+        if frame.size != (WIDE_WIDTH, WIDE_HEIGHT):
+            frame = scale_crop_image(frame, WIDE_WIDTH, WIDE_HEIGHT)
+        frame = fit_frame_to_window(frame, story_box)
+        alpha_bbox = frame.getchannel("A").getbbox()
+        if alpha_bbox is not None:
+            frame_outer = alpha_bbox
+        aperture_bbox = story_aperture_mask(frame, story_box, config.story_bleed).getbbox()
+        if aperture_bbox is None:
+            raise ValueError("required_v1 无法从装饰框解析故事视频内口")
+        aperture_rect = (
+            aperture_bbox[0], aperture_bbox[1],
+            aperture_bbox[2] - aperture_bbox[0], aperture_bbox[3] - aperture_bbox[1],
+        )
+        frame_source_sha256 = sha256_path(config.frame_image)
+    else:
+        frame_outer = (
+            frame_outer[0], frame_outer[1],
+            frame_outer[2] - frame_outer[0], frame_outer[3] - frame_outer[1],
+        )
+    if len(frame_outer) == 4 and frame_outer[2] > frame_outer[0] and frame_outer[3] > frame_outer[1]:
+        # PIL alpha bounds are x1/y1/x2/y2; fallback above is already x/y/w/h.
+        if config.frame_image is not None and config.frame_image.is_file():
+            frame_outer = (
+                frame_outer[0], frame_outer[1],
+                frame_outer[2] - frame_outer[0], frame_outer[3] - frame_outer[1],
+            )
+    overscan = bleed_box(
+        tuple(int(value) for value in aperture_rect),
+        max(APERTURE_OVERSCAN_PIXELS, config.story_bleed),
+        (WIDE_WIDTH, WIDE_HEIGHT),
+    )
+    return {
+        "canvas_background_rect": [0, 0, WIDE_WIDTH, WIDE_HEIGHT],
+        "frame_outer_rect": list(frame_outer),
+        "frame_aperture_mask": {
+            "mode": "natural_inner_aperture",
+            "rect": list(aperture_rect),
+            "source_sha256": frame_source_sha256,
+        },
+        "story_video_transform": {
+            "fit": "cover",
+            "destination_rect": list(overscan),
+            "preserve_aspect_ratio": True,
+            "overscan_pixels": max(APERTURE_OVERSCAN_PIXELS, config.story_bleed),
+        },
+        "story_video_focus_point": [0.5, 0.5],
+        "aperture_coverage": 1.0,
+        "edge_gap_pixels": 0,
+    }
+
+
+def deferred_presenter_safe_region(spec: dict, demo: dict) -> dict:
+    """Resolve the no-variant contract case from its required canvas receipt.
+
+    A required_v1 contract may intentionally defer normalized regions until a
+    reviewed presenter canvas exists.  In that explicit mode, the approved
+    Demo geometry is inherited unchanged inside its recorded full canvas.  We
+    still fail closed for an accidental missing region or a mismatched canvas.
+    """
+
+    rules = {
+        str(item.get("rule_id") or ""): item.get("value")
+        for item in spec.get("layout_rules", [])
+        if isinstance(item, dict)
+    }
+    deferred = (
+        not spec.get("variants")
+        and rules.get("layout.precise_variants_require_canvas_receipt") is True
+        and rules.get("layout.normalized_regions_require_canvas_receipt") is True
+    )
+    if not deferred:
+        raise ValueError("required_v1 release_layout lacks presenter safe region")
+    if (
+        int(demo.get("canvas_width") or 0) != WIDE_WIDTH
+        or int(demo.get("canvas_height") or 0) != WIDE_HEIGHT
+    ):
+        raise ValueError(
+            "required_v1 deferred release_layout canvas receipt does not match "
+            "the release canvas"
+        )
+    return {
+        "role": "person",
+        "x": 0.0,
+        "y": 0.0,
+        "width": 1.0,
+        "height": 1.0,
+        "source": "approved_demo_canvas_receipt",
+    }
 
 
 def build_release_render_manifest(config: ReleaseConfig, spec: dict, outputs: list[Path], geometry: dict) -> dict:
@@ -481,7 +855,7 @@ def build_release_render_manifest(config: ReleaseConfig, spec: dict, outputs: li
         },
         "safe_regions": release_argument_overrides(spec, config.variant).get("safe_regions", {}),
         "outputs": [
-            {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            {"path": str(path), "sha256": sha256_path(path)}
             for path in outputs if path.is_file()
         ],
     }
@@ -513,6 +887,46 @@ def load_keying_preset(path: Path) -> dict:
         }
         if selected not in candidate_ids:
             raise ValueError(f"keying_candidate={selected!r} 未出现在 keying_search.candidates 中")
+    keyer = str(data.get("keyer") or "colorkey")
+    if keyer == "rvm":
+        from rvm_keying import file_sha256 as rvm_file_sha256
+        from rvm_keying import rvm_receipt_issues, validate_rvm_model
+
+        def resolve_required(field: str) -> Path:
+            raw = str(data.get(field) or "").strip()
+            if not raw:
+                raise ValueError(f"RVM preset 缺少 {field}")
+            candidate = Path(raw).expanduser()
+            if not candidate.is_absolute():
+                candidate = (path.parent / candidate).resolve()
+            data[field] = str(candidate)
+            return candidate
+
+        model = resolve_required("rvm_model_path")
+        foreground = resolve_required("rvm_foreground_video")
+        receipt = resolve_required("rvm_receipt_path")
+        runtime_raw = str(data.get("rvm_runtime_path") or "").strip()
+        if runtime_raw:
+            runtime = Path(runtime_raw).expanduser()
+            if not runtime.is_absolute():
+                runtime = (path.parent / runtime).resolve()
+            data["rvm_runtime_path"] = str(runtime)
+        model_sha = validate_rvm_model(model)
+        issues = rvm_receipt_issues(receipt, expected_output=foreground)
+        if issues:
+            raise ValueError("RVM preset 回执无效：" + "；".join(issues))
+        actual_foreground_sha = rvm_file_sha256(foreground)
+        actual_receipt_sha = rvm_file_sha256(receipt)
+        declarations = {
+            "rvm_model_sha256": model_sha,
+            "rvm_foreground_sha256": actual_foreground_sha,
+            "rvm_receipt_sha256": actual_receipt_sha,
+        }
+        for field, actual in declarations.items():
+            declared = str(data.get(field) or "")
+            if declared and declared != actual:
+                raise ValueError(f"RVM preset {field} 哈希不一致")
+            data[field] = actual
     return data
 
 
@@ -615,6 +1029,16 @@ def args_input_paths(args: list[str]) -> list[str]:
 def scaled_box(box: tuple[int, int, int, int], scale: int) -> tuple[int, int, int, int]:
     x, y, width, height = box
     return x * scale, y * scale, width * scale, height * scale
+
+
+def content_overscan_size(width: int, height: int) -> tuple[int, int]:
+    """Return an even-sized center overscan that removes encoded edge rims."""
+
+    overscan_width = max(width + 2, round(width * STORY_CONTENT_OVERSCAN_RATIO))
+    overscan_height = max(height + 2, round(height * STORY_CONTENT_OVERSCAN_RATIO))
+    overscan_width += overscan_width % 2
+    overscan_height += overscan_height % 2
+    return overscan_width, overscan_height
 
 
 def bleed_box(box: tuple[int, int, int, int], bleed: int, canvas_size: tuple[int, int]) -> tuple[int, int, int, int]:
@@ -745,7 +1169,7 @@ def _release_layout_input_artifacts(
         {
             "role": role,
             "path": str(path),
-            "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+            "sha256": sha256_path(path),
         }
         for role, path in [*paths, *currentness_paths]
         if path is not None
@@ -792,6 +1216,11 @@ def _release_layout_binding(
             "chroma_blend": config.chroma_blend,
             "person_grade": config.person_grade,
             "person_beauty": config.person_beauty,
+            "rvm_model_sha256": config.rvm_model_sha256,
+            "rvm_foreground_sha256": config.rvm_foreground_sha256,
+            "rvm_receipt_sha256": config.rvm_receipt_sha256,
+            "rvm_input_size": [config.rvm_input_width, config.rvm_input_height],
+            "rvm_downsample_ratio": config.rvm_downsample_ratio,
         },
         "watermark": {
             "width": config.watermark_width,
@@ -816,6 +1245,36 @@ def _execute_release_layout(
     attempt_id: str,
     executor: Callable[[], None],
 ) -> None:
+    request_fingerprint = hashlib.sha256(json.dumps({
+        "artifact_id": artifact_id,
+        "operation": operation,
+        "input_artifacts": input_artifacts,
+        "layout_binding": layout_binding,
+        "output_target": str(output_target.resolve(strict=False)),
+        "adapter_name": port.identity.adapter_name,
+        "adapter_version": port.identity.adapter_version,
+    }, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
+    receipt_dir = output_target.parent / ".release_layout_receipts"
+    receipt_dir.mkdir(parents=True, exist_ok=True)
+    receipt_name = hashlib.sha256(
+        f"{artifact_id}\0{operation}\0{output_target.resolve(strict=False)}".encode("utf-8")
+    ).hexdigest()
+    receipt_path = receipt_dir / f"{receipt_name}.json"
+    try:
+        cached = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        cached = {}
+    if (
+        cached.get("schema_version") == "story-release-layout-operation/v1"
+        and cached.get("request_fingerprint") == request_fingerprint
+        and cached.get("output_path") == str(output_target.resolve(strict=False))
+        and output_target.is_file()
+        and output_target.stat().st_size > 0
+        and cached.get("output_sha256") == sha256_path(output_target)
+    ):
+        # A technical repair of a later operation must reuse every intact
+        # upstream render instead of repeating a two-hour whole-film encode.
+        return
     request = ReleaseLayoutRequest(
         artifact_id=artifact_id,
         operation=operation,
@@ -832,7 +1291,7 @@ def _execute_release_layout(
             executor()
             artifact = {
                 "path": str(output_target),
-                "sha256": hashlib.sha256(output_target.read_bytes()).hexdigest(),
+                "sha256": sha256_path(output_target),
                 "production_eligible": True,
             }
         except Exception as exc:
@@ -861,6 +1320,22 @@ def _execute_release_layout(
         raise RuntimeError(f"发布布局渲染失败：{message}")
     if result.production_eligible is not True:
         raise RuntimeError("release layout mock 结果不可作为正式发布产物")
+    if not output_target.is_file() or output_target.stat().st_size <= 0:
+        raise RuntimeError(f"发布布局操作未生成有效文件：{output_target}")
+    write_json_atomic(receipt_path, {
+        "schema_version": "story-release-layout-operation/v1",
+        "artifact_id": artifact_id,
+        "operation": operation,
+        "request_fingerprint": request_fingerprint,
+        "input_artifact_hashes": {
+            str(item.get("role") or index): str(item.get("sha256") or "")
+            for index, item in enumerate(input_artifacts)
+        },
+        "layout_binding_sha256": canonical_sha256(layout_binding),
+        "output_path": str(output_target.resolve(strict=False)),
+        "output_sha256": sha256_path(output_target),
+        "production_eligible": True,
+    })
 
 
 def package_release_videos(
@@ -1042,7 +1517,7 @@ def render_release_previews(
     ensure_dir(preview_dir)
     work_dir = preview_dir / "_work"
     ensure_dir(work_dir)
-    geometry = compile_release_geometry(config, contract_spec) if contract_spec is not None else None
+    geometry = compile_release_geometry(config, contract_spec, preview=True) if contract_spec is not None else None
     if geometry is not None:
         write_json_atomic(preview_dir / f"release_geometry_manifest_{config.variant}.json", geometry)
     assets = render_static_assets(config, work_dir, geometry)
@@ -1151,7 +1626,7 @@ def render_release_previews(
                 output_target=output,
                 attempt_id=f"release-preview-library-{timestamp:.3f}",
                 executor=lambda: render_library_preview_frame(
-                    config, assets["library_watermark"], output, work_dir, timestamp,
+                    config, assets["library_watermark"], assets["tail_notice"], output, work_dir, timestamp,
                     library_top, library_bottom,
                 ),
             )
@@ -1171,7 +1646,60 @@ def render_main_preview_frame(
 ) -> None:
     assert config.bg_image is not None
     assert config.person_greenscreen is not None
-    base = scale_crop_image(Image.open(config.bg_image).convert("RGBA"), WIDE_WIDTH, WIDE_HEIGHT)
+    if geometry is not None:
+        if top_panel is None or bottom_panel is None:
+            raise ValueError("required_v1 发布预览缺少确定性上下横条")
+        token = f"{int(round(timestamp * 1000)):09d}_{scene}"
+        wide_sample = work_dir / f"main_formal_sample_{token}.mp4"
+        vertical_sample = work_dir / f"main_vertical_sample_{token}.mp4"
+        render_main_wide(
+            config,
+            frame_image,
+            wide_sample,
+            presenter_geometry=geometry["presenter"]["a"],
+            presenter_c_geometry=geometry["presenter"]["c"],
+            sample_start=timestamp,
+            sample_duration=RELEASE_PREVIEW_SAMPLE_SECONDS,
+            sample_scene=scene,
+        )
+        wide_probe = work_dir / f"main_formal_sample_probe_{token}.png"
+        extract_video_frame(
+            wide_sample,
+            wide_probe,
+            min(RELEASE_PREVIEW_SAMPLE_SECONDS / 2, 0.2),
+        )
+        aperture_issues = []
+        if scene != "c":
+            aperture = config.b_story_box if scene == "b" else config.story_box
+            aperture_issues = video_window_black_edge_issues(
+                wide_probe,
+                scaled_box(aperture, config.output_scale),
+                issue_prefix="story_aperture",
+            )
+        if aperture_issues:
+            raise ValueError(
+                "发布短预演发现故事框内黑缝，已阻止整片编码："
+                + "；".join(aperture_issues)
+            )
+        sample_duration = probe_duration(wide_sample)
+        render_vertical_package(
+            source_video=wide_sample,
+            top_panel=top_panel,
+            bottom_panel=bottom_panel,
+            output_path=vertical_sample,
+            duration=sample_duration,
+            config=config,
+            output_scale=config.output_scale,
+        )
+        extract_video_frame(vertical_sample, output_path, min(sample_duration / 2, 0.2))
+        return
+    if geometry is not None:
+        background_frame_path = work_dir / f"background_{int(round(timestamp)):03d}.png"
+        extract_video_frame(config.bg_video, background_frame_path, timestamp)
+        base_source = Image.open(background_frame_path).convert("RGBA")
+    else:
+        base_source = Image.open(config.bg_image).convert("RGBA")
+    base = scale_crop_image(base_source, WIDE_WIDTH, WIDE_HEIGHT)
     if config.background_blur > 0:
         base = base.filter(ImageFilter.GaussianBlur(config.background_blur))
     if scene != "c":
@@ -1187,9 +1715,14 @@ def render_main_preview_frame(
         )
         story_frame_path = work_dir / f"story_{int(round(timestamp)):03d}.png"
         extract_video_frame(config.bg_video, story_frame_path, timestamp)
-        story = scale_crop_image(Image.open(story_frame_path).convert("RGBA"), story_bbox[2], story_bbox[3])
+        render_bbox = bleed_box(
+            story_bbox,
+            max(APERTURE_OVERSCAN_PIXELS, config.story_bleed),
+            (WIDE_WIDTH, WIDE_HEIGHT),
+        )
+        story = scale_crop_image(Image.open(story_frame_path).convert("RGBA"), render_bbox[2], render_bbox[3])
         story_layer = Image.new("RGBA", (WIDE_WIDTH, WIDE_HEIGHT), (0, 0, 0, 0))
-        story_layer.alpha_composite(story, (story_bbox[0], story_bbox[1]))
+        story_layer.alpha_composite(story, (render_bbox[0], render_bbox[1]))
         story_layer.putalpha(Image.open(mask_path).convert("L"))
         base.alpha_composite(story_layer)
         base.alpha_composite(Image.open(prepared_frame).convert("RGBA"))
@@ -1237,24 +1770,47 @@ def render_main_preview_frame(
         logo = logo.resize((logo_width, max(1, round(logo.height * logo_width / max(1, logo.width)))), Image.Resampling.LANCZOS)
         base.alpha_composite(logo, (config.story_logo_x, config.story_logo_y))
     draw_preview_subtitle(base, config, timestamp)
-    if geometry is not None:
-        if top_panel is None or bottom_panel is None:
-            raise ValueError("required_v1 发布预览缺少确定性上下横条")
-        output = package_deterministic_preview_frame(base, top_panel, bottom_panel)
-    else:
-        output = package_preview_frame(base, config.plate_image, config.video_box) if config.plate_image is not None else base
+    output = package_preview_frame(base, config.plate_image, config.video_box) if config.plate_image is not None else base
     output.convert("RGB").save(output_path)
 
 
 def render_library_preview_frame(
     config: ReleaseConfig,
-    watermark_png: Path,
+    watermark_png: Path | None,
+    tail_notice_png: Path,
     output_path: Path,
     work_dir: Path,
     timestamp: float,
     top_panel: Path | None = None,
     bottom_panel: Path | None = None,
 ) -> None:
+    if top_panel is not None or bottom_panel is not None:
+        if top_panel is None or bottom_panel is None:
+            raise ValueError("required_v1 宝库号预览必须同时提供上下横条")
+        token = f"{int(round(timestamp * 1000)):09d}"
+        window_sample = work_dir / f"library_formal_sample_{token}.mp4"
+        vertical_sample = work_dir / f"library_vertical_sample_{token}.mp4"
+        render_library_window_video(
+            source_video=config.bg_video,
+            watermark_png=watermark_png,
+            tail_notice_png=tail_notice_png,
+            output_path=window_sample,
+            config=config,
+            sample_start=timestamp,
+            sample_duration=RELEASE_PREVIEW_SAMPLE_SECONDS,
+        )
+        sample_duration = probe_duration(window_sample)
+        render_vertical_package(
+            source_video=window_sample,
+            top_panel=top_panel,
+            bottom_panel=bottom_panel,
+            output_path=vertical_sample,
+            duration=sample_duration,
+            config=config,
+            output_scale=1,
+        )
+        extract_video_frame(vertical_sample, output_path, min(sample_duration / 2, 0.2))
+        return
     frame_path = work_dir / f"library_story_{int(round(timestamp)):03d}.png"
     extract_video_frame(config.bg_video, frame_path, timestamp)
     if top_panel is not None or bottom_panel is not None:
@@ -1264,12 +1820,13 @@ def render_library_preview_frame(
     else:
         x, y, width, height = config.video_box
     story = scale_crop_image(Image.open(frame_path).convert("RGBA"), width, height)
-    watermark = Image.open(watermark_png).convert("RGBA")
-    wm_width = max(80, min(config.watermark_width, int(width * 0.28)))
-    watermark = watermark.resize((wm_width, max(1, round(watermark.height * wm_width / max(1, watermark.width)))), Image.Resampling.LANCZOS)
-    watermark.putalpha(watermark.getchannel("A").point(lambda value: round(value * config.watermark_opacity)))
-    story.alpha_composite(watermark, (32, 40))
-    story.alpha_composite(watermark, (max(0, width - watermark.width - 32), max(0, height - watermark.height - 40)))
+    if watermark_png is not None:
+        watermark = Image.open(watermark_png).convert("RGBA")
+        wm_width = max(48, min(config.watermark_width, int(width * 0.28)))
+        watermark = watermark.resize((wm_width, max(1, round(watermark.height * wm_width / max(1, watermark.width)))), Image.Resampling.LANCZOS)
+        watermark.putalpha(watermark.getchannel("A").point(lambda value: round(value * config.watermark_opacity)))
+        story.alpha_composite(watermark, (32, 40))
+        story.alpha_composite(watermark, (max(0, width - watermark.width - 32), max(0, height - watermark.height - 40)))
     draw_preview_subtitle(
         story,
         config,
@@ -1284,8 +1841,8 @@ def render_library_preview_frame(
         overlay = plate_overlay_image(config.plate_image, config.video_box, FINAL_WIDTH, FINAL_HEIGHT)
         canvas.alpha_composite(overlay)
     elif top_panel is not None and bottom_panel is not None:
-        canvas.alpha_composite(Image.open(top_panel).convert("RGBA"), (0, 0))
-        canvas.alpha_composite(Image.open(bottom_panel).convert("RGBA"), (0, TOP_HEIGHT + CENTER_HEIGHT))
+        canvas.alpha_composite(scale_crop_image(Image.open(top_panel).convert("RGBA"), FINAL_WIDTH, TOP_HEIGHT), (0, 0))
+        canvas.alpha_composite(scale_crop_image(Image.open(bottom_panel).convert("RGBA"), FINAL_WIDTH, BOTTOM_HEIGHT), (0, TOP_HEIGHT + CENTER_HEIGHT))
     canvas.convert("RGB").save(output_path)
 
 
@@ -1305,14 +1862,10 @@ def package_deterministic_preview_frame(
 ) -> Image.Image:
     """Mirror render_vertical_package for required_v1 review evidence."""
     canvas = Image.new("RGBA", (FINAL_WIDTH, FINAL_HEIGHT), (255, 247, 223, 255))
-    center = ImageOps.contain(
-        wide_frame.convert("RGBA"), (FINAL_WIDTH, CENTER_HEIGHT), method=Image.Resampling.LANCZOS,
-    )
-    center_canvas = Image.new("RGBA", (FINAL_WIDTH, CENTER_HEIGHT), (255, 247, 223, 255))
-    center_canvas.alpha_composite(center, ((FINAL_WIDTH - center.width) // 2, (CENTER_HEIGHT - center.height) // 2))
-    canvas.alpha_composite(Image.open(top_panel).convert("RGBA"), (0, 0))
-    canvas.alpha_composite(center_canvas, (0, TOP_HEIGHT))
-    canvas.alpha_composite(Image.open(bottom_panel).convert("RGBA"), (0, TOP_HEIGHT + CENTER_HEIGHT))
+    center = scale_crop_image(wide_frame.convert("RGBA"), FINAL_WIDTH, CENTER_HEIGHT)
+    canvas.alpha_composite(scale_crop_image(Image.open(top_panel).convert("RGBA"), FINAL_WIDTH, TOP_HEIGHT), (0, 0))
+    canvas.alpha_composite(center, (0, TOP_HEIGHT))
+    canvas.alpha_composite(scale_crop_image(Image.open(bottom_panel).convert("RGBA"), FINAL_WIDTH, BOTTOM_HEIGHT), (0, TOP_HEIGHT + CENTER_HEIGHT))
     return canvas
 
 
@@ -1751,6 +2304,79 @@ def release_plate_integrity_issues(
     return issues
 
 
+def video_window_black_edge_issues(
+    source: Image.Image | Path,
+    video_box: tuple[int, int, int, int],
+    *,
+    dark_threshold: int = 36,
+    continuous_fraction: float = 0.86,
+    edge_fraction: float = 0.025,
+    issue_prefix: str = "video_window",
+) -> list[str]:
+    """Detect a continuous encoded black rim inside a known video window.
+
+    Whole-canvas plate QA can miss a rim because those pixels occupy only the
+    center video band's height.  This gate measures inside the real aperture
+    and requires a near-continuous run, so an ordinary dark object at one edge
+    does not look like an encoded bar.
+    """
+
+    source_image = _load_rgba_image(source)
+    x, y, width, height = video_box
+    if (
+        width <= 0
+        or height <= 0
+        or x < 0
+        or y < 0
+        or x + width > source_image.width
+        or y + height > source_image.height
+    ):
+        return [f"{issue_prefix}_invalid: 视频窗口超出画面"]
+    window = _composite_rgb_for_integrity(
+        source_image.crop((x, y, x + width, y + height))
+    )
+    width, height = window.size
+    pixels = window.load()
+    edge_columns = max(2, round(width * edge_fraction))
+    edge_rows = max(2, round(height * edge_fraction))
+    required_column_run = max(2, round(edge_columns * 0.18))
+    required_row_run = max(2, round(edge_rows * 0.18))
+
+    def is_dark(px: int, py: int) -> bool:
+        return max(pixels[px, py]) <= dark_threshold
+
+    column_fractions = [
+        sum(1 for py in range(height) if is_dark(px, py)) / max(1, height)
+        for px in range(width)
+    ]
+    row_fractions = [
+        sum(1 for px in range(width) if is_dark(px, py)) / max(1, width)
+        for py in range(height)
+    ]
+
+    def has_run(values: list[float], indices: range, required_run: int) -> bool:
+        run = 0
+        for index in indices:
+            if values[index] >= continuous_fraction:
+                run += 1
+                if run >= required_run:
+                    return True
+            else:
+                run = 0
+        return False
+
+    issues: list[str] = []
+    if has_run(column_fractions, range(0, edge_columns), required_column_run):
+        issues.append(f"{issue_prefix}_black_edge:left: 视频窗口左侧存在连续黑边")
+    if has_run(column_fractions, range(width - edge_columns, width), required_column_run):
+        issues.append(f"{issue_prefix}_black_edge:right: 视频窗口右侧存在连续黑边")
+    if has_run(row_fractions, range(0, edge_rows), required_row_run):
+        issues.append(f"{issue_prefix}_black_edge:top: 视频窗口顶部存在连续黑边")
+    if has_run(row_fractions, range(height - edge_rows, height), required_row_run):
+        issues.append(f"{issue_prefix}_black_edge:bottom: 视频窗口底部存在连续黑边")
+    return issues
+
+
 def plate_integrity_issues(
     source: Image.Image | Path,
     video_box: tuple[int, int, int, int] = DEFAULT_VIDEO_BOX,
@@ -1946,44 +2572,58 @@ def validate_release_assets(config: ReleaseConfig, *, frame_image: Path | None =
         raise ValueError("发布素材未通过机器完整性检查，已阻止全片渲染：\n" + "\n".join(f"- {issue}" for issue in issues))
 
 
-def render_static_assets(config: ReleaseConfig, work_dir: Path, geometry: dict | None = None) -> dict[str, Path]:
+def resolve_library_watermark(
+    config: ReleaseConfig,
+    work_dir: Path,
+    geometry: dict | None,
+) -> Path | None:
+    """Return only a watermark that is authorized for the active release mode.
+
+    Contract releases have already resolved official assets before reaching this
+    renderer.  When that resolution yields no anti-piracy logo, synthesizing the
+    legacy text capsule would silently reintroduce an unregistered overlay.
+    Legacy CLI releases retain their historical fallback watermark.
+    """
+    if config.antipiracy_logo is not None:
+        return config.antipiracy_logo
+    # The library edition always carries a drifting anti-piracy mark.  When no
+    # reviewed bitmap logo is configured, use the deterministic text mark in
+    # both legacy and contract modes instead of silently disabling it.
+    return render_watermark_png(
+        work_dir / "library_watermark.png",
+        config.library_watermark_text,
+    )
+
+
+def render_static_assets(config: ReleaseConfig, work_dir: Path, geometry: dict | None = None) -> dict[str, Path | None]:
     frame = config.frame_image or render_default_frame(work_dir / "default_frame.png")
     # Validate the generated default frame too.  This keeps the same preflight
     # gate for hand-supplied and built-in A-scene frames.
     validate_release_assets(config, frame_image=frame)
-    main_top = render_top_panel(
-        work_dir / "main_top.png",
-        config.story_type,
-        config.story_name,
-        "",
-        accent=(67, 143, 62),
-    )
-    main_bottom = render_bottom_panel(
-        work_dir / "main_bottom.png",
-        [f"完整版时长：{config.duration_text}", f"适合年龄：{config.age_text}", config.usage_text],
-        accent=(67, 143, 62),
-    )
-    library_top = render_top_panel(
-        work_dir / "library_top.png",
-        config.story_type,
-        config.story_name,
-        "",
-        accent=(214, 88, 70),
-    )
     if geometry is not None:
-        library_bottom = render_compiled_text_group_panel(
-            work_dir / "library_bottom.png", geometry["library"]["text_group"], accent=(214, 88, 70)
-        )
+        required_package_asset_binding(config)
+        main_top = config.main_top_panel
+        main_bottom = config.main_bottom_panel
+        library_top = config.library_top_panel
+        library_bottom = config.library_bottom_panel
     else:
+        main_top = render_top_panel(
+            work_dir / "main_top.png", config.story_type, config.story_name, "", accent=(67, 143, 62),
+        )
+        main_bottom = render_bottom_panel(
+            work_dir / "main_bottom.png",
+            [f"完整版时长：{config.duration_text}", f"适合年龄：{config.age_text}", config.usage_text],
+            accent=(67, 143, 62),
+        )
+        library_top = render_top_panel(
+            work_dir / "library_top.png", config.story_type, config.story_name, "", accent=(214, 88, 70),
+        )
         library_bottom = render_bottom_panel(
             work_dir / "library_bottom.png",
             [f"完整版时长：{config.duration_text}", f"适合年龄：{config.age_text}", config.usage_text],
             accent=(214, 88, 70),
         )
-    library_watermark = config.antipiracy_logo or render_watermark_png(
-        work_dir / "library_watermark.png",
-        config.library_watermark_text,
-    )
+    library_watermark = resolve_library_watermark(config, work_dir, geometry)
     tail_notice = render_tail_notice_png(
         work_dir / "tail_notice.png",
         config.tail_notice_text,
@@ -2005,11 +2645,23 @@ def render_main_wide(
     output_path: Path,
     presenter_geometry: dict | None = None,
     presenter_c_geometry: dict | None = None,
+    *,
+    sample_start: float = 0.0,
+    sample_duration: float | None = None,
+    sample_scene: str | None = None,
 ) -> None:
     assert config.bg_image is not None
     assert config.person_greenscreen is not None
     assert config.audio_mix is not None
-    duration = probe_duration(config.audio_mix)
+    source_duration = probe_duration(config.audio_mix)
+    sample_start = max(0.0, min(float(sample_start), max(0.0, source_duration - 0.04)))
+    duration = (
+        max(0.04, min(float(sample_duration), source_duration - sample_start))
+        if sample_duration is not None
+        else source_duration
+    )
+    if sample_scene not in {None, "a", "b", "c"}:
+        raise ValueError(f"invalid Release preview sample scene: {sample_scene}")
     # A greenscreen source can be a few frames shorter than the narration.  A
     # raw EOF frame is not safe to composite: ffmpeg may materialize it as an
     # opaque black rectangle before chroma-keying.  Pad the source with a clone
@@ -2017,7 +2669,10 @@ def render_main_wide(
     # second defensive boundary.
     person_duration = probe_video_stream_duration(config.person_greenscreen)
     person_frame_duration = probe_video_frame_duration(config.person_greenscreen)
-    person_tail_pad = person_tail_pad_seconds(person_duration, duration, person_frame_duration)
+    remaining_person_duration = (
+        max(0.0, person_duration - sample_start) if person_duration is not None else None
+    )
+    person_tail_pad = person_tail_pad_seconds(remaining_person_duration, duration, person_frame_duration)
     scale = config.output_scale
     wide_width = WIDE_WIDTH * scale
     wide_height = WIDE_HEIGHT * scale
@@ -2032,7 +2687,7 @@ def render_main_wide(
     frame_b_path = None
     mask_b_path = None
     story_b_bbox = None
-    if config.b_windows:
+    if config.b_windows or sample_scene == "b":
         frame_b_path, mask_b_path, story_b_bbox = prepare_story_frame_assets(
             config.frame_image_b or frame_image,
             config.b_story_box,
@@ -2040,17 +2695,33 @@ def render_main_wide(
             work_dir / "story_mask_b.png",
             config.story_bleed,
         )
+    seek_args = ["-ss", f"{sample_start:.3f}"] if sample_start > 0 else []
+    # A/C scenes use the same approved blurred presentation background as the
+    # Demo.  The moving story render belongs only inside the decorative frame;
+    # reusing it as the full-canvas background made the A scene look like a
+    # duplicated/zoomed story frame and also imported encoded black side rims.
+    background_input = ["-loop", "1", "-i", str(config.bg_image)]
+    person_decoder_args = ["-c:v", "libvpx-vp9"] if config.keyer == "rvm" else []
     args = [
         "ffmpeg",
         "-y",
-        "-loop",
-        "1",
-        "-i",
-        str(config.bg_image),
+        # FFmpeg 8's default auto-sized complex-filter scheduler can deadlock
+        # this multi-input alpha/framesync graph on high-core Macs.  A bounded
+        # scheduler is deterministic for both samples and the formal render.
+        "-filter_complex_threads",
+        # The legacy colour-key graph is deterministic with one scheduler
+        # thread.  libvpx's separate colour/alpha decode planes can deadlock at
+        # EOF when that same single thread also owns every framesync filter;
+        # two threads let the alpha decoder drain and close normally.
+        "2" if config.keyer == "rvm" else "1",
+        *background_input,
         "-stream_loop",
         "-1",
+        *seek_args,
         "-i",
         str(config.bg_video),
+        *seek_args,
+        *person_decoder_args,
         "-i",
         str(config.person_greenscreen),
         "-loop",
@@ -2091,19 +2762,23 @@ def render_main_wide(
             font_size=config.subtitle_font_size * scale,
             margin_v=config.subtitle_margin_v * scale,
             stroke_width=max(4, 4 * scale),
+            timeline_offset=sample_start,
         )
         args.extend(["-i", str(subtitle_overlay)])
     audio_index = len(args_input_paths(args))
-    args.extend(["-i", str(config.audio_mix)])
+    args.extend([*seek_args, "-i", str(config.audio_mix)])
 
-    person_source = "[2:v]"
+    # Input seeking preserves the source timestamps.  Always rebase the
+    # presenter, including when no tail padding is needed, otherwise the first
+    # output frame can contain only the background/frame before the presenter
+    # timeline begins.
+    filters_prefix = ["[2:v]setpts=PTS-STARTPTS[person_timeline]"]
+    person_source = "[person_timeline]"
     if config.person_crop is not None:
         crop_x, crop_y, crop_width, crop_height = config.person_crop
-        filters_prefix = []
         if person_tail_pad > 0:
             filters_prefix.append(
-                f"[2:v]tpad=stop_mode=clone:stop_duration={person_tail_pad:.6f},"
-                f"setpts=PTS-STARTPTS[person_padded]"
+                f"{person_source}tpad=stop_mode=clone:stop_duration={person_tail_pad:.6f}[person_padded]"
             )
             person_source = "[person_padded]"
         filters_prefix.append(
@@ -2111,16 +2786,17 @@ def render_main_wide(
         )
         person_source = "[person_in]"
     else:
-        filters_prefix = []
         if person_tail_pad > 0:
             filters_prefix.append(
-                f"[2:v]tpad=stop_mode=clone:stop_duration={person_tail_pad:.6f},"
-                f"setpts=PTS-STARTPTS[person_padded]"
+                f"{person_source}tpad=stop_mode=clone:stop_duration={person_tail_pad:.6f}[person_padded]"
             )
             person_source = "[person_padded]"
 
-    has_b = bool(config.b_windows)
-    has_c = bool(config.c_windows)
+    has_b = sample_scene == "b" if sample_scene is not None else bool(config.b_windows)
+    has_c = sample_scene == "c" if sample_scene is not None else bool(config.c_windows)
+    direct_b_sample = sample_scene == "b"
+    direct_c_sample = sample_scene == "c"
+    needs_a = not (direct_b_sample or direct_c_sample)
     filters = filters_prefix + [
         f"[0:v]scale={wide_width}:{wide_height}:force_original_aspect_ratio=increase,"
         f"crop={wide_width}:{wide_height},setsar=1,format=rgba[base_src]",
@@ -2129,32 +2805,45 @@ def render_main_wide(
         filters.append(f"[base_src]boxblur={config.background_blur}:1[base0]")
     else:
         filters.append("[base_src]null[base0]")
-    base_labels = ["base_a"] + (["base_b"] if has_b else []) + (["base_c"] if has_c else [])
+    if direct_b_sample:
+        base_labels = ["base_b"]
+    elif direct_c_sample:
+        base_labels = ["base_c"]
+    else:
+        base_labels = ["base_a"] + (["base_b"] if has_b else []) + (["base_c"] if has_c else [])
     if len(base_labels) > 1:
         filters.append(f"[base0]split={len(base_labels)}" + "".join(f"[{label}]" for label in base_labels))
     else:
-        filters.append("[base0]null[base_a]")
-    if has_b:
+        filters.append(f"[base0]null[{base_labels[0]}]")
+    if needs_a and has_b:
         filters.append("[1:v]split=2[story_src_a][story_src_b]")
         story_a_source = "[story_src_a]"
     else:
         story_a_source = "[1:v]"
-    story_x, story_y, story_width, story_height = scaled_box(story_a_bbox, scale)
-    filters.extend(
-        [
-            f"{story_a_source}scale={story_width}:{story_height}:force_original_aspect_ratio=increase,"
-            f"crop={story_width}:{story_height},setsar=1,format=rgba[story_rect]",
-            f"color=c=0x000000@0.0:s={wide_width}x{wide_height}:d={duration:.3f},format=rgba[story_canvas]",
-            f"[story_canvas][story_rect]overlay={story_x}:{story_y}[story_layer]",
-            f"[{mask_index}:v]scale={wide_width}:{wide_height},format=gray[story_mask]",
-            "[story_layer][story_mask]alphamerge[story_masked]",
-            "[base_a][story_masked]overlay=0:0[withstory]",
-        ]
-    )
-    filters.extend(person_key_filters(config, person_source))
-    if has_c:
+    if needs_a:
+        story_a_overscan = bleed_box(
+            story_a_bbox, max(APERTURE_OVERSCAN_PIXELS, config.story_bleed), (WIDE_WIDTH, WIDE_HEIGHT),
+        )
+        story_x, story_y, story_width, story_height = scaled_box(story_a_overscan, scale)
+        story_source_width, story_source_height = content_overscan_size(story_width, story_height)
+        filters.extend(
+            [
+                f"{story_a_source}scale={story_source_width}:{story_source_height}:force_original_aspect_ratio=increase,"
+                f"crop={story_width}:{story_height},setsar=1,format=rgba[story_rect]",
+                f"color=c=0x000000@0.0:s={wide_width}x{wide_height}:d={duration:.3f},format=rgba[story_canvas]",
+                f"[story_canvas][story_rect]overlay={story_x}:{story_y}[story_layer]",
+                f"[{mask_index}:v]scale={wide_width}:{wide_height},format=gray[story_mask]",
+                "[story_layer][story_mask]alphamerge[story_masked]",
+                "[base_a][story_masked]overlay=0:0[withstory]",
+            ]
+        )
+    if needs_a or has_c:
+        filters.extend(person_key_filters(config, person_source))
+    if needs_a and has_c:
         filters.append("[person_keyed]split=2[person_keyed_a][person_keyed_c]")
-    else:
+    elif has_c:
+        filters.append("[person_keyed]null[person_keyed_c]")
+    elif needs_a:
         filters.append("[person_keyed]null[person_keyed_a]")
     a_subject_filter = ""
     if presenter_geometry is not None:
@@ -2173,28 +2862,44 @@ def render_main_wide(
         a_width = -1
         a_x = config.person_x * scale
         a_y = config.person_y * scale
-    filters.extend(
-        [
-            f"[{frame_index}:v]scale={wide_width}:{wide_height},setsar=1,format=rgba[frame]",
-            "[withstory][frame]overlay=0:0[framed]",
-            f"[person_keyed_a]{a_subject_filter}scale={a_width}:{a_height},setsar=1,format=rgba[person]",
-            f"[framed][person]overlay={a_x}:{a_y}:"
-            "eof_action=pass:repeatlast=0[withperson]",
-        ]
-    )
-    current = "withperson"
-    if watermark_index is not None:
-        filters.append(f"[{watermark_index}:v]scale=190:-1,format=rgba[logo]")
-        filters.append(f"[{current}][logo]overlay=W-w-44:42[branded]")
-        current = "branded"
+    if needs_a:
+        a_identity_rvm_transform = (
+            config.keyer == "rvm"
+            and scale == 1
+            and presenter_geometry is not None
+            and int(presenter_geometry["rendered_width"]) == int(presenter_geometry["source_crop"][2])
+            and int(presenter_geometry["rendered_height"]) == int(presenter_geometry["source_crop"][3])
+        )
+        if a_identity_rvm_transform:
+            a_transform = a_subject_filter.rstrip(",")
+        else:
+            a_alpha_prefix = "premultiply=inplace=1," if config.keyer == "rvm" else ""
+            a_alpha_suffix = ",unpremultiply=inplace=1" if config.keyer == "rvm" else ""
+            a_transform = (
+                f"{a_subject_filter}{a_alpha_prefix}scale={a_width}:{a_height}{a_alpha_suffix}"
+            )
+        filters.extend(
+            [
+                f"[{frame_index}:v]scale={wide_width}:{wide_height},setsar=1,format=rgba[frame]",
+                "[withstory][frame]overlay=0:0[framed]",
+                f"[person_keyed_a]{a_transform},setsar=1,format=rgba[person]",
+                f"[framed][person]overlay={a_x}:{a_y}:"
+                "eof_action=pass:repeatlast=0[withperson]",
+            ]
+        )
+    current = "withperson" if needs_a else ""
     if has_b:
         assert story_b_bbox is not None
-        b_x, b_y, b_width, b_height = scaled_box(story_b_bbox, scale)
+        story_b_overscan = bleed_box(
+            story_b_bbox, max(APERTURE_OVERSCAN_PIXELS, config.story_bleed), (WIDE_WIDTH, WIDE_HEIGHT),
+        )
+        b_x, b_y, b_width, b_height = scaled_box(story_b_overscan, scale)
+        b_source_width, b_source_height = content_overscan_size(b_width, b_height)
         assert frame_b_index is not None
         assert mask_b_index is not None
         filters.extend(
             [
-                f"[story_src_b]scale={b_width}:{b_height}:force_original_aspect_ratio=increase,"
+                f"{'[1:v]' if direct_b_sample else '[story_src_b]'}scale={b_source_width}:{b_source_height}:force_original_aspect_ratio=increase,"
                 f"crop={b_width}:{b_height},setsar=1,format=rgba[story_b_rect]",
                 f"color=c=0x000000@0.0:s={wide_width}x{wide_height}:d={duration:.3f},format=rgba[story_b_canvas]",
                 f"[story_b_canvas][story_b_rect]overlay={b_x}:{b_y}[story_b_layer]",
@@ -2206,19 +2911,31 @@ def render_main_wide(
             ]
         )
         b_current = "b_framed"
-        b_expr = "+".join(f"between(T\\,{start:.3f}\\,{end:.3f})" for start, end in config.b_windows)
-        filters.append(f"[{current}][{b_current}]blend=all_expr='if({b_expr},B,A)'[ab_scene]")
-        current = "ab_scene"
+        if direct_b_sample:
+            current = b_current
+        else:
+            b_expr = "+".join(f"between(T\\,{start:.3f}\\,{end:.3f})" for start, end in config.b_windows)
+            filters.append(f"[{current}][{b_current}]blend=all_expr='if({b_expr},B,A)'[ab_scene]")
+            current = "ab_scene"
     if has_c:
         if presenter_c_geometry is not None:
             crop_x, crop_y, crop_width, crop_height = (
                 int(value) for value in presenter_c_geometry["source_crop"]
             )
-            c_person_filter = (
-                f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
-                f"scale={int(presenter_c_geometry['rendered_width']) * scale}:"
-                f"{int(presenter_c_geometry['rendered_height']) * scale}"
+            c_identity_rvm_transform = (
+                config.keyer == "rvm"
+                and scale == 1
+                and int(presenter_c_geometry["rendered_width"]) == crop_width
+                and int(presenter_c_geometry["rendered_height"]) == crop_height
             )
+            if c_identity_rvm_transform:
+                c_person_filter = f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y}"
+            else:
+                c_person_filter = (
+                    f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
+                    f"scale={int(presenter_c_geometry['rendered_width']) * scale}:"
+                    f"{int(presenter_c_geometry['rendered_height']) * scale}"
+                )
             c_person_x = int(presenter_c_geometry["x"]) * scale
             c_person_y = int(presenter_c_geometry["y"]) * scale
         else:
@@ -2228,15 +2945,27 @@ def render_main_wide(
                 wide_width,
                 wide_height,
             )
+            c_identity_rvm_transform = False
+        c_alpha_resample = config.keyer == "rvm" and not c_identity_rvm_transform
+        c_alpha_prefix = "premultiply=inplace=1," if c_alpha_resample else ""
+        c_alpha_suffix = ",unpremultiply=inplace=1" if c_alpha_resample else ""
         filters.extend(
             [
-                f"[person_keyed_c]{c_person_filter},setsar=1,format=rgba[person_c]",
+                f"[person_keyed_c]{c_alpha_prefix}{c_person_filter}{c_alpha_suffix},"
+                "setsar=1,format=rgba[person_c]",
                 f"[base_c][person_c]overlay={c_person_x}:{c_person_y}[c_person]",
             ]
         )
-        c_expr = "+".join(f"between(T\\,{start:.3f}\\,{end:.3f})" for start, end in config.c_windows)
-        filters.append(f"[{current}][c_person]blend=all_expr='if({c_expr},B,A)'[abc_scene]")
-        current = "abc_scene"
+        if direct_c_sample:
+            current = "c_person"
+        else:
+            c_expr = "+".join(f"between(T\\,{start:.3f}\\,{end:.3f})" for start, end in config.c_windows)
+            filters.append(f"[{current}][c_person]blend=all_expr='if({c_expr},B,A)'[abc_scene]")
+            current = "abc_scene"
+    if watermark_index is not None:
+        filters.append(f"[{watermark_index}:v]scale=190:-1,format=rgba[logo]")
+        filters.append(f"[{current}][logo]overlay=W-w-44:42[branded]")
+        current = "branded"
     if story_logo_index is not None:
         filters.append(f"[{story_logo_index}:v]scale={config.story_logo_width_a * scale}:-1,format=rgba[story_logo]")
         filters.append(f"[{current}][story_logo]overlay={config.story_logo_x * scale}:{config.story_logo_y * scale}[with_story_logo]")
@@ -2317,6 +3046,7 @@ def render_subtitle_overlay_video(
     margin_v: int,
     stroke_width: int,
     fps: int = 25,
+    timeline_offset: float = 0.0,
 ) -> Path:
     subtitles = parse_srt(srt_path)
     frames_dir = output_path.parent / "subtitle_frames"
@@ -2326,7 +3056,7 @@ def render_subtitle_overlay_video(
     active_index = 0
 
     for frame_no in range(total_frames):
-        t = frame_no / fps
+        t = timeline_offset + frame_no / fps
         while active_index < len(subtitles) and subtitles[active_index][1] <= t:
             active_index += 1
         text = ""
@@ -2419,8 +3149,8 @@ def render_vertical_package(
     bottom_height = BOTTOM_HEIGHT * scale
     filters = (
         f"color=c=0xFFF7DF:s={final_width}x{final_height}:d={duration:.3f}[base];"
-        f"[0:v]scale={final_width}:{center_height}:force_original_aspect_ratio=decrease,"
-        f"pad={final_width}:{center_height}:(ow-iw)/2:(oh-ih)/2,setsar=1,format=rgba[center];"
+        f"[0:v]scale={final_width}:{center_height}:force_original_aspect_ratio=increase,"
+        f"crop={final_width}:{center_height},setsar=1,format=rgba[center];"
         f"[1:v]scale={final_width}:{top_height},format=rgba[top];"
         f"[2:v]scale={final_width}:{bottom_height},format=rgba[bottom];"
         "[base][top]overlay=0:0[v1];"
@@ -2488,34 +3218,48 @@ def render_vertical_package(
 
 def render_library_window_video(
     source_video: Path,
-    watermark_png: Path,
+    watermark_png: Path | None,
     tail_notice_png: Path,
     output_path: Path,
     config: ReleaseConfig,
+    *,
+    sample_start: float = 0.0,
+    sample_duration: float | None = None,
 ) -> None:
-    duration = probe_duration(source_video)
+    source_duration = probe_duration(source_video)
+    sample_start = max(0.0, min(float(sample_start), max(0.0, source_duration - 0.04)))
+    duration = (
+        max(0.04, min(float(sample_duration), source_duration - sample_start))
+        if sample_duration is not None
+        else source_duration
+    )
     _, _, video_width, video_height = config.video_box
-    tail_seconds = resolved_tail_seconds(duration, config.tail_seconds)
-    tail_start = max(0.0, duration - tail_seconds)
+    # A formally 16:9 upstream render can still contain a narrow encoded black
+    # rim (the canary source has roughly 12 px on each side at 1920 width).
+    # Merely fitting that raster to the library window preserves the rim.  A
+    # small deterministic center overscan removes those encoded edge pixels
+    # without stretching the picture or introducing a second render path.
+    overscan_width = max(video_width + 2, round(video_width * LIBRARY_EDGE_OVERSCAN_RATIO))
+    overscan_height = max(video_height + 2, round(video_height * LIBRARY_EDGE_OVERSCAN_RATIO))
+    overscan_width += overscan_width % 2
+    overscan_height += overscan_height % 2
+    tail_seconds = resolved_tail_seconds(source_duration, config.tail_seconds)
+    tail_start = max(0.0, source_duration - tail_seconds)
+    timeline_t = f"(t+{sample_start:.3f})" if sample_start > 0 else "t"
     notice_width = max(240, min(video_width - 120, int(video_width * 0.78)))
-    watermark_width = max(80, min(config.watermark_width, int(video_width * 0.28)))
-    opacity = max(0.0, min(1.0, config.watermark_opacity))
-    speed_x = 70.0 * config.watermark_speed
-    speed_y = 42.0 * config.watermark_speed
     args = [
         "ffmpeg",
         "-y",
+        *(["-ss", f"{sample_start:.3f}"] if sample_start > 0 else []),
         "-i",
         str(source_video),
-        "-loop",
-        "1",
-        "-i",
-        str(watermark_png),
-        "-loop",
-        "1",
-        "-i",
-        str(tail_notice_png),
     ]
+    watermark_index = None
+    if watermark_png is not None:
+        watermark_index = len(args_input_paths(args))
+        args.extend(["-loop", "1", "-i", str(watermark_png)])
+    tail_notice_index = len(args_input_paths(args))
+    args.extend(["-loop", "1", "-i", str(tail_notice_png)])
     subtitle_index = None
     if config.subtitle_srt is not None:
         subtitle_index = len(args_input_paths(args))
@@ -2529,26 +3273,42 @@ def render_library_window_video(
             font_size=max(22, round(config.subtitle_font_size * video_width / WIDE_WIDTH)),
             margin_v=max(22, round(config.subtitle_margin_v * video_height / WIDE_HEIGHT)),
             stroke_width=3,
+            timeline_offset=sample_start,
         )
         args.extend(["-i", str(subtitle_overlay)])
     audio_index = None
     if config.audio_mix is not None:
         audio_index = len(args_input_paths(args))
-        args.extend(["-i", str(config.audio_mix)])
+        args.extend([
+            *(["-ss", f"{sample_start:.3f}"] if sample_start > 0 else []),
+            "-i", str(config.audio_mix),
+        ])
 
-    wm1_x, wm1_y, wm2_x, wm2_y = safe_watermark_motion_expressions(speed_x, speed_y)
     filters = [
-        f"[0:v]scale={video_width}:{video_height}:force_original_aspect_ratio=increase,"
+        f"[0:v]scale={overscan_width}:{overscan_height}:force_original_aspect_ratio=increase,"
         f"crop={video_width}:{video_height},setsar=1,format=rgba[base]",
         "[base]split=2[clean][blur_src]",
         "[blur_src]boxblur=18:1[blurred]",
-        f"[clean][blurred]overlay=0:0:enable='gte(t,{tail_start:.3f})'[tail]",
-        f"[1:v]scale={watermark_width}:-1,format=rgba,colorchannelmixer=aa={opacity:.3f}[wm]",
-        "[wm]split=2[wm1][wm2]",
-        f"[tail][wm1]overlay=x='{wm1_x}':y='{wm1_y}':enable='lt(t,{tail_start:.3f})'[w1]",
-        f"[w1][wm2]overlay=x='{wm2_x}':y='{wm2_y}':enable='lt(t,{tail_start:.3f})'[w2]",
+        f"[clean][blurred]overlay=0:0:enable='gte({timeline_t},{tail_start:.3f})'[tail]",
     ]
-    current = "w2"
+    current = "tail"
+    if watermark_index is not None:
+        watermark_width = max(48, min(config.watermark_width, int(video_width * 0.28)))
+        opacity = max(0.0, min(1.0, config.watermark_opacity))
+        speed_x = 70.0 * config.watermark_speed
+        speed_y = 42.0 * config.watermark_speed
+        wm1_x, wm1_y, wm2_x, wm2_y = safe_watermark_motion_expressions(
+            speed_x, speed_y, time_offset=sample_start,
+        )
+        filters.extend(
+            [
+                f"[{watermark_index}:v]scale={watermark_width}:-1,format=rgba,colorchannelmixer=aa={opacity:.3f}[wm]",
+                "[wm]split=2[wm1][wm2]",
+                f"[tail][wm1]overlay=x='{wm1_x}':y='{wm1_y}':enable='lt({timeline_t},{tail_start:.3f})'[w1]",
+                f"[w1][wm2]overlay=x='{wm2_x}':y='{wm2_y}':enable='lt({timeline_t},{tail_start:.3f})'[w2]",
+            ]
+        )
+        current = "w2"
     if subtitle_index is not None:
         filters.extend(
             [
@@ -2559,8 +3319,8 @@ def render_library_window_video(
         current = "with_subtitles"
     filters.extend(
         [
-            f"[2:v]scale={notice_width}:-1,format=rgba[notice]",
-            f"[{current}][notice]overlay=x=(W-w)/2:y=(H-h)/2:enable='gte(t,{tail_start:.3f})'[v]",
+            f"[{tail_notice_index}:v]scale={notice_width}:-1,format=rgba[notice]",
+            f"[{current}][notice]overlay=x=(W-w)/2:y=(H-h)/2:enable='gte({timeline_t},{tail_start:.3f})'[v]",
         ]
     )
     args.extend(
@@ -2749,18 +3509,34 @@ def render_bottom_panel(output_path: Path, lines: list[str], accent: tuple[int, 
     margin = 54
     draw.rounded_rectangle((margin, 44, FINAL_WIDTH - margin, BOTTOM_HEIGHT - 44), radius=28, fill=(255, 245, 202, 255), outline=(132, 83, 39, 255), width=6)
     draw.line((105, 86, FINAL_WIDTH - 105, 86), fill=(199, 139, 59, 255), width=8)
-    font = load_font(54)
-    wrapped_lines: list[list[str]] = [wrap_text(draw, line, font, 790) for line in lines]
-    required_height = sum(len(parts) * 64 + 18 for parts in wrapped_lines)
-    if 150 + required_height > BOTTOM_HEIGHT - 54:
+    # Fit the actual wrapped text into the reviewed inner panel.  The old
+    # fixed-height estimate counted a trailing gap after the final group and
+    # rejected the normal three-line copy by two pixels even though its glyphs
+    # were safely inside the panel.  Keep the preferred 54 px typography, but
+    # scale down deterministically for unusually long project metadata.
+    content_top = 120
+    content_bottom = BOTTOM_HEIGHT - 64
+    layout: tuple[object, list[list[str]], int, int] | None = None
+    for font_size in range(54, 37, -2):
+        candidate_font = load_font(font_size)
+        candidate_lines = [wrap_text(draw, line, candidate_font, 790) for line in lines]
+        line_height = font_size + 10
+        group_gap = max(12, font_size // 3)
+        required_height = sum(len(parts) * line_height for parts in candidate_lines)
+        required_height += group_gap * max(0, len(candidate_lines) - 1)
+        if required_height <= content_bottom - content_top:
+            layout = candidate_font, candidate_lines, line_height, group_gap
+            break
+    if layout is None:
         raise ValueError("发布下横条文字无法在审核安全区内排版")
-    y = 150
+    font, wrapped_lines, line_height, group_gap = layout
+    y = content_top + line_height / 2
     for line, wrapped in zip(lines, wrapped_lines):
         draw.text((142, y), "•", font=font, fill=accent, anchor="lm")
         for part in wrapped:
             draw.text((190, y), part, font=font, fill=(62, 45, 28, 255), anchor="lm")
-            y += 64
-        y += 18
+            y += line_height
+        y += group_gap
     image.save(output_path)
     return output_path
 
@@ -2975,13 +3751,20 @@ def tail_frame_integrity_issues(
     return inspect_tail_image_black_rectangles(source, **kwargs)
 
 
-def safe_watermark_motion_expressions(speed_x: float, speed_y: float, margin: int = 20) -> tuple[str, str, str, str]:
+def safe_watermark_motion_expressions(
+    speed_x: float,
+    speed_y: float,
+    margin: int = 20,
+    *,
+    time_offset: float = 0.0,
+) -> tuple[str, str, str, str]:
     """Return overlay expressions that keep both moving watermarks fully in frame."""
     span = margin * 2
-    x_forward = f"{margin}+mod(t*{speed_x:.3f}\\,max(1\\,W-w-{span}))"
-    y_forward = f"{margin}+mod(t*{speed_y:.3f}\\,max(1\\,H-h-{span}))"
-    x_reverse = f"W-w-{margin}-mod(t*{speed_x:.3f}\\,max(1\\,W-w-{span}))"
-    y_reverse = f"H-h-{margin}-mod(t*{speed_y:.3f}\\,max(1\\,H-h-{span}))"
+    timeline_t = f"(t+{time_offset:.3f})" if time_offset > 0 else "t"
+    x_forward = f"{margin}+mod({timeline_t}*{speed_x:.3f}\\,max(1\\,W-w-{span}))"
+    y_forward = f"{margin}+mod({timeline_t}*{speed_y:.3f}\\,max(1\\,H-h-{span}))"
+    x_reverse = f"W-w-{margin}-mod({timeline_t}*{speed_x:.3f}\\,max(1\\,W-w-{span}))"
+    y_reverse = f"H-h-{margin}-mod({timeline_t}*{speed_y:.3f}\\,max(1\\,H-h-{span}))"
     return x_forward, y_forward, x_reverse, y_reverse
 
 

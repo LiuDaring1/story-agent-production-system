@@ -42,7 +42,10 @@ class StageDagInvariantTests(unittest.TestCase):
         self.assertEqual(set(STAGE_ESTIMATES_MINUTES), set(stages))
         self.assertEqual(set(STAGE_BRANCHES), set(stages))
         self.assertEqual(set(STAGE_WRITE_SETS), set(stages))
-        self.assertIn("product_package_review", STORY_STAGE_DEPENDENCIES["release_preview"])
+        self.assertIn("product_annotation_review", STORY_STAGE_DEPENDENCIES["release_preview"])
+        self.assertIn("release_preview", STORY_STAGE_DEPENDENCIES["product_package"])
+        self.assertEqual(STORY_STAGE_DEPENDENCIES["package_release"], ("release_preview",))
+        self.assertNotIn("product_package_review", STORY_STAGE_DEPENDENCIES["package_release"])
 
 
 if __name__ == "__main__":

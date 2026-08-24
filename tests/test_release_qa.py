@@ -17,6 +17,7 @@ from release_video import (
     safe_watermark_motion_expressions,
     story_frame_integrity_issues,
     validate_release_assets,
+    video_window_black_edge_issues,
 )
 from story_project import init_project, project_paths, qa_release, write_manifest
 
@@ -84,6 +85,21 @@ class ReleaseQaTests(unittest.TestCase):
         issues = release_plate_integrity_issues(image, (0, 416, 1080, 608))
         self.assertTrue(any("black_seam" in issue for issue in issues))
         self.assertTrue(any("black_rectangle" in issue for issue in issues))
+
+    def test_video_window_edge_gate_catches_center_band_rim_missed_by_whole_canvas(self) -> None:
+        image = Image.new("RGB", (1080, 1440), (245, 240, 220))
+        draw = ImageDraw.Draw(image)
+        video_box = (0, 416, 1080, 608)
+        draw.rectangle((1068, 416, 1079, 1023), fill=(4, 4, 4))
+        issues = video_window_black_edge_issues(image, video_box)
+        self.assertTrue(any("black_edge:right" in issue for issue in issues), issues)
+
+    def test_video_window_edge_gate_ignores_local_dark_object(self) -> None:
+        image = Image.new("RGB", (1080, 1440), (220, 190, 120))
+        draw = ImageDraw.Draw(image)
+        video_box = (0, 416, 1080, 608)
+        draw.rectangle((0, 416, 28, 560), fill=(0, 0, 0))
+        self.assertFalse(video_window_black_edge_issues(image, video_box))
 
     def test_story_frame_integrity_rejects_missing_corner(self) -> None:
         image = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
@@ -164,6 +180,41 @@ class ReleaseQaTests(unittest.TestCase):
             broken_config = SimpleNamespace(**{**vars(config), "frame_image_b": broken_b})
             with self.assertRaisesRegex(ValueError, "frame_empty"):
                 validate_release_assets(broken_config)
+
+    def test_release_asset_validation_without_b_windows_has_no_phantom_b_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            frame_path = Path(directory) / "story_frame_a.png"
+            image = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+            draw = ImageDraw.Draw(image)
+            story_box = (170, 250, 990, 557)
+            x, y, width, height = story_box
+            draw.rounded_rectangle(
+                (x - 58, y - 58, x + width + 58, y + height + 58),
+                radius=60,
+                outline=(105, 70, 36, 255),
+                width=18,
+            )
+            image.save(frame_path)
+            config = SimpleNamespace(
+                plate_image=None,
+                frame_image=frame_path,
+                story_box=story_box,
+                frame_image_b=None,
+                b_story_box=(150, 88, 1620, 911),
+                b_windows=(),
+            )
+
+            validate_release_assets(config)
+
+    def test_new_project_exposes_fixed_eight_hour_delivery_policy(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：八小时默认策略"
+            manifest = init_project(project, story_name="八小时默认策略", slug="eight-hour-default")
+
+            self.assertTrue(manifest["agent"]["runtime_deadline_enabled"])
+            self.assertEqual(manifest["agent"]["deadline_hours"], 8.0)
+            self.assertEqual(manifest["agent"]["target_delivery_seconds"], 28800)
+            self.assertEqual(manifest["agent"]["deadline_behavior"], "deliver_best_valid")
 
     def test_release_qa_requires_vertical_video_with_aligned_audio(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

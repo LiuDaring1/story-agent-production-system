@@ -109,16 +109,17 @@ class ProductQaTests(unittest.TestCase):
             self.assertAlmostEqual(default_mean, source_mean, delta=1.0)
             self.assertLess(explicit_mean, source_mean - 20)
 
-    def test_long_ppt_subtitle_has_at_most_two_lines_and_bounded_box(self) -> None:
+    def test_long_ppt_subtitle_is_single_line_small_and_bounded(self) -> None:
         text = "这是一个非常非常长的故事台词，用来验证字幕在幻灯片上不会生成占满底部的粗黑条。"
         clean, font_size = fit_ppt_subtitle_text(text)
-        self.assertLessEqual(clean.count("\n") + 1, 2)
-        self.assertGreaterEqual(font_size, 16)
+        self.assertNotIn("\n", clean)
+        self.assertLessEqual(font_size, 20)
+        self.assertGreaterEqual(font_size, 10)
         prs = Presentation()
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         add_ppt_subtitle(slide, text, prs)
         box = slide.shapes[-1]
-        self.assertLessEqual(box.height, int(prs.slide_height * 0.16))
+        self.assertLessEqual(box.height, int(prs.slide_height * 0.09))
         self.assertLessEqual(box.top + box.height, prs.slide_height)
 
     def test_customer_docx_uses_installed_cjk_font(self) -> None:

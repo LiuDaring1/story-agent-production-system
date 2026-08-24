@@ -303,6 +303,9 @@ _MORAL_START_RE = re.compile(
     r"|(?:不要|不能|一定要|要学会|要懂得|要|应该|需要|记住|明白)"
     r")"
 )
+_MORAL_CONTRAST_RE = re.compile(
+    r"^(?:小朋友们[,，、:：]?)*(?:光|只|仅仅).{1,40}(?:是不够的?|还不够|并不够).{0,50}(?:才|还要|更要|也要|真正)"
+)
 _OUTRO_START_RE = re.compile(
     r"^(?:小朋友们[,，、:：]?|亲爱的小朋友们[,，、:：]?)?(?:"
     r"(?:我的|这个|这则|今天的|本期的)?故事(?:已经)?(?:讲完[了啦]|结束[了啦]|就(?:讲|说)?到这里)"
@@ -430,7 +433,7 @@ def _is_moral_line(text: str) -> bool:
     # lesson.  Real morals in this workflow are declarative closing lines.
     if re.search(r"(?:吗|么)[？?]?$", clean):
         return False
-    return bool(_MORAL_START_RE.match(clean))
+    return bool(_MORAL_START_RE.match(clean) or _MORAL_CONTRAST_RE.match(clean))
 
 
 def _is_outro_line(text: str) -> bool:

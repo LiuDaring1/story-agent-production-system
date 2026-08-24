@@ -10,6 +10,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 
 from video_motion import (
+    VIDEO_REVIEW_POLICY_VERSION,
     adjacent_handoff_issues,
     canonical_json_bytes,
     compile_motion_plan,
@@ -20,6 +21,7 @@ from video_motion import (
     review_semantic_issues,
     schema_python_parity,
     video_receipt_issues,
+    video_review_policy_issues,
     write_video_receipt,
 )
 from story_project import init_project, project_paths, qa_videos
@@ -173,6 +175,60 @@ class VideoMotionQualityTests(unittest.TestCase):
         self.assertIn("scene_1:adjacent_handoff_consistent_missing", issues)
         self.assertIn("per_scene_reviews_incomplete:2", issues)
 
+    def test_hard_defect_policy_records_soft_continuity_deviation_without_retry(self) -> None:
+        payload = {
+            "quality_policy": VIDEO_REVIEW_POLICY_VERSION,
+            "per_scene_reviews": [
+                {"scene": 1, "story_state_consistent": False, "adjacent_handoff_consistent": False},
+            ],
+            "hard_defects": [],
+            "critical_errors": [],
+            "retry_indices": [],
+            "retry_instructions": [],
+        }
+        self.assertEqual(video_review_policy_issues(payload, expected_scenes=[1]), [])
+
+    def test_hard_defect_policy_rejects_unstructured_semantic_critical_error(self) -> None:
+        payload = {
+            "quality_policy": VIDEO_REVIEW_POLICY_VERSION,
+            "per_scene_reviews": [
+                {"scene": 1, "story_state_consistent": True, "adjacent_handoff_consistent": True},
+            ],
+            "hard_defects": [],
+            "critical_errors": ["左右方向不够精准"],
+            "retry_indices": [],
+            "retry_instructions": [],
+        }
+        self.assertIn(
+            "critical_error_not_structured",
+            video_review_policy_issues(payload, expected_scenes=[1]),
+        )
+
+    def test_hard_defect_policy_requires_matching_targeted_retry_prompt(self) -> None:
+        payload = {
+            "quality_policy": VIDEO_REVIEW_POLICY_VERSION,
+            "per_scene_reviews": [
+                {"scene": 1, "story_state_consistent": True, "adjacent_handoff_consistent": True},
+            ],
+            "hard_defects": [{
+                "scene": 1,
+                "hard_defect_code": "severe_anatomy_deformation",
+                "evidence": "mid.jpg 出现人手",
+            }],
+            "critical_errors": [{
+                "scene": 1,
+                "hard_defect_code": "severe_anatomy_deformation",
+            }],
+            "retry_indices": [1],
+            "retry_instructions": [{
+                "scene": 1,
+                "hard_defect_code": "severe_anatomy_deformation",
+                "instruction": "修复翅膀变成人手",
+                "provider_prompt": "公鸡自然抬起完整羽翼，羽翼始终为羽毛结构，不出现人手。",
+            }],
+        }
+        self.assertEqual(video_review_policy_issues(payload, expected_scenes=[1]), [])
+
     def test_adjacent_direction_and_state_pass_or_fail_by_declared_handoff(self) -> None:
         plan = compile_motion_plan(storyboard())
         self.assertEqual(adjacent_handoff_issues(plan["shots"]), [])
@@ -196,6 +252,8 @@ class VideoMotionQualityTests(unittest.TestCase):
         row = {"video_source_kind": "mock_provider", "production_eligible": "false"}
         self.assertEqual(formal_source_issues(row, production_mode=False), [])
         self.assertIn("non_production_video_source:mock_provider", formal_source_issues(row, production_mode=True))
+        editorial = {"video_source_kind": "editorial_adjacent_extension", "production_eligible": "true"}
+        self.assertEqual(formal_source_issues(editorial, production_mode=True), [])
 
     def test_receipt_binds_provider_output_and_detects_static_fallback(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

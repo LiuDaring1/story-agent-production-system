@@ -1,0 +1,16 @@
+{
+  "schema_version": "story-main-package-reference/v1",
+  "reference_role": "main_vertical_package",
+  "asset": "main_vertical_package_reference.png",
+  "sha256": "71dcf40cf3a54021960e151510a3018f6b1b86ffe3ebeee1614459d532a806f5",
+  "usage_scope": [
+    "main_release_plate_top",
+    "main_release_plate_bottom"
+  ],
+  "excluded_scopes": [
+    "title_card",
+    "moral_card",
+    "marketing_covers"
+  ],
+  "reference_text_is_structure_only": true
+}

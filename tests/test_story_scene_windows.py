@@ -4,10 +4,21 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from story_workflow import build_abc_scene_windows
+from story_workflow import build_abc_scene_windows, preview_times_with_b_coverage
 
 
 class StorySceneWindowTests(unittest.TestCase):
+    def test_preview_times_cover_every_b_window_without_duplicate_filenames(self) -> None:
+        result = preview_times_with_b_coverage(
+            "1,2,37,92",
+            "14.075-32.979,70.440-88.979,128.160-146.189",
+        )
+        times = [float(item) for item in result.split(",")]
+        self.assertEqual(times[:4], [1.0, 2.0, 37.0, 92.0])
+        for start, end in ((14.075, 32.979), (70.440, 88.979), (128.160, 146.189)):
+            self.assertTrue(any(start <= item <= end for item in times))
+        self.assertEqual(len({round(item) for item in times}), len(times))
+
     def test_starts_with_c_uses_b_and_finishes_with_a(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             srt = Path(directory) / "story.srt"

@@ -31,7 +31,12 @@ from pptx.util import Emu, Pt as PptPt
 
 from story_video_synthesizer.align import LineTiming, align_evenly, read_script_lines
 from story_contract_consumers import BINDING_FIELDS, semantic_line_indices, write_json_atomic
-from artifact_semantic_plan import load_current_artifact_semantic_plan, plan_binding, selected_line_indices
+from artifact_semantic_plan import (
+    load_current_artifact_semantic_plan,
+    plan_binding,
+    presentation_windows,
+    selected_line_indices,
+)
 from demo_quality import load_demo_brand_spec, write_demo_render_manifest
 from keying_quality import blurred_background_issues, file_sha256, keying_preset_lock_issues
 from production_keying import (
@@ -92,8 +97,7 @@ PPT_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PPT_P14_NS = "http://schemas.microsoft.com/office/powerpoint/2010/main"
 PPT_P14_EXT_URI = "{DAA4B4D4-6D71-4841-9C94-3DE7FCFB9230}"
 DELIVERY_CJK_FONT = "Arial Unicode MS"
-PPT_SUBTITLE_MAX_LINES = 2
-PPT_SUBTITLE_MAX_HEIGHT_RATIO = 0.16
+PPT_SUBTITLE_MAX_HEIGHT_RATIO = 0.09
 
 
 @dataclass(frozen=True)
@@ -110,6 +114,17 @@ class KeyingPreset:
     person_x: int | None = None
     person_y: int | None = None
     bottom_margin: int = 0
+    rvm_model_path: str = ""
+    rvm_model_sha256: str = ""
+    rvm_runtime_path: str = ""
+    rvm_foreground_video: str = ""
+    rvm_foreground_sha256: str = ""
+    rvm_receipt_path: str = ""
+    rvm_receipt_sha256: str = ""
+    rvm_input_width: int = 1920
+    rvm_input_height: int = 1080
+    rvm_downsample_ratio: float = 0.4
+    rvm_alpha_choke_pixels: int = 1
 
 
 def artifact_semantic_product_selections(
@@ -249,15 +264,20 @@ def build_product_package(args: argparse.Namespace) -> None:
         semantic_plan = load_current_artifact_semantic_plan(args.project_dir)
     demo_brand_spec: dict[str, Any] | None = None
     if semantic_plan is not None:
-        if demo_brand_spec_path is None or demo_logo is None:
-            raise ValueError("required_v1 Demo 必须提供审核合同编译出的 --demo-brand-spec 和唯一官方 --demo-logo")
+        if demo_brand_spec_path is None:
+            raise ValueError("required_v1 Demo 必须提供审核合同编译出的 --demo-brand-spec")
         demo_brand_spec, logo_args = load_demo_brand_spec(demo_brand_spec_path)
-        if demo_logo.resolve() != Path(logo_args["logo_path"]).resolve():
-            raise ValueError("Demo Logo 与审核合同编译规格不一致")
-        if (args.demo_logo_width, args.demo_logo_x, args.demo_logo_y) != (
-            logo_args["logo_width"], logo_args["logo_x"], logo_args["logo_y"]
-        ):
-            raise ValueError("Demo Logo 的确定性坐标/宽度与审核布局规格不一致")
+        reviewed_logo = logo_args["logo_path"]
+        if reviewed_logo is None:
+            if demo_logo is not None:
+                raise ValueError("审核合同禁用 Demo Logo，但命令仍提供了 --demo-logo")
+        else:
+            if demo_logo is None or demo_logo.resolve() != Path(reviewed_logo).resolve():
+                raise ValueError("Demo Logo 与审核合同编译规格不一致")
+            if (args.demo_logo_width, args.demo_logo_x, args.demo_logo_y) != (
+                logo_args["logo_width"], logo_args["logo_x"], logo_args["logo_y"]
+            ):
+                raise ValueError("Demo Logo 的确定性坐标/宽度与审核布局规格不一致")
     semantic_plan_selections = (
         artifact_semantic_product_selections(script_lines, semantic_plan)
         if semantic_plan is not None else None
@@ -282,6 +302,23 @@ def build_product_package(args: argparse.Namespace) -> None:
     manuscript_lines, _mi, _mt, manuscript_indices = selected("customer_manuscript")
     annotation_lines, _ai, _at, annotation_indices = selected("reading_annotation")
     demo_lines, _di, demo_timings, demo_indices = selected("demo")
+    ppt_semantic_cards: dict[int, str] = {}
+    content_images = list(images)
+    if semantic_plan is not None:
+        overrides = semantic_card_ppt_overrides(
+            ppt_indices=ppt_indices,
+            all_timings=timings,
+            semantic_plan=semantic_plan,
+            card_dir=args.project_dir / "01_分镜与图片" / "semantic_cards",
+        )
+        for position, source_index in enumerate(ppt_indices):
+            override = overrides.get(source_index)
+            if override is None:
+                continue
+            card_path, card_kind = override
+            ppt_images[position] = card_path
+            content_images[source_index] = card_path
+            ppt_semantic_cards[position] = card_kind
     product_content_manifest_path = work_dir / "product_content_manifest.json"
     if semantic_plan is not None:
         content_manifest = compile_product_content_manifest(
@@ -296,7 +333,7 @@ def build_product_package(args: argparse.Namespace) -> None:
                 "reading_annotation": annotation_indices,
                 "demo_subtitles": demo_indices,
             },
-            images=images,
+            images=content_images,
             timings=timings,
             timings_source=formal_timings_path,
         )
@@ -370,11 +407,13 @@ def build_product_package(args: argparse.Namespace) -> None:
         return
 
     preset_path = args.keying_preset_json.expanduser()
-    if semantic_plan is not None:
+    if semantic_plan is not None and not args.preview_only:
         lock_issues = keying_preset_lock_issues(preset_path)
         if lock_issues:
             raise RuntimeError("抠像 preset 未绑定当前机器 QA 与独立审核，拒绝渲染 Demo：" + "；".join(lock_issues))
     preset = load_keying_preset(preset_path)
+    if preset.keyer == "rvm":
+        person_path = Path(preset.rvm_foreground_video)
     source_greenscreen_sha256 = file_sha256(person_path)
     if demo_background is None:
         render_background_candidate_sheet(images, work_dir / "demo_background_candidates.jpg")
@@ -385,6 +424,7 @@ def build_product_package(args: argparse.Namespace) -> None:
     crop_bottom_ratio = max(0.0, min(0.2, args.demo_person_crop_bottom_ratio))
     source_width, source_height = probe_video_size(person_path)
     lock_path = preset_path.with_name("keying_preset.lock.json")
+    keying_lock_sha256 = file_sha256(lock_path) if lock_path.is_file() else ""
     presenter_geometry = compile_demo_presenter_geometry(
         source_width,
         source_height,
@@ -397,7 +437,7 @@ def build_product_package(args: argparse.Namespace) -> None:
         crop_bottom_ratio=crop_bottom_ratio,
         vertical_alignment=args.demo_person_vertical_align,
         keying_preset_sha256=file_sha256(preset_path),
-        keying_lock_sha256=file_sha256(lock_path),
+        keying_lock_sha256=keying_lock_sha256,
         source_greenscreen_sha256=source_greenscreen_sha256,
         production_keying_filter_fingerprint=production_keying_fingerprint(preset),
     )
@@ -544,6 +584,7 @@ def build_product_package(args: argparse.Namespace) -> None:
         ppt_with_sub,
         with_subtitles=True,
         total_duration=narration_duration,
+        semantic_card_positions=ppt_semantic_cards,
     )
     build_story_ppt(
         story_name,
@@ -554,14 +595,17 @@ def build_product_package(args: argparse.Namespace) -> None:
         ppt_no_sub,
         with_subtitles=False,
         total_duration=narration_duration,
+        semantic_card_positions=ppt_semantic_cards,
     )
     if semantic_plan is not None:
         ppt_evidence_dir = work_dir / "ppt_evidence"
         rows_with_sub = build_ppt_manifest_rows(
-            ppt_images, ppt_lines, ppt_timings, ppt_indices, narration_duration, with_subtitles=True
+            ppt_images, ppt_lines, ppt_timings, ppt_indices, narration_duration,
+            with_subtitles=True, semantic_card_positions=ppt_semantic_cards,
         )
         rows_no_sub = build_ppt_manifest_rows(
-            ppt_images, ppt_lines, ppt_timings, ppt_indices, narration_duration, with_subtitles=False
+            ppt_images, ppt_lines, ppt_timings, ppt_indices, narration_duration,
+            with_subtitles=False, semantic_card_positions=ppt_semantic_cards,
         )
         with_evidence = render_ppt_evidence(ppt_evidence_dir / "with_subtitles", rows_with_sub, with_subtitles=True)
         no_evidence = render_ppt_evidence(ppt_evidence_dir / "without_subtitles", rows_no_sub, with_subtitles=False)
@@ -1013,6 +1057,67 @@ JSON 单项格式示例：
     output_path.write_text(text, encoding="utf-8")
 
 
+def semantic_card_ppt_overrides(
+    *,
+    ppt_indices: list[int],
+    all_timings: list[LineTiming],
+    semantic_plan: Mapping[str, Any],
+    card_dir: Path,
+) -> dict[int, tuple[Path, str]]:
+    """Bind title/moral ImageGen cards to every PPT cue in their window."""
+
+    receipt_path = card_dir / "semantic_card_generation_receipt.json"
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError("PPT 缺少 ImageGen 片头/寓意卡回执") from exc
+    if (
+        receipt.get("schema_version") != "story-semantic-card-generation/v1"
+        or receipt.get("imagegen_native") is not True
+        or receipt.get("post_render_text_overlay") is not False
+    ):
+        raise RuntimeError("PPT 片头/寓意卡必须使用已审核的 ImageGen 一体化图卡")
+    items = receipt.get("cards") if isinstance(receipt.get("cards"), list) else []
+    by_kind = {
+        str(item.get("card_kind") or ""): item
+        for item in items
+        if isinstance(item, dict)
+    }
+    selected = set(ppt_indices)
+    overrides: dict[int, tuple[Path, str]] = {}
+    for window in presentation_windows(all_timings, semantic_plan):
+        card_kind = str(window.get("card_kind") or "")
+        item = by_kind.get(card_kind)
+        if item is None or str(item.get("text") or "") != str(window.get("text") or ""):
+            raise RuntimeError(f"PPT 语义卡回执文案不匹配：{card_kind}")
+        path = Path(str(item.get("path") or "")).expanduser().resolve()
+        try:
+            path.relative_to(card_dir.resolve())
+        except ValueError as exc:
+            raise RuntimeError(f"PPT 语义卡不在当前项目目录：{card_kind}") from exc
+        if not path.is_file() or item.get("sha256") != file_sha256(path):
+            raise RuntimeError(f"PPT 语义卡文件或哈希失效：{card_kind}")
+        if str(window.get("semantic_kind") or "") == "title":
+            # Keep the same title card visible for the complete host-opening
+            # narration window, even when that narration spans several cues.
+            source_indices = {
+                index
+                for index, timing in enumerate(all_timings)
+                if float(timing.source_start) < float(window["end"])
+                and float(timing.source_end) > float(window["start"])
+            }
+        else:
+            source_indices = {
+                int(number) - 1 for number in window.get("source_line_numbers", [])
+            }
+        targets = selected & source_indices
+        if not targets:
+            raise RuntimeError(f"PPT 语义选择未覆盖 {card_kind} 的时间窗")
+        for source_index in targets:
+            overrides[source_index] = (path, card_kind)
+    return overrides
+
+
 def build_story_ppt(
     story_name: str,
     images: list[Path],
@@ -1022,6 +1127,7 @@ def build_story_ppt(
     output_path: Path,
     with_subtitles: bool,
     total_duration: float | None = None,
+    semantic_card_positions: Mapping[int, str] | None = None,
 ) -> None:
     prs = Presentation()
     prs.slide_width = PPT_W
@@ -1041,10 +1147,11 @@ def build_story_ppt(
         )
     n = len(script_lines)
     slide_durations = ppt_slide_durations(timings[:n], total_duration)
+    semantic_card_positions = semantic_card_positions or {}
     for idx in range(n):
         slide = prs.slides.add_slide(prs.slide_layouts[6])
         fill_ppt_image(slide, images[idx], prs)
-        if with_subtitles:
+        if with_subtitles and idx not in semantic_card_positions:
             add_ppt_subtitle(slide, script_lines[idx], prs)
         set_ppt_advance(slide, slide_durations[idx])
 
@@ -1061,12 +1168,16 @@ def build_ppt_manifest_rows(
     total_duration: float,
     *,
     with_subtitles: bool,
+    semantic_card_positions: Mapping[int, str] | None = None,
 ) -> list[dict[str, Any]]:
     durations = ppt_slide_durations(timings, total_duration)
+    semantic_card_positions = semantic_card_positions or {}
     rows: list[dict[str, Any]] = []
     for position, (image, text, timing, source_index, duration) in enumerate(
         zip(images, script_lines, timings, source_indices, durations), start=1
     ):
+        card_kind = semantic_card_positions.get(position - 1)
+        subtitle_expected = with_subtitles and card_kind is None
         clean, font_size, subtitle_bbox = ppt_subtitle_layout(text)
         rows.append(
             {
@@ -1079,13 +1190,18 @@ def build_ppt_manifest_rows(
                 "timing_start": float(timing.source_start),
                 "timing_end": float(timing.source_start + duration),
                 "duration": float(duration),
-                "subtitle_expected": with_subtitles,
-                "subtitle_text": clean if with_subtitles else "",
-                "subtitle_font_size_pt": font_size if with_subtitles else None,
-                "subtitle_line_count": clean.count("\n") + 1 if with_subtitles else 0,
-                "subtitle_bbox": subtitle_bbox if with_subtitles else [],
-                "subtitle_safe_region": [0.0, 0.0, 1.0, 1.0] if with_subtitles else [],
-                "layout_mode": "full_bleed_with_bottom_subtitle" if with_subtitles else "full_bleed_clean",
+                "semantic_card_kind": card_kind,
+                "subtitle_expected": subtitle_expected,
+                "subtitle_text": clean if subtitle_expected else "",
+                "subtitle_font_size_pt": font_size if subtitle_expected else None,
+                "subtitle_line_count": clean.count("\n") + 1 if subtitle_expected else 0,
+                "subtitle_bbox": subtitle_bbox if subtitle_expected else [],
+                "subtitle_safe_region": [0.0, 0.0, 1.0, 1.0] if subtitle_expected else [],
+                "layout_mode": (
+                    f"full_bleed_{card_kind}" if card_kind
+                    else "full_bleed_with_bottom_subtitle" if with_subtitles
+                    else "full_bleed_clean"
+                ),
             }
         )
     return rows
@@ -1125,7 +1241,7 @@ def render_ppt_evidence(output_dir: Path, rows: list[dict[str, Any]], *, with_su
         canvas = Image.new("RGB", (960, 540), "black")
         fitted = ImageOps.fit(image, canvas.size, method=Image.Resampling.LANCZOS)
         canvas.paste(fitted)
-        if with_subtitles:
+        if with_subtitles and row.get("subtitle_expected"):
             draw = ImageDraw.Draw(canvas, "RGBA")
             bbox_ratio = row.get("subtitle_bbox") or [0.0, 0.0, 0.0, 0.0]
             y = int(canvas.height * float(bbox_ratio[1]))
@@ -1467,17 +1583,37 @@ def _render_demo_video_core(
     key_filter = keying_filter_chain("[1:v]", preset, crop_filter)
     if presenter_geometry is not None:
         person_filter, person_x, person_y = demo_person_layout_from_geometry(presenter_geometry)
+        rvm_identity_transform = (
+            preset.keyer == "rvm"
+            and bool(presenter_geometry.get("source_native"))
+            and len(presenter_geometry.get("source_crop") or []) == 4
+            and int(presenter_geometry["rendered_width"]) == int(presenter_geometry["source_crop"][2])
+            and int(presenter_geometry["rendered_height"]) == int(presenter_geometry["source_crop"][3])
+        )
+        if rvm_identity_transform:
+            crop_x, crop_y, crop_width, crop_height = (
+                int(value) for value in presenter_geometry["source_crop"]
+            )
+            # Cropping does not interpolate RGBA samples.  Avoiding an identity
+            # premultiply/scale/unpremultiply pass makes short RVM composites
+            # dramatically faster while preserving the exact alpha pixels.
+            person_filter = f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y}"
     elif preserve_native_composition(preset, crop_mode):
         person_filter, person_x, person_y = source_native_person_layout(person_video, preset, width, height)
+        rvm_identity_transform = False
     else:
         demo_person_height = min(int(height * preset.person_height_ratio), height)
         person_filter = f"scale=-1:{demo_person_height}"
         person_x = "(W-w)/2"
         person_y = "H-h" if vertical_align == "bottom" else "(H-h)/2"
+        rvm_identity_transform = False
+    alpha_resample = preset.keyer == "rvm" and not rvm_identity_transform
     filters = [
         f"[0:v]scale={width}:{height},setsar=1,format=rgba[bg]",
         key_filter,
-        f"[person_keyed]{person_filter},setsar=1,format=rgba[person]",
+        f"[person_keyed]{'premultiply=inplace=1,' if alpha_resample else ''}"
+        f"{person_filter}{',unpremultiply=inplace=1' if alpha_resample else ''},"
+        "setsar=1,format=rgba[person]",
         f"[bg][person]overlay={person_x}:{person_y}[withperson]",
         "[2:v]format=rgba[subtitles]",
         "[withperson][subtitles]overlay=0:0[v]",
@@ -1494,6 +1630,7 @@ def _render_demo_video_core(
         str(background),
         "-stream_loop",
         "-1",
+        *(["-c:v", "libvpx-vp9"] if preset.keyer == "rvm" else []),
         "-i",
         str(person_video),
         "-i",
@@ -1629,7 +1766,9 @@ def render_demo_preview_frame(
         f"[0:v]scale={width}:{height},setsar=1,format=rgba[bg]",
         "[1:v]setpts=PTS-STARTPTS[person_source]",
         key_filter,
-        f"[person_keyed]{person_filter},setsar=1,format=rgba[person]",
+        f"[person_keyed]{'premultiply=inplace=1,' if preset.keyer == 'rvm' else ''}"
+        f"{person_filter}{',unpremultiply=inplace=1' if preset.keyer == 'rvm' else ''},"
+        "setsar=1,format=rgba[person]",
         f"[bg][person]overlay={person_x}:{person_y}[withperson]",
         "[2:v]setpts=PTS-STARTPTS,format=rgba[subtitles]",
         "[withperson][subtitles]overlay=0:0[v]",
@@ -1641,6 +1780,7 @@ def render_demo_preview_frame(
         str(background),
         "-ss",
         f"{timestamp:.3f}",
+        *(["-c:v", "libvpx-vp9"] if preset.keyer == "rvm" else []),
         "-i",
         str(person_video),
         "-ss",
@@ -1848,9 +1988,9 @@ def write_product_preflight_handoff(
 
 ```json
 {{
-  "demo_person_crop_mode": "full-width",
+  "demo_person_crop_mode": "source-native",
   "demo_person_vertical_align": "bottom",
-  "demo_person_crop_bottom_ratio": 0.055
+  "demo_person_crop_bottom_ratio": 0.0
 }}
 ```
 """
@@ -2314,8 +2454,48 @@ def load_keying_preset(path: Path) -> KeyingPreset:
     if detected_bbox is not None and len(detected_bbox) != 4:
         raise ValueError("detected_person_bbox 必须是 x,y,w,h")
     keyer = str(data.get("keyer", "colorkey"))
-    if keyer not in {"colorkey", "chromakey"}:
-        raise ValueError("keyer 只能是 colorkey 或 chromakey")
+    if keyer not in {"colorkey", "chromakey", "rvm"}:
+        raise ValueError("keyer 只能是 colorkey、chromakey 或 rvm")
+
+    def resolve_path(field: str, *, required: bool = False) -> str:
+        raw = str(data.get(field) or "").strip()
+        if not raw:
+            if required:
+                raise ValueError(f"RVM preset 缺少 {field}")
+            return ""
+        resolved = Path(raw).expanduser()
+        if not resolved.is_absolute():
+            resolved = (path.parent / resolved).resolve()
+        return str(resolved)
+
+    rvm_model_path = resolve_path("rvm_model_path", required=keyer == "rvm")
+    rvm_runtime_path = resolve_path("rvm_runtime_path")
+    rvm_foreground_video = resolve_path("rvm_foreground_video", required=keyer == "rvm")
+    rvm_receipt_path = resolve_path("rvm_receipt_path", required=keyer == "rvm")
+    rvm_model_sha256 = str(data.get("rvm_model_sha256") or "")
+    rvm_foreground_sha256 = str(data.get("rvm_foreground_sha256") or "")
+    rvm_receipt_sha256 = str(data.get("rvm_receipt_sha256") or "")
+    if keyer == "rvm":
+        from rvm_keying import file_sha256 as rvm_file_sha256
+        from rvm_keying import rvm_receipt_issues, validate_rvm_model
+
+        foreground = Path(rvm_foreground_video)
+        receipt = Path(rvm_receipt_path)
+        actual_model_sha = validate_rvm_model(Path(rvm_model_path))
+        issues = rvm_receipt_issues(receipt, expected_output=foreground)
+        if issues:
+            raise ValueError("RVM preset 回执无效：" + "；".join(issues))
+        actual_foreground_sha = rvm_file_sha256(foreground)
+        if rvm_foreground_sha256 and rvm_foreground_sha256 != actual_foreground_sha:
+            raise ValueError("RVM preset foreground 哈希不一致")
+        actual_receipt_sha = rvm_file_sha256(receipt)
+        if rvm_receipt_sha256 and rvm_receipt_sha256 != actual_receipt_sha:
+            raise ValueError("RVM preset receipt 哈希不一致")
+        if rvm_model_sha256 and rvm_model_sha256 != actual_model_sha:
+            raise ValueError("RVM preset model 哈希不一致")
+        rvm_model_sha256 = actual_model_sha
+        rvm_foreground_sha256 = actual_foreground_sha
+        rvm_receipt_sha256 = actual_receipt_sha
     return KeyingPreset(
         keyer=keyer,
         chroma_color=str(data.get("chroma_color", "0x00FF00")),
@@ -2329,6 +2509,17 @@ def load_keying_preset(path: Path) -> KeyingPreset:
         person_x=int(round(float(data["person_x"]))) if data.get("person_x") is not None else None,
         person_y=int(round(float(data["person_y"]))) if data.get("person_y") is not None else None,
         bottom_margin=int(data.get("bottom_margin", 0)),
+        rvm_model_path=rvm_model_path,
+        rvm_model_sha256=rvm_model_sha256,
+        rvm_runtime_path=rvm_runtime_path,
+        rvm_foreground_video=rvm_foreground_video,
+        rvm_foreground_sha256=rvm_foreground_sha256,
+        rvm_receipt_path=rvm_receipt_path,
+        rvm_receipt_sha256=rvm_receipt_sha256,
+        rvm_input_width=int(data.get("rvm_input_width", 1920)),
+        rvm_input_height=int(data.get("rvm_input_height", 1080)),
+        rvm_downsample_ratio=float(data.get("rvm_downsample_ratio", 0.4)),
+        rvm_alpha_choke_pixels=int(data.get("rvm_alpha_choke_pixels", 1)),
     )
 
 
@@ -2747,7 +2938,7 @@ def add_ppt_subtitle(slide, text: str, prs: Presentation) -> None:
     box.fill.fore_color.rgb = PptRGBColor(0, 0, 0)
     tf = box.text_frame
     tf.clear()
-    tf.word_wrap = True
+    tf.word_wrap = False
     tf.vertical_anchor = MSO_ANCHOR.MIDDLE
     tf.margin_left = 0
     tf.margin_right = 0
@@ -2767,36 +2958,21 @@ def ppt_subtitle_layout(text: str) -> tuple[str, int, list[float]]:
     """Return the subtitle layout contract shared by PPT and QA evidence."""
 
     clean, font_size = fit_ppt_subtitle_text(text)
-    line_count = min(PPT_SUBTITLE_MAX_LINES, clean.count("\n") + 1)
-    height_ratio = 0.09 if line_count == 1 else 0.14
-    height_ratio = min(PPT_SUBTITLE_MAX_HEIGHT_RATIO, height_ratio)
+    height_ratio = min(PPT_SUBTITLE_MAX_HEIGHT_RATIO, 0.08)
     return clean, font_size, [0.0, 1.0 - height_ratio, 1.0, height_ratio]
 
 
 def fit_ppt_subtitle_text(text: str) -> tuple[str, int]:
     clean = clean_ppt_subtitle_text(text)
     if not clean:
-        return "", 28
-    if len(clean) <= 22:
-        return clean, 28
+        return "", 20
 
-    # Keep the subtitle to two balanced lines.  Chinese text has no reliable
-    # whitespace boundaries, so prefer punctuation/spaces near the midpoint,
-    # then fall back to a character split.  A very long sentence still stays
-    # within the bounded two-line box and gets a verifiably smaller font.
-    midpoint = len(clean) // 2
-    split_at = min(
-        range(1, len(clean)),
-        key=lambda idx: abs(idx - midpoint)
-        + (0 if clean[idx - 1] in " ，,；;：:、 " or clean[idx] in " ，,；;：:、 " else 4),
-    )
-    first = clean[:split_at].strip()
-    second = clean[split_at:].strip()
-    if not first or not second:
-        first, second = clean[:midpoint], clean[midpoint:]
-    longest_line = max(len(first), len(second))
-    font_size = max(16, min(28, int(round(28 * 22 / max(22, longest_line)))))
-    return f"{first}\n{second}", font_size
+    # The customer PPT contract is deliberately restrained: one centered
+    # subtitle line with a small font.  Scale only the font for unusually long
+    # rows; never insert a synthetic line break that changes the approved
+    # one-line visual language or causes QA to review a different layout.
+    font_size = max(10, min(20, int(round(20 * 44 / max(44, len(clean))))))
+    return clean, font_size
 
 
 def clean_ppt_subtitle_text(text: str) -> str:

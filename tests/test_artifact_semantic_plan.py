@@ -253,6 +253,36 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         plan = compile_artifact_semantic_plan(project, source)
         self.assertEqual(plan["visual_cards"], [])
+
+    def test_host_opening_synthesizes_contract_title_and_declarative_moral_cards(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        project, manifest = _new_project(Path(temporary.name))
+        source = Path(manifest["inputs"]["story_text"])
+        source.write_text(
+            "大家好，我是绵羊姐姐。\n"
+            "今天给大家讲《爱比美的公鸡》。\n"
+            "公鸡走进了森林。\n"
+            "小朋友们，光长得好看是不够的，能帮助大家才是真正的美。\n",
+            encoding="utf-8",
+        )
+        from story_project import project_paths, write_manifest
+        write_manifest(project_paths(project), manifest)
+        contract = _contract(
+            project,
+            manifest,
+            ("host_intro", "story_announcement", "story_body", "moral"),
+        )
+        contract["story"]["title"] = "爱比美的公鸡"
+        _agent, _paths = _lock_contract(project, manifest, contract_payload=contract)
+        plan = compile_artifact_semantic_plan(project, source)
+        cards = {item["card_kind"]: item for item in plan["visual_cards"]}
+        self.assertEqual(cards["title_card"]["text"], "爱比美的公鸡")
+        self.assertEqual(cards["title_card"]["source_line_numbers"], [1, 2])
+        self.assertEqual(
+            cards["moral_card"]["text"],
+            "光长得好看是不够的，能帮助大家才是真正的美。",
+        )
         self.assertFalse(plan["pre_roll_diagnostic"]["suspected"])
 
     def test_storyboard_plan_requires_semantic_plan_binding(self) -> None:
@@ -278,6 +308,8 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
             "shot_size": "wide", "focal_character": "主角", "visible_characters": ["主角"],
             "excluded_characters": [], "continuity_group": "opening", "appearance_ids": [],
             "visual_description": "主角出发",
+            "speaker": "none", "listener": "none", "narrative_focus": "主角出发",
+            "emotion": "期待", "shot_intent": "建立行动方向", "transition_reason": "开场建立镜头",
             "scale_basis": {"applicable": False, "relationship_ids": [], "reason": "合同没有尺度关系"},
             "current_story_state": {}, "visual_state_evidence": {},
             "subject_action": "主角自然出发",

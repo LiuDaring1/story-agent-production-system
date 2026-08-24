@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
@@ -27,7 +28,7 @@ from story_module_registry import build_story_semantics_registry
 
 
 PLAN_SCHEMA_VERSION = "1.0"
-PLAN_COMPILER_VERSION = "1"
+PLAN_COMPILER_VERSION = "3"
 PLAN_SCHEMA_PATH = Path(__file__).with_name("schemas") / "artifact_semantic_plan" / "v1" / "artifact_semantic_plan.schema.json"
 ARTIFACTS = (
     "demo_subtitles", "background_visual", "background_subtitles",
@@ -129,12 +130,29 @@ def compile_artifact_semantic_plan(
         artifacts[artifact] = {"decisions": decisions}
 
     _validate_mutual_exclusion(artifacts)
-    cards = _compile_visual_cards(lines, artifacts["background_visual"]["decisions"])
     prefix = []
     for line_number in range(1, len(lines) + 1):
         if kind_by_line[line_number] == "story_body":
             break
         prefix.append(line_number)
+    opening_for_title = [
+        line_number
+        for line_number in prefix
+        if kind_by_line[line_number] in {"host_intro", "story_announcement"}
+    ]
+    cards = _compile_visual_cards(
+        lines,
+        artifacts["background_visual"]["decisions"],
+        contract_title=str(contract.get("story", {}).get("title") or ""),
+        opening_line_numbers=opening_for_title,
+    )
+    title_card_lines = {
+        int(line_number)
+        for card in cards
+        if card.get("card_kind") == "title_card"
+        for line_number in card.get("source_line_numbers", [])
+    }
+    unresolved_prefix = [line_number for line_number in prefix if line_number not in title_card_lines]
 
     projection = {
         "story": {"title": str(contract.get("story", {}).get("title") or "")},
@@ -160,8 +178,8 @@ def compile_artifact_semantic_plan(
         "artifacts": artifacts,
         "visual_cards": cards,
         "pre_roll_diagnostic": {
-            "suspected": bool(prefix),
-            "source_line_numbers": prefix,
+            "suspected": bool(unresolved_prefix),
+            "source_line_numbers": unresolved_prefix,
             "action": "record_only_no_auto_trim",
         },
     }
@@ -393,22 +411,57 @@ def schema_python_parity() -> list[str]:
     return errors
 
 
-def _compile_visual_cards(lines: Sequence[str], decisions: Sequence[Mapping[str, Any]]) -> list[dict[str, Any]]:
+def _compile_visual_cards(
+    lines: Sequence[str],
+    decisions: Sequence[Mapping[str, Any]],
+    *,
+    contract_title: str = "",
+    opening_line_numbers: Sequence[int] = (),
+) -> list[dict[str, Any]]:
     cards = []
     for decision in decisions:
         if decision["action"] != "visual_substitute":
             continue
         kind = decision["semantic_kind"]
         line_numbers = decision["source_line_numbers"]
+        card_text = "\n".join(lines[number - 1] for number in line_numbers)
+        if kind == "moral":
+            card_text = moral_card_display_text(card_text)
         cards.append({
             "semantic_kind": kind,
             "card_kind": CARD_KINDS[kind],
-            "text": "\n".join(lines[number - 1] for number in line_numbers),
+            "text": card_text,
             "source_line_numbers": line_numbers,
             "mutual_exclusion_group": decision["mutual_exclusion_group"],
             "timing_rule": "until_first_story_body_cue" if kind == "title" else "semantic_cue_range",
         })
+    if not any(card["semantic_kind"] == "title" for card in cards):
+        title = contract_title.strip().strip("《》")
+        opening = [int(value) for value in opening_line_numbers]
+        if title and opening:
+            cards.insert(
+                0,
+                {
+                    "semantic_kind": "title",
+                    "card_kind": "title_card",
+                    "text": title,
+                    "source_line_numbers": opening,
+                    "mutual_exclusion_group": "title_presentation",
+                    "timing_rule": "until_first_story_body_cue",
+                },
+            )
     return cards
+
+
+def moral_card_display_text(text: str) -> str:
+    """Strip the spoken child-address from the visual moral card only."""
+
+    return re.sub(
+        r"^\s*(?:(?:亲爱的)\s*)?小朋友们?\s*[,，、:：!！]?\s*",
+        "",
+        text,
+        count=1,
+    ).strip()
 
 
 def _validate_mutual_exclusion(artifacts: Mapping[str, Any]) -> None:

@@ -1,0 +1,14 @@
+{
+  "schema_version": "story-brand-asset/v1",
+  "asset_role": "official_program_logo",
+  "asset_path": "assets/brand/program_logo.png",
+  "sha256": "6c086459c3e06b6996096ade35254bda061c57a3df285f2d93f4f8a3fb013557",
+  "source_path": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材/节目 logo.png",
+  "allowed_uses": [
+    "demo",
+    "release_video",
+    "product_package",
+    "moving_antipiracy_watermark"
+  ],
+  "max_per_frame": 1
+}

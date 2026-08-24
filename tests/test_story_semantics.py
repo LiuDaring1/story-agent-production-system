@@ -98,6 +98,15 @@ class StorySemanticsTests(unittest.TestCase):
 
         self.assertTrue(all(semantics.kind_at(i) == SemanticKind.STORY_BODY for i in range(1, 4)))
 
+    def test_declarative_beauty_lesson_is_recognized_as_moral(self) -> None:
+        source = [
+            "公鸡帮大家叫醒了邻居。",
+            "小朋友们，光长得好看是不够的，能帮助大家才是真正的美。",
+        ]
+        semantics = classify_story(source)
+        self.assertEqual(semantics.kind_at(1), SemanticKind.STORY_BODY)
+        self.assertEqual(semantics.kind_at(2), SemanticKind.MORAL)
+
 
 if __name__ == "__main__":
     unittest.main()

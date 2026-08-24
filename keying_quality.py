@@ -138,7 +138,13 @@ def _alpha_topology(alpha: Image.Image) -> dict[str, float | int]:
     mask = alpha.convert("L").point(lambda value: 255 if value >= 128 else 0)
     bbox = mask.getbbox()
     if bbox is None:
-        return {"alpha_hole_ratio": 0.0, "detached_component_count": 0, "edge_roughness": 0.0}
+        return {
+            "alpha_hole_ratio": 0.0,
+            "suspicious_internal_hole_ratio": 0.0,
+            "enclosed_transparent_region_count": 0,
+            "detached_component_count": 0,
+            "edge_roughness": 0.0,
+        }
     cropped = mask.crop(bbox)
     width, height = cropped.size
     pixels = cropped.load()
@@ -166,16 +172,33 @@ def _alpha_topology(alpha: Image.Image) -> dict[str, float | int]:
     foreground_area = max(1, sum(foreground_sizes))
     significant = sum(1 for size in foreground_sizes if size >= max(6, foreground_area * 0.004))
 
-    # Transparent components not connected to the crop boundary are holes.
+    # Transparent components not connected to the crop boundary are enclosed
+    # negative space.  The total remains useful diagnostic evidence, but it is
+    # not automatically damage: an arm touching the torso can legitimately
+    # enclose a long strip of green screen.  Only compact components in the
+    # central torso core are treated as suspicious internal matte holes.
     seen.clear()
     hole_area = 0
+    suspicious_hole_area = 0
+    enclosed_count = 0
     for y in range(height):
         for x in range(width):
             if not pixels[x, y] and (x, y) not in seen:
                 transparent = component((x, y), False)
                 touches_edge = any(px in {0, width - 1} or py in {0, height - 1} for px, py in transparent)
                 if not touches_edge and len(transparent) >= 4:
+                    enclosed_count += 1
                     hole_area += len(transparent)
+                    xs = [point[0] for point in transparent]
+                    ys = [point[1] for point in transparent]
+                    component_width = max(xs) - min(xs) + 1
+                    component_height = max(ys) - min(ys) + 1
+                    compactness = min(component_width, component_height) / max(component_width, component_height)
+                    centroid_x = sum(xs) / len(xs) / max(1, width)
+                    centroid_y = sum(ys) / len(ys) / max(1, height)
+                    in_torso_core = 0.28 <= centroid_x <= 0.72 and 0.20 <= centroid_y <= 0.90
+                    if in_torso_core and compactness >= 0.30:
+                        suspicious_hole_area += len(transparent)
 
     edge = _edge_mask(mask)
     edge_area = sum(1 for value in edge.get_flattened_data() if value > 0)
@@ -183,6 +206,8 @@ def _alpha_topology(alpha: Image.Image) -> dict[str, float | int]:
     unstable = sum(1 for value in ImageChops.difference(mask, smoothed).get_flattened_data() if value > 0)
     return {
         "alpha_hole_ratio": round(hole_area / foreground_area, 5),
+        "suspicious_internal_hole_ratio": round(suspicious_hole_area / foreground_area, 5),
+        "enclosed_transparent_region_count": enclosed_count,
         "detached_component_count": max(0, significant - 1),
         "edge_roughness": round(unstable / max(1, edge_area), 5),
     }
@@ -238,7 +263,7 @@ def analyze_keyed_rgba(image: Image.Image, *, region_boxes: dict[str, tuple[int,
     if max(corner_alpha, default=0.0) > 0.15:
         critical.append("background_leak:corners")
     topology = _alpha_topology(alpha)
-    if topology["alpha_hole_ratio"] > 0.012:
+    if topology["suspicious_internal_hole_ratio"] > 0.003:
         critical.append("alpha_holes_or_internal_transparency")
     if topology["detached_component_count"] > 2:
         critical.append("contour_fragments")

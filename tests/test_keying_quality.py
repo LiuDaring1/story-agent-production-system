@@ -281,6 +281,20 @@ class KeyingQualityTests(unittest.TestCase):
         hole_result = analyze_keyed_rgba(hole)
         self.assertIn("alpha_holes_or_internal_transparency", hole_result["critical_errors"])
 
+    def test_enclosed_arm_torso_negative_space_is_not_an_internal_hole(self) -> None:
+        natural = Image.new("RGBA", (180, 200), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(natural)
+        draw.ellipse((65, 8, 115, 58), fill=(186, 145, 116, 255))
+        draw.rounded_rectangle((55, 48, 125, 180), radius=15, fill=(186, 145, 116, 255))
+        # Bent arms meet the torso again at the hip.  The enclosed transparent
+        # strips are real anatomical negative space, not holes in the subject.
+        draw.line(((58, 65), (28, 82), (42, 135), (60, 120)), fill=(186, 145, 116, 255), width=15, joint="curve")
+        draw.line(((122, 65), (152, 82), (138, 135), (120, 120)), fill=(186, 145, 116, 255), width=15, joint="curve")
+        result = analyze_keyed_rgba(natural)
+        self.assertGreater(result["topology"]["alpha_hole_ratio"], 0.012)
+        self.assertEqual(result["topology"]["suspicious_internal_hole_ratio"], 0.0)
+        self.assertNotIn("alpha_holes_or_internal_transparency", result["critical_errors"])
+
     def test_hand_and_hem_damage_are_region_specific_failures(self) -> None:
         damaged = _silhouette()
         alpha = damaged.getchannel("A")

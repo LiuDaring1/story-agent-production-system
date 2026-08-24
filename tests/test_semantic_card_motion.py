@@ -9,15 +9,25 @@ from pathlib import Path
 from PIL import Image
 
 from semantic_card_motion import (
+    MOTION_PROVIDER_RESOLUTION,
+    MOTION_PROVIDER_SAFE_PROMPT_CHARS,
     MOTION_RECEIPT_SCHEMA,
     file_sha256,
     load_semantic_card_motion_paths,
+    semantic_card_motion_prompt,
     semantic_card_motion_receipt_issues,
     write_semantic_card_motion_request,
 )
 
 
 class SemanticCardMotionTests(unittest.TestCase):
+    def test_provider_prompt_stays_within_observed_safe_limit(self) -> None:
+        prompt = semantic_card_motion_prompt()
+        self.assertLessEqual(
+            len(prompt.encode("utf-16-le")) // 2,
+            MOTION_PROVIDER_SAFE_PROMPT_CHARS,
+        )
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.card_dir = Path(self.temporary.name) / "semantic_cards"
@@ -130,6 +140,10 @@ class SemanticCardMotionTests(unittest.TestCase):
         )
         request = json.loads(request_path.read_text(encoding="utf-8"))
         self.assertEqual([row["required_duration_seconds"] for row in request["cards"]], [4.0, 4.0])
+        self.assertEqual(
+            [row["requested_resolution"] for row in request["cards"]],
+            [MOTION_PROVIDER_RESOLUTION] * 2,
+        )
         self.assertEqual(request["cards"][0]["presentation_window_seconds"], 7.0)
         self.assertTrue(request["production_requires_provider_video"])
 

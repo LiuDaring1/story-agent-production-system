@@ -11,6 +11,8 @@ MOTION_REQUEST_SCHEMA = "story-semantic-card-motion-request/v1"
 MOTION_RECEIPT_SCHEMA = "story-semantic-card-motion/v1"
 MOTION_PROMPT_VERSION = "story-semantic-card-motion-prompt/v1"
 MOTION_CLIP_SECONDS = 4.0
+MOTION_PROVIDER_SAFE_PROMPT_CHARS = 120
+MOTION_PROVIDER_RESOLUTION = "720p"
 
 
 def file_sha256(path: Path) -> str:
@@ -27,11 +29,9 @@ def semantic_card_motion_prompt() -> str:
     """A stable image-to-video instruction that treats all text as locked pixels."""
 
     return (
-        "以所附首帧原图为唯一构图与文字依据，镜头完全固定。"
-        "所有中文文字及其背板区域必须像素级稳定：不得改字、增字、少字、变形、闪烁、"
-        "位移、缩放、呼吸或重绘。只允许非文字装饰元素做克制微动，例如微弱光影、羽毛、麦穗、"
-        "树叶或云雾的轻微摆动。不得新增人物、Logo、水印、字幕或其他信息，不得改变画面层级。"
-        "动作应能自然循环，首帧和末帧的文字与原图完全一致。"
+        "以首帧为唯一依据，镜头固定。所有中文文字和文字背板完全静止，不得改字、增删、"
+        "变形、闪烁、位移、缩放或重绘。仅让光影、羽毛、麦穗、树叶、云雾等非文字元素"
+        "轻微运动。不得新增人物、文字、Logo、水印或字幕，首尾衔接自然。"
     )
 
 
@@ -68,6 +68,12 @@ def write_semantic_card_motion_request(
     card_dir.mkdir(parents=True, exist_ok=True)
     static_receipt, static_by_kind = _load_static_card_receipt(card_dir)
     prompt = semantic_card_motion_prompt()
+    prompt_chars = len(prompt.encode("utf-16-le")) // 2
+    if prompt_chars > MOTION_PROVIDER_SAFE_PROMPT_CHARS:
+        raise RuntimeError(
+            "片头/寓意卡微动 Prompt 超过当前 provider 安全上限："
+            f"{prompt_chars}>{MOTION_PROVIDER_SAFE_PROMPT_CHARS}"
+        )
     prompt_sha256 = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
     cards: list[dict[str, Any]] = []
     seen: set[str] = set()
@@ -100,7 +106,10 @@ def write_semantic_card_motion_request(
                 "required_duration_seconds": MOTION_CLIP_SECONDS,
                 "presentation_window_seconds": round(presentation_duration, 3),
                 "requested_ratio": "16:9",
-                "requested_resolution": "1080p",
+                # Grok's currently configured production channel is native
+                # 720p. The final release compositor still encodes 1080p; do
+                # not request the unavailable 4-second + 1080p combination.
+                "requested_resolution": MOTION_PROVIDER_RESOLUTION,
                 "prompt": prompt,
                 "prompt_sha256": prompt_sha256,
                 "text_region_locked": True,

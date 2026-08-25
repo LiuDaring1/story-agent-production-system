@@ -2323,6 +2323,91 @@ def assert_runnable(manifest: dict[str, Any], project_dir: Path | None = None) -
             )
 
 
+def migrate_code_binding(
+    project_dir: Path,
+    *,
+    expected_old_revision: str,
+    migrated_by: str,
+    reason: str,
+) -> tuple[dict[str, Any], Path]:
+    """Explicitly bind an idle project to the current checked-out revision.
+
+    The normal runner deliberately refuses revision drift.  This operation is
+    the audited escape hatch: callers must name the exact previous revision,
+    the code root must remain unchanged, and stale paths from another Codex
+    worktree are still rejected.
+    """
+
+    paths = project_paths(project_dir.expanduser().resolve())
+    expected_old_revision = expected_old_revision.strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", expected_old_revision):
+        raise AgentRuntimeError("expected_old_revision 必须是完整的 40 位 Git commit")
+    actor = migrated_by.strip()
+    migration_reason = reason.strip()
+    if not actor or not migration_reason:
+        raise AgentRuntimeError("显式迁移必须记录 migrated_by 和 reason")
+
+    with job_lock(paths.root):
+        manifest = ensure_manifest_v2(load_manifest(paths) or {})
+        agent = manifest["agent"]
+        old_identity = agent.get("code_identity", {})
+        if not isinstance(old_identity, dict):
+            raise AgentRuntimeError("项目缺少有效 code_identity，不能自动推断旧绑定")
+        old_root = str(old_identity.get("code_root") or "")
+        old_revision = str(old_identity.get("git_revision") or "").lower()
+        if old_revision != expected_old_revision:
+            raise AgentRuntimeError(
+                "旧 commit 核对失败："
+                f"manifest={old_revision or '<missing>'}, expected={expected_old_revision}"
+            )
+
+        new_identity = runtime_code_identity()
+        new_root = str(new_identity.get("code_root") or "")
+        new_revision = str(new_identity.get("git_revision") or "").lower()
+        if not new_root or not re.fullmatch(r"[0-9a-f]{40}", new_revision):
+            raise AgentRuntimeError("当前代码身份不完整，拒绝迁移")
+        if Path(old_root).expanduser().resolve() != Path(new_root).expanduser().resolve():
+            raise AgentRuntimeError(
+                "code_root 发生变化；本命令只允许同一工作树内显式升级 commit"
+            )
+        stale_paths = worktree_binding_issues(manifest, Path(new_root))
+        if stale_paths:
+            raise AgentRuntimeError("cross_worktree_binding_mismatch: " + "；".join(stale_paths[:12]))
+
+        before_sha256 = file_sha256(paths.manifest) if paths.manifest.is_file() else ""
+        migration_id = f"{int(time.time())}-{uuid.uuid4().hex[:12]}"
+        receipt_path = paths.status / "code_binding_migrations" / f"{migration_id}.json"
+        migrated_at = now()
+        migration_record = {
+            "migration_id": migration_id,
+            "from": {"code_root": old_root, "git_revision": old_revision},
+            "to": {"code_root": new_root, "git_revision": new_revision},
+            "migrated_at": migrated_at,
+            "migrated_by": actor,
+            "reason": migration_reason,
+            "receipt": str(receipt_path),
+        }
+        agent["code_identity"] = dict(new_identity)
+        agent.setdefault("code_binding_migrations", []).append(migration_record)
+        agent["last_code_binding_migration"] = migration_record
+        if str(agent.get("blocked_reason") or "").startswith("cross_worktree_binding_mismatch"):
+            agent["blocked_reason"] = ""
+            if agent.get("status") == "blocked":
+                agent["status"] = "pending"
+        write_manifest(paths, manifest)
+        after_sha256 = file_sha256(paths.manifest)
+        receipt = {
+            "kind": "story_agent_code_binding_migration_v1",
+            **migration_record,
+            "project_dir": str(paths.root),
+            "project_manifest_sha256_before": before_sha256,
+            "project_manifest_sha256_after": after_sha256,
+        }
+        save_json(receipt_path, receipt)
+        assert_runnable(manifest, paths.root)
+        return manifest, receipt_path
+
+
 def recovery_guidance(manifest: dict[str, Any]) -> str:
     ensure_manifest_v2(manifest)
     agent = manifest["agent"]

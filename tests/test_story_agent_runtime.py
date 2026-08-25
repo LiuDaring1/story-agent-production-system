@@ -49,6 +49,8 @@ from story_agent_runtime import (
     review_passes,
     manifest_context_sha256,
     mark_stage,
+    migrate_code_binding,
+    runtime_code_identity,
     job_lock,
     prepared_input_contract_errors,
     refresh_prepared_inputs,
@@ -180,6 +182,38 @@ class StoryAgentRuntimeTests(unittest.TestCase):
         manifest.setdefault("outputs", {})["stale"] = "/tmp/.codex/worktrees/another-checkout/output.mp4"
         with self.assertRaisesRegex(AgentRuntimeError, "cross_worktree_binding_mismatch"):
             assert_runnable(manifest)
+
+    def test_code_binding_migration_requires_exact_old_revision_and_writes_receipt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：显式版本迁移"
+            init_project(project, story_name="显式版本迁移", slug="binding-migration")
+            paths = project_paths(project)
+            manifest = ensure_manifest_v2(load_manifest(paths) or {})
+            old_revision = "a" * 40
+            manifest["agent"]["code_identity"]["git_revision"] = old_revision
+            write_manifest(paths, manifest)
+
+            with self.assertRaisesRegex(AgentRuntimeError, "旧 commit 核对失败"):
+                migrate_code_binding(
+                    project,
+                    expected_old_revision="b" * 40,
+                    migrated_by="test",
+                    reason="test mismatch",
+                )
+
+            migrated, receipt_path = migrate_code_binding(
+                project,
+                expected_old_revision=old_revision,
+                migrated_by="test",
+                reason="bind the canary to the reviewed revision",
+            )
+            self.assertEqual(migrated["agent"]["code_identity"], runtime_code_identity())
+            self.assertTrue(receipt_path.is_file())
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["from"]["git_revision"], old_revision)
+            self.assertEqual(receipt["to"], runtime_code_identity())
+            self.assertEqual(receipt["project_manifest_sha256_after"], file_sha256(paths.manifest))
+            assert_runnable(migrated, project)
     def test_library_release_receipt_uses_variant_specific_demo_bindings(self) -> None:
         common = {
             "demo_render_manifest_sha256": "a" * 64,

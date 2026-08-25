@@ -141,6 +141,7 @@ from story_agent_runtime import (
     load_control,
     mark_stage,
     manifest_context_sha256,
+    migrate_code_binding,
     process_is_alive,
     render_job_report,
     request_cancel,
@@ -8059,6 +8060,17 @@ def main() -> None:
         "--module-execution-mode", choices=sorted(ALLOWED_MODULE_EXECUTION_MODES), default=""
     )
 
+    migrate_binding = subparsers.add_parser(
+        "migrate-code-binding",
+        help="显式把空闲项目从已核对的旧 commit 迁移到当前工作树 commit，并写审计回执",
+    )
+    migrate_binding.add_argument("--job", default="")
+    migrate_binding.add_argument("--registry", type=Path)
+    migrate_binding.add_argument("--project-dir", type=Path)
+    migrate_binding.add_argument("--expected-old-revision", required=True)
+    migrate_binding.add_argument("--migrated-by", default="user")
+    migrate_binding.add_argument("--reason", required=True)
+
     notifications = subparsers.add_parser("notifications", help="查看或确认项目通知")
     notifications.add_argument("--job", default="")
     notifications.add_argument("--registry", type=Path)
@@ -8243,6 +8255,28 @@ def main() -> None:
                     "project_dir": str(args.project_dir.expanduser().resolve()),
                     "storyboard_text": manifest.get("inputs", {}).get("storyboard_text", ""),
                     "confirmed_subtitles": manifest.get("inputs", {}).get("confirmed_subtitles", ""),
+                },
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return
+    if args.command == "migrate-code-binding":
+        project_dir = JobRegistry(args.registry).resolve(args.job) if args.job else args.project_dir
+        if project_dir is None:
+            parser.error("migrate-code-binding 需要 --job 或 --project-dir")
+        manifest, receipt = migrate_code_binding(
+            project_dir,
+            expected_old_revision=args.expected_old_revision,
+            migrated_by=args.migrated_by,
+            reason=args.reason,
+        )
+        print(
+            json.dumps(
+                {
+                    "project_dir": str(project_dir.expanduser().resolve()),
+                    "code_identity": manifest.get("agent", {}).get("code_identity", {}),
+                    "receipt": str(receipt),
                 },
                 ensure_ascii=False,
                 indent=2,

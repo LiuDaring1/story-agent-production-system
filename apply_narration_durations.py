@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import math
 from pathlib import Path
+from typing import Sequence
 
 from story_video_synthesizer.align import align_script_to_narration, sanitize_script_line, save_timings
 from story_video_synthesizer.volcengine_video import duration_to_supported_frames, read_jobs_csv, write_jobs_csv
@@ -41,17 +42,27 @@ def generation_duration_for_target(
     fixed_duration: float = 10.0,
     min_generation_seconds: float = 1.0,
     max_generation_seconds: float = 15.0,
+    generation_duration_choices: Sequence[float] = (),
 ) -> int | float:
     """Choose the provider request duration for one narration window.
 
     ``fixed`` is intentionally the legacy behavior: use the configured fixed
-    duration unchanged.  ``adaptive-seconds`` rounds the target up to the next
-    whole second and clamps it to the provider's advertised integer range.
+    duration unchanged. ``adaptive-seconds`` either selects the nearest
+    advertised discrete choice or rounds up within the provider's integer
+    range.
     """
 
     mode = normalize_duration_mode(duration_mode)
     if mode == "fixed":
         return float(fixed_duration)
+    choices = tuple(sorted({float(item) for item in generation_duration_choices}))
+    if choices:
+        if any(not math.isfinite(item) or item <= 0 for item in choices):
+            raise ValueError("供应商秒数选项必须是正的有限数")
+        target = float(target_duration)
+        # On an exact tie prefer the longer native clip, preserving temporal
+        # detail before the compositor applies one uniform speed change.
+        return min(choices, key=lambda seconds: (abs(seconds - target), -seconds))
     minimum, maximum = _integer_generation_bounds(min_generation_seconds, max_generation_seconds)
     return max(minimum, min(maximum, math.ceil(float(target_duration))))
 
@@ -98,6 +109,11 @@ def main() -> None:
         type=float,
         help="adaptive-seconds 的供应商最大整数秒（默认 15）",
     )
+    parser.add_argument(
+        "--generation-duration-choices",
+        default="",
+        help="供应商仅允许的离散秒数，逗号分隔，例如 6,10；设置后按目标时长选最近一档",
+    )
     parser.add_argument("--padding", default=0.15, type=float, help="给每句额外补一点点秒数，避免被切太紧")
     parser.add_argument("--fps", default=24, type=int, help="frames 换算帧率")
     parser.add_argument("--min-frames", default=29, type=int)
@@ -125,6 +141,11 @@ def main() -> None:
         raise RuntimeError(f"对齐结果 {len(timings)} 条，任务 CSV {len(rows)} 条，数量不一致。")
 
     duration_mode = ADAPTIVE_DURATION_MODE if args.adaptive_seconds else normalize_duration_mode(args.duration_mode)
+    duration_choices = tuple(
+        float(part.strip())
+        for part in args.generation_duration_choices.split(",")
+        if part.strip()
+    )
     if duration_mode == ADAPTIVE_DURATION_MODE:
         generation_min_seconds, generation_max_seconds = _integer_generation_bounds(
             args.min_generation_seconds,
@@ -141,6 +162,7 @@ def main() -> None:
             fixed_duration=args.max_duration,
             min_generation_seconds=args.min_generation_seconds,
             max_generation_seconds=args.max_generation_seconds,
+            generation_duration_choices=duration_choices,
         )
         if duration_mode == ADAPTIVE_DURATION_MODE:
             # Keep a truthful compatibility value for old consumers, but do
@@ -162,6 +184,7 @@ def main() -> None:
         row["duration_mode"] = duration_mode
         row["generation_min_seconds"] = "" if generation_min_seconds is None else str(generation_min_seconds)
         row["generation_max_seconds"] = "" if generation_max_seconds is None else str(generation_max_seconds)
+        row["generation_duration_choices"] = ",".join(_format_duration(item) for item in duration_choices)
         row["frames"] = str(frames)
         row["effective_duration"] = f"{effective_duration:.3f}"
         row["needs_slowdown"] = "yes" if target_duration > effective_duration + 0.05 else "no"
@@ -187,8 +210,8 @@ def main() -> None:
     trim_count = sum(1 for row in rows if row.get("needs_trim") == "yes")
     print(f"API {duration_mode} 生成总时长约：{total_generation_duration:.2f} 秒")
     print(f"实际请求片段总时长约：{total_effective_duration:.2f} 秒")
-    print(f"需要后期裁切匹配的镜头数：{trim_count}")
-    print(f"需要后期慢放匹配的镜头数：{slowdown_count}")
+    print(f"需要统一加速匹配的镜头数：{trim_count}")
+    print(f"需要统一慢放匹配的镜头数：{slowdown_count}")
     print(f"时间轴：{timings_path}")
     print(f"任务清单：{jobs_path}")
 

@@ -21,6 +21,7 @@ from story_video_synthesizer.toapis_video import (
     MIN_SECONDS as TOAPIS_MIN_SECONDS,
     MAX_PROMPT_CHARS as TOAPIS_MAX_PROMPT_CHARS,
     DEFAULT_USER_AGENT,
+    GROK_VIDEO_1_0_DEFAULT_SECONDS,
     ToAPIsVideoClient,
     build_toapis_task_body,
     extract_toapis_video_url,
@@ -177,6 +178,36 @@ class VideoProviderAdapterTests(unittest.TestCase):
                     fallback_seconds="8",
                     min_seconds=1,
                     max_seconds=15,
+                ),
+                expected,
+            )
+
+    def test_grok_video_1_0_selects_only_six_or_ten_seconds_per_scene(self) -> None:
+        for requested, expected in [
+            ("2", "6"),
+            ("6", "6"),
+            ("6.01", "6"),
+            ("7.99", "6"),
+            ("8", "10"),
+            ("9", "10"),
+            ("14", "10"),
+        ]:
+            self.assertEqual(
+                resolve_row_generation_seconds(
+                    {"generation_duration": requested},
+                    model="grok-video-1.0",
+                    fallback_seconds="6",
+                    min_seconds=6,
+                    max_seconds=10,
+                ),
+                expected,
+            )
+            self.assertEqual(
+                row_request_seconds(
+                    {"generation_duration": requested},
+                    model="grok-video-1.0",
+                    is_toapis=True,
+                    fallback_seconds="6",
                 ),
                 expected,
             )
@@ -505,6 +536,23 @@ class VideoProviderAdapterTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 build_toapis_task_body(
                     model=TOAPIS_DEFAULT_MODEL,
+                    prompt="测试",
+                    image_url="https://files.example/scene.png",
+                    seconds=seconds,
+                )
+
+    def test_toapis_grok_video_1_0_defaults_to_six_and_rejects_other_durations(self) -> None:
+        body = build_toapis_task_body(
+            model="grok-video-1.0",
+            prompt="花瓣和叶片轻轻摆动，文字保持稳定",
+            image_url="https://files.example/title.png",
+        )
+        self.assertEqual(GROK_VIDEO_1_0_DEFAULT_SECONDS, "6")
+        self.assertEqual(body["seconds"], "6")
+        for seconds in ("5", "7", "8", "9", "11"):
+            with self.assertRaisesRegex(ValueError, "只能是 6 或 10"):
+                build_toapis_task_body(
+                    model="grok-video-1.0",
                     prompt="测试",
                     image_url="https://files.example/scene.png",
                     seconds=seconds,

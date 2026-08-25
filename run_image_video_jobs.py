@@ -32,6 +32,7 @@ from story_video_synthesizer.toapis_video import (
     DEFAULT_RATIO as TOAPIS_DEFAULT_RATIO,
     DEFAULT_SECONDS as TOAPIS_DEFAULT_SECONDS,
     DEFAULT_RESOLUTION as TOAPIS_DEFAULT_RESOLUTION,
+    GROK_VIDEO_1_0_MODEL,
     LEGACY_DEFAULT_SECONDS as TOAPIS_LEGACY_DEFAULT_SECONDS,
     ToAPIsVideoClient,
     build_toapis_task_body,
@@ -242,7 +243,7 @@ def row_extra_body(jobs_csv: Path, row: dict[str, str], extra_body: dict[str, ob
     """Build idempotency metadata without letting extra_body override row seconds."""
 
     payload = toapis_extra_body(jobs_csv, row, extra_body)
-    if str(model).strip().lower() == TOAPIS_DEFAULT_MODEL:
+    if str(model).strip().lower() in {TOAPIS_DEFAULT_MODEL, GROK_VIDEO_1_0_MODEL}:
         payload.pop("seconds", None)
     return payload
 
@@ -273,7 +274,7 @@ def main() -> None:
     parser.add_argument(
         "--seconds",
         default=os.getenv("VIDEO_SECONDS", ""),
-        help="供应商接口生成秒数；ToAPIs grok-video-1.5 支持 1–15 秒，默认 8 秒",
+        help="供应商接口生成秒数；ToAPIs grok-video-1.0 仅支持 6/10 秒，1.5 支持 1–15 秒",
     )
     parser.add_argument("--size", default=os.getenv("VIDEO_SIZE", ""), help="视频清晰度，例如 720P 或 1080P")
     parser.add_argument("--timing-mode", choices=["frames", "duration"], default="frames", help="默认用 frames 支持小数秒")

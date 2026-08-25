@@ -14,6 +14,7 @@ from semantic_card_motion import (
     MOTION_RECEIPT_SCHEMA,
     file_sha256,
     load_semantic_card_motion_paths,
+    select_motion_provider_seconds,
     semantic_card_motion_prompt,
     semantic_card_motion_receipt_issues,
     write_semantic_card_motion_request,
@@ -133,7 +134,7 @@ class SemanticCardMotionTests(unittest.TestCase):
         )
         return receipt
 
-    def test_request_uses_short_loopable_provider_clips_not_full_opening_duration(self) -> None:
+    def test_request_chooses_nearest_six_or_ten_second_clip_without_looping(self) -> None:
         request_path = write_semantic_card_motion_request(
             card_dir=self.card_dir,
             windows=self.windows,
@@ -141,12 +142,19 @@ class SemanticCardMotionTests(unittest.TestCase):
         )
         request = json.loads(request_path.read_text(encoding="utf-8"))
         self.assertEqual([row["required_duration_seconds"] for row in request["cards"]], [6.0, 6.0])
+        self.assertEqual([row["loop_policy"] for row in request["cards"]], ["forbidden", "forbidden"])
         self.assertEqual(
             [row["requested_resolution"] for row in request["cards"]],
             [MOTION_PROVIDER_RESOLUTION] * 2,
         )
         self.assertEqual(request["cards"][0]["presentation_window_seconds"], 7.0)
         self.assertTrue(request["production_requires_provider_video"])
+
+    def test_provider_duration_selection_uses_nearest_choice_and_longer_tie(self) -> None:
+        self.assertEqual(select_motion_provider_seconds(2.0), 6.0)
+        self.assertEqual(select_motion_provider_seconds(7.9), 6.0)
+        self.assertEqual(select_motion_provider_seconds(8.0), 10.0)
+        self.assertEqual(select_motion_provider_seconds(13.0), 10.0)
 
     def test_receipt_requires_current_provider_video_and_text_stability(self) -> None:
         request_path = write_semantic_card_motion_request(

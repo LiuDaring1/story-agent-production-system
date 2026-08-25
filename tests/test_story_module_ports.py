@@ -167,6 +167,7 @@ class StoryModulePortTests(unittest.TestCase):
         self.assertEqual(port.capabilities.supported["default_duration"], legacy.default_seconds)
         self.assertEqual(port.capabilities.supported["min_duration"], legacy.min_seconds)
         self.assertEqual(port.capabilities.supported["max_duration"], legacy.max_seconds)
+        self.assertEqual(port.capabilities.supported["duration_choices"], legacy.duration_choices)
         self.assertEqual(port.capabilities.supported["resolution"], legacy.default_resolution)
         self.assertEqual(port.capabilities.supported["ratio"], legacy.default_ratio)
         self.assertEqual(port.estimate_cost(9), legacy.estimate_cost(9))

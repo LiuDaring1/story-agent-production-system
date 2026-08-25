@@ -39,7 +39,6 @@ from story_module_ports import (
 from story_video_synthesizer.image_video import validate_image_video_jobs
 from semantic_card_motion import (
     semantic_card_motion_receipt_issues,
-    write_semantic_card_motion_request,
 )
 from story_contract_runtime import (
     CONTRACT_POLICY_LEGACY,
@@ -3209,6 +3208,7 @@ class StoryAgent:
         supported = provider.capabilities.supported if provider is not None else {}
         min_seconds = supported.get("min_duration")
         max_seconds = supported.get("max_duration")
+        duration_choices = tuple(supported.get("duration_choices") or ())
         if provider is not None and min_seconds is not None and max_seconds is not None:
             command.extend(
                 [
@@ -3220,6 +3220,13 @@ class StoryAgent:
                     str(int(max_seconds)),
                 ]
             )
+            if duration_choices:
+                command.extend(
+                    [
+                        "--generation-duration-choices",
+                        ",".join(f"{float(item):g}" for item in duration_choices),
+                    ]
+                )
         return self._workflow(command, "写入旁白时长")
 
     def _stage_generate_videos(self, manifest: dict[str, Any]) -> StageResult:
@@ -4096,33 +4103,29 @@ class StoryAgent:
                 return StageResult("blocked", "ImageGen 片头/寓意卡未通过机器绑定：" + "；".join(remaining), handoff)
 
         # Static ImageGen cards are only the first half of the production
-        # contract.  Formal assembly requires short, loopable provider clips
-        # whose native text has passed first/middle/last-frame stability QA.
-        motion_windows = [
-            {**card, "start": 0.0, "end": 4.0}
-            for card in cards
-        ]
-        motion_request = write_semantic_card_motion_request(
-            card_dir=card_dir,
-            windows=motion_windows,
-            artifact_semantic_plan_sha256=file_sha256(semantic_plan_path(self.context.project_dir)),
-        )
+        # contract.  The formal compositor builds the provider request from
+        # real aligned audio windows; do not create a fake four-second request
+        # here.  If a timing-bound request already exists, accept only its
+        # current text-stable provider receipt. Otherwise assembly will write
+        # the exact 6s/10s request and stop with the generated handoff.
+        motion_request = card_dir / "semantic_card_motion_request.json"
         motion_receipt = card_dir / "semantic_card_motion_receipt.json"
-        motion_issues = semantic_card_motion_receipt_issues(motion_request, motion_receipt)
-        if not motion_issues:
+        if motion_request.is_file():
+            motion_issues = semantic_card_motion_receipt_issues(motion_request, motion_receipt)
+        else:
+            motion_issues = ["semantic_card_motion_timing_request_pending"]
+        if motion_request.is_file() and not motion_issues:
             return StageResult(
                 "done",
                 "ImageGen 片头/寓意卡及文字锁定微动版已绑定当前语义计划。",
                 motion_receipt,
             )
         if not self.context.execute:
-            return StageResult("done", "dry-run：将生成文字锁定的片头/寓意卡微动版。", motion_request)
-        return StageResult(
-            "blocked",
-            "正式合成不接受静态片头/寓意卡；需先执行当前图生视频请求并通过文字稳定性抽检："
-            + "；".join(motion_issues),
-            card_dir / "semantic_card_motion_handoff.md",
-        )
+            return StageResult("done", "dry-run：正式合成将按真实音频窗口生成 6/10 秒微动请求。", motion_request)
+        # Let the compositor calculate the real title/moral windows.  It will
+        # either consume the current receipt or fail closed after writing the
+        # exact provider request and handoff.
+        return StageResult("done", "静态语义卡已通过；微动请求将在正式音频对齐后生成。", motion_request)
 
     def _stage_release_assets(self, manifest: dict[str, Any]) -> StageResult:
         if not self._legacy_contract_policy(manifest):

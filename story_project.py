@@ -145,6 +145,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "default_seconds": 6,
                 "min_seconds": 6,
                 "max_seconds": 10,
+                "duration_choices": [6, 10],
                 "default_resolution": "720p",
                 "default_ratio": "16:9",
             },

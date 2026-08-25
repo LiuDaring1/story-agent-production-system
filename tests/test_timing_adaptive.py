@@ -13,6 +13,7 @@ from apply_narration_durations import generation_duration_for_target
 from story_agent import AgentContext, StoryAgent
 from story_project import init_project, project_paths, write_manifest
 from story_video_synthesizer.align import LineTiming
+from story_video_synthesizer.pipeline import SynthesisConfig, _render_video_segments
 
 
 class AdaptiveTimingTests(unittest.TestCase):
@@ -28,6 +29,40 @@ class AdaptiveTimingTests(unittest.TestCase):
         self.assertEqual(generation_duration_for_target(4.17, **kwargs), 5)
         self.assertEqual(generation_duration_for_target(0.01, **kwargs), 1)
         self.assertEqual(generation_duration_for_target(99.0, **kwargs), 15)
+
+    def test_discrete_provider_seconds_choose_nearest_and_fit_later(self) -> None:
+        kwargs = {
+            "duration_mode": "adaptive-seconds",
+            "min_generation_seconds": 6,
+            "max_generation_seconds": 10,
+            "generation_duration_choices": (6, 10),
+        }
+        self.assertEqual(generation_duration_for_target(6.1, **kwargs), 6)
+        self.assertEqual(generation_duration_for_target(7.99, **kwargs), 6)
+        self.assertEqual(generation_duration_for_target(8.0, **kwargs), 10)
+        self.assertEqual(generation_duration_for_target(12.5, **kwargs), 10)
+
+    def test_compositor_uses_the_complete_clip_with_uniform_speed_change(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "provider_10s.mp4"
+            source.write_bytes(b"fixture")
+            config = SynthesisConfig(
+                video_dir=root,
+                script_path=root / "script.txt",
+                narration_path=root / "voice.wav",
+                music_path=root / "music.mp3",
+                output_dir=root,
+            )
+            timing = LineTiming(1, "测试", 0.0, 6.5, 6.5, 0.0, 6.5)
+            with patch(
+                "story_video_synthesizer.pipeline.probe_duration", return_value=10.0
+            ), patch("story_video_synthesizer.pipeline.run_command") as run:
+                _render_video_segments([source], [timing], [6.5], root / "work", config)
+            command = run.call_args.args[0]
+            video_filter = command[command.index("-vf") + 1]
+            self.assertIn("trim=0:10.000", video_filter)
+            self.assertIn("setpts=0.65000000*(PTS-STARTPTS)", video_filter)
 
     def test_fixed_mode_keeps_existing_generation_duration(self) -> None:
         self.assertEqual(

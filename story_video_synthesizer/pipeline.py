@@ -500,12 +500,13 @@ def _render_video_segments(
         _progress(config, f"第 {timing.index} 个片段：{video_path.name} -> {target_duration:.1f}s")
         source_duration = probe_duration(video_path)
         output_path = work_dir / f"segment_{timing.index:03}.mp4"
-        if source_duration + 0.01 >= target_duration:
-            trim_duration = target_duration
-            timing_filter = f"trim=0:{trim_duration:.3f},setpts=PTS-STARTPTS"
-        else:
-            speed_ratio = target_duration / max(0.01, source_duration)
-            timing_filter = f"trim=0:{source_duration:.3f},setpts={speed_ratio:.8f}*(PTS-STARTPTS)"
+        if source_duration <= 0:
+            raise RuntimeError(f"无法读取图生视频时长：{video_path}")
+        # Use the complete provider clip and apply one uniform speed change.
+        # Grok 1.0 requests the nearest native 6s/10s duration, so this avoids
+        # both an abrupt tail cut and a visibly repeating motion loop.
+        speed_ratio = target_duration / source_duration
+        timing_filter = f"trim=0:{source_duration:.3f},setpts={speed_ratio:.8f}*(PTS-STARTPTS)"
 
         video_filter = (
             f"{timing_filter},"
@@ -663,15 +664,17 @@ def _overlay_semantic_cards(
     motion_paths: dict[str, Path] = {}
     if not allow_static_preview:
         request_path = card_dir / "semantic_card_motion_request.json"
-        if not request_path.is_file():
-            plan_sha256 = str(receipt.get("artifact_semantic_plan_sha256") or "")
-            if len(plan_sha256) != 64:
-                raise RuntimeError("片头/寓意卡微动缺少当前语义计划哈希")
-            write_semantic_card_motion_request(
-                card_dir=card_dir,
-                windows=windows,
-                artifact_semantic_plan_sha256=plan_sha256,
-            )
+        plan_sha256 = str(receipt.get("artifact_semantic_plan_sha256") or "")
+        if len(plan_sha256) != 64:
+            raise RuntimeError("片头/寓意卡微动缺少当前语义计划哈希")
+        # Rebuild deterministically from the real aligned audio windows.  A
+        # provisional/manual request must not lock production to a fake 4s/6s
+        # title duration.
+        write_semantic_card_motion_request(
+            card_dir=card_dir,
+            windows=windows,
+            artifact_semantic_plan_sha256=plan_sha256,
+        )
         motion_paths = load_semantic_card_motion_paths(
             request_path,
             card_dir / "semantic_card_motion_receipt.json",
@@ -684,13 +687,25 @@ def _overlay_semantic_cards(
             kind = str(window["card_kind"])
             if kind not in motion_paths:
                 raise RuntimeError(f"片头/寓意卡微动缺少输出：{kind}")
-            args.extend(["-stream_loop", "-1", "-i", str(motion_paths[kind])])
+            args.extend(["-i", str(motion_paths[kind])])
     current = "[0:v]"
     filters = []
     for offset, window in enumerate(windows, start=1):
         output = "[v]" if offset == len(windows) else f"[card{offset}]"
         card_label = f"[card_image{offset}]"
-        input_timeline = "" if allow_static_preview else "setpts=PTS-STARTPTS,"
+        if allow_static_preview:
+            input_timeline = ""
+        else:
+            kind = str(window["card_kind"])
+            source_duration = probe_duration(motion_paths[kind])
+            presentation_duration = max(0.001, float(window["end"]) - float(window["start"]))
+            if source_duration <= 0:
+                raise RuntimeError(f"无法读取片头/寓意卡微动时长：{kind}")
+            speed_ratio = presentation_duration / source_duration
+            input_timeline = (
+                f"trim=0:{source_duration:.3f},"
+                f"setpts={speed_ratio:.8f}*(PTS-STARTPTS)+{float(window['start']):.3f}/TB,"
+            )
         filters.append(
             f"[{offset}:v]{input_timeline}scale={config.width}:{config.height}:force_original_aspect_ratio=increase,"
             f"crop={config.width}:{config.height},setsar=1{card_label}"

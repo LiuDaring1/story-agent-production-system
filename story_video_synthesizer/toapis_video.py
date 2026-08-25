@@ -16,7 +16,10 @@ from story_video_synthesizer.volcengine_video import CreateTaskResult, QueryTask
 
 DEFAULT_BASE_URL = "https://toapis.com/v1"
 DEFAULT_MODEL = "grok-video-1.5"
+GROK_VIDEO_1_0_MODEL = "grok-video-1.0"
 DEFAULT_SECONDS = "8"
+GROK_VIDEO_1_0_DEFAULT_SECONDS = "6"
+GROK_VIDEO_1_0_SECONDS = {6, 10}
 MIN_SECONDS = 1
 MAX_SECONDS = 15
 DEFAULT_RESOLUTION = "720p"
@@ -78,16 +81,22 @@ def _normalize_prompt(model: str, value: Any) -> str:
 
 
 def _default_seconds_for_model(model: str) -> str:
-    return DEFAULT_SECONDS if model.strip().lower() == DEFAULT_MODEL else LEGACY_DEFAULT_SECONDS
+    normalized = model.strip().lower()
+    if normalized == DEFAULT_MODEL:
+        return DEFAULT_SECONDS
+    if normalized == GROK_VIDEO_1_0_MODEL:
+        return GROK_VIDEO_1_0_DEFAULT_SECONDS
+    return LEGACY_DEFAULT_SECONDS
 
 
 def _normalize_seconds(model: str, value: Any) -> str:
     if value is None or str(value).strip() == "":
         value = _default_seconds_for_model(model)
-    # Preserve the historical ToAPIs body contract for older models.  The
-    # strict one-to-fifteen integer validation is specific to grok-video-1.5;
-    # legacy callers may still pass provider-specific string values.
-    if model.strip().lower() != DEFAULT_MODEL:
+    normalized_model = model.strip().lower()
+    # Preserve opaque values only for genuinely legacy/unknown models. Grok
+    # Video 1.0 has a documented discrete duration contract and must fail
+    # before a paid request when a caller supplies anything except 6 or 10.
+    if normalized_model not in {DEFAULT_MODEL, GROK_VIDEO_1_0_MODEL}:
         return str(value)
     try:
         numeric = float(value)
@@ -96,7 +105,9 @@ def _normalize_seconds(model: str, value: Any) -> str:
     if not numeric.is_integer():
         raise ValueError(f"ToAPIs seconds 必须是整数（{MIN_SECONDS}–{MAX_SECONDS}）")
     seconds = int(numeric)
-    if model.strip().lower() == DEFAULT_MODEL and not MIN_SECONDS <= seconds <= MAX_SECONDS:
+    if normalized_model == GROK_VIDEO_1_0_MODEL and seconds not in GROK_VIDEO_1_0_SECONDS:
+        raise ValueError("grok-video-1.0 的 seconds 只能是 6 或 10 秒")
+    if normalized_model == DEFAULT_MODEL and not MIN_SECONDS <= seconds <= MAX_SECONDS:
         raise ValueError(f"grok-video-1.5 的 seconds 必须在 {MIN_SECONDS}–{MAX_SECONDS} 秒之间")
     return str(seconds)
 

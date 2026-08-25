@@ -1474,6 +1474,7 @@ class ExistingVideoGeneratorAdapter:
                 "multi_image_conditioning": False,
                 "min_duration": provider.min_seconds,
                 "max_duration": provider.max_seconds,
+                "duration_choices": provider.duration_choices,
                 "default_duration": provider.default_seconds,
                 "resolution": provider.default_resolution,
                 "ratio": provider.default_ratio,

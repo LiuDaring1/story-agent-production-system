@@ -10,7 +10,7 @@ from typing import Any, Mapping, Sequence
 MOTION_REQUEST_SCHEMA = "story-semantic-card-motion-request/v1"
 MOTION_RECEIPT_SCHEMA = "story-semantic-card-motion/v1"
 MOTION_PROMPT_VERSION = "story-semantic-card-motion-prompt/v1"
-MOTION_CLIP_SECONDS = 6.0
+MOTION_PROVIDER_SECONDS = (6.0, 10.0)
 MOTION_PROVIDER_SAFE_PROMPT_CHARS = 120
 MOTION_PROVIDER_RESOLUTION = "720p"
 
@@ -33,6 +33,18 @@ def semantic_card_motion_prompt() -> str:
         "变形、闪烁、位移、缩放或重绘。仅让光影、羽毛、麦穗、树叶、云雾等非文字元素"
         "轻微运动。不得新增人物、文字、Logo、水印或字幕，首尾衔接自然。"
     )
+
+
+def select_motion_provider_seconds(presentation_duration: float) -> float:
+    """Choose the nearest Grok 1.0 native duration for one card window.
+
+    Grok Video 1.0 exposes two exact duration choices.  On an exact tie the
+    longer clip wins, preserving more native temporal detail before the final
+    compositor applies a single uniform speed change.
+    """
+
+    target = max(0.5, float(presentation_duration))
+    return min(MOTION_PROVIDER_SECONDS, key=lambda seconds: (abs(seconds - target), -seconds))
 
 
 def _load_static_card_receipt(card_dir: Path) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
@@ -92,6 +104,7 @@ def write_semantic_card_motion_request(
         if not source.is_file() or file_sha256(source) != item.get("sha256"):
             raise RuntimeError(f"图生视频源图或哈希已失效：{kind}")
         presentation_duration = max(0.5, float(window["end"]) - float(window["start"]))
+        provider_duration = select_motion_provider_seconds(presentation_duration)
         cards.append(
             {
                 "card_kind": kind,
@@ -100,11 +113,13 @@ def write_semantic_card_motion_request(
                 "source_image_path": str(source),
                 "source_image_sha256": file_sha256(source),
                 "output_video_path": str(card_dir / f"{kind}_motion.mp4"),
-                # One short loopable provider clip is reused for the complete
-                # presentation window.  This avoids paying for a long host
-                # opening while still producing real non-static motion.
-                "required_duration_seconds": MOTION_CLIP_SECONDS,
+                # The provider clip is selected from Grok 1.0's exact 6/10s
+                # choices, then uniformly time-fitted to the real presentation
+                # window.  It is never repeated as a loop.
+                "required_duration_seconds": provider_duration,
                 "presentation_window_seconds": round(presentation_duration, 3),
+                "time_fit_policy": "uniform_setpts_to_presentation_window",
+                "loop_policy": "forbidden",
                 "requested_ratio": "16:9",
                 # The configured ToAPIs routes are native 720p. The final
                 # release compositor still encodes 1080p; requesting 1080p
@@ -136,7 +151,9 @@ def write_semantic_card_motion_request(
             [
                 "# 片头/寓意卡图生视频任务",
                 "",
+
                 "必须用当前正式图生视频 provider 执行，不得用缩放静态图或本地假动效冒充。",
+                "每张卡必须按请求中的 6 秒或 10 秒生成；合成时只允许整段统一变速贴合真实语音窗口，禁止循环。",
                 "每张卡最多首次生成加两轮定向修正。中文文字任一抽检帧不稳定都不得通过。",
                 f"机器请求：`{path}`",
                 f"完成后写入：`{card_dir / 'semantic_card_motion_receipt.json'}`",

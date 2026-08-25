@@ -3,7 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 
 class VideoProviderConfigError(ValueError):
@@ -18,24 +18,32 @@ def resolve_row_generation_seconds(
     min_seconds: float | None = None,
     max_seconds: float | None = None,
 ) -> str:
-    """Resolve a per-row whole-second request for Grok Video 1.5.
+    """Resolve a per-row provider-supported duration.
 
     The row's ``generation_duration`` wins over ``duration`` and the CLI/config
-    fallback.  Older providers deliberately keep their historical global
-    ``--seconds`` behavior, so this helper returns the fallback unchanged for
-    non-Grok models.
+    fallback. Grok Video 1.5 accepts a bounded whole-second range, while Grok
+    Video 1.0 accepts the discrete values 6 or 10 seconds. Older providers keep
+    their historical global ``--seconds`` behavior.
     """
 
-    if str(model).strip().lower() != "grok-video-1.5":
+    normalized_model = str(model).strip().lower()
+    if normalized_model not in {"grok-video-1.0", "grok-video-1.5"}:
         return str(fallback_seconds)
     raw = _first_nonempty_row_value(row, "generation_duration", "duration")
     value = fallback_seconds if raw is None else raw
     try:
         numeric = float(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"Grok Video 1.5 每镜 seconds 不是数字：{value!r}") from exc
+        raise ValueError(f"{model} 每镜 seconds 不是数字：{value!r}") from exc
     if not math.isfinite(numeric):
-        raise ValueError(f"Grok Video 1.5 每镜 seconds 不是有限数字：{value!r}")
+        raise ValueError(f"{model} 每镜 seconds 不是有限数字：{value!r}")
+    if normalized_model == "grok-video-1.0":
+        # The provider guide advertises two exact choices, not every integer in
+        # the 6–10 interval. Pick the closest native duration, preferring the
+        # longer clip on an exact tie so the compositor retains more temporal
+        # detail. Assembly then applies one uniform speed change to fit the
+        # narration window exactly; it never loops the generated motion.
+        return str(min((6, 10), key=lambda seconds: (abs(seconds - numeric), -seconds)))
     minimum = max(1, math.ceil(float(1 if min_seconds is None else min_seconds)))
     maximum = math.floor(float(15 if max_seconds is None else max_seconds))
     if maximum < minimum:
@@ -69,6 +77,7 @@ class VideoProviderAdapter:
     default_seconds: float | None = None
     min_seconds: float | None = None
     max_seconds: float | None = None
+    duration_choices: tuple[float, ...] = ()
     default_resolution: str = ""
     default_ratio: str = ""
 
@@ -146,6 +155,7 @@ def resolve_video_provider(config: dict[str, Any], root: Path, override: str = "
         default_seconds=_optional_float(raw.get("default_seconds")),
         min_seconds=_optional_float(raw.get("min_seconds")),
         max_seconds=_optional_float(raw.get("max_seconds")),
+        duration_choices=_optional_float_tuple(raw.get("duration_choices")),
         default_resolution=str(raw.get("default_resolution", "")).strip(),
         default_ratio=str(raw.get("default_ratio", "")).strip(),
     )
@@ -155,3 +165,14 @@ def _optional_float(value: Any) -> float | None:
     if value is None or value == "":
         return None
     return float(value)
+
+
+def _optional_float_tuple(value: Any) -> tuple[float, ...]:
+    if value is None or value == "":
+        return ()
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        raise VideoProviderConfigError("duration_choices 必须是数字数组")
+    choices = tuple(sorted({float(item) for item in value}))
+    if not choices or any(not math.isfinite(item) or item <= 0 for item in choices):
+        raise VideoProviderConfigError("duration_choices 必须是正的有限秒数")
+    return choices

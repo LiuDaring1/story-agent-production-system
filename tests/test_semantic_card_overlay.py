@@ -13,7 +13,7 @@ from story_video_synthesizer.pipeline import SynthesisConfig, _overlay_semantic_
 
 
 class SemanticCardOverlayTests(unittest.TestCase):
-    def test_six_second_provider_motion_loops_for_full_semantic_title_window(self) -> None:
+    def test_provider_motion_uniformly_slows_to_full_title_window_without_looping(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             card_dir = root / "cards"
@@ -40,6 +40,9 @@ class SemanticCardOverlayTests(unittest.TestCase):
             with patch(
                 "story_video_synthesizer.pipeline.load_semantic_card_motion_paths",
                 return_value={"title_card": motion},
+            ), patch(
+                "story_video_synthesizer.pipeline.probe_duration",
+                return_value=6.0,
             ), patch("story_video_synthesizer.pipeline.run_command") as run:
                 _overlay_semantic_cards(
                     root / "story.mp4",
@@ -50,10 +53,10 @@ class SemanticCardOverlayTests(unittest.TestCase):
                     config,
                 )
             command = run.call_args.args[0]
-            self.assertIn("-stream_loop", command)
-            self.assertEqual(command[command.index("-stream_loop") + 1], "-1")
+            self.assertNotIn("-stream_loop", command)
             filter_graph = command[command.index("-filter_complex") + 1]
             self.assertIn("between(t,0.000,10.200)", filter_graph)
+            self.assertIn("setpts=1.70000000*(PTS-STARTPTS)+0.000/TB", filter_graph)
 
 
 if __name__ == "__main__":

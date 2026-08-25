@@ -286,6 +286,11 @@ def main() -> None:
         type=float,
         help="adaptive-seconds 的供应商最大整数秒（默认 15）",
     )
+    timing.add_argument(
+        "--generation-duration-choices",
+        default="",
+        help="供应商离散秒数选项，例如 6,10；按真实镜头时长选最近值",
+    )
 
     generate = subparsers.add_parser("generate", help="调用视频 API 生成片段")
     generate.add_argument("--jobs-csv", required=True, type=Path)
@@ -704,6 +709,8 @@ def main() -> None:
                     str(args.max_generation_seconds),
                 ]
             )
+        if args.generation_duration_choices.strip():
+            command.extend(["--generation-duration-choices", args.generation_duration_choices])
         run_script("apply_narration_durations.py", *command)
     elif args.command == "generate":
         continuity_errors = validate_image_video_jobs(args.jobs_csv)

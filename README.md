@@ -489,20 +489,24 @@ python3 prepare_image_video_jobs.py \
 当前默认模型：
 
 ```text
-grok-video-3
+grok-video-1.0
 ```
 
-默认接口是 `https://toapis.com/v1/videos/generations`，横屏 `16:9`、720p，每次生成固定 10 秒。本地参考图会先上传到 `/v1/uploads/images`，再以 URL 提交异步视频任务。如果要让每个视频片段的时长贴合讲故事原声，先把旁白音频对齐到任务 CSV：
+默认接口是 `https://toapis.com/v1/videos/generations`，横屏 `16:9`、720p。Grok Video 1.0 的生成时长是精确两档 `6` 秒或 `10` 秒，不是 6–10 之间任意整数。本地参考图会先上传到 `/v1/uploads/images`，再以 URL 提交异步 I2V 任务。供应商文档虽列出 R2V，当前 Story Agent 适配器尚未实现 R2V 请求合同，不会静默切换。如果要让每个视频片段的时长贴合讲故事原声，先把旁白音频对齐到任务 CSV：
 
 ```bash
 python3 apply_narration_durations.py \
   --jobs-csv "/path/to/story_image_video_jobs/story-slug_image_video_jobs.csv" \
   --narration "/path/to/narration.mp3" \
   --whisper-model base \
-  --language zh
+  --language zh \
+  --duration-mode adaptive-seconds \
+  --min-generation-seconds 6 \
+  --max-generation-seconds 10 \
+  --generation-duration-choices 6,10
 ```
 
-脚本会把每个镜头的真实旁白秒数写入 `target_duration`，并把 API 生成时长按固定 10 秒写入 `generation_duration` 和 `effective_duration`。低于 10 秒的镜头会标记 `needs_trim=yes`，最终合成器会裁切；超过 10 秒的镜头会标记 `needs_slowdown=yes`，最终合成器会慢放匹配旁白长度。
+脚本会把每个镜头的真实旁白秒数写入 `target_duration`，在 `6/10` 中选最接近的原生生成时长写入 `generation_duration`（恰好 8 秒时选 10 秒）。最终合成器使用整段统一变速精确贴合旁白：素材较长时统一加速，较短时统一慢放；不裁掉动作尾部，也不循环重复。片头/寓意卡同样依据对齐后的真实音频窗口选 6 或 10 秒；超过 10 秒时使用 10 秒原生动效统一慢放，禁止循环。
 
 先把 API Key 放到环境变量，不要写进文件：
 

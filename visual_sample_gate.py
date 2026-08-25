@@ -749,6 +749,18 @@ def visual_sample_generation_jobs(
         and isinstance(supplemental.get("generation_strategy_by_sample"), Mapping)
         else {}
     )
+    retry_instructions = (
+        supplemental.get("retry_instruction_by_sample", {})
+        if isinstance(supplemental, Mapping)
+        and isinstance(supplemental.get("retry_instruction_by_sample"), Mapping)
+        else {}
+    )
+    rejected_references = (
+        supplemental.get("rejected_reference_asset_by_sample", {})
+        if isinstance(supplemental, Mapping)
+        and isinstance(supplemental.get("rejected_reference_asset_by_sample"), Mapping)
+        else {}
+    )
     visual_style = projection.get("visual_style", {})
     characters = projection.get("characters", {})
     world_scale = projection.get("world_scale", {})
@@ -777,6 +789,23 @@ def visual_sample_generation_jobs(
         if isinstance(requirement, Mapping) and requirement.get("kind") == "style_anchor"
         for value in requirement.get("content_refs", [])
     }
+    requirement_by_id = {
+        str(item.get("sample_id") or ""): item
+        for item in plan.get("requirements", [])
+        if isinstance(item, Mapping) and str(item.get("sample_id") or "")
+    }
+
+    def ready_reference(sample_id: str) -> dict[str, str] | None:
+        item = requirement_by_id.get(sample_id)
+        if not isinstance(item, Mapping) or not isinstance(item.get("asset"), Mapping):
+            return None
+        return {
+            "sample_id": sample_id,
+            "path": str(item["asset"].get("path") or item.get("expected_path") or ""),
+            "sha256": str(item["asset"].get("sha256") or ""),
+            "role": "approved_mother_sample",
+        }
+
     jobs: list[dict[str, Any]] = []
     for item in requirements:
         sample_id = str(item.get("sample_id") or "")
@@ -849,6 +878,46 @@ def visual_sample_generation_jobs(
                 ):
                     relevant_character_ids.add(character_id)
         relevant["characters"] = project_characters(relevant_character_ids)
+        reference_assets: list[dict[str, str]] = []
+        previous = rejected_references.get(sample_id)
+        if isinstance(previous, Mapping) and previous.get("path") and previous.get("sha256"):
+            reference_assets.append(
+                {
+                    "sample_id": sample_id,
+                    "path": str(previous["path"]),
+                    "sha256": str(previous["sha256"]),
+                    "role": "rejected_sample_for_targeted_edit",
+                }
+            )
+        dependency_sample_ids: list[str] = []
+        if kind == "scale_anchor" and sample_id != "style_anchor":
+            mother = ready_reference("style_anchor")
+            if mother is not None:
+                reference_assets.append(mother)
+            elif "style_anchor" in requirement_by_id:
+                dependency_sample_ids.append("style_anchor")
+        elif kind == "state_anchor":
+            refs = [str(value) for value in item.get("content_refs", [])]
+            machine_id = refs[0] if refs else ""
+            candidates = [
+                candidate
+                for candidate in plan.get("requirements", [])
+                if isinstance(candidate, Mapping)
+                and candidate.get("kind") == "state_anchor"
+                and str(candidate.get("sample_id") or "") != sample_id
+                and [str(value) for value in candidate.get("content_refs", [])][:1] == [machine_id]
+            ]
+            mother_row = next(
+                (candidate for candidate in candidates if isinstance(candidate.get("asset"), Mapping)),
+                candidates[0] if candidates else None,
+            )
+            if isinstance(mother_row, Mapping):
+                mother_id = str(mother_row.get("sample_id") or "")
+                mother = ready_reference(mother_id)
+                if mother is not None:
+                    reference_assets.append(mother)
+                elif mother_id:
+                    dependency_sample_ids.append(mother_id)
         jobs.append(
             {
                 "sample_id": sample_id,
@@ -856,6 +925,9 @@ def visual_sample_generation_jobs(
                 "expected_path": item.get("expected_path"),
                 "need_reason": item.get("need_reason"),
                 "strategy": str(strategies.get(sample_id) or "baseline_single_asset"),
+                "retry_instruction": str(retry_instructions.get(sample_id) or ""),
+                "reference_assets": reference_assets,
+                "dependency_sample_ids": dependency_sample_ids,
                 "relevant_contract": relevant,
             }
         )
@@ -940,7 +1012,20 @@ def write_visual_sample_supplemental_request(
                 requested.add(str(item.get("sample_id")))
     requested &= required_ids
     if not requested:
-        requested = required_ids
+        for field in ("p0_errors", "issues", "retry_instructions"):
+            rows = review.get(field, [])
+            if not isinstance(rows, list):
+                continue
+            requested.update(
+                str(item.get("sample_id") or "")
+                for item in rows
+                if isinstance(item, Mapping) and str(item.get("sample_id") or "") in required_ids
+            )
+    if not requested:
+        raise ValueError(
+            "independent visual review failed but did not identify retry_sample_ids; "
+            "refusing an unbounded all-sample retry"
+        )
     previous: dict[str, Any] = {}
     try:
         candidate = json.loads(paths["supplemental_request"].read_text(encoding="utf-8"))
@@ -985,6 +1070,20 @@ def write_visual_sample_supplemental_request(
             for sample_id in sorted(requested)
         }
     repeated_failure = fingerprint in previous_fingerprints
+    retry_instruction_by_sample: dict[str, str] = {}
+    instruction_rows = review.get("retry_instructions", [])
+    if isinstance(instruction_rows, list):
+        for item in instruction_rows:
+            if not isinstance(item, Mapping):
+                continue
+            sample_id = str(item.get("sample_id") or "")
+            instruction = str(item.get("instruction") or item.get("evidence") or "").strip()
+            if sample_id in requested and instruction:
+                retry_instruction_by_sample[sample_id] = instruction
+        if not retry_instruction_by_sample and len(instruction_rows) == len(requested):
+            for sample_id, instruction in zip(sorted(requested), instruction_rows):
+                if isinstance(instruction, str) and instruction.strip():
+                    retry_instruction_by_sample[sample_id] = instruction.strip()
     history.append(
         {
             "failed_attempt": failed_attempt_count,
@@ -1006,6 +1105,8 @@ def write_visual_sample_supplemental_request(
         "failure_fingerprint": fingerprint,
         "repeated_failure": repeated_failure,
         "generation_strategy_by_sample": strategy_by_sample,
+        "retry_instruction_by_sample": retry_instruction_by_sample,
+        "rejected_reference_asset_by_sample": {},
         "failure_history": history[-VISUAL_SAMPLE_MAX_ATTEMPTS:],
         "reason": (
             "independent_review_failed_change_strategy"
@@ -1014,6 +1115,70 @@ def write_visual_sample_supplemental_request(
         ),
     }
     return write_json_atomic(paths["supplemental_request"], payload)
+
+
+def enrich_visual_sample_supplemental_request(project_root: Path | str) -> Path | None:
+    """Bind retry instructions and the latest quarantined source image.
+
+    Review failure is recorded before rejected files are moved so the retry
+    receipt can survive a crash between those operations.  This idempotent
+    enrichment step is therefore called both immediately after quarantine and
+    again before the next generation attempt.
+    """
+
+    root = Path(project_root)
+    paths = visual_sample_paths(root)
+    try:
+        request = json.loads(paths["supplemental_request"].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(request, dict) or request.get("version") != 2:
+        return None
+    requested = {
+        str(value)
+        for value in request.get("sample_ids", [])
+        if isinstance(request.get("sample_ids"), list) and str(value)
+    }
+    if not requested:
+        return None
+    try:
+        review = json.loads(paths["review"].read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        review = {}
+    instructions = dict(request.get("retry_instruction_by_sample", {})) \
+        if isinstance(request.get("retry_instruction_by_sample"), Mapping) else {}
+    rows = review.get("retry_instructions", []) if isinstance(review, Mapping) else []
+    if isinstance(rows, list):
+        for item in rows:
+            if not isinstance(item, Mapping):
+                continue
+            sample_id = str(item.get("sample_id") or "")
+            instruction = str(item.get("instruction") or item.get("evidence") or "").strip()
+            if sample_id in requested and instruction:
+                instructions[sample_id] = instruction
+    references = dict(request.get("rejected_reference_asset_by_sample", {})) \
+        if isinstance(request.get("rejected_reference_asset_by_sample"), Mapping) else {}
+    rejected_root = paths["directory"] / "rejected"
+    for sample_id in sorted(requested):
+        existing = references.get(sample_id)
+        if isinstance(existing, Mapping):
+            candidate = root / str(existing.get("path") or "")
+            if candidate.is_file() and file_sha256(candidate) == existing.get("sha256"):
+                continue
+        candidates = sorted(
+            rejected_root.glob(f"*/{sample_id}.png"),
+            key=lambda item: item.stat().st_mtime,
+            reverse=True,
+        ) if rejected_root.is_dir() else []
+        if candidates:
+            candidate = candidates[0]
+            references[sample_id] = {
+                "path": _project_relative(candidate, root),
+                "sha256": file_sha256(candidate),
+            }
+    request["retry_instruction_by_sample"] = instructions
+    request["rejected_reference_asset_by_sample"] = references
+    return write_json_atomic(paths["supplemental_request"], request)
 
 
 def visual_sample_review_payload_issues(payload: Mapping[str, Any], plan: Mapping[str, Any]) -> list[str]:
@@ -1035,8 +1200,21 @@ def visual_sample_review_payload_issues(payload: Mapping[str, Any], plan: Mappin
         checks = adherence.get("checks")
         if isinstance(checks, list):
             for item in checks:
-                if isinstance(item, Mapping) and item.get("passed") is True and item.get("evidence"):
-                    actual_adherence.add(str(item.get("dimension") or ""))
+                if not isinstance(item, Mapping) or item.get("passed") is not True:
+                    continue
+                evidence = item.get("evidence") or item.get("observations") or item.get("conclusion")
+                if not evidence:
+                    continue
+                dimension = str(item.get("dimension") or "")
+                if dimension:
+                    actual_adherence.add(dimension)
+                relevant = item.get("relevant_contract")
+                contract_paths = relevant if isinstance(relevant, list) else [relevant]
+                for contract_path in contract_paths:
+                    value = str(contract_path or "")
+                    for name in ("visual_style", "characters", "world_scale", "story_state"):
+                        if value == name or f"contracts.{name}" in value:
+                            actual_adherence.add(name)
         if not expected_adherence.issubset(actual_adherence):
             issues.append("contract_adherence missing: " + ",".join(sorted(expected_adherence - actual_adherence)))
     issues.extend(product_quality_review_issues(payload.get("product_quality"), plan.get("review_profile", {})))
@@ -1045,7 +1223,9 @@ def visual_sample_review_payload_issues(payload: Mapping[str, Any], plan: Mappin
     covered = {
         str(item.get("sample_id"))
         for item in matrix
-        if isinstance(matrix, list) and isinstance(item, Mapping) and item.get("evidence")
+        if isinstance(matrix, list)
+        and isinstance(item, Mapping)
+        and (item.get("evidence") or item.get("observations") or item.get("conclusion"))
     } if isinstance(matrix, list) else set()
     if sample_ids - covered:
         issues.append("evidence_matrix missing samples: " + ",".join(sorted(sample_ids - covered)))
@@ -1109,6 +1289,7 @@ __all__ = [
     "VISUAL_SAMPLE_SCHEMA_PATH", "VISUAL_SAMPLE_SCHEMA_VERSION",
     "compile_product_quality_profile", "compile_visual_sample_plan", "load_current_visual_sample_plan",
     "product_quality_review_issues",
+    "enrich_visual_sample_supplemental_request",
     "validate_visual_sample_plan", "visual_sample_asset_paths", "visual_sample_binding",
     "visual_sample_generation_jobs",
     "visual_sample_lock_is_current", "visual_sample_machine_issues",

@@ -75,6 +75,7 @@ from artifact_semantic_plan import (
 )
 from visual_sample_gate import (
     ANATOMICAL_COHERENCE_REVIEW_RULE,
+    enrich_visual_sample_supplemental_request,
     load_current_visual_sample_plan,
     product_quality_review_issues,
     visual_sample_asset_paths,
@@ -2681,6 +2682,7 @@ class StoryAgent:
         if not self.context.execute:
             return StageResult("done", "dry-run：将优先复用合同预览，并只生成故事实际缺少的视觉小样。")
         try:
+            enrich_visual_sample_supplemental_request(self.context.project_dir)
             visual_design_port = self._modules().visual_design()
             plan_path = write_visual_sample_plan(self.context.project_dir, context, visual_design_port)
             plan = load_current_visual_sample_plan(self.context.project_dir, context, visual_design_port)
@@ -2709,6 +2711,9 @@ class StoryAgent:
                         "- style_anchor 同时作为风格与角色身份母版，不要再为每个角色分别画一张重复参考。",
                         "- 每个 state_anchor 必须是一张只呈现一个指定状态的独立图片；严禁把 F0～Fn 或所有状态挤在一张接触表里。",
                         "- strategy=targeted_regeneration 时只修审核指出的缺陷；strategy=single_state_single_asset 或 simplify_to_single_subject_contract_evidence 时必须减少同图约束并改变实现方法，禁止照搬上一轮提示词和版式。",
+                        "- retry_instruction 是本轮唯一返工范围；不得顺手重设计已经通过的部分。",
+                        "- reference_assets 必须作为 ImageGen 的真实图片输入使用，不能只读文字概括后丢弃原图。role=approved_mother_sample 用于锁定身份/实体；role=rejected_sample_for_targeted_edit 只用于保留正确部分并修掉已指出缺陷。",
+                        "- dependency_sample_ids 非空时，必须先生成依赖母版，再把新母版文件作为后续 ImageGen 的参考图；禁止并行独立抽奖。",
                         *( ["- 以下图片是用户确认的整体风格参考，必须用作 ImageGen 参考图，不复制具体角色：", *[f"  - `{path}`" for path in style_references]] if style_references else [] ),
                         "",
                         "## 身份扩展禁令",
@@ -2727,8 +2732,34 @@ class StoryAgent:
             )
             sample_prompt = (
                 "严格执行 handoff。使用 ImageGen 仅补齐其中列出的 supplemental_sample；"
+                "重试必须实际传入 reference_assets 或本轮 dependency_sample_ids 产出的母版图片；"
                 "不要修改合同、计划或正式故事图片。完成前逐文件确认可解码且路径精确。"
             )
+            reference_inputs: list[dict[str, Any]] = []
+            seen_reference_paths: set[str] = set()
+            for job in generation_jobs:
+                for reference in job.get("reference_assets", []):
+                    if not isinstance(reference, Mapping):
+                        continue
+                    value = str(reference.get("path") or "")
+                    path = Path(value)
+                    if not path.is_absolute():
+                        path = self.context.project_dir / path
+                    path_key = str(path)
+                    if (
+                        not path.is_file()
+                        or path_key in seen_reference_paths
+                        or file_sha256(path) != reference.get("sha256")
+                    ):
+                        continue
+                    seen_reference_paths.add(path_key)
+                    reference_inputs.append(
+                        {
+                            "role": str(reference.get("role") or "visual_sample_reference"),
+                            "path": path_key,
+                            "sha256": file_sha256(path),
+                        }
+                    )
             result = self._execute_image_generation(
                 artifact_id="visual-samples-supplemental",
                 operation="generate_visual_samples",
@@ -2746,6 +2777,7 @@ class StoryAgent:
                         {"role": "approved_style_reference", "path": str(path), "sha256": file_sha256(path)}
                         for path in style_references
                     ),
+                    *reference_inputs,
                 ),
                 attempt_id=f"visual-samples-attempt-{int(manifest.get('agent', {}).get('stages', {}).get('visual_samples', {}).get('attempts', 0))}",
             )
@@ -2828,6 +2860,7 @@ class StoryAgent:
                         if source.is_file():
                             quarantine.mkdir(parents=True, exist_ok=True)
                             shutil.move(str(source), str(quarantine / source.name))
+                    enrich_visual_sample_supplemental_request(self.context.project_dir)
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
                 pass
         message = "视觉小样审核未通过"

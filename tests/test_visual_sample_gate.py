@@ -40,9 +40,11 @@ from visual_sample_gate import (
     P0_CATEGORIES,
     VISUAL_SAMPLE_SCHEMA_PATH,
     compile_visual_sample_plan,
+    enrich_visual_sample_supplemental_request,
     load_current_visual_sample_plan,
     validate_visual_sample_plan,
     visual_sample_binding,
+    visual_sample_generation_jobs,
     visual_sample_lock_is_current,
     visual_sample_paths,
     visual_sample_review_payload_issues,
@@ -477,6 +479,111 @@ class VisualSampleGateTests(unittest.TestCase):
             self.assertEqual(third["failed_attempt_count"], 3)
             self.assertFalse(agent._can_retry_visual_sample_review(third))
 
+    def test_rich_review_evidence_shape_is_accepted_without_protocol_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, _manifest, _agent, context = _fixture(Path(directory), preview_kinds=())
+            plan = _ready_plan(project, context)
+            review = _passing_review(plan, visual_sample_paths(project)["plan"])
+            contract_path_by_dimension = {
+                "visual_style": "contracts.visual_style",
+                "characters": "contracts.characters",
+                "world_scale": "contracts.world_scale.relationships[0]",
+                "story_state": "contracts.story_state.machines[0].states[0]",
+            }
+            review["contract_adherence"]["checks"] = [
+                {
+                    "sample_id": plan["requirements"][0]["sample_id"],
+                    "relevant_contract": contract_path_by_dimension[dimension],
+                    "passed": True,
+                    "evidence": f"bound evidence for {dimension}",
+                }
+                for dimension in plan["review_profile"]["contract_adherence"]
+            ]
+            review["evidence_matrix"] = [
+                {
+                    "sample_id": item["sample_id"],
+                    "observations": ["file opened and inspected"],
+                    "conclusion": "sample passes its scoped contract",
+                }
+                for item in plan["requirements"]
+            ]
+            self.assertEqual(visual_sample_review_payload_issues(review, plan), [])
+
+    def test_retry_uses_quarantined_image_and_approved_mother_references(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, _manifest, _agent, context = _fixture(Path(directory), preview_kinds=())
+            plan = _ready_plan(project, context)
+            paths = visual_sample_paths(project)
+            write_visual_sample_machine_qa(project, plan)
+            write_review_bundle(
+                paths["bundle"],
+                [paths["plan"], paths["machine_qa"], context, *[project / item["expected_path"] for item in plan["requirements"]]],
+            )
+            style_id = "style_anchor"
+            scale_id = "scale_anchor"
+            states = [item for item in plan["requirements"] if item["kind"] == "state_anchor"]
+            base_state_id = states[0]["sample_id"]
+            retry_state_ids = [item["sample_id"] for item in states[1:]]
+            retry_ids = [style_id, scale_id, *retry_state_ids]
+            review = _passing_review(plan, paths["bundle"])
+            review.update(
+                approved=False,
+                score=78,
+                p0_errors=[{"sample_id": style_id, "category": "unsupported_identity_feature"}],
+                retry_sample_ids=retry_ids,
+                retry_instructions=[
+                    {"sample_id": sample_id, "instruction": f"repair only {sample_id}"}
+                    for sample_id in retry_ids
+                ],
+            )
+            save_json(paths["review"], review)
+            write_visual_sample_supplemental_request(project, plan, review)
+            rejected = paths["directory"] / "rejected" / "fixture-attempt"
+            rejected.mkdir(parents=True)
+            by_id = {item["sample_id"]: item for item in plan["requirements"]}
+            for sample_id in retry_ids:
+                source = project / by_id[sample_id]["expected_path"]
+                source.replace(rejected / source.name)
+            enrich_visual_sample_supplemental_request(project)
+            retry_plan = compile_visual_sample_plan(project, context)
+            missing = [item for item in retry_plan["requirements"] if not isinstance(item.get("asset"), dict)]
+            projection = json.loads(context.read_text(encoding="utf-8"))["contract_projection"]
+            jobs = visual_sample_generation_jobs(retry_plan, projection, missing)
+            jobs_by_id = {item["sample_id"]: item for item in jobs}
+            self.assertEqual(set(jobs_by_id), set(retry_ids))
+            self.assertEqual(jobs_by_id[style_id]["retry_instruction"], f"repair only {style_id}")
+            self.assertIn(
+                "rejected_sample_for_targeted_edit",
+                {item["role"] for item in jobs_by_id[style_id]["reference_assets"]},
+            )
+            self.assertIn(style_id, jobs_by_id[scale_id]["dependency_sample_ids"])
+            for sample_id in retry_state_ids:
+                references = jobs_by_id[sample_id]["reference_assets"]
+                self.assertIn(base_state_id, {item["sample_id"] for item in references})
+                self.assertIn("approved_mother_sample", {item["role"] for item in references})
+
+    def test_review_without_retry_scope_never_defaults_to_all_samples(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, _manifest, _agent, context = _fixture(Path(directory), preview_kinds=())
+            plan = _ready_plan(project, context)
+            paths = visual_sample_paths(project)
+            write_visual_sample_machine_qa(project, plan)
+            write_review_bundle(
+                paths["bundle"],
+                [paths["plan"], paths["machine_qa"], context, *[project / item["expected_path"] for item in plan["requirements"]]],
+            )
+            review = _passing_review(plan, paths["bundle"])
+            review.update(
+                approved=False,
+                score=70,
+                retry_sample_ids=[],
+                retry_instructions=[],
+                issues=["unspecified failure"],
+            )
+            save_json(paths["review"], review)
+            with self.assertRaisesRegex(ValueError, "refusing an unbounded all-sample retry"):
+                write_visual_sample_supplemental_request(project, plan, review)
+
     def test_environment_only_relationships_do_not_multiply_scale_reference_images(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -519,6 +626,7 @@ class VisualSampleGateTests(unittest.TestCase):
             self.assertEqual(
                 captured["prompt"],
                 "严格执行 handoff。使用 ImageGen 仅补齐其中列出的 supplemental_sample；"
+                "重试必须实际传入 reference_assets 或本轮 dependency_sample_ids 产出的母版图片；"
                 "不要修改合同、计划或正式故事图片。完成前逐文件确认可解码且路径精确。",
             )
             self.assertEqual(captured["handoff"], visual_sample_paths(project)["handoff"])

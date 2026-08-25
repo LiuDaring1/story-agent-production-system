@@ -38,6 +38,7 @@ from story_contract_runtime import (
     legacy_passthrough_allowed,
     locked_contract_binding,
     mark_contract_consumer_completed,
+    normalize_contract_policy_provenance,
     write_contract_lock,
     write_contract_consumer_context,
     write_trusted_input_chain,
@@ -303,6 +304,30 @@ class StoryContractRuntimeTests(unittest.TestCase):
             self.assertEqual(resolved["label"], "3D卡通")
             self.assertIn("圆润可爱的角色比例", resolved["prompt"])
             self.assertIn("材质细腻但不过度真实", resolved["prompt"])
+
+    def test_runtime_downgrades_story_routing_and_composite_brand_policy_provenance(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            paths = contract_paths(project)
+            chain = build_trusted_input_chain(project, manifest, load_config())
+            contract = _runtime_valid_contract(project, manifest)
+            task = next(item for item in chain["sources"] if item["source"] == "task_input")
+            contract["contracts"]["semantic_artifacts"]["mappings"][0]["provenance"] = {
+                "source": "task_input",
+                "source_ref": task["source_ref"],
+                "source_sha256": task["sha256"],
+                "evidence_quote": "通用测试故事",
+            }
+            save_json(paths["contract"], contract)
+
+            changes = normalize_contract_policy_provenance(paths["contract"], chain)
+
+            self.assertGreaterEqual(len(changes), 2)
+            updated = json.loads(paths["contract"].read_text(encoding="utf-8"))
+            mapping = updated["contracts"]["semantic_artifacts"]["mappings"][0]
+            self.assertEqual(mapping["provenance"]["source"], "agent_inference")
+            asset = updated["contracts"]["brand"]["assets"][0]
+            self.assertEqual(asset["provenance"]["source"], "agent_inference")
 
     def test_independent_review_hash_binds_and_runtime_lock_invalidates_on_tamper(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

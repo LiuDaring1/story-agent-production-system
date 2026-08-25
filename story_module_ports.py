@@ -17,7 +17,7 @@ PRODUCT_PACKAGE_PORT_VERSION = "story-product-package-port/v1"
 COMPOSITOR_PORT_VERSION = "story-compositor-port/v1"
 RELEASE_LAYOUT_PORT_VERSION = "story-release-layout-port/v1"
 PUBLISH_ASSET_PORT_VERSION = "story-publish-asset-port/v1"
-STORY_SEMANTICS_COMPILER_VERSION = "story-semantics-classifier/v1"
+STORY_SEMANTICS_COMPILER_VERSION = "story-semantics-classifier/v2"
 STORY_SEMANTIC_KINDS = frozenset(
     {"title", "host_intro", "story_announcement", "story_body", "moral", "outro"}
 )

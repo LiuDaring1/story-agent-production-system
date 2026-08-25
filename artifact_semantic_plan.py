@@ -39,6 +39,7 @@ ACTIONS = frozenset({"include", "exclude", "visual_substitute"})
 SUBTITLE_POLICIES = frozenset({"show", "hide", "inherit"})
 PROVENANCE_SOURCES = frozenset({"task_input", "project_config", "brand_or_global_default", "agent_inference"})
 CARD_KINDS = {"title": "title_card", "moral": "moral_card"}
+RUNTIME_DEFAULT_MAPPING_SOURCE = "artifact-semantic-mapping-default/v1"
 
 
 def semantic_kinds_in_source(
@@ -73,16 +74,17 @@ def semantic_kinds_in_source(
     return tuple(dict.fromkeys(kind_by_line[index] for index in range(1, len(lines) + 1)))
 
 
-def complete_missing_semantic_mappings(
+def reconcile_semantic_mappings(
     contract_path: Path | str,
     semantic_source: Path | str,
     semantics_port: StorySemanticsPort | None = None,
-) -> list[dict[str, Any]]:
-    """Append only absent required mappings using a fixed runtime policy.
+) -> dict[str, Any]:
+    """Reconcile Runtime-owned defaults with the actual semantic source.
 
-    Existing producer choices remain untouched.  The function owns only the
-    repetitive cross product required by the downstream compiler, preventing a
-    language model omission from surviving a high-scoring contract review.
+    Existing producer choices remain untouched.  Only Runtime-generated
+    defaults are removed when a classifier correction proves that their kind
+    is absent.  The repetitive cross product is then completed deterministically,
+    preventing both missing mappings and stale false-positive card mappings.
     """
 
     target = Path(contract_path)
@@ -96,6 +98,23 @@ def complete_missing_semantic_mappings(
         semantics_port,
         story_id=str(contract.get("story", {}).get("story_id") or ""),
     )
+    kind_set = set(kinds)
+    removed: list[dict[str, Any]] = []
+    retained: list[dict[str, Any]] = []
+    for raw in mappings:
+        provenance = raw.get("provenance") if isinstance(raw, Mapping) else None
+        runtime_default = (
+            isinstance(provenance, Mapping)
+            and provenance.get("source") == "agent_inference"
+            and provenance.get("source_ref") == RUNTIME_DEFAULT_MAPPING_SOURCE
+        )
+        if runtime_default and str(raw.get("semantic_kind") or "") not in kind_set:
+            removed.append(dict(raw))
+            continue
+        retained.append(raw)
+    if removed:
+        mappings[:] = retained
+
     existing: set[tuple[str, str]] = set()
     for raw in mappings:
         if not isinstance(raw, Mapping):
@@ -118,7 +137,7 @@ def complete_missing_semantic_mappings(
                 "subtitle_policy": "show" if artifact.endswith("subtitles") else "inherit",
                 "provenance": {
                     "source": "agent_inference",
-                    "source_ref": "artifact-semantic-mapping-default/v1",
+                    "source_ref": RUNTIME_DEFAULT_MAPPING_SOURCE,
                 },
             }
             if artifact == "background_visual" and kind in CARD_KINDS:
@@ -138,9 +157,25 @@ def complete_missing_semantic_mappings(
             mappings.append(mapping)
             added.append(mapping)
             existing.add((kind, artifact))
-    if added:
+    if added or removed:
         write_json_atomic(target, contract)
-    return added
+    return {
+        "semantic_kinds": list(kinds),
+        "added_mappings": added,
+        "removed_mappings": removed,
+    }
+
+
+def complete_missing_semantic_mappings(
+    contract_path: Path | str,
+    semantic_source: Path | str,
+    semantics_port: StorySemanticsPort | None = None,
+) -> list[dict[str, Any]]:
+    """Backward-compatible wrapper returning only newly added mappings."""
+
+    return list(
+        reconcile_semantic_mappings(contract_path, semantic_source, semantics_port)["added_mappings"]
+    )
 
 
 def semantic_plan_path(project_root: Path | str) -> Path:

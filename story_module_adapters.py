@@ -72,7 +72,7 @@ from video_provider_adapter import VideoProviderAdapter, resolve_row_generation_
 VIDEO_ADAPTER_VERSION = "story-existing-video-adapter/v1"
 KEYER_ADAPTER_VERSION = "story-production-ffmpeg-keyer/v1"
 VIDEO_BATCH_INVOCATION_VERSION = "story-video-batch-invocation/v1"
-STORY_SEMANTICS_ADAPTER_VERSION = "story-existing-semantics-adapter/v1"
+STORY_SEMANTICS_ADAPTER_VERSION = "story-existing-semantics-adapter/v2"
 VISUAL_DESIGN_ADAPTER_VERSION = "story-approved-contract-visual-design-adapter/v1"
 IMAGE_GENERATOR_ADAPTER_VERSION = "story-codex-imagegen-adapter/v1"
 MUSIC_PROVIDER_ADAPTER_VERSION = "story-suno-browser-adapter/v1"

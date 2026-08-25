@@ -300,7 +300,10 @@ _MORAL_START_RE = re.compile(
     r"|道理(?:是|告诉我们)"
     r"|我们(?:要|应该|需要|一定要|不能|不要|得学会|要学会)"
     r"|做人(?:要|应该|不能|不要)"
-    r"|(?:不要|不能|一定要|要学会|要懂得|要|应该|需要|记住|明白)"
+    # A bare ``不能`` is commonly a narrative predicate (for example
+    # ``腿跛了 / 不能跑跳``), not an audience-facing lesson.  Keep it only in
+    # the explicit ``我们不能`` / ``做人不能`` branches above.
+    r"|(?:不要|一定要|要学会|要懂得|要|应该|需要|记住|明白)"
     r")"
 )
 _MORAL_CONTRAST_RE = re.compile(

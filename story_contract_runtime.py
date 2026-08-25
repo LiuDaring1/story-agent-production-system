@@ -222,6 +222,91 @@ def defer_contract_visual_samples(contract_path: Path, receipt_path: Path) -> Pa
     return receipt_path
 
 
+def normalize_contract_policy_provenance(
+    contract_path: Path,
+    trusted_inputs: Mapping[str, Any],
+) -> list[dict[str, Any]]:
+    """Downgrade composite policy claims that their evidence cannot prove.
+
+    Narrative text can prove that a semantic kind exists, but it cannot prove
+    how every product should route that kind.  Likewise, a configuration value
+    containing only a Logo path cannot prove usage limits stored on the same
+    composite asset object.  These are deterministic Runtime policies and must
+    be labelled as inference instead of borrowing elevated source priority.
+    """
+
+    payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    changes: list[dict[str, Any]] = []
+
+    mappings = payload.get("contracts", {}).get("semantic_artifacts", {}).get("mappings", [])
+    if isinstance(mappings, list):
+        for index, mapping in enumerate(mappings):
+            if not isinstance(mapping, dict):
+                continue
+            provenance = mapping.get("provenance")
+            if not isinstance(provenance, Mapping):
+                continue
+            if (
+                provenance.get("source") == "task_input"
+                and provenance.get("source_ref") == "task_input.story_text"
+            ):
+                mapping["provenance"] = {
+                    "source": "agent_inference",
+                    "source_ref": "runtime-semantic-routing-policy/v1",
+                }
+                changes.append(
+                    {
+                        "path": f"/contracts/semantic_artifacts/mappings/{index}/provenance",
+                        "reason": "story text proves content, not product routing policy",
+                    }
+                )
+
+    source_receipts = {
+        (str(item.get("source") or ""), str(item.get("source_ref") or "")): item
+        for item in trusted_inputs.get("sources", [])
+        if isinstance(item, Mapping)
+    }
+    assets = payload.get("contracts", {}).get("brand", {}).get("assets", [])
+    if isinstance(assets, list):
+        for index, asset in enumerate(assets):
+            if not isinstance(asset, dict):
+                continue
+            provenance = asset.get("provenance")
+            if not isinstance(provenance, Mapping) or provenance.get("source") == "agent_inference":
+                continue
+            receipt = source_receipts.get(
+                (str(provenance.get("source") or ""), str(provenance.get("source_ref") or ""))
+            )
+            evidence: Any = None
+            if isinstance(receipt, Mapping):
+                try:
+                    evidence = _resolve_runtime_json_pointer(
+                        receipt.get("json"), str(provenance.get("evidence_pointer") or "")
+                    )
+                except (KeyError, IndexError, TypeError, ValueError):
+                    evidence = None
+            policy_supported = (
+                isinstance(evidence, Mapping)
+                and evidence.get("allowed_uses") == asset.get("allowed_uses")
+                and evidence.get("max_per_frame") == asset.get("max_per_frame")
+            )
+            if not policy_supported:
+                asset["provenance"] = {
+                    "source": "agent_inference",
+                    "source_ref": "runtime-brand-asset-usage-policy/v1",
+                }
+                changes.append(
+                    {
+                        "path": f"/contracts/brand/assets/{index}/provenance",
+                        "reason": "asset pointer does not prove composite usage policy",
+                    }
+                )
+
+    if changes:
+        save_json(contract_path, payload)
+    return changes
+
+
 def contract_runtime_issues(project_root: Path | str) -> list[str]:
     root = Path(project_root)
     paths = contract_paths(root)
@@ -913,6 +998,23 @@ def _json_sha256(value: Any) -> str:
     return hashlib.sha256(canonical_json_bytes(value)).hexdigest()
 
 
+def _resolve_runtime_json_pointer(value: Any, pointer: str) -> Any:
+    if pointer == "":
+        return value
+    if not pointer.startswith("/"):
+        raise ValueError("JSON pointer must start with '/'")
+    current = value
+    for raw in pointer[1:].split("/"):
+        token = raw.replace("~1", "/").replace("~0", "~")
+        if isinstance(current, Mapping):
+            current = current[token]
+        elif isinstance(current, list):
+            current = current[int(token)]
+        else:
+            raise TypeError("JSON pointer traversed a scalar")
+    return current
+
+
 __all__ = [
     "CONTRACT_POLICY_LEGACY",
     "CONTRACT_POLICY_REQUIRED",
@@ -937,6 +1039,7 @@ __all__ = [
     "legacy_eligibility_receipt",
     "legacy_passthrough_allowed",
     "mark_contract_consumer_completed",
+    "normalize_contract_policy_provenance",
     "locked_contract_binding",
     "write_contract_lock",
     "write_contract_consumer_context",

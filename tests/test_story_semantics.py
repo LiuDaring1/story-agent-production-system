@@ -107,6 +107,22 @@ class StorySemanticsTests(unittest.TestCase):
         self.assertEqual(semantics.kind_at(1), SemanticKind.STORY_BODY)
         self.assertEqual(semantics.kind_at(2), SemanticKind.MORAL)
 
+    def test_narrative_inability_near_story_end_is_not_promoted_to_moral(self) -> None:
+        source = [
+            "最后只剩一片青花瓣了。",
+            "珍妮想，最后一片得做一件有意义的事。",
+            "这时她看见门口坐着个小男孩。",
+            "腿却跛了。",
+            "不能跑跳。",
+            "珍妮小心地撕下青花瓣。",
+            "小男孩立刻站了起来，高兴地跑啊跳啊。",
+            "珍妮也感受到了真正的快乐。",
+        ]
+
+        semantics = classify_story(source)
+
+        self.assertTrue(all(semantics.kind_at(index) == SemanticKind.STORY_BODY for index in range(1, 9)))
+
 
 if __name__ == "__main__":
     unittest.main()

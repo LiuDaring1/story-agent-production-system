@@ -17,6 +17,7 @@ from artifact_semantic_plan import (
     load_current_artifact_semantic_plan,
     plan_binding,
     presentation_windows,
+    reconcile_semantic_mappings,
     schema_python_parity,
     selected_line_indices,
     semantic_plan_path,
@@ -224,10 +225,13 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             _lock_contract(project, manifest, contract_payload=contract)
         contract = _contract(project, manifest, ("story_body",))
-        contract["contracts"]["semantic_artifacts"]["mappings"].pop()
         _agent, _ = _lock_contract(project, manifest, contract_payload=contract)
+        # Normal production now reconciles mappings before review.  A changed
+        # classifier result presented directly to the compiler must still fail
+        # closed instead of inventing an unreviewed policy downstream.
+        unexpected_kind = MockStorySemanticsAdapter(kinds=("moral",))
         with self.assertRaisesRegex(ValueError, "missing required semantic mapping"):
-            compile_artifact_semantic_plan(project, source)
+            compile_artifact_semantic_plan(project, source, unexpected_kind)
 
     def test_mutual_exclusion_and_first_last_windows(self) -> None:
         temporary, project, _manifest, source, _agent = self._fixture()
@@ -289,6 +293,9 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
         self.assertFalse(plan["pre_roll_diagnostic"]["suspected"])
 
     def test_runtime_completes_only_missing_mapping_pairs_before_review(self) -> None:
+        from story_contract_runtime import contract_paths
+        from story_project import save_json
+
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         project, manifest = _new_project(Path(temporary.name))
@@ -303,7 +310,8 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
         from story_project import project_paths, write_manifest
         write_manifest(project_paths(project), manifest)
         contract = _contract(project, manifest, ("story_body",))
-        _agent, paths = _lock_contract(project, manifest, contract_payload=contract)
+        paths = contract_paths(project)
+        save_json(paths["contract"], contract)
         fake = MockStorySemanticsAdapter(
             kinds=("host_intro", "story_announcement", "story_body", "moral")
         )
@@ -328,6 +336,31 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
         self.assertEqual(
             {item["card_kind"] for item in plan["visual_cards"]},
             {"title_card", "moral_card"},
+        )
+
+    def test_runtime_removes_only_stale_runtime_default_kinds(self) -> None:
+        from story_contract_runtime import contract_paths
+        from story_project import save_json
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        project, manifest = _new_project(Path(temporary.name))
+        source = Path(manifest["inputs"]["story_text"])
+        source.write_text("主角走进森林。\n不要只注重外表。\n", encoding="utf-8")
+        contract = _contract(project, manifest, ("story_body",))
+        paths = contract_paths(project)
+        save_json(paths["contract"], contract)
+        with_moral = MockStorySemanticsAdapter(kinds=("story_body", "moral"))
+        first = reconcile_semantic_mappings(paths["contract"], source, with_moral)
+        self.assertEqual(len(first["added_mappings"]), 7)
+
+        without_moral = MockStorySemanticsAdapter(kinds=("story_body", "story_body"))
+        second = reconcile_semantic_mappings(paths["contract"], source, without_moral)
+        self.assertEqual(len(second["removed_mappings"]), 7)
+        updated = json.loads(paths["contract"].read_text(encoding="utf-8"))
+        self.assertEqual(
+            {item["semantic_kind"] for item in updated["contracts"]["semantic_artifacts"]["mappings"]},
+            {"story_body"},
         )
 
     def test_storyboard_plan_requires_semantic_plan_binding(self) -> None:

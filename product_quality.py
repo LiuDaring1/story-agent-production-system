@@ -15,7 +15,9 @@ from PIL import Image
 
 from artifact_semantic_plan import plan_binding, selected_line_indices
 from product_text_projection import (
+    ANNOTATION_TEXT_TRANSFORM_VERSION,
     PUBLIC_TEXT_TRANSFORM_VERSION,
+    compile_annotation_story_lines,
     compile_public_story_lines,
     public_line_list_sha256,
 )
@@ -24,7 +26,7 @@ from product_text_projection import (
 PRODUCT_CONTENT_SCHEMA_VERSION = "story-product-content/v2"
 PRODUCT_CONTENT_COMPILER_VERSION = "2.0.0"
 PRODUCT_TIMING_COMPILER_VERSION = "story-product-timing/v1"
-PPT_RENDER_MANIFEST_VERSION = "story-ppt-render/v1"
+PPT_RENDER_MANIFEST_VERSION = "story-ppt-render/v2"
 ANNOTATION_RECEIPT_VERSION = "story-reading-annotation/v1"
 PRODUCT_PACKAGE_MANIFEST_VERSION = "story-product-package/v1"
 
@@ -102,10 +104,12 @@ def _normalise_public(text: str) -> str:
     return re.sub(r"\s+", "", text).strip()
 
 
-def _public_text_issues(text: str, *, prefix: str) -> list[str]:
+def _public_text_issues(text: str, *, prefix: str, allow_identity_placeholder: bool = False) -> list[str]:
     issues: list[str] = []
     lowered = text.lower()
     for token in FORBIDDEN_PUBLIC_TOKENS:
+        if allow_identity_placeholder and token == "____":
+            continue
         if token.lower() in lowered:
             issues.append(f"{prefix}_forbidden_token:{token}")
     if PRESENTER_IDENTITY_PATTERN.search(text):
@@ -148,6 +152,7 @@ def compile_product_content_manifest(
     if not timings_source.is_file():
         raise ValueError("required_v1 product content requires a formal timings source")
     public_lines = compile_public_story_lines(raw_source_lines)
+    annotation_lines = compile_annotation_story_lines(raw_source_lines)
     if source_lines != public_lines:
         raise ValueError("public source lines do not match the deterministic public-text projection")
     try:
@@ -164,11 +169,12 @@ def compile_product_content_manifest(
     selection_payload: dict[str, Any] = {}
     for artifact, indices in selections.items():
         rows: list[dict[str, Any]] = []
+        artifact_lines = annotation_lines if artifact == "reading_annotation" else source_lines
         for index in indices:
             row: dict[str, Any] = {
                 "source_line_index": index,
-                "text": source_lines[index],
-                "text_sha256": stable_sha256(source_lines[index]),
+                "text": artifact_lines[index],
+                "text_sha256": stable_sha256(artifact_lines[index]),
             }
             if artifact == "ppt":
                 row["image_path"] = str(images[index])
@@ -199,6 +205,11 @@ def compile_product_content_manifest(
             "transform_version": PUBLIC_TEXT_TRANSFORM_VERSION,
             "line_count": len(public_lines),
             "normalized_line_list_sha256": public_line_list_sha256(public_lines),
+        },
+        "annotation_text_projection": {
+            "transform_version": ANNOTATION_TEXT_TRANSFORM_VERSION,
+            "line_count": len(annotation_lines),
+            "normalized_line_list_sha256": public_line_list_sha256(annotation_lines),
         },
         "timings_source": {
             "path": str(timings_source),
@@ -249,6 +260,7 @@ def product_content_manifest_issues(
         if payload.get("semantic_source", {}).get("line_count") != len(raw_source_lines):
             issues.append("product_content_semantic_source_line_count_mismatch")
         source_lines = compile_public_story_lines(raw_source_lines)
+        annotation_lines = compile_annotation_story_lines(raw_source_lines)
         projection = payload.get("public_text_projection", {})
         if projection.get("transform_version") != PUBLIC_TEXT_TRANSFORM_VERSION:
             issues.append("product_content_public_transform_version_stale")
@@ -256,6 +268,13 @@ def product_content_manifest_issues(
             issues.append("product_content_public_line_count_mismatch")
         if projection.get("normalized_line_list_sha256") != public_line_list_sha256(source_lines):
             issues.append("product_content_public_projection_stale")
+        annotation_projection = payload.get("annotation_text_projection", {})
+        if annotation_projection.get("transform_version") != ANNOTATION_TEXT_TRANSFORM_VERSION:
+            issues.append("product_content_annotation_transform_version_stale")
+        if annotation_projection.get("line_count") != len(annotation_lines):
+            issues.append("product_content_annotation_line_count_mismatch")
+        if annotation_projection.get("normalized_line_list_sha256") != public_line_list_sha256(annotation_lines):
+            issues.append("product_content_annotation_projection_stale")
     timing_binding = payload.get("timings_source", {})
     timing_path = Path(str(timing_binding.get("path") or "")) if isinstance(timing_binding, dict) else Path()
     if not timing_path.is_file() or timing_binding.get("sha256") != file_sha256(timing_path):
@@ -305,7 +324,8 @@ def product_content_manifest_issues(
             else:
                 if selection.get("source_line_indices") != expected_indices:
                     issues.append(f"product_content_selection_indices_stale:{artifact}")
-                expected_rows = [(index, source_lines[index]) for index in expected_indices]
+                artifact_lines = annotation_lines if artifact == "reading_annotation" else source_lines
+                expected_rows = [(index, artifact_lines[index]) for index in expected_indices]
                 actual_rows = [
                     (row.get("source_line_index"), str(row.get("text") or ""))
                     for row in rows if isinstance(row, dict)
@@ -462,7 +482,9 @@ def annotation_receipt_issues(receipt_path: Path) -> list[str]:
             public_block_text = "\n".join(
                 [str(block.get("marked_text") or ""), *(str(note) for note in block.get("notes", []) if note)]
             )
-            issues.extend(_public_text_issues(public_block_text.replace("**", ""), prefix="annotation"))
+            issues.extend(_public_text_issues(
+                public_block_text.replace("**", ""), prefix="annotation", allow_identity_placeholder=True,
+            ))
         if flattened != selected_indices:
             issues.append("annotation_block_indices_coverage_mismatch")
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -647,35 +669,44 @@ def ppt_render_manifest_issues(manifest_path: Path) -> list[str]:
                 issues.append("pptx_slide_count_mismatch")
             for row, slide_name in zip(rows, slide_names):
                 texts = "".join(_ppt_xml_texts(archive, slide_name))
-                expected = str(row.get("subtitle_text") or "")
-                if bool(payload.get("with_subtitles")):
-                    if row.get("subtitle_expected"):
-                        if _normalise_public(texts) != _normalise_public(expected):
-                            issues.append(f"ppt_subtitle_text_mismatch:{row.get('slide_index')}")
-                    elif texts.strip():
-                        issues.append(f"ppt_semantic_card_contains_post_text:{row.get('slide_index')}")
+                if bool(payload.get("with_subtitles")) and not row.get("subtitle_expected") and texts.strip():
+                    issues.append(f"ppt_semantic_card_contains_post_text:{row.get('slide_index')}")
                 if not bool(payload.get("with_subtitles")) and texts.strip():
                     issues.append(f"ppt_clean_variant_contains_subtitle:{row.get('slide_index')}")
                 root = etree.fromstring(archive.read(slide_name))
                 rel_name = f"ppt/slides/_rels/{Path(slide_name).name}.rels"
-                relationship_targets: list[str] = []
+                relationships: dict[str, str] = {}
                 if rel_name in archive.namelist():
                     rel_root = etree.fromstring(archive.read(rel_name))
-                    relationship_targets = [str(value) for value in rel_root.xpath("//*[local-name()='Relationship']/@Target")]
-                expected_image_sha = str(row.get("image_sha256") or "")
-                embedded_image_shas: list[str] = []
-                for target in relationship_targets:
+                    for relationship in rel_root.xpath("//*[local-name()='Relationship']"):
+                        relationship_id = str(relationship.get("Id") or "")
+                        target = str(relationship.get("Target") or "")
+                        if relationship_id and target:
+                            relationships[relationship_id] = target
+                picture_records: list[dict[str, Any]] = []
+                for picture in root.xpath("//*[local-name()='pic']"):
+                    embeds = picture.xpath(".//*[local-name()='blip']/@*[local-name()='embed']")
+                    if not embeds:
+                        continue
+                    target = relationships.get(str(embeds[0]), "")
                     if "/media/" not in target and not target.startswith("../media/"):
                         continue
                     media_name = "ppt/media/" + Path(target).name
-                    if media_name in archive.namelist() and not Path(media_name).name.startswith("bgm"):
-                        embedded_image_shas.append(hashlib.sha256(archive.read(media_name)).hexdigest())
-                if expected_image_sha not in embedded_image_shas:
+                    if media_name not in archive.namelist() or Path(media_name).name.startswith("bgm"):
+                        continue
+                    transforms = picture.xpath("./*[local-name()='spPr']/*[local-name()='xfrm']")
+                    picture_records.append({
+                        "sha256": hashlib.sha256(archive.read(media_name)).hexdigest(),
+                        "transform": transforms[0] if transforms else None,
+                    })
+                expected_image_sha = str(row.get("image_sha256") or "")
+                background_records = [record for record in picture_records if record["sha256"] == expected_image_sha]
+                if not background_records:
                     issues.append(f"ppt_embedded_image_mismatch:{row.get('slide_index')}")
                 image = Path(str(row.get("image_path") or ""))
-                transforms = root.xpath("//*[local-name()='pic']/*[local-name()='spPr']/*[local-name()='xfrm']")
-                if image.is_file() and transforms:
-                    extents = transforms[0].xpath("./*[local-name()='ext']")
+                background_transform = background_records[0]["transform"] if background_records else None
+                if image.is_file() and background_transform is not None:
+                    extents = background_transform.xpath("./*[local-name()='ext']")
                     if extents:
                         rendered_width = int(extents[0].get("cx", 0))
                         rendered_height = int(extents[0].get("cy", 0))
@@ -695,15 +726,21 @@ def ppt_render_manifest_issues(manifest_path: Path) -> list[str]:
                 else:
                     issues.append(f"ppt_image_geometry_missing:{row.get('slide_index')}")
                 if bool(payload.get("with_subtitles")) and row.get("subtitle_expected"):
-                    text_shapes = root.xpath(
-                        "//*[local-name()='sp'][.//*[local-name()='txBody']]"
-                        "/*[local-name()='spPr']/*[local-name()='xfrm']"
-                    )
-                    if len(text_shapes) != 1:
-                        issues.append(f"ppt_subtitle_shape_count_invalid:{row.get('slide_index')}")
+                    if row.get("subtitle_render_mode") != "transparent_raster":
+                        issues.append(f"ppt_subtitle_render_mode_invalid:{row.get('slide_index')}")
+                    if texts.strip():
+                        issues.append(f"ppt_subtitle_live_text_present:{row.get('slide_index')}")
+                    expected_layer_sha = str(row.get("subtitle_layer_sha256") or "")
+                    subtitle_records = [
+                        record for record in picture_records
+                        if expected_layer_sha and record["sha256"] == expected_layer_sha
+                    ]
+                    if len(subtitle_records) != 1:
+                        issues.append(f"ppt_subtitle_picture_count_invalid:{row.get('slide_index')}")
                     else:
-                        offsets = text_shapes[0].xpath("./*[local-name()='off']")
-                        extents = text_shapes[0].xpath("./*[local-name()='ext']")
+                        transform = subtitle_records[0]["transform"]
+                        offsets = transform.xpath("./*[local-name()='off']") if transform is not None else []
+                        extents = transform.xpath("./*[local-name()='ext']") if transform is not None else []
                         if not offsets or not extents:
                             issues.append(f"ppt_subtitle_geometry_missing:{row.get('slide_index')}")
                         else:

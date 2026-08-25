@@ -412,6 +412,8 @@ class ProductQualityTests(unittest.TestCase):
         pptx = self.root / "with.pptx"
         build_story_ppt("故事", self.images, self.lines, self.timings, music, pptx, True, 2.0)
         rows = build_ppt_manifest_rows(self.images, self.lines, self.timings, [0, 1], 2.0, with_subtitles=True)
+        self.assertTrue(all(row["subtitle_render_mode"] == "transparent_raster" for row in rows))
+        self.assertTrue(all(len(row["subtitle_layer_sha256"]) == 64 for row in rows))
         manifest = self.root / "ppt.json"
         write_ppt_render_manifest(
             manifest,
@@ -543,6 +545,8 @@ class ProductQualityTests(unittest.TestCase):
         pptx = self.root / "clean.pptx"
         build_story_ppt("故事", self.images, self.lines, self.timings, music, pptx, False, 2.0)
         rows = build_ppt_manifest_rows(self.images, self.lines, self.timings, [0, 1], 2.0, with_subtitles=False)
+        self.assertTrue(all(row["subtitle_render_mode"] == "none" for row in rows))
+        self.assertTrue(all(row["subtitle_layer_sha256"] == "" for row in rows))
         manifest = self.root / "clean.json"
         write_ppt_render_manifest(manifest, pptx=pptx, with_subtitles=False, rows=rows, music=music, content_manifest=content)
         self.assertEqual(ppt_render_manifest_issues(manifest), [])

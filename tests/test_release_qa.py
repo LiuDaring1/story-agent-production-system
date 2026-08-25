@@ -55,6 +55,9 @@ class ReleaseQaTests(unittest.TestCase):
         for expression in expressions:
             self.assertIn("max(1\\,", expression)
             self.assertNotIn(")-w", expression)
+            self.assertIn("cos(PI*", expression)
+            self.assertIn("floor(", expression)
+            self.assertNotIn("mod(", expression)
         self.assertTrue(expressions[0].startswith("20+"))
         self.assertTrue(expressions[1].startswith("20+"))
         self.assertTrue(expressions[2].startswith("W-w-20-"))
@@ -206,14 +209,14 @@ class ReleaseQaTests(unittest.TestCase):
 
             validate_release_assets(config)
 
-    def test_new_project_exposes_fixed_eight_hour_delivery_policy(self) -> None:
+    def test_new_project_exposes_fixed_ten_hour_delivery_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：八小时默认策略"
-            manifest = init_project(project, story_name="八小时默认策略", slug="eight-hour-default")
+            manifest = init_project(project, story_name="十小时默认策略", slug="ten-hour-default")
 
             self.assertTrue(manifest["agent"]["runtime_deadline_enabled"])
-            self.assertEqual(manifest["agent"]["deadline_hours"], 8.0)
-            self.assertEqual(manifest["agent"]["target_delivery_seconds"], 28800)
+            self.assertEqual(manifest["agent"]["deadline_hours"], 10.0)
+            self.assertEqual(manifest["agent"]["target_delivery_seconds"], 36000)
             self.assertEqual(manifest["agent"]["deadline_behavior"], "deliver_best_valid")
 
     def test_release_qa_requires_vertical_video_with_aligned_audio(self) -> None:

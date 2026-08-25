@@ -31,11 +31,12 @@ from story_contract_runtime import (
 MANIFEST_VERSION = 2
 DEFAULT_SOFT_BUDGET_CNY = 50.0
 DEFAULT_HARD_BUDGET_CNY = 100.0
+STORY_AGENT_RELEASE_VERSION = "3.6.1-canary"
 # V3.6 targets an overnight run.  At the deadline the scheduler freezes new
 # aesthetic retries and exposes the best hash-valid output; it does not launch
 # final_delivery/doctor or restart the full DAG.
-DEFAULT_DEADLINE_HOURS = 8.0
-DEFAULT_TARGET_DELIVERY_SECONDS = 8 * 60 * 60
+DEFAULT_DEADLINE_HOURS = 10.0
+DEFAULT_TARGET_DELIVERY_SECONDS = 10 * 60 * 60
 DEFAULT_DEADLINE_BEHAVIOR = "deliver_best_valid"
 DEFAULT_MIN_FREE_DISK_GB = 10.0
 PASS_SCORE = 85
@@ -499,12 +500,13 @@ def ensure_manifest_v2(
     agent.setdefault("heartbeat_at", "")
     agent.setdefault("last_checkpoint", "")
     agent.setdefault("blocked_reason", "")
-    # V3.6 has one project-wide autonomous target: deliver the best valid
-    # version at eight hours instead of continuing an unbounded retry loop.
-    configured_deadline = DEFAULT_DEADLINE_HOURS
+    # One project-wide deadline prevents unbounded aesthetic retry loops.
+    # The default follows the repository production contract; callers may
+    # still pass an explicit project-specific deadline.
+    configured_deadline = max(0.0, float(deadline_hours))
     agent["runtime_deadline_enabled"] = True
     agent["deadline_hours"] = configured_deadline
-    agent["target_delivery_seconds"] = DEFAULT_TARGET_DELIVERY_SECONDS
+    agent["target_delivery_seconds"] = configured_deadline * 60 * 60
     agent["deadline_behavior"] = DEFAULT_DEADLINE_BEHAVIOR
     agent["max_full_resolution_encodes"] = 1
     agent.setdefault("min_free_disk_gb", DEFAULT_MIN_FREE_DISK_GB)
@@ -2215,7 +2217,7 @@ def _freeze_best_valid_delivery(
     )
     save_json(target, receipt)
     summary = paths.status / (
-        "接受当前版本交付清单.md" if user_initiated else "8小时最佳有效版本交付清单.md"
+        "接受当前版本交付清单.md" if user_initiated else "时限截止最佳有效版本交付清单.md"
     )
     summary.write_text(
         "\n".join([
@@ -2362,7 +2364,8 @@ def render_job_report(project_dir: Path) -> Path:
         f"- 状态：{agent.get('status', 'pending')}",
         f"- 最后检查点：{agent.get('last_checkpoint') or '无'}",
         f"- 心跳：{agent.get('heartbeat_at') or '无'}",
-        f"- 已运行：{elapsed_hours:.2f} 小时；固定运行时限：已取消（仍受取消、心跳、磁盘和硬预算门禁约束）",
+        f"- Story Agent 版本：{STORY_AGENT_RELEASE_VERSION}",
+        f"- 已运行：{elapsed_hours:.2f} 小时；运行时限：{float(agent.get('deadline_hours') or DEFAULT_DEADLINE_HOURS):g} 小时；策略：{agent.get('deadline_behavior') or DEFAULT_DEADLINE_BEHAVIOR}",
         f"- 成本：¥{float(budget.get('spent', 0)):.2f} / 软上限 ¥{float(budget.get('soft_limit', 0)):.2f} / 硬上限 ¥{float(budget.get('hard_limit', 0)):.2f}",
         f"- 预算预留：¥{float(budget.get('reserved', 0)):.2f}（开放 {len(open_reservations)} 笔）",
         f"- 阻塞原因：{agent.get('blocked_reason') or '无'}",

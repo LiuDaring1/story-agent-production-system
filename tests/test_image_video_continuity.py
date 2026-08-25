@@ -59,6 +59,16 @@ class ImageVideoContinuityTests(unittest.TestCase):
             "scene": 1,
             "character_state": state,
             "visible_characters": ["character_a"],
+            "continuity_group": "location_a_sequence",
+            "location_state": {
+                "location_id": "location_a", "time_of_day": "day",
+                "change_from_previous": False, "change_cue": "",
+            },
+            "character_knowledge": {
+                "character_a": {"aware_of": [], "unaware_of": [], "gaze_target": "story action"},
+            },
+            "required_visible_actions": [],
+            "state_transition_evidence": {},
             "scale_basis": {"applicable": False, "reason": "single character"},
             "current_story_state": {"state_machine": state},
             "visual_state_evidence": {"state_machine": "visible"},

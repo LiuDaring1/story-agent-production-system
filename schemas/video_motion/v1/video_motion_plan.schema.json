@@ -5,8 +5,8 @@
   "additionalProperties": false,
   "required": ["schema_version", "compiler_version", "contract_schema_version", "story_contract_sha256", "story_contract_dependency_sha256", "contract_projection_sha256", "storyboard_sha256", "shots"],
   "properties": {
-    "schema_version": {"const": "1.1.0"},
-    "compiler_version": {"const": "1.1.0"},
+    "schema_version": {"const": "1.2.0"},
+    "compiler_version": {"const": "1.2.0"},
     "contract_schema_version": {"type": "string", "minLength": 1},
     "story_contract_sha256": {"type": "string", "minLength": 1},
     "story_contract_dependency_sha256": {"type": "string", "minLength": 1},

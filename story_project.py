@@ -13,7 +13,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping
 
 from PIL import Image, ImageDraw, ImageFont, ImageStat
 
@@ -42,7 +42,8 @@ from cover_quality import (
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "pipeline_config.json"
 MAIN_PACKAGE_REFERENCE_MANIFEST = ROOT / "assets" / "references" / "main_vertical_package_reference.json"
-MAIN_PACKAGE_PROMPT_VERSION = "story-main-package-fixed-prompt/v1"
+MAIN_PACKAGE_PROMPT_VERSION = "story-main-package-fixed-prompt/v2"
+MAIN_PACKAGE_RECEIPT_SCHEMA_VERSION = "story-main-package-generation/v2"
 MAIN_PACKAGE_PANEL_SIZE = (2304, 888)
 MANIFEST_NAME = "project_manifest.json"
 STATUS_DIR_NAME = "99_项目状态"
@@ -125,7 +126,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "external_tools": {
         "suno_story_score_skill": str(Path.home() / "Downloads" / "suno-story-score.skill"),
-        "story_performance_script_skill": str(Path.home() / "Downloads" / "story-performance-script.skill"),
+        "story_performance_script_skill": "skills/story-performance-script/SKILL.md",
     },
     "video_api": {
         "provider": "toapis_grok_1_0",
@@ -178,8 +179,8 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "agent_defaults": {
         "soft_budget_cny": 50.0,
         "hard_budget_cny": 100.0,
-        "deadline_hours": 8.0,
-        "target_delivery_seconds": 28800,
+        "deadline_hours": 10.0,
+        "target_delivery_seconds": 36000,
         "runtime_deadline_enabled": True,
         "deadline_behavior": "deliver_best_valid",
         "max_full_resolution_encodes": 1,
@@ -360,8 +361,8 @@ def default_manifest(paths: ProjectPaths, config: dict[str, Any], story_name: st
             "heartbeat_at": "",
             "last_checkpoint": "",
             "blocked_reason": "",
-            "deadline_hours": float(agent_defaults.get("deadline_hours", 8.0)),
-            "target_delivery_seconds": int(agent_defaults.get("target_delivery_seconds", 28800)),
+            "deadline_hours": float(agent_defaults.get("deadline_hours", 10.0)),
+            "target_delivery_seconds": int(agent_defaults.get("target_delivery_seconds", 36000)),
             "runtime_deadline_enabled": bool(agent_defaults.get("runtime_deadline_enabled", True)),
             "deadline_behavior": str(agent_defaults.get("deadline_behavior") or "deliver_best_valid"),
             "max_full_resolution_encodes": int(agent_defaults.get("max_full_resolution_encodes", 1)),
@@ -1162,7 +1163,9 @@ def main_package_fixed_prompt_template() -> str:
         "必须实际查看并使用原图，不能只依据文字摘要重建。分别生成两张 2304×888 位图："
         "顶部只包含故事类型《{story_type}》和故事名称《{story_title}》；"
         "底部只包含‘完整版时长：{duration}’、‘适合年龄：{age_range}’和"
-        "‘适用于{use_cases}’。上下图属于同一视觉系统，可随故事类型克制调整配色、字体和少量主题元素。"
+        "‘适用于{use_cases}’。上下图必须像参考图那样属于一块连续、从容的节目包装系统："
+        "以大留白、清楚标题层级和少量主题点缀为主，不要把信息拆成许多相互竞争的牌匾、卡片或商品功能框。"
+        "可随故事类型克制调整配色、字体和少量主题元素，但不得变成资料包商品页；主账号与宝库号必须一眼可区分。"
         "参考图里的历史故事、煮酒论英雄、4分50秒、8岁以上及示例人物只用于理解结构，"
         "不得出现在新图。文字必须原生融入图像，禁止生成空板后再由程序叠字。"
         "不要生成中间视频区域，不要生成完整竖屏成图，不要添加二维码、平台 UI、陌生 Logo、人物或吉祥物。"
@@ -1208,6 +1211,8 @@ def build_main_package_spec(
         "reference_content_leak_check": "required",
         "render_usage_proof": "required_before_release_qa",
         "excluded_scopes": ["title_card", "moral_card", "marketing_covers"],
+        "account_role": "main_account_vertical_release",
+        "story_identity": {"story_type": story_type, "story_title": story_title},
     }
 
 
@@ -1269,6 +1274,9 @@ def create_theme_asset_request(project_dir: Path) -> dict[str, Path]:
         config=config,
     )
     request_path.write_text(request, encoding="utf-8")
+    package_spec["theme_request_path"] = str(request_path)
+    package_spec["theme_request_sha256"] = hashlib.sha256(request_path.read_bytes()).hexdigest()
+    save_json(output_paths["main_package_spec"], package_spec)
     handoff = build_theme_asset_handoff(request_path)
     handoff_path.write_text(handoff, encoding="utf-8")
     manifest["outputs"]["theme_assets_prompt"] = str(request_path)
@@ -1307,7 +1315,7 @@ def build_theme_asset_handoff(request_path: Path) -> str:
         "6. 允许用 Pillow 只做后处理：裁切、三段拼接、尺寸整理、透明通道和 QA；不允许用 Pillow 添加、覆盖或修正底板文字。\n"
         "7. 故事框只生成一个统一源图和一个透明 PNG；A/B 景复用同一个框，具体缩放与摆放放到发布视频合成环节处理，"
         "不要在第 12 步生成两套故事框或机械裁坏 B 框。\n"
-        "8. 最终文件必须保存到任务书指定的绝对路径，文件名完全一致；并按任务书写出 main_package_generation_receipt.json，记录参考图、Prompt 与输出哈希、OCR、示例内容泄漏检查和 attempt_count（1–3，首次加最多两轮定向修正）。\n"
+        "8. 最终文件必须保存到任务书指定的绝对路径，文件名完全一致；并按任务书写出 main_package_generation_receipt.json，记录参考图、Prompt、任务书、主账号背景、故事框源图/透明框和上下图哈希，OCR、示例内容泄漏检查、主/宝库号角色区分审核和 attempt_count（1–3，首次加最多两轮定向修正）。\n"
         "9. 主题素材通过 QA 后，只生成抠像候选与站立/大手势短样本，用来确定人物大小、初始 X 轴、抠像边缘和背景融合；不要在本阶段重复运行完整发布预演。\n"
         "10. 把最终布局和抠像参数写回桌面故事项目的 04_发布视频/keying/keying_preset.json。后续 release_preview 阶段会用完整背景成片、同一正式合成代码和最终 Demo 参数自动抽渲代表帧，并展示到 Dashboard；不要求用户半夜点击批准。\n"
         "11. 只处理发布视觉定版，不要改分镜、图生视频、配乐、背景成片，也不要编码完整发布视频；自动预检通过后，状态机才允许一次正式全片编码。"
@@ -1476,7 +1484,8 @@ def build_theme_asset_imagegen_request(
 - 背景图是 1920x1080，且不能自带故事框。
 - 故事框源图为单一设计；只导出一个 1920x1080 透明 PNG，A/B 在发布视频合成环节复用。
 - 文件已经保存到任务书指定路径。
-- `main_package_generation_receipt.json` 必须声明 imagegen 同时接收了参考图和固定 Prompt，绑定上下图 SHA-256，逐项记录 OCR 观察值并确认示例故事名/时长/年龄/人物没有泄漏；`attempt_count` 为 1–3。
+- `main_package_generation_receipt.json` 使用 `story-main-package-generation/v2`，必须声明 imagegen 同时接收了参考图和固定 Prompt，绑定任务书、上下图、主账号背景、故事框源图与透明框 SHA-256，逐项记录 OCR 观察值并确认示例故事名/时长/年龄/人物没有泄漏；`attempt_count` 为 1–3。
+- 回执必须写 `story_identity`，并在 `account_role_review` 中确认：参考图的简洁层级被保留、主账号没有做成宝库号资料包商品页、信息层级清楚，并附具体 evidence。
 """
 
 
@@ -1520,7 +1529,29 @@ def main_package_receipt_issues(paths: ProjectPaths) -> list[str]:
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return [*issues, "main_package_generation_receipt_missing_or_invalid"]
-    if receipt.get("schema_version") != "story-main-package-generation/v1":
+    issues.extend(main_package_generation_receipt_issues(
+        spec,
+        receipt,
+        {
+            "top_plate": theme_dir / "main_release_plate_top.png",
+            "bottom_plate": theme_dir / "main_release_plate_bottom.png",
+            "main_background": theme_dir / "main_background_16x9.png",
+            "story_frame_source": theme_dir / "story_frame_source.png",
+            "story_frame_a": theme_dir / "story_frame_a.png",
+        },
+    ))
+    return sorted(set(issues))
+
+
+def main_package_generation_receipt_issues(
+    spec: Mapping[str, Any],
+    receipt: Mapping[str, Any],
+    expected_outputs: Mapping[str, Path],
+) -> list[str]:
+    """Validate current-story lineage and account-role identity for release art."""
+
+    issues: list[str] = []
+    if receipt.get("schema_version") != MAIN_PACKAGE_RECEIPT_SCHEMA_VERSION:
         issues.append("main_package_generation_receipt_schema_invalid")
     if receipt.get("imagegen_reference_attached") is not True:
         issues.append("main_package_reference_not_attached_to_imagegen")
@@ -1530,21 +1561,43 @@ def main_package_receipt_issues(paths: ProjectPaths) -> list[str]:
         attempt_count = 0
     if not 1 <= attempt_count <= 3:
         issues.append("main_package_generation_attempt_count_invalid")
-    for field in ("reference_asset", "reference_sha256", "fixed_prompt_template_sha256"):
+    for field in (
+        "reference_asset", "reference_sha256", "fixed_prompt_template_sha256",
+        "theme_request_path", "theme_request_sha256",
+    ):
         if receipt.get(field) != spec.get(field):
             issues.append(f"main_package_receipt_binding_mismatch:{field}")
-    outputs = receipt.get("outputs") if isinstance(receipt.get("outputs"), dict) else {}
-    for key, filename in (
-        ("top_plate", "main_release_plate_top.png"),
-        ("bottom_plate", "main_release_plate_bottom.png"),
+    request_path = Path(str(spec.get("theme_request_path") or "")).expanduser()
+    if (
+        not request_path.is_file()
+        or hashlib.sha256(request_path.read_bytes()).hexdigest() != spec.get("theme_request_sha256")
     ):
-        path = theme_dir / filename
-        item = outputs.get(key) if isinstance(outputs.get(key), dict) else {}
+        issues.append("main_package_theme_request_stale")
+    expected_identity = {
+        "story_type": str(spec.get("story_type") or ""),
+        "story_title": str(spec.get("story_title") or ""),
+    }
+    if spec.get("story_identity") != expected_identity or receipt.get("story_identity") != expected_identity:
+        issues.append("main_package_story_identity_mismatch")
+    if spec.get("account_role") != "main_account_vertical_release":
+        issues.append("main_package_account_role_invalid")
+    role_review = receipt.get("account_role_review") if isinstance(receipt.get("account_role_review"), Mapping) else {}
+    for field in (
+        "passed", "reference_hierarchy_preserved", "main_not_library_product_packaging",
+        "simple_information_hierarchy",
+    ):
+        if role_review.get(field) is not True:
+            issues.append(f"main_package_account_role_review_failed:{field}")
+    if not str(role_review.get("evidence") or "").strip():
+        issues.append("main_package_account_role_review_evidence_missing")
+    outputs = receipt.get("outputs") if isinstance(receipt.get("outputs"), Mapping) else {}
+    for key, path in expected_outputs.items():
+        item = outputs.get(key) if isinstance(outputs.get(key), Mapping) else {}
         if not path.is_file():
             issues.append(f"main_package_output_missing:{key}")
         elif item.get("path") != str(path) or item.get("sha256") != hashlib.sha256(path.read_bytes()).hexdigest():
             issues.append(f"main_package_output_binding_mismatch:{key}")
-    ocr = receipt.get("ocr_validation") if isinstance(receipt.get("ocr_validation"), dict) else {}
+    ocr = receipt.get("ocr_validation") if isinstance(receipt.get("ocr_validation"), Mapping) else {}
     if ocr.get("passed") is not True:
         issues.append("main_package_ocr_not_passed")
     expected_text = {
@@ -1556,7 +1609,7 @@ def main_package_receipt_issues(paths: ProjectPaths) -> list[str]:
     }
     if ocr.get("expected") != expected_text or ocr.get("observed") != expected_text:
         issues.append("main_package_ocr_text_mismatch")
-    leak = receipt.get("reference_content_leak_check") if isinstance(receipt.get("reference_content_leak_check"), dict) else {}
+    leak = receipt.get("reference_content_leak_check") if isinstance(receipt.get("reference_content_leak_check"), Mapping) else {}
     if leak.get("passed") is not True or leak.get("leaked_items") not in ([], None):
         issues.append("main_package_reference_content_leak")
     return sorted(set(issues))

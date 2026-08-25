@@ -121,6 +121,7 @@ class ProductQaTests(unittest.TestCase):
         box = slide.shapes[-1]
         self.assertLessEqual(box.height, int(prs.slide_height * 0.09))
         self.assertLessEqual(box.top + box.height, prs.slide_height)
+        self.assertEqual(box.shape_type, 13)  # PICTURE: WPS-safe transparent raster, not a black textbox.
 
     def test_customer_docx_uses_installed_cjk_font(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -151,7 +152,10 @@ class ProductQaTests(unittest.TestCase):
             self.assertEqual(story_xml.count("字体检查"), 1)
             with zipfile.ZipFile(annotation_docx) as archive:
                 annotation_xml = archive.read("word/document.xml").decode("utf-8")
-            self.assertGreaterEqual(annotation_xml.count("w:cantSplit"), 4)
+            self.assertEqual(annotation_xml.count("w:cantSplit"), 1)
+            self.assertNotIn("情绪：", annotation_xml)
+            self.assertNotIn("表演细节：", annotation_xml)
+            self.assertIn("温暖；自然地读出中文", annotation_xml)
 
     def test_demo_preview_normalizes_sought_video_timestamps(self) -> None:
         preset = KeyingPreset()

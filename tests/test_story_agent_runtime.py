@@ -1493,7 +1493,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertFalse(story.exists())
             self.assertTrue((archive / story.name).exists())
 
-    def test_resume_preserves_cumulative_runtime_with_fixed_eight_hour_deadline(self) -> None:
+    def test_resume_preserves_cumulative_runtime_with_fixed_ten_hour_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：累计时限"
             manifest = init_project(project, story_name="累计时限", slug="cumulative-runtime")
@@ -1511,7 +1511,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             resumed["agent"]["active_elapsed_seconds"] = 2.1 * 3600
             assert_runnable(resumed)
             self.assertTrue(resumed["agent"]["runtime_deadline_enabled"])
-            self.assertEqual(resumed["agent"]["deadline_hours"], 8.0)
+            self.assertEqual(resumed["agent"]["deadline_hours"], 10.0)
 
     def test_reconcile_archives_unbound_story_images_and_normalizes_stale_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1582,7 +1582,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(reloaded["agent"]["stages"]["story_images_review"]["status"], "pending")
             self.assertEqual(reloaded["agent"]["branch_blockers"], {})
             self.assertTrue(reloaded["agent"]["runtime_deadline_enabled"])
-            self.assertEqual(reloaded["agent"]["deadline_hours"], 8.0)
+            self.assertEqual(reloaded["agent"]["deadline_hours"], 10.0)
 
     def test_reconcile_marks_interrupted_but_verified_prior_stage_passed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

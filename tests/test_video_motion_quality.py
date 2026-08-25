@@ -48,6 +48,15 @@ def shot(scene: int, *, direction: str = "left_to_right", primary: str = "subjec
         "scale_basis": {"applicable": False, "reason": "single character"},
         "current_story_state": state,
         "visual_state_evidence": {"state_machine": "visible"},
+        "location_state": {
+            "location_id": "location_a", "time_of_day": "day",
+            "change_from_previous": False, "change_cue": "",
+        },
+        "character_knowledge": {
+            "character_a": {"aware_of": ["story action"], "unaware_of": [], "gaze_target": "story action"},
+        },
+        "required_visible_actions": [],
+        "state_transition_evidence": {},
         "subject_action": "character_a performs a clear story action",
         "environment_motion": "background elements move gently",
         "camera_motion": "stable natural follow",

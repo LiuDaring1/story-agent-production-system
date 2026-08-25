@@ -75,11 +75,13 @@ def approved_demo_geometry(
     canvas_height: int,
     detected_bbox: Sequence[int] | None = None,
 ) -> dict[str, Any]:
-    """Compile the same source-native transform used by the approved Demo.
+    """Compile the legacy approved-Demo transform.
 
-    The detected box only removes transparent/green surroundings.  It does not
-    fit the subject to a target box: scale is derived exclusively from the
-    complete source frame and canvas.
+    With no ``detected_bbox`` this is the production source-native transform
+    and must retain the full alpha canvas.  Supplying a box explicitly selects
+    the older preset-crop mode.  Keeping those modes distinct prevents a bbox
+    sampled from one quiet frame from masquerading as source-native geometry
+    and cutting off a later wide gesture.
     """
     if min(source_width, source_height, canvas_width, canvas_height) <= 0:
         raise ValueError("presenter source/canvas dimensions must be positive")
@@ -95,6 +97,7 @@ def approved_demo_geometry(
             raise ValueError("detected presenter bbox exceeds source")
         crop = [x, y, width, height]
     x, y, width, height = crop
+    source_native = detected_bbox is None
     return {
         "source_width": source_width,
         "source_height": source_height,
@@ -104,9 +107,9 @@ def approved_demo_geometry(
         "scale": scale,
         "x": source_canvas_x + round(x * scale),
         "y": source_canvas_y + round(y * scale),
-        "crop_mode": "detected_bbox_source_native" if detected_bbox is not None else "source_native",
-        "vertical_alignment": "source_canvas_center",
-        "source_native": True,
+        "crop_mode": "source-native" if source_native else "preset",
+        "vertical_alignment": "source_canvas_center" if source_native else "center",
+        "source_native": source_native,
     }
 
 
@@ -266,6 +269,12 @@ def demo_presenter_geometry_issues(
             issues.append("demo_presenter_geometry_rendered_width_inconsistent")
         if abs(int(payload.get("rendered_height") or 0) - expected_height) > 1:
             issues.append("demo_presenter_geometry_rendered_height_inconsistent")
+    if payload.get("source_native") is True:
+        expected_native_crop = [
+            0, 0, int(payload.get("source_width") or 0), int(payload.get("source_height") or 0),
+        ]
+        if crop != expected_native_crop:
+            issues.append("demo_presenter_geometry_source_native_crop_not_full_canvas")
     crop_bottom_ratio = payload.get("crop_bottom_ratio")
     if (
         isinstance(crop_bottom_ratio, bool)
@@ -307,6 +316,13 @@ def release_a_geometry(
     scale or vertical correction and is therefore blocked rather than silently
     shrinking the presenter.
     """
+    if demo.get("source_native") is True:
+        expected_crop = [0, 0, int(demo.get("source_width") or 0), int(demo.get("source_height") or 0)]
+        if list(demo.get("source_crop") or []) != expected_crop:
+            raise ValueError(
+                "source-native presenter geometry must preserve the full alpha canvas; "
+                "initial subject detection cannot become a duration-wide crop"
+            )
     safe = _box(person_region, canvas_width, canvas_height)
     width = int(demo["rendered_width"])
     height = int(demo["rendered_height"])

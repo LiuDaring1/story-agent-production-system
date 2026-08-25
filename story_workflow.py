@@ -1596,7 +1596,7 @@ def run_package_release_project(
             effective_preview_times = preview_times_with_keying_coverage(preview_times, keying_preset)
             if selected_variant == "main":
                 b_windows, _c_windows = resolve_scene_windows(bg_video)
-                effective_preview_times = preview_times_with_b_coverage(preview_times, b_windows)
+                effective_preview_times = preview_times_with_b_coverage(effective_preview_times, b_windows)
             command.extend(["--preview-dir", preview_dir, "--preview-times", effective_preview_times])
             if selected_variant == "main" and preview_person_layouts:
                 command.extend(["--preview-person-layouts", preview_person_layouts])

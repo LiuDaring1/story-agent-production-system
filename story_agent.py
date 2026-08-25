@@ -94,6 +94,7 @@ from video_motion import (
     video_receipt_issues,
     write_video_receipt,
 )
+from storyboard_continuity import storyboard_continuity_issues
 from keying_quality import (
     keying_preset_lock_issues,
     keying_review_images,
@@ -130,6 +131,7 @@ from story_agent_runtime import (
     STORY_STAGE_DEPENDENCIES,
     STORY_STAGE_SEQUENCE,
     STAGE_ESTIMATES_MINUTES,
+    STORY_AGENT_RELEASE_VERSION,
     assert_runnable,
     accept_current_outputs,
     deliver_best_valid_at_deadline,
@@ -490,7 +492,7 @@ class StoryAgent:
         try:
             _updated, receipt = deliver_best_valid_at_deadline(
                 self.context.project_dir,
-                notes="达到 8 小时目标；停止新增审美返工并冻结当前最佳哈希有效版本。",
+                notes="达到项目运行时限；停止新增审美返工并冻结当前最佳哈希有效版本。",
             )
         except AgentRuntimeError as exc:
             freeze_runtime(manifest["agent"])
@@ -1388,6 +1390,7 @@ class StoryAgent:
             except (ValueError, json.JSONDecodeError):
                 supervisor["running"] = False
         payload = {
+            "story_agent_version": STORY_AGENT_RELEASE_VERSION,
             "job_id": manifest.get("agent", {}).get("job_id", ""),
             "project_dir": str(self.context.project_dir),
             "next_stage": stage_name,
@@ -2147,6 +2150,8 @@ class StoryAgent:
                 "视觉风格只能由用户/项目配置的明确选择决定；必须把可信来源链 /resolved_image_style 中的 key、label 和 prompt 原样绑定到 visual_style.style_profile，不得根据故事类型、标题或文本关键词换风格。",
                 "角色身份锚点只锁定原文明确说明或用户明确指定的特征。未指定的外观不写成合同硬约束，由图像模型按已选整体风格完成角色设计。",
                 "角色卡、尺度锚点、风格锚点、布局预览按故事实际需要条件生成；无需预览的类型不要创建占位。一个已批准文件覆盖多个角色时必须复用同一路径和哈希，不能把逻辑检查角色误解成多张独立图片。",
+                "story_state 必须覆盖会被消耗、撕下、打碎、修复、交付或逐步减少的关键道具。每个状态要精确写明仍存在的数量、成员、颜色或完整性，并把不应再出现的旧状态写入 forbidden，不能只写‘发生变化’。",
+                "每个不可逆的实体状态迁移必须在 transition 写 must_show_action=true、action_subject 和 action_object；触发动作必须来自原文，不得编造。只有瞬间跳切、明确离屏事件或抽象状态才可写 must_show_action=false。",
                 "尺度优先 qualitative_relation；只有可信依据或机器布局需要时才写宽容数值区间及 numeric_basis。",
                 "如果多个角色会在同一画面出现，world_scale.relationships 只覆盖有故事或布局必要的宽松视觉层级；不得为所有角色两两建立无依据的总排序。儿童卡通允许为了表演和可读性适度夸张小角色，不能按现实物种厘米比例机械判定。已有用户批准母版时，定性关系应忠于母版实际画面，不得仅凭现实常识写成 much_smaller。环境或动作参照不是角色尺度证明，不要求为其另画尺度图。",
                 "scale_anchor 的 content_refs 只能列出该图实际可比较的角色大小关系；啄木鸟在树上、青蛙在稻田、蜜蜂采蜜等环境/动作关系不得为了凑覆盖率塞入尺度预览。",
@@ -3195,7 +3200,7 @@ class StoryAgent:
         if model_dir.exists():
             command.extend(["--whisper-model-dir", str(model_dir)])
         # Timing strategy follows the selected provider adapter.  Only the
-        # current Grok Video 1.5 adapter advertises whole-second, per-second
+        # Provider adapters advertise whole-second, per-second
         # generation bounds; legacy providers retain fixed-duration behavior.
         try:
             provider = self._modules().video_generator()
@@ -5480,8 +5485,11 @@ class StoryAgent:
                 "",
                 "这是全自动 Agent 模式，不需要向用户确认分镜。状态机已经写好并锁定分镜文本；必须只读使用该文件，绝对不得改写、合并、删减或重排任何一行。",
                 "可以创建或更新视觉圣经和图生视频提示词文件，然后连续生成图片；镜头编号必须逐行对应锁定分镜。",
-                f"必须先写入机器可读分镜计划：`{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}`。每镜包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description、speaker、listener、narrative_focus、emotion、shot_intent、transition_reason；story_text 必须逐行等于锁定分镜。无说话者/听话者时写 none。",
+                f"必须先写入机器可读分镜计划：`{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}`。每镜包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description、speaker、listener、narrative_focus、emotion、shot_intent、transition_reason、location_state、character_knowledge、required_visible_actions、state_transition_evidence；story_text 必须逐行等于锁定分镜。无说话者/听话者时写 none。",
                 "镜头选择必须依据人物关系、说话者/听话者、情绪变化和叙事重点；不机械地逢对白就正反打，也不得让整段对白始终保持同一多人全景。",
+                "连续发生且原文没有转场的镜头必须沿用同一个 continuity_group、location_state.location_id 和 time_of_day；若确有地点或时间变化，change_from_previous=true 且 change_cue 必须逐字指出原文中的转场依据，禁止为了画面多样性擅自换到室内、黄昏或另一地点。",
+                "character_knowledge 必须逐一记录可见角色的 aware_of、unaware_of 和 gaze_target。角色在发现某事之前不得看向、回应或配合它；偷吃、躲藏、误会、秘密等信息差要同时约束静帧构图和图生视频表演。",
+                "required_visible_actions 用对象数组记录 machine_id、action、subject、object、visibility。合同中 must_show_action=true 的迁移，当前镜必须把触发动作明确画在画面里，不能只画动作后的结果，也不能把动作前状态与目的地结果揉成一张图。state_transition_evidence 必须逐状态机记录 from、to、visibility、evidence。",
                 "机器可读分镜计划的顶层还必须原样记录合同请求清单中的 contract_schema_version、story_contract_sha256、story_contract_dependency_sha256 和 contract_projection，并把逐镜列表放在 shots 字段；contract_projection 不得删减、改写或用模型推断覆盖。",
                 "机器可读分镜计划还必须原样记录当前逐产物语义呈现计划的 artifact_semantic_plan_sha256、artifact_semantic_plan_schema_version、artifact_semantic_plan_dependency_sha256；缺失或旧绑定将被 Runtime 拒绝。",
                 "机器可读分镜计划还必须原样记录 visual_sample_schema_version、visual_sample_plan_sha256、visual_sample_review_bundle_sha256、visual_sample_lock_sha256；旧小样或旧审核绑定将被 Runtime 拒绝。",
@@ -5773,6 +5781,9 @@ class StoryAgent:
             "subject_action", "environment_motion", "camera_motion", "entry_state", "exit_state",
             "screen_direction", "adjacent_handoff", "expected_motion",
         }
+        continuity_required = {
+            "location_state", "character_knowledge", "required_visible_actions", "state_transition_evidence",
+        }
         for index, (row, text) in enumerate(zip(rows, story_lines), start=1):
             if not isinstance(row, dict) or not required.issubset(row):
                 return False
@@ -5785,7 +5796,11 @@ class StoryAgent:
             if not str(row["shot_size"]).strip() or not str(row["focal_character"]).strip():
                 return False
             if not self._legacy_contract_policy(self._manifest()):
-                if not motion_required.issubset(row) or not director_required.issubset(row):
+                if (
+                    not motion_required.issubset(row)
+                    or not director_required.issubset(row)
+                    or not continuity_required.issubset(row)
+                ):
                     return False
                 if any(not str(row.get(key) or "").strip() for key in director_required):
                     return False
@@ -5824,6 +5839,9 @@ class StoryAgent:
                     return False
                 if not str(expected_motion.get("rationale") or "").strip():
                     return False
+        if not self._legacy_contract_policy(self._manifest()):
+            if storyboard_continuity_issues(rows, state_rows):
+                return False
         return True
 
     def _visual_continuity_contract_path(self) -> Path | None:
@@ -7838,9 +7856,9 @@ def main() -> None:
     submit.add_argument("--hard-budget", default=100.0, type=float)
     submit.add_argument(
         "--deadline-hours",
-        default=8.0,
+        default=10.0,
         type=float,
-        help="自主生产目标时限；默认 8 小时，届时冻结最佳有效版本并停止新增审美返工",
+        help="自主生产目标时限；默认 10 小时，届时冻结最佳有效版本并停止新增审美返工",
     )
     submit.add_argument("--force", action="store_true", help="即使同一原片已投喂也创建新任务")
 

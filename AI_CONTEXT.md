@@ -52,7 +52,7 @@ Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_ru
 ## 外部能力
 
 - 图片：Codex ImageGen。
-- 视频：通过 `video_provider_adapter.py`；当前首选 ToAPIs Grok Video 1.5。
+- 视频：通过 `video_provider_adapter.py`；当前首选 ToAPIs Grok Video 1.0，供应商/模型保持可插拔。
 - 音乐：Ego Browser/Suno，必须经过带输入哈希的音乐 QA。
 - 媒体：FFmpeg/ffprobe。
 - 文档：LibreOffice、python-docx、PPTX 工具链。
@@ -61,7 +61,7 @@ Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_ru
 
 - 指挥官：`gpt-5.6-sol`，负责关键判断和独立审核。
 - 工人：`gpt-5.6-luna`，负责生产、工具执行和确定性工作。
-- 当前配置使用 Sol X-high 与 Luna Max；这是基线，不代表所有任务永久必须使用最高档。
+- 当前配置使用 Sol Medium 与 Luna High；Max/X-high 只允许在明确升级后使用，不是常规默认值。
 - 独立审核必须与生产上下文隔离，不能让生产者自证完成。
 
 ## 不要做

@@ -43,6 +43,9 @@
                 "to": {"type": "string", "minLength": 1},
                 "trigger": {"type": "string", "minLength": 1},
                 "boundary_ref": {"type": "string", "minLength": 1},
+                "must_show_action": {"type": "boolean"},
+                "action_subject": {"type": "string", "minLength": 1},
+                "action_object": {"type": "string", "minLength": 1},
                 "provenance": {"$ref": "common.schema.json#/$defs/provenance"}
               }
             }

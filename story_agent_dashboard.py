@@ -72,7 +72,7 @@ def render_dashboard_html(*, poll_seconds: float = 2.0) -> str:
 </head>
 <body>
 <main>
-  <header><div><h1>Story Agent 实时看板</h1><div id="project" class="muted"></div></div>
+  <header><div><h1>Story Agent <span id="version">未标注版本</span> 实时看板</h1><div id="project" class="muted"></div></div>
     <div><button id="acceptCurrent" type="button">接受当前版本</button>
       <div class="muted"><span id="updated">等待数据</span></div></div></header>
   <section id="error" class="panel error" hidden></section>
@@ -105,6 +105,7 @@ function metricCard(label, data) {{
     (detail.startsWith("/") ? artifact(detail) : esc(detail))+'</div></article>';
 }}
 function render(snapshot) {{
+  document.getElementById("version").textContent = snapshot.story_agent_version || "未标注版本";
   document.getElementById("project").textContent = snapshot.project_dir || "";
   document.getElementById("updated").textContent = new Date().toLocaleTimeString();
   document.getElementById("agent").innerHTML = badge(snapshot.agent_status);
@@ -123,10 +124,18 @@ function render(snapshot) {{
   document.getElementById("eta").textContent = ((snapshot.estimated_remaining_minutes || {{}}).nominal || 0) + " 分钟";
   const timing = snapshot.timing || {{}}, delivery = snapshot.delivery_state || "";
   const usage = snapshot.cost_and_usage || {{}};
+  const deadlineLabel = timing.runtime_deadline_enabled
+    ? (Number(timing.deadline_hours || 0).toFixed(1).replace(/[.]0$/, "") + " 小时运行时限")
+    : "Story Agent 活跃执行时间";
+  const deadlineDetail = timing.runtime_deadline_enabled
+    ? ('已用 '+esc(timing.active_elapsed_seconds == null ? "—" : Math.round(timing.active_elapsed_seconds)+"秒")+
+       ' · 剩余 '+esc(timing.remaining_deadline_hours == null ? "—" : timing.remaining_deadline_hours+"小时"))
+    : ('已用 '+esc(timing.active_elapsed_seconds == null ? "—" : Math.round(timing.active_elapsed_seconds)+"秒")+
+       ' · 当前未启用固定截止');
   document.getElementById("runReason").innerHTML = [
     '<div class="item"><strong>为什么正在运行</strong><div>'+esc(snapshot.why_running || snapshot.blocked_reason || "等待下一阶段")+'</div></div>',
-    '<div class="item"><strong>8 小时时限</strong><div>已用 '+esc(timing.active_elapsed_seconds == null ? "—" : Math.round(timing.active_elapsed_seconds)+"秒")+
-      ' · 剩余 '+esc(timing.remaining_deadline_hours == null ? "—" : timing.remaining_deadline_hours+"小时")+'</div></div>',
+    '<div class="item"><strong>'+esc(deadlineLabel)+'</strong><div>'+deadlineDetail+
+      ' · 口径：Story Agent 运行区间，不等于 Codex 桌面任务的“已处理”累计时间</div></div>',
     '<div class="item"><strong>交付</strong><div>'+esc(delivery || snapshot.agent_status || "—")+'</div></div>',
     '<div class="item"><strong>模型/成本</strong><div>Codex '+esc(usage.codex_calls || 0)+' 次 · '+esc(usage.codex_total_tokens_reported || 0)+
       ' tokens · 供应商费用 ¥'+Number(usage.provider_cost_cny || 0).toFixed(2)+'</div></div>',

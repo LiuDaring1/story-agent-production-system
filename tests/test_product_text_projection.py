@@ -3,9 +3,11 @@ from __future__ import annotations
 import unittest
 
 from product_text_projection import (
+    ANNOTATION_IDENTITY_PLACEHOLDER,
     PUBLIC_TEXT_TRANSFORM_VERSION,
     clean_public_story_text,
     compile_public_story_lines,
+    compile_annotation_story_lines,
 )
 
 
@@ -45,6 +47,13 @@ class ProductTextProjectionTests(unittest.TestCase):
         text = "大家好，我是故事老师。今天要给大家讲故事。"
 
         self.assertEqual(clean_public_story_text(text), "今天要给大家讲故事。")
+
+    def test_annotation_replaces_presenter_identity_with_customer_blank(self) -> None:
+        raw = ["大家好，我是绵羊姐姐，今天讲《通用故事》。", "正文。"]
+        projected = compile_annotation_story_lines(raw)
+        self.assertEqual(projected[0], ANNOTATION_IDENTITY_PLACEHOLDER + "今天讲《通用故事》。")
+        self.assertNotIn("绵羊姐姐", projected[0])
+        self.assertEqual(projected[1], raw[1])
 
 
 if __name__ == "__main__":

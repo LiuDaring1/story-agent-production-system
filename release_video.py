@@ -444,7 +444,11 @@ def required_package_asset_binding(config: ReleaseConfig) -> dict[str, object]:
         raise ValueError("required_v1 主账号包装合同或回执损坏") from exc
     if package_spec.get("reference_role") != "main_vertical_package":
         raise ValueError("required_v1 主账号包装参考图角色无效")
-    from story_project import load_main_package_reference, main_package_fixed_prompt_template
+    from story_project import (
+        load_main_package_reference,
+        main_package_fixed_prompt_template,
+        main_package_generation_receipt_issues,
+    )
 
     stable_reference = load_main_package_reference()
     reference_path = Path(str(package_spec.get("reference_asset") or "")).expanduser()
@@ -461,7 +465,7 @@ def required_package_asset_binding(config: ReleaseConfig) -> dict[str, object]:
     expected_template_sha = hashlib.sha256(main_package_fixed_prompt_template().encode("utf-8")).hexdigest()
     if package_spec.get("fixed_prompt_template_sha256") != expected_template_sha:
         raise ValueError("required_v1 主账号包装固定 Prompt 已失效")
-    if receipt.get("schema_version") != "story-main-package-generation/v1":
+    if receipt.get("schema_version") != "story-main-package-generation/v2":
         raise ValueError("required_v1 主账号包装生成回执 schema 无效")
     try:
         attempt_count = int(receipt.get("attempt_count") or 0)
@@ -498,6 +502,29 @@ def required_package_asset_binding(config: ReleaseConfig) -> dict[str, object]:
         item = receipt_outputs.get(key) if isinstance(receipt_outputs.get(key), dict) else {}
         if item.get("path") != str(path) or item.get("sha256") != sha256_path(path):
             raise ValueError(f"required_v1 主账号包装回执未绑定实际输出：{key}")
+    receipt_dir = config.main_package_receipt.parent
+    receipt_issues = main_package_generation_receipt_issues(
+        package_spec,
+        receipt,
+        {
+            "top_plate": config.main_top_panel,
+            "bottom_plate": config.main_bottom_panel,
+            "main_background": config.bg_image or receipt_dir / "main_background_16x9.png",
+            "story_frame_source": receipt_dir / "story_frame_source.png",
+            "story_frame_a": config.frame_image or receipt_dir / "story_frame_a.png",
+        },
+    )
+    if receipt_issues:
+        raise ValueError("required_v1 主账号主题素材链路无效：" + "、".join(receipt_issues))
+    if config.variant in {"both", "library"}:
+        main_hashes = {
+            sha256_path(path) for path in (config.main_top_panel, config.main_bottom_panel) if path is not None
+        }
+        library_hashes = {
+            sha256_path(path) for path in (config.library_top_panel, config.library_bottom_panel) if path is not None
+        }
+        if main_hashes & library_hashes:
+            raise ValueError("required_v1 主账号与宝库号包装输出被错误复用")
     return {
         "reference_asset": str(reference_path),
         "reference_sha256": reference_sha,
@@ -3758,13 +3785,22 @@ def safe_watermark_motion_expressions(
     *,
     time_offset: float = 0.0,
 ) -> tuple[str, str, str, str]:
-    """Return overlay expressions that keep both moving watermarks fully in frame."""
+    """Return slow, smooth, integer-position watermark paths inside safe margins.
+
+    A modulo sawtooth jumps from one edge to the other and sub-pixel positions
+    can shimmer after H.264 scaling.  Cosine ping-pong reaches each edge with
+    zero velocity, while ``floor(...+0.5)`` keeps overlay coordinates integral.
+    """
     span = margin * 2
     timeline_t = f"(t+{time_offset:.3f})" if time_offset > 0 else "t"
-    x_forward = f"{margin}+mod({timeline_t}*{speed_x:.3f}\\,max(1\\,W-w-{span}))"
-    y_forward = f"{margin}+mod({timeline_t}*{speed_y:.3f}\\,max(1\\,H-h-{span}))"
-    x_reverse = f"W-w-{margin}-mod({timeline_t}*{speed_x:.3f}\\,max(1\\,W-w-{span}))"
-    y_reverse = f"H-h-{margin}-mod({timeline_t}*{speed_y:.3f}\\,max(1\\,H-h-{span}))"
+    x_range = f"max(1\\,W-w-{span})"
+    y_range = f"max(1\\,H-h-{span})"
+    x_walk = f"floor({x_range}*(0.5-0.5*cos(PI*{timeline_t}*{speed_x:.3f}/{x_range}))+0.5)"
+    y_walk = f"floor({y_range}*(0.5-0.5*cos(PI*{timeline_t}*{speed_y:.3f}/{y_range}))+0.5)"
+    x_forward = f"{margin}+{x_walk}"
+    y_forward = f"{margin}+{y_walk}"
+    x_reverse = f"W-w-{margin}-{x_walk}"
+    y_reverse = f"H-h-{margin}-{y_walk}"
     return x_forward, y_forward, x_reverse, y_reverse
 
 

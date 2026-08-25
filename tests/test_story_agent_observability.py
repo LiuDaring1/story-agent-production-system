@@ -129,6 +129,7 @@ class StoryAgentObservabilityTests(unittest.TestCase):
             self.assertIn("原因 / 重跑范围 / 产物", html)
             self.assertIn("正式编码", html)
             self.assertIn("ImageGen", html)
+            self.assertIn('id="version"', html)
 
     def test_status_dashboard_and_real_pid_share_one_effective_snapshot(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -168,6 +169,7 @@ class StoryAgentObservabilityTests(unittest.TestCase):
                 read_only=True,
             )
             payload = agent.status_payload()
+            self.assertEqual(payload["story_agent_version"], "3.6.1-canary")
             self.assertTrue(payload["supervisor"]["running"])
             self.assertEqual(payload["supervisor"]["pid"], os.getpid())
             self.assertEqual(payload["supervisor"]["effective_status"], "waiting_for_user")

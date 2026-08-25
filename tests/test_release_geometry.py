@@ -10,7 +10,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 from release_geometry import (
     RELEASE_GEOMETRY_COMPILER_VERSION,
@@ -65,6 +65,18 @@ def _config(root: Path, *, person_region_ready: bool = True) -> ReleaseConfig:
     Image.new("RGBA", (2304, 888), (235, 225, 205, 255)).save(bottom_panel)
     package_spec = root / "main_package_spec.json"
     package_receipt = root / "main_package_generation_receipt.json"
+    theme_request = root / "theme_assets_imagegen_request.md"
+    theme_request.write_text("fixture theme request", encoding="utf-8")
+    main_background = root / "main_background_16x9.png"
+    frame_source = root / "story_frame_source.png"
+    frame_a = root / "story_frame_a.png"
+    Image.new("RGBA", (1920, 1080), (220, 210, 180, 255)).save(main_background)
+    Image.new("RGBA", (1920, 1080), (255, 0, 255, 255)).save(frame_source)
+    frame_fixture = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+    frame_draw = ImageDraw.Draw(frame_fixture)
+    frame_draw.rectangle((0, 84, 1111, 815), fill=(220, 170, 90, 255))
+    frame_draw.rectangle((100, 200, 999, 699), fill=(0, 0, 0, 0))
+    frame_fixture.save(frame_a)
     expected_text = {
         "story_type": "儿童故事",
         "story_title": "通用故事",
@@ -82,27 +94,42 @@ def _config(root: Path, *, person_region_ready: bool = True) -> ReleaseConfig:
         top_panel=top_panel,
         bottom_panel=bottom_panel,
     )
+    spec_payload["theme_request_path"] = str(theme_request)
+    spec_payload["theme_request_sha256"] = hashlib.sha256(theme_request.read_bytes()).hexdigest()
     save_json(package_spec, spec_payload)
     save_json(package_receipt, {
-        "schema_version": "story-main-package-generation/v1",
+        "schema_version": "story-main-package-generation/v2",
         "attempt_count": 1,
         "imagegen_reference_attached": True,
         "reference_asset": spec_payload["reference_asset"],
         "reference_sha256": spec_payload["reference_sha256"],
         "fixed_prompt_template_sha256": spec_payload["fixed_prompt_template_sha256"],
+        "theme_request_path": spec_payload["theme_request_path"],
+        "theme_request_sha256": spec_payload["theme_request_sha256"],
+        "story_identity": spec_payload["story_identity"],
+        "account_role_review": {
+            "passed": True,
+            "reference_hierarchy_preserved": True,
+            "main_not_library_product_packaging": True,
+            "simple_information_hierarchy": True,
+            "evidence": "single calm hierarchy follows the bound main-account reference",
+        },
         "ocr_validation": {"passed": True, "expected": expected_text, "observed": expected_text},
         "reference_content_leak_check": {"passed": True, "leaked_items": []},
         "outputs": {
             "top_plate": {"path": str(top_panel), "sha256": hashlib.sha256(top_panel.read_bytes()).hexdigest()},
             "bottom_plate": {"path": str(bottom_panel), "sha256": hashlib.sha256(bottom_panel.read_bytes()).hexdigest()},
+            "main_background": {"path": str(main_background), "sha256": hashlib.sha256(main_background.read_bytes()).hexdigest()},
+            "story_frame_source": {"path": str(frame_source), "sha256": hashlib.sha256(frame_source.read_bytes()).hexdigest()},
+            "story_frame_a": {"path": str(frame_a), "sha256": hashlib.sha256(frame_a.read_bytes()).hexdigest()},
         },
     })
     return ReleaseConfig(
         story_name="通用故事", duration_text="2分30秒", bg_video=root / "bg.mp4", output_dir=root,
-        variant="main", bg_image=None, person_greenscreen=source, audio_mix=None,
+        variant="main", bg_image=main_background, person_greenscreen=source, audio_mix=None,
         watermark_logo=None, antipiracy_logo=None, plate_image=None,
         video_box=(0, 0, FINAL_WIDTH, CENTER_HEIGHT), watermark_width=100,
-        watermark_opacity=.5, watermark_speed=1, frame_image=None,
+        watermark_opacity=.5, watermark_speed=1, frame_image=frame_a,
         story_box=(100, 200, 900, 500), story_bleed=0, background_blur=0,
         frame_image_b=None, b_story_box=(220, 150, 1200, 675),
         b_windows=((10.0, 20.0),), c_windows=((30.0, 40.0),), story_logo=None,
@@ -251,6 +278,21 @@ class ReleaseGeometryTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError, "未实际附带"):
                     compile_release_geometry(config, _spec())
 
+    def test_required_package_rejects_main_art_that_looks_like_library_product_packaging(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            assert config.main_package_receipt is not None
+            receipt = json.loads(config.main_package_receipt.read_text(encoding="utf-8"))
+            receipt["account_role_review"]["main_not_library_product_packaging"] = False
+            config.main_package_receipt.write_text(json.dumps(receipt), encoding="utf-8")
+            plan = {"schema_version": "story-artifact-semantic-plan/v1", "story_contract_dependency_sha256": "f" * 64}
+            with patch("release_video.load_current_artifact_semantic_plan", return_value=plan), patch(
+                "release_video.keying_preset_lock_issues", return_value=[]
+            ):
+                with self.assertRaisesRegex(ValueError, "account_role_review"):
+                    compile_release_geometry(config, _spec())
+
     def test_contract_release_omits_unregistered_and_legacy_logo_overlays(self) -> None:
         story = Path("story-logo.png")
         watermark = Path("watermark.png")
@@ -340,6 +382,31 @@ class ReleaseGeometryTests(unittest.TestCase):
         self.assertEqual(geometry["source_crop"], [0, 0, 1920, 1080])
         self.assertEqual(geometry["rendered_width"], 1920)
         self.assertEqual(geometry["rendered_height"], 1080)
+
+    def test_release_rejects_fake_source_native_crop_that_can_cut_later_gestures(self) -> None:
+        geometry = compile_demo_presenter_geometry(
+            1920, 1080, 1920, 1080,
+            person_crop=None,
+            detected_bbox=(420, 60, 1080, 1000),
+            person_height_ratio=1.0,
+            crop_mode="source-native",
+            crop_bottom_ratio=0.0,
+            vertical_alignment="center",
+            keying_preset_sha256="1" * 64,
+            keying_lock_sha256="2" * 64,
+            source_greenscreen_sha256="3" * 64,
+            production_keying_filter_fingerprint="4" * 64,
+        )
+        geometry["source_crop"] = [420, 60, 1080, 1000]
+        with self.assertRaisesRegex(ValueError, "full alpha canvas"):
+            release_a_geometry(
+                geometry,
+                {"x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0},
+                1920,
+                1080,
+                right_blank_region={"x": 0.55, "y": 0.0, "width": 0.45, "height": 1.0},
+                initial_subject_bbox=(420, 60, 1080, 1000),
+            )
 
     def test_initial_anchor_centers_subject_in_right_blank_without_dynamic_repositioning(self) -> None:
         demo = approved_demo_geometry(1920, 1080, 1920, 1080, (0, 0, 1920, 1080))

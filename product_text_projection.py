@@ -9,6 +9,8 @@ from story_semantics import SemanticKind, classify_story
 
 
 PUBLIC_TEXT_TRANSFORM_VERSION = "story-public-text/v2"
+ANNOTATION_TEXT_TRANSFORM_VERSION = "story-annotation-text/v1"
+ANNOTATION_IDENTITY_PLACEHOLDER = "大家好，我是________。"
 
 _PRESENTER_INTRO = re.compile(
     r"(?:大家好\s*[，,。！？!?]?\s*)?"
@@ -52,6 +54,32 @@ def compile_public_story_lines(raw_lines: Sequence[str]) -> list[str]:
         else line
         for index, line in enumerate(rows, start=1)
     ]
+
+
+def compile_annotation_story_lines(raw_lines: Sequence[str]) -> list[str]:
+    """Project transcript rows for the customer-editable performance script.
+
+    Unlike public video/manuscript output, the annotation document keeps an
+    explicit blank identity slot so the customer can fill in their own name.
+    The original presenter identity is never retained and source row indices
+    remain unchanged.
+    """
+
+    rows = [str(line) for line in raw_lines]
+    semantics = classify_story(rows)
+    projected: list[str] = []
+    for index, line in enumerate(rows, start=1):
+        if semantics.kind_at(index) is not SemanticKind.HOST_INTRO:
+            projected.append(line)
+            continue
+        match = _PRESENTER_INTRO.search(line)
+        if match is None:
+            projected.append(line)
+            continue
+        remainder = (line[:match.start()] + line[match.end():]).strip()
+        remainder = re.sub(r"^[，,：:；;。！？!?\s]+", "", remainder)
+        projected.append(ANNOTATION_IDENTITY_PLACEHOLDER + remainder)
+    return projected
 
 
 def clean_public_story_text(text: str) -> str:

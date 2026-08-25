@@ -9,9 +9,11 @@ from typing import Any, Mapping, Sequence
 
 from PIL import Image, ImageChops, ImageStat
 
+from storyboard_continuity import storyboard_continuity_issues
 
-MOTION_PLAN_SCHEMA_VERSION = "1.1.0"
-MOTION_PLAN_COMPILER_VERSION = "1.1.0"
+
+MOTION_PLAN_SCHEMA_VERSION = "1.2.0"
+MOTION_PLAN_COMPILER_VERSION = "1.2.0"
 MOTION_LEVELS = {"none", "low", "moderate", "high"}
 MOTION_PRIMARIES = {"subject", "environment", "camera", "quiet"}
 SCREEN_DIRECTIONS = {
@@ -60,6 +62,15 @@ def compile_motion_plan(storyboard_payload: Mapping[str, Any]) -> dict[str, Any]
             "story_contract_dependency_sha256", "contract_projection_sha256", "storyboard_sha256",
         )
     }
+    contract_projection = storyboard_payload.get("contract_projection")
+    state_machines = []
+    if isinstance(contract_projection, Mapping):
+        story_state = contract_projection.get("story_state")
+        if isinstance(story_state, Mapping) and isinstance(story_state.get("machines"), list):
+            state_machines = story_state["machines"]
+    continuity_errors = storyboard_continuity_issues(shots, state_machines)
+    if continuity_errors:
+        raise ValueError("分镜连续性合同无效：" + "；".join(continuity_errors))
     result_shots: list[dict[str, Any]] = []
     for row in shots:
         if not isinstance(row, dict):
@@ -71,6 +82,10 @@ def compile_motion_plan(storyboard_payload: Mapping[str, Any]) -> dict[str, Any]
             "scale_basis": row.get("scale_basis", {}),
             "required": row.get("continuity_required", []),
             "forbidden": row.get("continuity_forbidden", []),
+            "location_state": row.get("location_state", {}),
+            "character_knowledge": row.get("character_knowledge", {}),
+            "required_visible_actions": row.get("required_visible_actions", []),
+            "state_transition_evidence": row.get("state_transition_evidence", {}),
         }
         result_shots.append({
             "scene": row.get("scene"),

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import json
 import os
 import re
@@ -69,6 +71,7 @@ from product_quality import (
 )
 from product_text_projection import (
     clean_public_story_text as _clean_public_story_text,
+    compile_annotation_story_lines,
     compile_public_story_lines,
 )
 
@@ -161,7 +164,11 @@ def main() -> None:
     parser.add_argument("--demo-brand-spec", type=Path, help="审核合同编译出的 Demo 官方 Logo 与布局规格")
     parser.add_argument("--annotation-docx", type=Path, help="人工/模型精修后的朗读标注文档；传入后直接使用，不走自动草稿")
     parser.add_argument("--annotation-json", type=Path, help="按 story-performance-script.skill 精修后的朗读标注 JSON")
-    parser.add_argument("--annotation-skill-path", default=Path.home() / "Downloads" / "story-performance-script.skill", type=Path)
+    parser.add_argument(
+        "--annotation-skill-path",
+        default=Path(__file__).resolve().parent / "skills" / "story-performance-script" / "SKILL.md",
+        type=Path,
+    )
     parser.add_argument("--allow-draft-annotation", action="store_true", help="允许使用规则草稿生成朗读标注；默认禁止，避免产出不可用假成品")
     parser.add_argument("--keying-preset-json", type=Path, help="已确认的绿幕抠像参数 JSON")
     parser.add_argument("--allow-test-greenscreen", action="store_true", help="允许使用文件名含 test/测试 的绿幕素材")
@@ -213,6 +220,8 @@ def build_product_package(args: argparse.Namespace) -> None:
     demo_logo = args.demo_logo.expanduser() if args.demo_logo else None
     demo_brand_spec_path = args.demo_brand_spec.expanduser() if args.demo_brand_spec else None
     annotation_skill_path = args.annotation_skill_path.expanduser()
+    if not annotation_skill_path.is_file():
+        raise FileNotFoundError(f"朗读标注 Skill 不存在：{annotation_skill_path}")
     output_root = args.output_root.expanduser()
     work_dir = (
         args.work_dir.expanduser()
@@ -244,6 +253,7 @@ def build_product_package(args: argparse.Namespace) -> None:
 
     script_lines = read_script_lines(script_path)
     public_script_lines = compile_public_story_lines(script_lines)
+    annotation_script_lines = compile_annotation_story_lines(script_lines)
     images = sorted_image_files(images_dir, slug=args.slug or None)
     if not images:
         raise ValueError(f"镜头图片目录为空：{images_dir}")
@@ -289,10 +299,11 @@ def build_product_package(args: argparse.Namespace) -> None:
             indices = list(semantic_plan_selections[key])
         else:
             indices = semantic_line_indices(script_lines, semantic_spec, artifact) if semantic_spec else list(range(len(script_lines)))
-        lines = [public_script_lines[index] for index in indices]
+        source_rows = annotation_script_lines if artifact == "reading_annotation" else public_script_lines
+        lines = [source_rows[index] for index in indices]
         selected_images = [images[index] for index in indices]
         selected_timings = [
-            LineTiming(position + 1, public_script_lines[index], timings[index].source_start, timings[index].source_end,
+            LineTiming(position + 1, source_rows[index], timings[index].source_start, timings[index].source_end,
                        timings[index].duration, timings[index].timeline_start, timings[index].timeline_end)
             for position, index in enumerate(indices)
         ]
@@ -909,63 +920,60 @@ def render_annotation_blocks_docx(story_name: str, blocks: list[AnnotationBlock]
     doc = Document()
     section = doc.sections[0]
     section.orientation = WD_ORIENT.PORTRAIT
-    section.top_margin = Inches(0.7)
-    section.bottom_margin = Inches(0.7)
-    section.left_margin = Inches(0.8)
-    section.right_margin = Inches(0.8)
+    section.top_margin = Inches(0.46)
+    section.bottom_margin = Inches(0.46)
+    section.left_margin = Inches(0.55)
+    section.right_margin = Inches(0.55)
 
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     run = title.add_run(f"《{story_name}》表演化批注脚本")
-    set_run_font(run, "微软雅黑", 22, "1A3A5C", bold=True)
+    title.paragraph_format.space_after = Pt(1)
+    set_run_font(run, "微软雅黑", 17, "1A3A5C", bold=True)
     subtitle = doc.add_paragraph()
     subtitle.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    sub_run = subtitle.add_run("适用人群：家长 · 幼师 · 儿童戏剧指导老师")
-    set_run_font(sub_run, "微软雅黑", 10, "888888")
-
-    legend = doc.add_table(rows=1, cols=1)
-    prevent_table_row_split(legend.rows[0])
-    legend_cell = legend.cell(0, 0)
-    set_cell_shading(legend_cell, "D4E6F1")
-    set_cell_border(legend_cell, "000000", 8)
-    p = legend_cell.paragraphs[0]
-    p.add_run("符号说明\n")
-    set_run_font(p.runs[-1], "微软雅黑", 12, "1A3A5C", bold=True)
-    add_markup_runs(p, "**加粗红色字体**  重读/强调词 —— 朗读时放慢加重，与肢体动作同步卡点。\n /  短停顿（约0.5秒）：句中换气或小节奏感。\n //  长停顿（1-2秒）：制造悬念，为情感爆发蓄力。")
+    subtitle.paragraph_format.space_after = Pt(3)
+    sub_run = subtitle.add_run("红字＝重音　/＝短停顿　//＝明显停顿；开头姓名留空，由使用者填写")
+    set_run_font(sub_run, "微软雅黑", 8, "777777")
 
     for index, block in enumerate(blocks, start=1):
-        doc.add_paragraph("")
-        table = doc.add_table(rows=3, cols=1)
+        table = doc.add_table(rows=1, cols=1)
         table.autofit = True
-        for row in table.rows:
-            prevent_table_row_split(row)
-        title_cell, text_cell, note_cell = table.cell(0, 0), table.cell(1, 0), table.cell(2, 0)
-        for cell in (title_cell, text_cell, note_cell):
-            cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
-            set_cell_border(cell, "AED6F1", 6)
-        set_cell_shading(title_cell, "D4E6F1")
-        set_cell_shading(note_cell, "EAF4FB")
+        cell = table.cell(0, 0)
+        cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.CENTER
+        # Each annotation card is deliberately compact enough to fit on a
+        # page. Keep its heading, marked story text, and guidance together so
+        # Word/WPS cannot strand a card title at the bottom of one page and
+        # move the body to the next page.
+        prevent_table_row_split(table.rows[0])
+        set_cell_border(cell, "D7E4EC", 4)
+        set_cell_shading(cell, "F7FAFC")
+        set_cell_margins(cell, top=55, bottom=55, left=90, right=90)
 
-        p = title_cell.paragraphs[0]
-        run = p.add_run(f"【段落 {index}】  {block.title}")
-        set_run_font(run, "微软雅黑", 11, "1A3A5C", bold=True)
+        heading = cell.paragraphs[0]
+        heading.paragraph_format.space_after = Pt(0)
+        run = heading.add_run(f"{index}. {block.title}")
+        set_run_font(run, "微软雅黑", 8, "527086", bold=True)
 
-        p = text_cell.paragraphs[0]
-        p.paragraph_format.line_spacing = 1.35
-        add_markup_runs(p, block.marked_text)
+        marked = cell.add_paragraph()
+        marked.paragraph_format.line_spacing = 1.05
+        marked.paragraph_format.space_before = Pt(0)
+        marked.paragraph_format.space_after = Pt(0)
+        add_markup_runs(marked, block.marked_text)
 
-        p = note_cell.paragraphs[0]
-        p.paragraph_format.line_spacing = 1.35
-        emotion_run = p.add_run("情绪：")
-        set_run_font(emotion_run, "仿宋", 10, "1A3A5C", bold=True)
-        note_run = p.add_run(block.emotion + "\n")
-        set_run_font(note_run, "仿宋", 10, "1A3A5C")
-        for note_index, note in enumerate(block.notes):
-            body_run = p.add_run(note)
-            set_run_font(body_run, "仿宋", 10, "1A3A5C")
-            if note_index != len(block.notes) - 1:
-                br = p.add_run("\n")
-                set_run_font(br, "仿宋", 10, "1A3A5C")
+        guidance = cell.add_paragraph()
+        guidance.paragraph_format.line_spacing = 1.0
+        guidance.paragraph_format.space_before = Pt(1)
+        guidance.paragraph_format.space_after = Pt(0)
+        natural_guidance = "；".join([block.emotion.rstrip("。；"), *(note.rstrip("。；") for note in block.notes)]) + "。"
+        guide_run = guidance.add_run(natural_guidance)
+        set_run_font(guide_run, "仿宋", 8, "36566D")
+
+        spacer = doc.add_paragraph()
+        spacer.paragraph_format.space_after = Pt(0)
+        spacer.paragraph_format.space_before = Pt(0)
+        spacer_run = spacer.add_run()
+        set_run_font(spacer_run, "微软雅黑", 2, "FFFFFF")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(output_path)
@@ -977,6 +985,21 @@ def prevent_table_row_split(row: Any) -> None:
     tr_properties = row._tr.get_or_add_trPr()
     if tr_properties.find(docx_qn("w:cantSplit")) is None:
         tr_properties.append(OxmlElement("w:cantSplit"))
+
+
+def set_cell_margins(cell: Any, *, top: int, bottom: int, left: int, right: int) -> None:
+    tc_pr = cell._tc.get_or_add_tcPr()
+    margins = tc_pr.first_child_found_in("w:tcMar")
+    if margins is None:
+        margins = OxmlElement("w:tcMar")
+        tc_pr.append(margins)
+    for edge, value in (("top", top), ("bottom", bottom), ("left", left), ("right", right)):
+        element = margins.find(docx_qn(f"w:{edge}"))
+        if element is None:
+            element = OxmlElement(f"w:{edge}")
+            margins.append(element)
+        element.set(docx_qn("w:w"), str(value))
+        element.set(docx_qn("w:type"), "dxa")
 
 
 def load_annotation_blocks(path: Path, *, require_source_indices: bool = False) -> list[AnnotationBlock]:
@@ -1039,7 +1062,7 @@ def write_annotation_request(
 - 不要套话，不要写“开头要说清楚”“先交代人物情境”这类通用句。
 - 批注像有经验的幼儿园故事老师当面说话：温和、短句、先给角色心情或画面，再给声音和动作；禁止“内容重点、节奏落点、情绪层次”等分析术语。
 - 每段 2-4 句，按场景/角色/情绪转折拆分。
-- marked_text 必须逐字覆盖下方已经清洁的故事台词；主持人自我介绍整句删除，除此之外不得润色、增删、改代词或改句尾。
+- marked_text 必须逐字覆盖下方已经清洁的故事台词；开头的真实主持人身份已替换为“大家好，我是________。”，必须保留这个供客户填写的空位，除此之外不得润色、增删、改代词或改句尾。
 - 红字只标真正需要重读的内容词、角色/道具首次出现、关键动作、矛盾转折、道理关键词；不得整句连红。
 - 批注必须基于文本本身，写清楚为什么这样读，如何配合语气、停顿、表情或动作。
 - 输出 JSON 数组，每项字段为 title、source_line_indices、marked_text、emotion、notes。
@@ -1179,6 +1202,10 @@ def build_ppt_manifest_rows(
         card_kind = semantic_card_positions.get(position - 1)
         subtitle_expected = with_subtitles and card_kind is None
         clean, font_size, subtitle_bbox = ppt_subtitle_layout(text)
+        subtitle_layer_sha256 = ""
+        if subtitle_expected:
+            subtitle_layer_bytes, _subtitle_height, _subtitle_bbox = render_ppt_subtitle_layer(text)
+            subtitle_layer_sha256 = hashlib.sha256(subtitle_layer_bytes).hexdigest()
         rows.append(
             {
                 "slide_index": position,
@@ -1197,6 +1224,8 @@ def build_ppt_manifest_rows(
                 "subtitle_line_count": clean.count("\n") + 1 if subtitle_expected else 0,
                 "subtitle_bbox": subtitle_bbox if subtitle_expected else [],
                 "subtitle_safe_region": [0.0, 0.0, 1.0, 1.0] if subtitle_expected else [],
+                "subtitle_render_mode": "transparent_raster" if subtitle_expected else "none",
+                "subtitle_layer_sha256": subtitle_layer_sha256,
                 "layout_mode": (
                     f"full_bleed_{card_kind}" if card_kind
                     else "full_bleed_with_bottom_subtitle" if with_subtitles
@@ -1242,21 +1271,11 @@ def render_ppt_evidence(output_dir: Path, rows: list[dict[str, Any]], *, with_su
         fitted = ImageOps.fit(image, canvas.size, method=Image.Resampling.LANCZOS)
         canvas.paste(fitted)
         if with_subtitles and row.get("subtitle_expected"):
-            draw = ImageDraw.Draw(canvas, "RGBA")
-            bbox_ratio = row.get("subtitle_bbox") or [0.0, 0.0, 0.0, 0.0]
-            y = int(canvas.height * float(bbox_ratio[1]))
-            bottom = int(canvas.height * (float(bbox_ratio[1]) + float(bbox_ratio[3])))
-            draw.rectangle((0, y, canvas.width, canvas.height), fill=(0, 0, 0, 220))
-            font = load_font(int(row.get("subtitle_font_size_pt") or 28))
-            text = str(row.get("subtitle_text") or "")
-            text_bbox = draw.multiline_textbbox((0, 0), text, font=font, spacing=0, align="center")
-            text_width = text_bbox[2] - text_bbox[0]
-            text_height = text_bbox[3] - text_bbox[1]
-            x = max(12, (canvas.width - text_width) // 2)
-            text_y = y + max(0, (bottom - y - text_height) // 2) - text_bbox[1]
-            draw.multiline_text(
-                (x, text_y), text, font=font, fill=(255, 255, 255, 255), spacing=0, align="center"
-            )
+            layer_bytes, _height, bbox_ratio = render_ppt_subtitle_layer(str(row.get("source_text") or ""))
+            with Image.open(io.BytesIO(layer_bytes)) as source_layer:
+                layer_height = max(1, round(canvas.height * float(bbox_ratio[3])))
+                layer = source_layer.convert("RGBA").resize((canvas.width, layer_height), Image.Resampling.LANCZOS)
+            canvas.paste(layer, (0, canvas.height - layer_height), layer)
         return canvas
 
     rendered: list[Path] = []
@@ -2930,28 +2949,49 @@ def set_ppt_advance(slide, seconds: float) -> None:
 
 
 def add_ppt_subtitle(slide, text: str, prs: Presentation) -> None:
+    layer_bytes, height, _bbox = render_ppt_subtitle_layer(
+        text,
+        slide_width=int(prs.slide_width),
+        slide_height=int(prs.slide_height),
+    )
+    slide.shapes.add_picture(
+        io.BytesIO(layer_bytes), 0, prs.slide_height - height,
+        width=prs.slide_width, height=height,
+    )
+
+
+def render_ppt_subtitle_layer(
+    text: str,
+    *,
+    slide_width: int = int(PPT_W),
+    slide_height: int = int(PPT_H),
+) -> tuple[bytes, int, list[float]]:
+    """Return the exact WPS-safe raster subtitle used by PPT and its QA manifest."""
+
     clean, font_size, bbox = ppt_subtitle_layout(text)
-    height = min(int(prs.slide_height * PPT_SUBTITLE_MAX_HEIGHT_RATIO), int(prs.slide_height * bbox[3]))
+    height = min(int(slide_height * PPT_SUBTITLE_MAX_HEIGHT_RATIO), int(slide_height * bbox[3]))
     height = max(1, height)
-    box = slide.shapes.add_textbox(0, prs.slide_height - height, prs.slide_width, height)
-    box.fill.solid()
-    box.fill.fore_color.rgb = PptRGBColor(0, 0, 0)
-    tf = box.text_frame
-    tf.clear()
-    tf.word_wrap = False
-    tf.vertical_anchor = MSO_ANCHOR.MIDDLE
-    tf.margin_left = 0
-    tf.margin_right = 0
-    tf.margin_top = 0
-    tf.margin_bottom = 0
-    p = tf.paragraphs[0]
-    p.alignment = PP_ALIGN.CENTER
-    run = p.add_run()
-    run.text = clean
-    run.font.name = DELIVERY_CJK_FONT
-    run.font.size = PptPt(font_size)
-    run.font.bold = True
-    run.font.color.rgb = PptRGBColor(255, 255, 255)
+    # WPS and PowerPoint do not render all theme/font/fill combinations the
+    # same way.  A transparent subtitle raster gives both applications the
+    # exact same one-line white text with a thin black outline, without the
+    # opaque black rectangle that appeared in the canary deck.
+    pixel_width = 1920
+    pixel_height = max(72, round(pixel_width * height / slide_width))
+    layer = Image.new("RGBA", (pixel_width, pixel_height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(layer)
+    font = load_font(max(24, round(font_size * 2.6)))
+    text_bbox = draw.textbbox((0, 0), clean, font=font, stroke_width=4)
+    text_width = text_bbox[2] - text_bbox[0]
+    text_height = text_bbox[3] - text_bbox[1]
+    x = max(8, (pixel_width - text_width) // 2 - text_bbox[0])
+    y = max(0, (pixel_height - text_height) // 2 - text_bbox[1])
+    draw.text(
+        (x, y), clean, font=font, fill=(255, 255, 255, 255),
+        stroke_width=4, stroke_fill=(0, 0, 0, 255),
+    )
+    buffer = io.BytesIO()
+    layer.save(buffer, format="PNG")
+    return buffer.getvalue(), height, bbox
 
 
 def ppt_subtitle_layout(text: str) -> tuple[str, int, list[float]]:

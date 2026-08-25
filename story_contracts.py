@@ -776,6 +776,14 @@ def _validate_state_contract(
                         ContractIssue(transition_path, "unknown_reference", "transition states must be declared")
                     )
                 _require_nonempty_string(transition, "trigger", transition_path, issues)
+                must_show_action = transition.get("must_show_action")
+                if must_show_action is not None and not isinstance(must_show_action, bool):
+                    issues.append(ContractIssue(
+                        transition_path + ".must_show_action", "type", "must be a boolean"
+                    ))
+                if must_show_action is True:
+                    _require_nonempty_string(transition, "action_subject", transition_path, issues)
+                    _require_nonempty_string(transition, "action_object", transition_path, issues)
                 _validate_provenance(transition.get("provenance"), transition_path + ".provenance", issues)
         if machine_id:
             if machine_id in machine_ids:

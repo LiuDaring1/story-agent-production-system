@@ -132,8 +132,8 @@
   "agent_defaults": {
     "soft_budget_cny": 50.0,
     "hard_budget_cny": 100.0,
-    "deadline_hours": 8.0,
-    "target_delivery_seconds": 28800,
+    "deadline_hours": 10.0,
+    "target_delivery_seconds": 36000,
     "runtime_deadline_enabled": true,
     "deadline_behavior": "deliver_best_valid",
     "max_full_resolution_encodes": 1,

@@ -107,7 +107,7 @@ class FullAutoContractTests(unittest.TestCase):
         self.assertIn(defaults["commander_reasoning_effort"], {"medium", "high"})
         self.assertEqual(defaults["worker_reasoning_effort"], "high")
         self.assertEqual(load_config()["release_defaults"]["output_scale"], 1)
-        self.assertEqual(defaults["target_delivery_seconds"], 28800)
+        self.assertEqual(defaults["target_delivery_seconds"], 36000)
         self.assertEqual(defaults["max_full_resolution_encodes"], 1)
 
     def test_video_provider_defaults_to_grok_10_with_selectable_15_fallback(self) -> None:

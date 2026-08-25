@@ -22,7 +22,9 @@ from story_video_synthesizer.toapis_video import (
     MAX_PROMPT_CHARS as TOAPIS_MAX_PROMPT_CHARS,
     DEFAULT_USER_AGENT,
     GROK_VIDEO_1_0_DEFAULT_SECONDS,
+    GROK_VIDEO_1_0_MAX_REFERENCE_IMAGES,
     ToAPIsVideoClient,
+    build_toapis_reference_task_body,
     build_toapis_task_body,
     extract_toapis_video_url,
 )
@@ -36,7 +38,7 @@ from run_image_video_jobs import (
     toapis_extra_body,
 )
 import run_image_video_jobs
-from story_video_synthesizer.volcengine_video import CreateTaskResult
+from story_video_synthesizer.volcengine_video import CreateTaskResult, QueryTaskResult
 
 
 class VideoProviderAdapterTests(unittest.TestCase):
@@ -557,6 +559,96 @@ class VideoProviderAdapterTests(unittest.TestCase):
                     image_url="https://files.example/scene.png",
                     seconds=seconds,
                 )
+
+    def test_toapis_grok_video_1_0_r2v_uses_references_without_first_frame(self) -> None:
+        body = build_toapis_reference_task_body(
+            model="grok-video-1.0",
+            prompt="老婆婆走近迷路的小姑娘，停下关心地询问她。",
+            reference_urls=[
+                "https://files.example/jenny.png",
+                "https://files.example/grandmother.png",
+                "https://files.example/forest.png",
+            ],
+            seconds=6,
+        )
+        self.assertEqual(body["reference_images"], [
+            "https://files.example/jenny.png",
+            "https://files.example/grandmother.png",
+            "https://files.example/forest.png",
+        ])
+        self.assertEqual(body["duration"], 6)
+        self.assertNotIn("image", body)
+        self.assertNotIn("images", body)
+
+    def test_toapis_grok_video_1_0_r2v_validates_reference_count_and_duration(self) -> None:
+        self.assertEqual(GROK_VIDEO_1_0_MAX_REFERENCE_IMAGES, 7)
+        with self.assertRaisesRegex(ValueError, "至少需要一张"):
+            build_toapis_reference_task_body(
+                model="grok-video-1.0", prompt="测试", reference_urls=[], seconds=6,
+            )
+        with self.assertRaisesRegex(ValueError, "不能超过 7 张"):
+            build_toapis_reference_task_body(
+                model="grok-video-1.0",
+                prompt="测试",
+                reference_urls=[f"https://files.example/{index}.png" for index in range(8)],
+                seconds=6,
+            )
+        with self.assertRaisesRegex(ValueError, "只能是 6 或 10"):
+            build_toapis_reference_task_body(
+                model="grok-video-1.0",
+                prompt="测试",
+                reference_urls=["https://files.example/jenny.png"],
+                seconds=8,
+            )
+
+    def test_toapis_reference_task_uploads_each_reference_and_submits_r2v_body(self) -> None:
+        client = ToAPIsVideoClient("test-secret")
+        paths = [Path("jenny.png"), Path("grandmother.png")]
+        with (
+            patch.object(client, "upload_image", side_effect=[
+                "https://files.example/jenny.png",
+                "https://files.example/grandmother.png",
+            ]) as upload,
+            patch.object(client, "_request", return_value={"id": "r2v-123"}) as request,
+        ):
+            created = client.create_reference_task(
+                model="grok-video-1.0",
+                prompt="老婆婆关心地询问珍妮。",
+                reference_paths=paths,
+                seconds=6,
+            )
+        self.assertEqual(created.task_id, "r2v-123")
+        self.assertEqual([call.args[0] for call in upload.call_args_list], paths)
+        payload = __import__("json").loads(request.call_args.args[2].decode("utf-8"))
+        self.assertEqual(payload["reference_images"], [
+            "https://files.example/jenny.png",
+            "https://files.example/grandmother.png",
+        ])
+        self.assertNotIn("images", payload)
+
+    def test_toapis_reference_task_reuses_stable_business_id(self) -> None:
+        client = ToAPIsVideoClient("test-secret")
+        existing = QueryTaskResult(
+            task_id="story-r2v-shot-a",
+            status="in_progress",
+            video_url=None,
+            error=None,
+            raw={"id": "provider-task-123", "status": "in_progress"},
+        )
+        with (
+            patch.object(client, "upload_image", return_value="https://files.example/jenny.png"),
+            patch.object(client, "get_task", return_value=existing),
+            patch.object(client, "_request") as request,
+        ):
+            created = client.create_reference_task(
+                model="grok-video-1.0",
+                prompt="老婆婆走近珍妮。",
+                reference_paths=[Path("jenny.png")],
+                seconds=6,
+                extra_body={"client_business_id": "story-r2v-shot-a"},
+            )
+        self.assertEqual(created.task_id, "provider-task-123")
+        request.assert_not_called()
 
     def test_legacy_toapis_model_keeps_opaque_seconds_values_compatible(self) -> None:
         body = build_toapis_task_body(

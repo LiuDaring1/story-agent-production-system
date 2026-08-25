@@ -20,6 +20,7 @@ GROK_VIDEO_1_0_MODEL = "grok-video-1.0"
 DEFAULT_SECONDS = "8"
 GROK_VIDEO_1_0_DEFAULT_SECONDS = "6"
 GROK_VIDEO_1_0_SECONDS = {6, 10}
+GROK_VIDEO_1_0_MAX_REFERENCE_IMAGES = 7
 MIN_SECONDS = 1
 MAX_SECONDS = 15
 DEFAULT_RESOLUTION = "720p"
@@ -58,6 +59,54 @@ def build_toapis_task_body(
     body["prompt"] = _normalize_prompt(model_name, body.get("prompt"))
     body["seconds"] = _normalize_seconds(model_name, body.get("seconds"))
     body["resolution"] = _normalize_resolution(body.get("resolution", DEFAULT_RESOLUTION))
+    return body
+
+
+def build_toapis_reference_task_body(
+    *,
+    model: str,
+    prompt: str,
+    reference_urls: list[str],
+    ratio: str = DEFAULT_RATIO,
+    seconds: str | int | float | None = None,
+    resolution: str = DEFAULT_RESOLUTION,
+    extra_body: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build an R2V request without accidentally pinning a first frame.
+
+    ToAPIs distinguishes a first-frame image from consistency references by
+    field name.  R2V therefore sends ``reference_images`` and deliberately
+    omits ``image``/``images``.  Grok Video 1.0 currently accepts at most seven
+    references and the same discrete 6/10-second duration choices as I2V.
+    """
+
+    model_name = str(model).strip()
+    urls = [str(url).strip() for url in reference_urls if str(url).strip()]
+    if not urls:
+        raise ValueError("ToAPIs R2V 至少需要一张参考图片。")
+    if len(urls) > GROK_VIDEO_1_0_MAX_REFERENCE_IMAGES:
+        raise ValueError(
+            f"ToAPIs Grok R2V 参考图片不能超过 {GROK_VIDEO_1_0_MAX_REFERENCE_IMAGES} 张"
+        )
+    if any(not url.startswith(("http://", "https://")) for url in urls):
+        raise ValueError("ToAPIs R2V 参考图片必须是公网 HTTP(S) URL。")
+    requested_seconds = _default_seconds_for_model(model_name) if seconds is None else seconds
+    body: dict[str, Any] = {
+        "model": model_name,
+        "prompt": _normalize_prompt(model_name, prompt),
+        "reference_images": urls,
+        "duration": int(_normalize_seconds(model_name, requested_seconds)),
+        "resolution": _normalize_resolution(resolution),
+        "aspect_ratio": str(ratio or DEFAULT_RATIO).strip(),
+    }
+    if extra_body:
+        body.update(extra_body)
+    body["prompt"] = _normalize_prompt(model_name, body.get("prompt"))
+    body["duration"] = int(_normalize_seconds(model_name, body.get("duration")))
+    body["resolution"] = _normalize_resolution(body.get("resolution", DEFAULT_RESOLUTION))
+    body["reference_images"] = urls
+    body.pop("image", None)
+    body.pop("images", None)
     return body
 
 
@@ -230,6 +279,46 @@ class ToAPIsVideoClient:
         task_id = payload.get("id") or payload.get("task_id")
         if not task_id:
             raise RuntimeError(f"ToAPIs 创建任务成功但没有返回任务 ID：{payload}")
+        return CreateTaskResult(task_id=str(task_id), raw=payload)
+
+    def create_reference_task(
+        self,
+        *,
+        model: str,
+        prompt: str,
+        reference_paths: list[Path] | None = None,
+        reference_urls: list[str] | None = None,
+        ratio: str = DEFAULT_RATIO,
+        seconds: str | int | float | None = None,
+        resolution: str = DEFAULT_RESOLUTION,
+        extra_body: dict[str, Any] | None = None,
+    ) -> CreateTaskResult:
+        urls = list(reference_urls or [])
+        urls.extend(self.upload_image(path) for path in (reference_paths or []))
+        client_business_id = str((extra_body or {}).get("client_business_id") or "").strip()
+        if client_business_id:
+            try:
+                existing = self.get_task(client_business_id)
+            except RuntimeError as exc:
+                message = str(exc)
+                if "HTTP 404" not in message and "task_not_exist" not in message:
+                    raise
+            else:
+                existing_id = existing.raw.get("id") or existing.task_id
+                return CreateTaskResult(task_id=str(existing_id), raw=existing.raw)
+        body = build_toapis_reference_task_body(
+            model=model,
+            prompt=prompt,
+            reference_urls=urls,
+            ratio=ratio,
+            seconds=seconds,
+            resolution=resolution,
+            extra_body=extra_body,
+        )
+        payload = self._request("POST", "videos/generations", json.dumps(body, ensure_ascii=False).encode())
+        task_id = payload.get("id") or payload.get("task_id")
+        if not task_id:
+            raise RuntimeError(f"ToAPIs 创建 R2V 任务成功但没有返回任务 ID：{payload}")
         return CreateTaskResult(task_id=str(task_id), raw=payload)
 
     def get_task(self, task_id: str) -> QueryTaskResult:

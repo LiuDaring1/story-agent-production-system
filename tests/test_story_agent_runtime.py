@@ -1810,6 +1810,59 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(record["attempts"], 2)
             self.assertEqual(agent.calls, 2)
 
+    def test_stop_after_stage_pauses_before_any_downstream_work(self) -> None:
+        class BoundedCanaryAgent(StoryAgent):
+            calls: list[str] = []
+
+            def _stage_checks(self):
+                return [
+                    (
+                        "story_images_review",
+                        lambda _manifest: "story_images_review" in self.calls,
+                        lambda _manifest: StageResult("done", "unused"),
+                    ),
+                    (
+                        "prepare_jobs",
+                        lambda _manifest: "prepare_jobs" in self.calls,
+                        lambda _manifest: StageResult("done", "unused"),
+                    ),
+                ]
+
+            def _next_stage(self, _manifest):
+                stage = "story_images_review" if "story_images_review" not in self.calls else "prepare_jobs"
+
+                def action(_current):
+                    self.calls.append(stage)
+                    return StageResult("done", stage)
+
+                return stage, action
+
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：有界短测"
+            init_project(project, story_name="有界短测", slug="bounded-canary")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="有界短测",
+                slug="bounded-canary",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+                stop_after_stage="story_images_review",
+            )
+            agent = BoundedCanaryAgent(context)
+            self.assertEqual(agent.run(max_steps=4), 0)
+            self.assertEqual(agent.calls, ["story_images_review"])
+            manifest = load_manifest(project_paths(project))
+            assert manifest is not None
+            self.assertEqual(manifest["agent"]["status"], "pending")
+            self.assertEqual(manifest["agent"]["pause"]["stage"], "story_images_review")
+
     def test_codex_subtask_failure_retries_in_a_new_attempt(self) -> None:
         class CodexFailOnceAgent(StoryAgent):
             calls = 0

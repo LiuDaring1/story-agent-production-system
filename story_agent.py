@@ -288,6 +288,7 @@ class AgentContext:
     scheduler: str = "linear"
     max_parallel: int = 1
     notification_sinks: str = "project"
+    stop_after_stage: str = ""
 
     @property
     def paths(self):
@@ -503,6 +504,40 @@ class StoryAgent:
         print(f"DEADLINE: 已冻结最佳有效版本：{receipt}")
         return 0
 
+    def _pause_if_stop_stage_reached(self, manifest: dict[str, Any]) -> int | None:
+        """Pause a bounded canary immediately after one verified stage gate."""
+
+        target = self.context.stop_after_stage.strip()
+        if not target or not self.context.execute:
+            return None
+        predicate = next((done for name, done, _action in self._stage_checks() if name == target), None)
+        if predicate is None:
+            raise AgentRuntimeError(f"未知 stop-after-stage：{target}")
+        try:
+            reached = bool(predicate(manifest))
+        except Exception:
+            reached = False
+        if not reached:
+            return None
+        from story_project import write_manifest
+
+        freeze_runtime(manifest["agent"])
+        manifest["agent"]["status"] = "pending"
+        manifest["agent"]["blocked_reason"] = ""
+        manifest["agent"]["pause"] = {
+            "reason": "stop_after_stage",
+            "stage": target,
+            "paused_at": now(),
+        }
+        write_manifest(self.context.paths, manifest)
+        self._record_event(
+            "requested_stage_pause",
+            {"stage": target, "status": "pending", "message": "已在验证阶段门后暂停。"},
+        )
+        render_job_report(self.context.project_dir)
+        print(f"PAUSED: 已通过 {target} 门禁，未启动下游阶段。")
+        return 0
+
     def _run_linear(self, max_steps: int) -> int:
         with job_lock(self.context.project_dir):
             manifest = self._manifest()
@@ -512,6 +547,7 @@ class StoryAgent:
 
             if self.context.execute:
                 manifest["agent"]["status"] = "running"
+                manifest["agent"].pop("pause", None)
                 start_runtime(manifest["agent"])
                 write_manifest(self.context.paths, manifest)
             self._record_event("agent_start", {"execute": self.context.execute, "codex_mode": self.context.codex_mode})
@@ -521,6 +557,9 @@ class StoryAgent:
                 deadline_exit = self._deadline_exit_if_needed(manifest)
                 if deadline_exit is not None:
                     return deadline_exit
+                requested_pause = self._pause_if_stop_stage_reached(manifest)
+                if requested_pause is not None:
+                    return requested_pause
                 stage_name, action = self._next_stage(manifest)
                 if self.context.execute:
                     self._reconcile_completed_stage_records(manifest, stage_name)
@@ -626,6 +665,9 @@ class StoryAgent:
                     return deadline_exit
                 self._reconcile_all_completed_stage_records(manifest)
                 manifest = load_manifest(self.context.paths) or manifest
+                requested_pause = self._pause_if_stop_stage_reached(manifest)
+                if requested_pause is not None:
+                    return requested_pause
                 completed = self._completed_stage_names(manifest)
                 if self._recover_stale_stage_blockers(manifest, completed, blocked_this_run):
                     write_manifest(self.context.paths, manifest)
@@ -7885,6 +7927,12 @@ def main() -> None:
     run.add_argument("--slug", default="")
     run.add_argument("--execute", action="store_true", help="真正执行本地命令；默认只 dry-run")
     run.add_argument("--max-steps", default=999, type=int, help="本轮最多推进阶段数；默认 999，面向一键跑完整链路")
+    run.add_argument(
+        "--stop-after-stage",
+        choices=STORY_STAGE_SEQUENCE,
+        default="",
+        help="限界短测：指定阶段后置门禁通过后立即暂停，不启动下游生产",
+    )
     run.add_argument("--update-latest-episode", action="store_true")
     run.add_argument("--codex-mode", choices=["handoff", "cli"], default="handoff", help="智能节点处理方式：handoff=生成交接文件后暂停；cli=自动调用 codex exec")
     run.add_argument("--codex-model", default="", help="指挥官模型；留空使用 pipeline_config.json 的 commander_model")
@@ -8507,6 +8555,7 @@ def main() -> None:
             scheduler=args.scheduler,
             max_parallel=max(1, args.max_parallel),
             notification_sinks=args.notification_sinks,
+            stop_after_stage=args.stop_after_stage,
         )
         try:
             exit_code = StoryAgent(context, module_registry=module_registry).run(max(1, args.max_steps))

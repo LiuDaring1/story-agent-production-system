@@ -101,6 +101,15 @@ from video_motion import (
     write_video_receipt,
 )
 from storyboard_continuity import storyboard_continuity_issues
+from story_image_director import (
+    DIRECTOR_BRIEF_VERSION,
+    DIRECTOR_DECISIONS_VERSION,
+    DIRECTOR_RESULT_VERSION,
+    DirectorProtocolError,
+    compile_legacy_storyboard_plan,
+    merge_director_decisions,
+    validate_director_result,
+)
 from keying_quality import (
     keying_preset_lock_issues,
     keying_review_images,
@@ -297,6 +306,12 @@ class AgentContext:
     max_parallel: int = 1
     notification_sinks: str = "project"
     stop_after_stage: str = ""
+    story_image_director_executor: str = ""
+
+    def resolved_story_image_director_executor(self) -> str:
+        if self.story_image_director_executor:
+            return self.story_image_director_executor
+        return "frontend_handoff" if self.codex_mode == "handoff" else "codex_cli"
 
     @property
     def paths(self):
@@ -996,6 +1011,8 @@ class StoryAgent:
                 str(self.context.codex_timeout),
                 "--codex-story-image-batch-size",
                 str(self.context.codex_story_image_batch_size),
+                "--story-image-director-executor",
+                self.context.resolved_story_image_director_executor(),
                 "--module-profile",
                 self._modules().selection_profile(),
                 "--module-execution-mode",
@@ -3259,7 +3276,19 @@ class StoryAgent:
             return StageResult("done", f"故事图片已完整：{len(story_lines)}/{len(story_lines)} 张。", handoff)
 
         batch_size = max(1, self.context.codex_story_image_batch_size)
-        batch = missing[:batch_size]
+        decisions_path = self._story_image_director_decisions_path()
+        if decisions_path.is_file():
+            try:
+                decisions_payload = json.loads(decisions_path.read_text(encoding="utf-8"))
+                covered = {int(value) for value in decisions_payload.get("coverage", [])}
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                covered = set()
+            eligible = [index for index in missing if index in covered]
+        else:
+            eligible = missing
+        if not eligible:
+            return StageResult("blocked", "handoff_required：当前缺失镜头尚无已 ingest 的导演决策。", self._story_image_director_brief_path())
+        batch = eligible[:batch_size]
         batch_request = self._write_story_image_batch_request(
             staging=staging,
             staging_images=staging_images,
@@ -5509,17 +5538,19 @@ class StoryAgent:
         output_path = log_dir / f"{int(time.time())}_{stage}_codex_last_message.md"
         log_path = log_dir / f"{int(time.time())}_{stage}_codex_exec.log"
         prompt_text = prompt_path.read_text(encoding="utf-8")
+        task_root = self.context.project_dir if stage == "story_image_control_plan" else ROOT
+        additional_root = ROOT if task_root == self.context.project_dir else self.context.project_dir
         command = [
             self.context.codex_path,
             "-a",
             self.context.codex_approval,
             "exec",
             "--cd",
-            str(ROOT),
+            str(task_root),
             "--sandbox",
             self.context.codex_sandbox,
             "--add-dir",
-            str(self.context.project_dir),
+            str(additional_root),
             "--skip-git-repo-check",
             "--output-last-message",
             str(output_path),
@@ -5545,7 +5576,7 @@ class StoryAgent:
         env = normalized_subprocess_environment(overrides=self._module_subprocess_env())
         process = subprocess.Popen(
             command,
-            cwd=str(ROOT),
+            cwd=str(task_root),
             env=env,
             text=True,
             stdout=subprocess.PIPE,
@@ -5788,11 +5819,426 @@ class StoryAgent:
     def _story_image_filename(self, index: int) -> str:
         return f"{self.context.slug}_scene_{index:02d}.png"
 
+    # Kept as private compatibility helpers for old canary recovery artifacts.
+    # The lightweight path below does not call them.
     def _story_image_control_seed_path(self) -> Path:
         return self._codex_stage_dir("codex_story_images") / f"{self.context.slug}_storyboard_plan.seed.json"
 
     def _story_image_control_draft_path(self) -> Path:
         return self._codex_stage_dir("codex_story_images") / f"{self.context.slug}_storyboard_plan.model.json"
+
+    def _story_image_director_brief_path(self) -> Path:
+        return self._codex_stage_dir("codex_story_images") / f"{self.context.slug}_director_brief.json"
+
+    def _story_image_director_result_path(self) -> Path:
+        return self._codex_stage_dir("codex_story_images") / f"{self.context.slug}_director_result.json"
+
+    def _story_image_director_decisions_path(self) -> Path:
+        return self._codex_stage_dir("codex_story_images") / f"{self.context.slug}_director_decisions.json"
+
+    def _story_image_partial_plan_path(self) -> Path:
+        return self._codex_stage_dir("codex_story_images") / f"{self.context.slug}_storyboard_plan.partial.json"
+
+    def _story_image_active_plan_path(self) -> Path:
+        full = self._codex_stage_dir("codex_story_images") / f"{self.context.slug}_storyboard_plan.json"
+        return full if full.is_file() else self._story_image_partial_plan_path()
+
+    def _story_image_director_approved_references(self) -> list[dict[str, Any]]:
+        references: list[dict[str, Any]] = []
+        sample_assets = visual_sample_paths(self.context.project_dir)["assets"]
+        for path in sorted(sample_assets.glob("*")):
+            if not path.is_file() or path.suffix.lower() not in {".png", ".jpg", ".jpeg", ".webp"}:
+                continue
+            references.append(
+                {
+                    "reference_id": f"visual_sample:{path.stem}",
+                    "path": str(path.resolve()),
+                    "sha256": file_sha256(path),
+                    "role": "approved_visual_sample",
+                }
+            )
+        for index, path in enumerate(self._approved_style_reference_paths(), start=1):
+            references.append(
+                {
+                    "reference_id": f"user_style:{index:02d}",
+                    "path": str(path),
+                    "sha256": file_sha256(path),
+                    "role": "user_approved_style_reference",
+                }
+            )
+        return references
+
+    def _story_image_director_catalog(self, contract_context: Path | None) -> dict[str, Any]:
+        projection: Mapping[str, Any] = {}
+        if contract_context is not None and contract_context.is_file():
+            payload = json.loads(contract_context.read_text(encoding="utf-8"))
+            raw_projection = payload.get("contract_projection", {}) if isinstance(payload, dict) else {}
+            if isinstance(raw_projection, Mapping):
+                projection = raw_projection
+        character_rows = projection.get("characters", {}).get("characters", [])
+        machine_rows = projection.get("story_state", {}).get("machines", [])
+        scale_rows = projection.get("world_scale", {}).get("relationships", [])
+        return {
+            "characters": [
+                {
+                    "character_id": str(item.get("character_id") or ""),
+                    "display_name": str(item.get("display_name") or ""),
+                    "identity_anchors": list(item.get("identity_anchors", [])),
+                    "forbidden_features": list(item.get("forbidden_features", [])),
+                }
+                for item in character_rows
+                if isinstance(item, Mapping) and str(item.get("character_id") or "")
+            ],
+            "state_machines": [
+                {
+                    "machine_id": str(item.get("machine_id") or ""),
+                    "entity_ref": str(item.get("entity_ref") or ""),
+                    "initial_state": str(item.get("initial_state") or ""),
+                    "states": [
+                        {
+                            "state_id": str(state.get("state_id") or ""),
+                            "description": str(state.get("description") or ""),
+                        }
+                        for state in item.get("states", [])
+                        if isinstance(state, Mapping) and str(state.get("state_id") or "")
+                    ],
+                    "transitions": [
+                        {
+                            "from": str(transition.get("from") or ""),
+                            "to": str(transition.get("to") or ""),
+                            "trigger": str(transition.get("trigger") or ""),
+                            "must_show_action": bool(transition.get("must_show_action")),
+                            "action_subject": str(transition.get("action_subject") or ""),
+                            "action_object": str(transition.get("action_object") or ""),
+                        }
+                        for transition in item.get("transitions", [])
+                        if isinstance(transition, Mapping)
+                    ],
+                }
+                for item in machine_rows
+                if isinstance(item, Mapping) and str(item.get("machine_id") or "")
+            ],
+            "scale_relationships": [
+                {
+                    "relationship_id": str(item.get("relationship_id") or ""),
+                    "subject": str(item.get("subject") or ""),
+                    "reference": str(item.get("reference") or ""),
+                    "qualitative_relation": str(item.get("qualitative_relation") or ""),
+                    "visual_guidance": str(item.get("visual_guidance") or ""),
+                }
+                for item in scale_rows
+                if isinstance(item, Mapping) and str(item.get("relationship_id") or "")
+            ],
+        }
+
+    def _write_story_image_director_brief(
+        self,
+        *,
+        staging_storyboard: Path,
+        story_lines: list[str],
+        contract_context: Path | None,
+        requested_scenes: list[int],
+    ) -> Path:
+        semantic_path = self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"
+        sample_paths = visual_sample_paths(self.context.project_dir)
+        decisions_path = self._story_image_director_decisions_path()
+        existing_coverage: list[int] = []
+        if decisions_path.is_file():
+            try:
+                existing = json.loads(decisions_path.read_text(encoding="utf-8"))
+                existing_coverage = [int(value) for value in existing.get("coverage", [])]
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                existing_coverage = []
+        brief = {
+            "schema_version": DIRECTOR_BRIEF_VERSION,
+            "story_title": self.context.story_name,
+            "slug": self.context.slug,
+            "executor": self.context.resolved_story_image_director_executor(),
+            "authoritative_storyboard_path": str(staging_storyboard),
+            "authoritative_storyboard_sha256": file_sha256(staging_storyboard),
+            "contract_context_path": str(contract_context or ""),
+            "contract_context_sha256": file_sha256(contract_context) if contract_context and contract_context.is_file() else "",
+            "artifact_semantic_plan_path": str(semantic_path if semantic_path.is_file() else ""),
+            "artifact_semantic_plan_sha256": file_sha256(semantic_path) if semantic_path.is_file() else "",
+            "visual_sample_lock_path": str(sample_paths["lock"] if sample_paths["lock"].is_file() else ""),
+            "visual_sample_lock_sha256": file_sha256(sample_paths["lock"]) if sample_paths["lock"].is_file() else "",
+            "requested_scenes": requested_scenes,
+            "existing_coverage": existing_coverage,
+            "story_shots": [
+                {"scene": index, "story_text": text}
+                for index, text in enumerate(story_lines, start=1)
+            ],
+            "catalog": self._story_image_director_catalog(contract_context),
+            "approved_references": self._story_image_director_approved_references(),
+            "result_output_path": str(self._story_image_director_result_path()),
+            "result_schema": {
+                "schema_version": DIRECTOR_RESULT_VERSION,
+                "required_top_level": ["schema_version", "brief_sha256", "executor", "continuity_ledger", "decisions"],
+                "decision_fields": [
+                    "scene", "continuity_group", "location", "subject", "shot_size",
+                    "visible_characters", "excluded_characters", "character_knowledge",
+                    "required_visible_actions", "state_updates", "scale_relationship_ids",
+                    "reference_ids", "image_prompt", "video_prompt", "emotion",
+                    "subject_action", "environment_motion", "camera_motion",
+                    "screen_direction", "expected_motion",
+                ],
+            },
+            "policy": {
+                "only_requested_scenes": True,
+                "omit_story_text_from_result": True,
+                "runtime_inherits_unchanged_state": True,
+                "runtime_compiles_legacy_plan": True,
+                "do_not_generate_images": True,
+            },
+        }
+        target = self._story_image_director_brief_path()
+        save_json(target, brief)
+        return target
+
+    def _story_image_director_prompt(self, brief: Path) -> str:
+        result = self._story_image_director_result_path()
+        return "\n".join(
+            [
+                "只执行精简故事图片导演决策，不生成任何图片，不调用 ImageGen，不修改合同、分镜原文或既有小样。",
+                f"读取唯一 brief：`{brief}`。它已列出本轮 requested_scenes、精简目录、已审核参考图和结果 Schema。",
+                f"把结果写到：`{result}`，brief_sha256 必须等于当前 brief 文件 SHA-256。",
+                "结果只写 requested_scenes；不要重复 story_text，不要复制合同，不要逐镜重复未变化状态机。",
+                "state_updates 只写本镜真实发生变化的 machine_id；Runtime 会继承其他状态并确定性编译旧下游格式。",
+                "角色尚未知情时必须写入 unaware_of 并让 gaze_target 避开该对象；连续场景保持地点、时间和 continuity_anchor。",
+                "发生合同状态迁移时，在 required_visible_actions 写清触发动作，且 visibility=in_frame。",
+                "reference_ids 只能引用 brief 中的已审核图片；image_prompt 写当前镜画面，video_prompt 只写简短表演和运动。",
+                "完成后只报告结果文件，不开始生图。",
+            ]
+        )
+
+    def _story_image_director_bindings(
+        self,
+        *,
+        staging_storyboard: Path,
+        contract_context: Path | None,
+    ) -> tuple[Mapping[str, Any], dict[str, Any]]:
+        if contract_context is None or not contract_context.is_file():
+            return {}, {
+                "authoritative_storyboard_path": str(staging_storyboard),
+                "authoritative_storyboard_sha256": file_sha256(staging_storyboard),
+            }
+        expected = json.loads(contract_context.read_text(encoding="utf-8"))
+        projection = expected.get("contract_projection", {})
+        semantic_source = self._artifact_semantic_source(self._manifest())
+        if semantic_source is None:
+            raise DirectorProtocolError("semantic source is missing")
+        semantic_path = self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"
+        semantic_plan = load_current_artifact_semantic_plan(self.context.project_dir, semantic_source)
+        bindings = {
+            "authoritative_storyboard_path": str(staging_storyboard),
+            "authoritative_storyboard_sha256": file_sha256(staging_storyboard),
+            **{
+                field: expected.get(field)
+                for field in (
+                    "contract_schema_version",
+                    "story_contract_sha256",
+                    "story_contract_dependency_sha256",
+                    "contract_projection",
+                )
+            },
+            **artifact_semantic_plan_binding(semantic_path, semantic_plan),
+            **visual_sample_binding(self.context.project_dir),
+        }
+        return projection if isinstance(projection, Mapping) else {}, bindings
+
+    def _write_story_image_visual_bible(self, decisions: Mapping[str, Any], target: Path) -> None:
+        ledger = decisions.get("continuity_ledger", {}) if isinstance(decisions, Mapping) else {}
+        references = self._story_image_director_approved_references()
+        target.write_text(
+            "# Runtime 编译视觉连续性账本\n\n"
+            "本文件由精简导演结果和已审核参考图确定性编译；未变化状态由 Runtime 继承。\n\n"
+            "## 导演连续性账本\n\n"
+            + json.dumps(ledger, ensure_ascii=False, indent=2)
+            + "\n\n## 已审核参考图\n\n"
+            + "\n".join(f"- {item['reference_id']}: `{item['path']}` ({item['sha256']})" for item in references)
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def _compile_story_image_director_decisions(
+        self,
+        *,
+        decisions: Mapping[str, Any],
+        staging_storyboard: Path,
+        story_lines: list[str],
+        contract_context: Path | None,
+    ) -> Path:
+        projection, bindings = self._story_image_director_bindings(
+            staging_storyboard=staging_storyboard,
+            contract_context=contract_context,
+        )
+        compiled = compile_legacy_storyboard_plan(
+            decisions=decisions,
+            story_lines=story_lines,
+            contract_projection=projection,
+            bindings=bindings,
+            approved_references=self._story_image_director_approved_references(),
+        )
+        staging = self._codex_stage_dir("codex_story_images")
+        target = (
+            staging / f"{self.context.slug}_storyboard_plan.json"
+            if compiled.complete
+            else self._story_image_partial_plan_path()
+        )
+        save_json(target, compiled.payload)
+        self._write_story_image_visual_bible(decisions, staging / f"{self.context.slug}_visual_bible.md")
+        if compiled.complete and not self._storyboard_plan_valid(target, staging_storyboard):
+            raise DirectorProtocolError("Runtime compiled full storyboard plan failed legacy consumer validation")
+        if storyboard_continuity_issues(compiled.payload.get("shots", []), projection.get("story_state", {}).get("machines", [])):
+            raise DirectorProtocolError("Runtime compiled storyboard plan failed continuity validation")
+        return target
+
+    def ingest_story_image_director_result(self, result_path: Path) -> dict[str, Any]:
+        brief_path = self._story_image_director_brief_path()
+        if not brief_path.is_file():
+            raise DirectorProtocolError("current director brief is missing")
+        try:
+            brief = json.loads(brief_path.read_text(encoding="utf-8"))
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise DirectorProtocolError(f"director handoff JSON is unreadable: {exc}") from exc
+        brief_sha = file_sha256(brief_path)
+        result_sha = file_sha256(result_path)
+        normalized = validate_director_result(brief, result, expected_brief_sha256=brief_sha)
+        decisions_path = self._story_image_director_decisions_path()
+        existing: Mapping[str, Any] | None = None
+        if decisions_path.is_file():
+            try:
+                loaded = json.loads(decisions_path.read_text(encoding="utf-8"))
+                existing = loaded if isinstance(loaded, Mapping) else None
+            except (OSError, json.JSONDecodeError):
+                existing = None
+        merged = merge_director_decisions(
+            existing,
+            result=result,
+            normalized_decisions=normalized,
+            brief_path=brief_path,
+            brief_sha256=brief_sha,
+            result_path=result_path,
+            result_sha256=result_sha,
+        )
+        story_lines = [
+            line.strip()
+            for line in Path(brief["authoritative_storyboard_path"]).read_text(encoding="utf-8-sig").splitlines()
+            if line.strip()
+        ]
+        expected_prefix = list(range(1, max(merged["coverage"], default=0) + 1))
+        if merged["coverage"] != expected_prefix:
+            raise DirectorProtocolError("ingested director scenes must form a contiguous prefix")
+        save_json(decisions_path, merged)
+        plan = self._compile_story_image_director_decisions(
+            decisions=merged,
+            staging_storyboard=Path(brief["authoritative_storyboard_path"]),
+            story_lines=story_lines,
+            contract_context=Path(brief["contract_context_path"]) if brief.get("contract_context_path") else None,
+        )
+        receipt_dir = self.context.paths.status / "story_image_director_ingest"
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        receipt = receipt_dir / f"{int(time.time())}-{result_sha[:12]}.json"
+        save_json(
+            receipt,
+            {
+                "version": 1,
+                "status": "accepted",
+                "brief_path": str(brief_path),
+                "brief_sha256": brief_sha,
+                "result_path": str(result_path),
+                "result_sha256": result_sha,
+                "decisions_path": str(decisions_path),
+                "decisions_sha256": file_sha256(decisions_path),
+                "compiled_plan_path": str(plan),
+                "compiled_plan_sha256": file_sha256(plan),
+                "coverage": merged["coverage"],
+                "stage_marked_passed": False,
+            },
+        )
+        return {"receipt": str(receipt), "plan": str(plan), "coverage": merged["coverage"]}
+
+    def ingest_story_image_batch(self, scene_sources: Mapping[int, Path]) -> dict[str, Any]:
+        if not scene_sources:
+            raise DirectorProtocolError("image ingest has no scene sources")
+        decisions_path = self._story_image_director_decisions_path()
+        plan_path = self._story_image_active_plan_path()
+        storyboard = self._codex_stage_dir("codex_story_images") / f"{self.context.slug}_storyboard_lines.txt"
+        if not decisions_path.is_file() or not plan_path.is_file() or not storyboard.is_file():
+            raise DirectorProtocolError("director decisions, compiled plan, and authoritative storyboard are required")
+        decisions = json.loads(decisions_path.read_text(encoding="utf-8"))
+        covered = {int(value) for value in decisions.get("coverage", [])}
+        plan = json.loads(plan_path.read_text(encoding="utf-8"))
+        rows = {int(item.get("scene")): item for item in plan.get("shots", []) if isinstance(item, Mapping)}
+        staging_images = self._codex_stage_dir("codex_story_images") / "images"
+        final_images = self.context.paths.images / "images"
+        staging_images.mkdir(parents=True, exist_ok=True)
+        final_images.mkdir(parents=True, exist_ok=True)
+        items: list[dict[str, Any]] = []
+        for scene, raw_source in sorted(scene_sources.items()):
+            source = raw_source.expanduser().resolve()
+            if scene not in covered or scene not in rows:
+                raise DirectorProtocolError(f"scene {scene} has no accepted director decision")
+            if not source.is_file():
+                raise DirectorProtocolError(f"scene {scene} source image is missing: {source}")
+            try:
+                with Image.open(source) as image:
+                    width, height = image.size
+                    image.verify()
+            except Exception as exc:
+                raise DirectorProtocolError(f"scene {scene} source image is unreadable: {exc}") from exc
+            if width < 640 or height < 360 or abs((width / height) - (16 / 9)) > 0.08:
+                raise DirectorProtocolError(f"scene {scene} image must be a usable 16:9 frame; got {width}x{height}")
+            name = self._story_image_filename(scene)
+            staging_target = staging_images / name
+            final_target = final_images / name
+            source_sha = file_sha256(source)
+            for target in (staging_target, final_target):
+                if target.is_file() and file_sha256(target) != source_sha:
+                    raise DirectorProtocolError(f"refusing to overwrite an existing different image: {target}")
+                if not target.is_file():
+                    shutil.copy2(source, target)
+            self._record_story_image_status(scene, "done", str(final_target))
+            items.append(
+                {
+                    "scene": scene,
+                    "source_path": str(source),
+                    "source_sha256": source_sha,
+                    "width": width,
+                    "height": height,
+                    "staging_target": str(staging_target),
+                    "final_target": str(final_target),
+                    "compiled_decision_sha256": hashlib.sha256(
+                        json.dumps(rows[scene], ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                    ).hexdigest(),
+                }
+            )
+        contract_context = contract_consumer_path(self.context.project_dir, "storyboard_images")
+        story_lines = [line.strip() for line in storyboard.read_text(encoding="utf-8-sig").splitlines() if line.strip()]
+        if contract_context.is_file():
+            self._write_story_image_generation_manifest(contract_context, storyboard, story_lines)
+        receipt_dir = self.context.paths.status / "story_image_batch_ingest"
+        receipt_dir.mkdir(parents=True, exist_ok=True)
+        receipt = receipt_dir / f"{int(time.time())}-{hashlib.sha256(json.dumps(items, ensure_ascii=False, sort_keys=True).encode()).hexdigest()[:12]}.json"
+        save_json(
+            receipt,
+            {
+                "version": 1,
+                "status": "accepted",
+                "director_decisions_path": str(decisions_path),
+                "director_decisions_sha256": file_sha256(decisions_path),
+                "compiled_plan_path": str(plan_path),
+                "compiled_plan_sha256": file_sha256(plan_path),
+                "authoritative_storyboard_path": str(storyboard),
+                "authoritative_storyboard_sha256": file_sha256(storyboard),
+                "items": items,
+                "stage_marked_passed": False,
+                "downstream_started": False,
+            },
+        )
+        self._save_state()
+        return {"receipt": str(receipt), "scenes": [item["scene"] for item in items]}
 
     def _story_image_control_input_sha256(
         self,
@@ -6032,12 +6478,87 @@ class StoryAgent:
         contract_context: Path | None,
         authoritative_storyboard_sha: str,
     ) -> StageResult | None:
-        plan = staging / f"{self.context.slug}_storyboard_plan.json"
         if self._has_story_visual_control():
+            plan = staging / f"{self.context.slug}_storyboard_plan.json"
             if plan.is_file():
                 self._write_story_video_controls_from_plan(staging=staging, plan=plan)
             return None
         progress = self.state.setdefault("codex_story_images", {})
+        decisions_path = self._story_image_director_decisions_path()
+        coverage: list[int] = []
+        if decisions_path.is_file():
+            try:
+                decisions = json.loads(decisions_path.read_text(encoding="utf-8"))
+                coverage = [int(value) for value in decisions.get("coverage", [])]
+                self._compile_story_image_director_decisions(
+                    decisions=decisions,
+                    staging_storyboard=staging_storyboard,
+                    story_lines=story_lines,
+                    contract_context=contract_context,
+                )
+            except (OSError, TypeError, ValueError, json.JSONDecodeError, DirectorProtocolError) as exc:
+                progress.update(
+                    {
+                        "control_plan_status": "invalid_ingest",
+                        "control_plan_error": str(exc),
+                        "updated_at": now(),
+                    }
+                )
+                self._save_state()
+                return StageResult("blocked", f"精简导演结果无法确定性编译：{exc}", decisions_path)
+        missing_images = set(self._missing_story_image_indices(story_lines))
+        ready_missing = [scene for scene in coverage if scene in missing_images]
+        if ready_missing:
+            progress.update(
+                {
+                    "control_plan_status": "partial_validated" if len(coverage) < len(story_lines) else "validated",
+                    "director_coverage": coverage,
+                    "updated_at": now(),
+                }
+            )
+            self._save_state()
+            return None
+        next_scene = len(coverage) + 1
+        if next_scene > len(story_lines):
+            if plan.is_file() and self._storyboard_plan_valid(plan, staging_storyboard):
+                self._write_story_video_controls_from_plan(staging=staging, plan=plan)
+                return None
+            return StageResult("blocked", "导演决策已覆盖全部镜头，但完整旧版分镜计划校验失败。", decisions_path)
+        request_size = max(1, min(5, self.context.codex_story_image_batch_size))
+        requested_scenes = list(range(next_scene, min(len(story_lines), next_scene + request_size - 1) + 1))
+        brief = self._write_story_image_director_brief(
+            staging_storyboard=staging_storyboard,
+            story_lines=story_lines,
+            contract_context=contract_context,
+            requested_scenes=requested_scenes,
+        )
+        executor = self.context.resolved_story_image_director_executor()
+        if executor == "frontend_handoff":
+            progress.update(
+                {
+                    "control_plan_status": "handoff_required",
+                    "director_executor": executor,
+                    "director_coverage": coverage,
+                    "requested_scenes": requested_scenes,
+                    "handoff_path": str(brief),
+                    "updated_at": now(),
+                }
+            )
+            self._save_state()
+            self._record_event(
+                "story_image_control_plan",
+                {
+                    "status": "handoff_required",
+                    "message": f"等待前台导演结果，镜头：{requested_scenes}",
+                    "stage": "codex_story_images",
+                    "handoff": str(brief),
+                },
+            )
+            return StageResult(
+                "blocked",
+                f"handoff_required：请按精简 brief 完成镜头 {requested_scenes}，再通过受控 ingest 提交；尚未调用 ImageGen。",
+                brief,
+            )
         control_input_sha256 = self._story_image_control_input_sha256(
             staging_storyboard=staging_storyboard,
             contract_context=contract_context,
@@ -6062,32 +6583,37 @@ class StoryAgent:
             }
         )
         self._save_state()
-        seed = self._write_story_image_control_seed(
-            staging_storyboard=staging_storyboard,
-            story_lines=story_lines,
-            contract_context=contract_context,
-        )
         self._record_event(
             "story_image_control_plan",
             {
                 "status": "running",
-                "message": f"正在生成一次性逐镜控制计划（第 {attempt}/2 次）；不调用 ImageGen。Runtime seed 已落盘：{seed}",
+                "message": f"正在生成精简导演决策（第 {attempt}/2 次），镜头 {requested_scenes}；不调用 ImageGen。",
                 "stage": "codex_story_images",
             },
         )
         result = self._codex_task(
             stage="story_image_control_plan",
-            label="一次性故事出图控制计划",
-            handoff=seed,
-            prompt=self._story_image_control_prompt(
-                seed=seed,
-                staging=staging,
-                staging_storyboard=staging_storyboard,
-                contract_context=contract_context,
-                attempt=attempt,
-            ),
+            label="精简故事图片导演决策",
+            handoff=brief,
+            prompt=self._story_image_director_prompt(brief),
         )
         if result.status != "done":
+            if result.status == "blocked":
+                progress.update(
+                    {
+                        "control_plan_status": "handoff_required",
+                        "director_executor": "frontend_handoff",
+                        "handoff_path": str(brief),
+                        "handoff_reason": result.message,
+                    }
+                )
+                progress["updated_at"] = now()
+                self._save_state()
+                return StageResult(
+                    "blocked",
+                    f"handoff_required：嵌套 CLI 因额度、权限或账号边界停止；请由前台执行精简 brief，不自动重试。原错误：{result.message}",
+                    brief,
+                )
             progress["control_plan_status"] = result.status
             progress["updated_at"] = now()
             self._save_state()
@@ -6097,31 +6623,35 @@ class StoryAgent:
             progress["control_plan_status"] = "rejected_storyboard_rewrite"
             self._save_state()
             return StageResult("retrying", "控制计划生产者改写了只读权威分镜；已恢复原文，尚未调用 ImageGen。", handoff)
-        compiled = self._compile_story_image_control_plan(
-            draft=self._story_image_control_draft_path(),
-            target=plan,
-            staging_storyboard=staging_storyboard,
-            story_lines=story_lines,
-            contract_context=contract_context,
-        )
-        visual_bible = staging / f"{self.context.slug}_visual_bible.md"
-        if not compiled or not visual_bible.is_file() or not visual_bible.read_text(encoding="utf-8", errors="ignore").strip():
+        try:
+            ingest = self.ingest_story_image_director_result(self._story_image_director_result_path())
+        except (OSError, DirectorProtocolError) as exc:
             progress["control_plan_status"] = "invalid"
+            progress["control_plan_error"] = str(exc)
             progress["updated_at"] = now()
             self._save_state()
             return StageResult(
                 "retrying",
-                f"一次性逐镜控制计划第 {attempt}/2 次未通过确定性 Schema/连续性校验；下一次只定向修订控制文件，不调用 ImageGen。",
-                handoff,
+                f"精简导演结果第 {attempt}/2 次未通过受控 ingest：{exc}；下一次只修订结果 JSON，不调用 ImageGen。",
+                brief,
             )
-        self._write_story_video_controls_from_plan(staging=staging, plan=plan)
-        progress.update({"control_plan_status": "validated", "updated_at": now()})
+        coverage = [int(value) for value in ingest["coverage"]]
+        active_plan = Path(ingest["plan"])
+        if active_plan.name.endswith("_storyboard_plan.json"):
+            self._write_story_video_controls_from_plan(staging=staging, plan=active_plan)
+        progress.update(
+            {
+                "control_plan_status": "validated" if len(coverage) == len(story_lines) else "partial_validated",
+                "director_coverage": coverage,
+                "updated_at": now(),
+            }
+        )
         self._save_state()
         self._record_event(
             "story_image_control_plan",
             {
                 "status": "passed",
-                "message": "一次性逐镜控制计划已通过确定性校验；正式图片批次将只执行已锁定的逐镜字段。",
+                "message": f"精简导演结果已通过受控 ingest，当前覆盖镜头：{coverage}。",
                 "stage": "codex_story_images",
             },
         )
@@ -6167,7 +6697,7 @@ class StoryAgent:
         story_lines: list[str],
         indices: list[int],
     ) -> Path:
-        plan = staging / f"{self.context.slug}_storyboard_plan.json"
+        plan = self._story_image_active_plan_path()
         rows: list[dict[str, Any]] = []
         if plan.is_file():
             try:
@@ -8612,6 +9142,12 @@ def main() -> None:
     run.add_argument("--codex-path", default="codex")
     run.add_argument("--codex-timeout", default=3600, type=int, help="单个 codex exec 子任务超时时间，秒")
     run.add_argument("--codex-story-image-batch-size", default=15, type=int, help="codex_story_images 每个 CLI 子任务批量生成的图片数量；默认 15，通常覆盖一个完整故事")
+    run.add_argument(
+        "--story-image-director-executor",
+        choices=["frontend_handoff", "codex_cli"],
+        default="",
+        help="精简图片导演执行器；默认随 codex-mode 选择，前台恢复可显式使用 frontend_handoff",
+    )
     run.add_argument("--scheduler", choices=["linear", "dag"], default="linear", help="linear 保留旧行为；dag 并行调度独立分支")
     run.add_argument("--max-parallel", default=3, type=int, help="DAG 最多并行 stage worker 数")
     run.add_argument("--module-profile", choices=sorted(ALLOWED_MODULE_PROFILES), default="")
@@ -8633,6 +9169,11 @@ def main() -> None:
     start.add_argument("--codex-worker-reasoning-effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default="")
     start.add_argument("--codex-timeout", default=3600, type=int)
     start.add_argument("--max-steps", default=999, type=int)
+    start.add_argument(
+        "--story-image-director-executor",
+        choices=["frontend_handoff", "codex_cli"],
+        default="codex_cli",
+    )
     start.add_argument("--scheduler", choices=["linear", "dag"], default="dag")
     start.add_argument("--max-parallel", default=3, type=int)
     start.add_argument("--module-profile", choices=sorted(ALLOWED_MODULE_PROFILES), default="")
@@ -8660,6 +9201,11 @@ def main() -> None:
     supervise.add_argument("--codex-worker-reasoning-effort", choices=["low", "medium", "high", "xhigh", "max", "ultra"], default="")
     supervise.add_argument("--codex-timeout", default=3600, type=int)
     supervise.add_argument("--max-steps", default=999, type=int)
+    supervise.add_argument(
+        "--story-image-director-executor",
+        choices=["frontend_handoff", "codex_cli"],
+        default="codex_cli",
+    )
     supervise.add_argument("--scheduler", choices=["linear", "dag"], default="dag")
     supervise.add_argument("--max-parallel", default=3, type=int)
     supervise.add_argument("--module-profile", choices=sorted(ALLOWED_MODULE_PROFILES), default="")
@@ -8692,6 +9238,11 @@ def main() -> None:
     run_stage.add_argument("--codex-path", default="codex")
     run_stage.add_argument("--codex-timeout", default=3600, type=int)
     run_stage.add_argument("--codex-story-image-batch-size", default=15, type=int)
+    run_stage.add_argument(
+        "--story-image-director-executor",
+        choices=["frontend_handoff", "codex_cli"],
+        default="",
+    )
     run_stage.add_argument("--module-profile", choices=sorted(ALLOWED_MODULE_PROFILES), default="")
     run_stage.add_argument(
         "--module-execution-mode", choices=sorted(ALLOWED_MODULE_EXECUTION_MODES), default=""
@@ -8737,6 +9288,24 @@ def main() -> None:
     migrate_binding.add_argument("--expected-old-revision", required=True)
     migrate_binding.add_argument("--migrated-by", default="user")
     migrate_binding.add_argument("--reason", required=True)
+
+    ingest_director = subparsers.add_parser(
+        "ingest-story-image-director-result",
+        help="校验精简导演结果、继承状态并编译现有下游分镜格式；不会把阶段标记为通过",
+    )
+    ingest_director.add_argument("--project-dir", required=True, type=Path)
+    ingest_director.add_argument("--result", required=True, type=Path)
+    ingest_director.add_argument("--story-name", default="")
+    ingest_director.add_argument("--slug", default="")
+
+    ingest_images = subparsers.add_parser(
+        "ingest-story-image-batch",
+        help="按 SCENE=PATH 受控接收前台 ImageGen 图片并写 SHA-256 回执；不会放行阶段或启动下游",
+    )
+    ingest_images.add_argument("--project-dir", required=True, type=Path)
+    ingest_images.add_argument("--image", action="append", required=True, help="可重复，例如 1=/path/scene-01.png")
+    ingest_images.add_argument("--story-name", default="")
+    ingest_images.add_argument("--slug", default="")
 
     notifications = subparsers.add_parser("notifications", help="查看或确认项目通知")
     notifications.add_argument("--job", default="")
@@ -8859,6 +9428,7 @@ def main() -> None:
                     codex_reasoning_effort=args.codex_reasoning_effort,
                     codex_worker_reasoning_effort=args.codex_worker_reasoning_effort,
                     codex_story_image_batch_size=max(1, args.codex_story_image_batch_size),
+                    story_image_director_executor=args.story_image_director_executor,
                     scheduler="linear",
                     max_parallel=1,
                     notification_sinks=args.notification_sinks,
@@ -8927,6 +9497,52 @@ def main() -> None:
                 indent=2,
             )
         )
+        return
+    if args.command in {"ingest-story-image-director-result", "ingest-story-image-batch"}:
+        project_dir = args.project_dir.expanduser().resolve()
+        existing_manifest = load_manifest(project_paths(project_dir)) or {}
+        existing_story = existing_manifest.get("story", {}) if isinstance(existing_manifest.get("story"), dict) else {}
+        story_name = infer_story_name(None, args.story_name or str(existing_story.get("name") or ""), project_dir)
+        slug = args.slug.strip() or str(existing_story.get("slug") or "") or slugify(story_name)
+        context = AgentContext(
+            project_dir=project_dir,
+            inbox=None,
+            story_name=story_name,
+            slug=slug,
+            execute=True,
+            update_latest_episode=False,
+            codex_mode="handoff",
+            codex_model="",
+            codex_sandbox="workspace-write",
+            codex_approval="never",
+            codex_path="codex",
+            codex_timeout=30,
+            codex_story_image_batch_size=3,
+            story_image_director_executor="frontend_handoff",
+        )
+        agent = StoryAgent(context)
+        assert_runnable(agent._manifest(), project_dir)
+        try:
+            if args.command == "ingest-story-image-director-result":
+                outcome = agent.ingest_story_image_director_result(args.result.expanduser().resolve())
+            else:
+                scene_sources: dict[int, Path] = {}
+                for item in args.image:
+                    raw_scene, separator, raw_path = str(item).partition("=")
+                    if not separator:
+                        parser.error("--image 必须使用 SCENE=PATH 格式")
+                    try:
+                        scene = int(raw_scene)
+                    except ValueError:
+                        parser.error(f"--image 镜头号非法：{raw_scene}")
+                    if scene in scene_sources:
+                        parser.error(f"--image 镜头重复：{scene}")
+                    scene_sources[scene] = Path(raw_path)
+                outcome = agent.ingest_story_image_batch(scene_sources)
+        except DirectorProtocolError as exc:
+            print(json.dumps({"status": "rejected", "error": str(exc)}, ensure_ascii=False, indent=2))
+            raise SystemExit(2)
+        print(json.dumps({"status": "accepted", **outcome}, ensure_ascii=False, indent=2))
         return
     if args.command == "migrate-code-binding":
         project_dir = JobRegistry(args.registry).resolve(args.job) if args.job else args.project_dir
@@ -9007,6 +9623,8 @@ def main() -> None:
                 str(max(5, args.max_backoff)),
                 "--notification-sinks",
                 args.notification_sinks,
+                "--story-image-director-executor",
+                args.story_image_director_executor,
             ]
             if args.disable_codex_recovery:
                 command.append("--disable-codex-recovery")
@@ -9101,6 +9719,8 @@ def main() -> None:
             module_registry.selection_execution_mode(),
             "--notification-sinks",
             args.notification_sinks,
+            "--story-image-director-executor",
+            args.story_image_director_executor,
         ]
         if args.registry:
             run_command.extend(["--registry", str(args.registry.expanduser())])
@@ -9129,6 +9749,7 @@ def main() -> None:
             scheduler=args.scheduler,
             max_parallel=max(1, args.max_parallel),
             notification_sinks=args.notification_sinks,
+            story_image_director_executor=args.story_image_director_executor,
         )
         snapshot_agent = StoryAgent(
             AgentContext(
@@ -9257,6 +9878,7 @@ def main() -> None:
             max_parallel=max(1, args.max_parallel),
             notification_sinks=args.notification_sinks,
             stop_after_stage=args.stop_after_stage,
+            story_image_director_executor=args.story_image_director_executor,
         )
         try:
             exit_code = StoryAgent(context, module_registry=module_registry).run(max(1, args.max_steps))

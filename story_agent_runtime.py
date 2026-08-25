@@ -31,7 +31,7 @@ from story_contract_runtime import (
 MANIFEST_VERSION = 2
 DEFAULT_SOFT_BUDGET_CNY = 50.0
 DEFAULT_HARD_BUDGET_CNY = 100.0
-STORY_AGENT_RELEASE_VERSION = "3.6.2-canary.4"
+STORY_AGENT_RELEASE_VERSION = "3.6.2-canary.8"
 # V3.6 targets an overnight run.  At the deadline the scheduler freezes new
 # aesthetic retries and exposes the best hash-valid output; it does not launch
 # final_delivery/doctor or restart the full DAG.

@@ -18,6 +18,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 
+from PIL import Image
+
 from story_agent import (
     AgentContext,
     StageResult,
@@ -317,33 +319,59 @@ class StoryAgentRuntimeTests(unittest.TestCase):
                 calls.append(kwargs["stage"])
                 self.assertEqual(kwargs["stage"], "story_image_control_plan")
                 self.assertIn("不生成任何图片", kwargs["prompt"])
+                brief = agent._story_image_director_brief_path()
                 rows = []
-                for scene, text in enumerate(("第一镜。", "第二镜。"), start=1):
+                for scene in (1, 2):
                     rows.append(
                         {
                             "scene": scene,
-                            "story_text": text,
-                            "narrative_function": "setup",
+                            "continuity_group": "opening",
+                            "location": {
+                                "location_id": "home",
+                                "time_of_day": "day",
+                                "continuity_anchor": "window",
+                                "change_cue": "",
+                            },
+                            "subject": "主角",
                             "shot_size": "wide",
-                            "focal_character": "主角",
                             "visible_characters": ["主角"],
                             "excluded_characters": [],
-                            "continuity_group": "opening",
-                            "appearance_ids": ["hero_v1"],
-                            "visual_description": text,
-                            "scale_basis": {"applicable": False, "relationship_ids": [], "reason": "不适用"},
-                            "current_story_state": {},
-                            "visual_state_evidence": {},
+                            "character_knowledge": {
+                                "主角": {"aware_of": [], "unaware_of": [], "gaze_target": "前方"}
+                            },
+                            "required_visible_actions": [],
+                            "state_updates": {},
+                            "scale_relationship_ids": [],
+                            "reference_ids": [],
+                            "image_prompt": f"主角完成第{scene}镜。",
+                            "video_prompt": f"参考当前图片，完成第{scene}镜动作。",
+                            "emotion": "平静",
                             "subject_action": "主角自然行动",
                             "environment_motion": "环境轻微变化",
                             "camera_motion": "稳定镜头",
-                            "video_prompt": f"参考当前图片，完成第{scene}镜动作。",
+                            "screen_direction": "stationary",
+                            "expected_motion": {
+                                "primary": "subject",
+                                "subject_level": "low",
+                                "environment_level": "low",
+                                "camera_level": "none",
+                                "rationale": "轻微表演即可",
+                            },
                         }
                     )
-                agent._story_image_control_draft_path().write_text(
-                    json.dumps({"shots": rows}, ensure_ascii=False), encoding="utf-8"
+                agent._story_image_director_result_path().write_text(
+                    json.dumps(
+                        {
+                            "schema_version": "story_image_director_result_v1",
+                            "brief_sha256": file_sha256(brief),
+                            "executor": "codex_cli",
+                            "continuity_ledger": {"appearance": "hero_v1"},
+                            "decisions": rows,
+                        },
+                        ensure_ascii=False,
+                    ),
+                    encoding="utf-8",
                 )
-                (staging / "control-once_visual_bible.md").write_text("# 视觉圣经\n", encoding="utf-8")
                 return StageResult("done", "control ready")
 
             with patch.object(agent, "_codex_task", side_effect=write_control):
@@ -358,7 +386,8 @@ class StoryAgentRuntimeTests(unittest.TestCase):
                 )
             self.assertIsNone(result)
             self.assertEqual(calls, ["story_image_control_plan"])
-            self.assertTrue((staging / "control-once_storyboard_plan.seed.json").is_file())
+            self.assertTrue((staging / "control-once_director_brief.json").is_file())
+            self.assertTrue((staging / "control-once_director_decisions.json").is_file())
             self.assertTrue((staging / "control-once_storyboard_plan.json").is_file())
             self.assertTrue((staging / "control-once_flow_video_prompts.csv").is_file())
             self.assertFalse(any(staging_images.glob("*.png")))
@@ -374,6 +403,184 @@ class StoryAgentRuntimeTests(unittest.TestCase):
                     authoritative_storyboard_sha=file_sha256(storyboard),
                 )
             self.assertIsNone(second)
+
+    def test_frontend_director_handoff_is_small_and_does_not_launch_nested_codex(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：前台快速导演"
+            manifest = as_frozen_v3_legacy(init_project(project, story_name="前台快速导演", slug="frontend-director"))
+            paths = project_paths(project)
+            source = paths.inputs / "frontend-director_source.txt"
+            source.write_text("第一镜。\n第二镜。\n第三镜。\n", encoding="utf-8")
+            manifest["inputs"]["story_text"] = str(source)
+            write_manifest(paths, manifest)
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="前台快速导演",
+                slug="frontend-director",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+                codex_story_image_batch_size=3,
+            )
+            agent = StoryAgent(context)
+            staging = agent._codex_stage_dir("codex_story_images")
+            images = staging / "images"
+            images.mkdir(parents=True, exist_ok=True)
+            storyboard = staging / "frontend-director_storyboard_lines.txt"
+            storyboard.write_text("第一镜。\n第二镜。\n第三镜。\n", encoding="utf-8")
+            handoff = staging / "handoff.md"
+            handoff.write_text("任务书", encoding="utf-8")
+            with patch.object(agent, "_codex_task", side_effect=AssertionError("nested Codex must not run")):
+                result = agent._ensure_story_image_control(
+                    handoff=handoff,
+                    staging=staging,
+                    staging_images=images,
+                    staging_storyboard=storyboard,
+                    story_lines=["第一镜。", "第二镜。", "第三镜。"],
+                    contract_context=None,
+                    authoritative_storyboard_sha=file_sha256(storyboard),
+                )
+            self.assertEqual(result.status, "blocked")
+            self.assertIn("handoff_required", result.message)
+            brief_path = agent._story_image_director_brief_path()
+            brief = json.loads(brief_path.read_text(encoding="utf-8"))
+            self.assertEqual(brief["requested_scenes"], [1, 2, 3])
+            self.assertLess(len(agent._story_image_director_prompt(brief_path).encode("utf-8")), 10_000)
+            self.assertEqual(agent.state["codex_story_images"]["control_plan_status"], "handoff_required")
+
+    def test_cli_director_account_blocker_switches_to_frontend_without_retry(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：额度切换"
+            manifest = as_frozen_v3_legacy(init_project(project, story_name="额度切换", slug="quota-handoff"))
+            paths = project_paths(project)
+            source = paths.inputs / "quota-handoff_source.txt"
+            source.write_text("唯一镜头。\n", encoding="utf-8")
+            manifest["inputs"]["story_text"] = str(source)
+            write_manifest(paths, manifest)
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="额度切换",
+                slug="quota-handoff",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="cli",
+                codex_model="gpt-5.6-sol",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+                story_image_director_executor="codex_cli",
+            )
+            agent = StoryAgent(context)
+            staging = agent._codex_stage_dir("codex_story_images")
+            images = staging / "images"
+            images.mkdir(parents=True, exist_ok=True)
+            storyboard = staging / "quota-handoff_storyboard_lines.txt"
+            storyboard.write_text("唯一镜头。\n", encoding="utf-8")
+            handoff = staging / "handoff.md"
+            handoff.write_text("任务书", encoding="utf-8")
+            with patch.object(agent, "_codex_task", return_value=StageResult("blocked", "usage limit")) as task:
+                result = agent._ensure_story_image_control(
+                    handoff=handoff,
+                    staging=staging,
+                    staging_images=images,
+                    staging_storyboard=storyboard,
+                    story_lines=["唯一镜头。"],
+                    contract_context=None,
+                    authoritative_storyboard_sha=file_sha256(storyboard),
+                )
+            self.assertEqual(task.call_count, 1)
+            self.assertEqual(result.status, "blocked")
+            self.assertIn("不自动重试", result.message)
+            self.assertEqual(agent.state["codex_story_images"]["control_plan_status"], "handoff_required")
+
+    def test_frontend_image_ingest_writes_hash_receipt_without_passing_stage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：前台图片接收"
+            manifest = as_frozen_v3_legacy(init_project(project, story_name="前台图片接收", slug="frontend-image"))
+            paths = project_paths(project)
+            source_text = paths.inputs / "frontend-image_source.txt"
+            source_text.write_text("唯一镜头。\n", encoding="utf-8")
+            manifest["inputs"]["story_text"] = str(source_text)
+            write_manifest(paths, manifest)
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="前台图片接收",
+                slug="frontend-image",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+                codex_story_image_batch_size=1,
+            )
+            agent = StoryAgent(context)
+            staging = agent._codex_stage_dir("codex_story_images")
+            storyboard = staging / "frontend-image_storyboard_lines.txt"
+            storyboard.parent.mkdir(parents=True, exist_ok=True)
+            storyboard.write_text("唯一镜头。\n", encoding="utf-8")
+            brief_path = agent._write_story_image_director_brief(
+                staging_storyboard=storyboard,
+                story_lines=["唯一镜头。"],
+                contract_context=None,
+                requested_scenes=[1],
+            )
+            result_path = Path(directory) / "director-result.json"
+            result_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": "story_image_director_result_v1",
+                        "brief_sha256": file_sha256(brief_path),
+                        "executor": "frontend_handoff",
+                        "continuity_ledger": {},
+                        "decisions": [
+                            {
+                                "scene": 1,
+                                "continuity_group": "room",
+                                "location": {"location_id": "room", "time_of_day": "day", "continuity_anchor": "window", "change_cue": ""},
+                                "subject": "hero",
+                                "shot_size": "medium",
+                                "visible_characters": ["hero"],
+                                "excluded_characters": [],
+                                "character_knowledge": {"hero": {"aware_of": [], "unaware_of": [], "gaze_target": "front"}},
+                                "required_visible_actions": [],
+                                "state_updates": {},
+                                "scale_relationship_ids": [],
+                                "reference_ids": [],
+                                "image_prompt": "hero in room",
+                                "video_prompt": "hero breathes gently",
+                                "emotion": "calm",
+                                "subject_action": "stands",
+                                "environment_motion": "curtain moves",
+                                "camera_motion": "locked",
+                                "screen_direction": "stationary",
+                                "expected_motion": {"primary": "subject", "subject_level": "low", "environment_level": "low", "camera_level": "none", "rationale": "quiet scene"},
+                            }
+                        ],
+                    },
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+            agent.ingest_story_image_director_result(result_path)
+            generated = Path(directory) / "generated.png"
+            Image.new("RGB", (1600, 900), (20, 80, 140)).save(generated)
+            outcome = agent.ingest_story_image_batch({1: generated})
+            receipt = json.loads(Path(outcome["receipt"]).read_text(encoding="utf-8"))
+            self.assertFalse(receipt["stage_marked_passed"])
+            self.assertFalse(receipt["downstream_started"])
+            self.assertTrue((paths.images / "images" / "frontend-image_scene_01.png").is_file())
 
     def test_prepared_entry_binds_clean_video_and_confirmed_text_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -792,6 +999,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             env = popen.call_args.kwargs["env"]
             self.assertEqual(command[command.index("--module-profile") + 1], "mock-music")
             self.assertEqual(command[command.index("--module-execution-mode") + 1], "test")
+            self.assertEqual(command[command.index("--story-image-director-executor") + 1], "codex_cli")
             for name, value in locked.items():
                 self.assertEqual(env[name], value)
 

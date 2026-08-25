@@ -1,23 +1,28 @@
-# Delivery contract
+# 交付合同
 
-## Required user-facing outputs
+## 用户可见产物
 
-- `主账号发布视频.mp4`
-- `宝库号发布视频.mp4`
-- Main-account and library-account title, body, and topic suggestions
-- Six approved covers: 3:4, 4:3, and 16:9 for each account
-- Basic package: consumer manuscript, reading annotation, music, demonstration video, titled background image
-- Advanced package: consumer manuscript, reading annotation, music, demonstration video, PPT with/without subtitles, background video with/without subtitles
+- `主账号发布视频.mp4`、`宝库号发布视频.mp4`。
+- 两个账号各自的标题、正文和话题建议。
+- 两个账号各 3:4、4:3、16:9 三张审核通过的封面，共六张。
+- 基础版：客户故事文稿、朗读标注、配乐、示范视频、带标题背景图。
+- 进阶版：基础版全部内容、含/无字幕背景视频，以及四种完整动态 PPT：
+  - 含字幕自动版、无字幕自动版。
+  - 含字幕控场版、无字幕控场版。
 
-## Required internal evidence
+## 必要内部证据
 
-- Original source fingerprint and preserved project copy
-- Raw transcript, edit decisions, kept intervals, clean script, and subtitles
-- Stage attempts, timestamps, artifact paths, reviewer score, and critical-error list
-- Cost ledger with soft limit ¥50 and hard limit ¥100
-- `99_项目状态/成本报告.md`, `QA汇总.md`, and `异常说明.md`; none may appear inside either customer package
-- Final QA summary, exception report, and total delivery checklist
+- 确认文本、调色绿幕视频和提取音频的路径及 SHA-256。
+- `story_r2v_plan.json`、供应商任务回执和逐镜目标文件对应关系。
+- `qa_music_report.json` 与当前输入哈希。
+- `keying_search.json`、候选帧、锁定 RVM 预设及独立审核。
+- `story_ppt_plan.json`、`qa_dynamic_ppt_report.json` 与四种 PPT 的媒体和播放 QA。
+- 当前有效的独立审核文件、总成本和 `story_run.json`。
+- 成本报告、QA 汇总与异常说明只允许出现在 `99_项目状态`，不得混入客户资料包。
 
-## Completion gate
+## 完成门禁
 
-Claim completion only when all required outputs exist and every intelligent/visual stage has a current passing review. A review is current only when its `artifact_sha256` matches the artifact on disk. External login, CAPTCHA, payment, platform-risk, disk-space, and API-auth failures are blockers, not permission to fabricate success.
+- 文件存在不能替代 QA；独立审核必须 `approved: true`、分数至少 85、关键错误为空且 SHA-256 当前有效。
+- 每个视频任务必须逐一匹配计划中的目标文件，不能用 MP4 数量代替。
+- 任何输入或依赖哈希变化都会使对应下游产物失效，但不得使无关分支或上游自动重跑。
+- 外部登录、CAPTCHA、支付、磁盘或密钥问题应记录为分支阻塞，禁止伪造成功。

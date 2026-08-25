@@ -116,12 +116,33 @@ def align_with_whisper(
         raise RuntimeError("Whisper 没有返回可用的词/字时间戳。")
 
     char_times = _char_times(tokens)
+    return align_confirmed_text_to_char_times(script_lines, char_times)
+
+
+def align_confirmed_text_to_char_times(
+    script_lines: list[str],
+    char_times: list[tuple[str, float, float]],
+) -> list[LineTiming]:
+    """Map immutable confirmed text onto ASR timestamps.
+
+    ASR characters are timing hints only.  Returned ``LineTiming.line`` values
+    always come from ``script_lines``.  Local recognition substitutions and
+    omissions are interpolated from surrounding anchors; only a transcript
+    with effectively no usable anchors is rejected.
+    """
+
+    script_lines = [sanitize_script_line(line) for line in script_lines]
     script_clean_lines = [clean_text(line) for line in script_lines]
     script_clean = "".join(script_clean_lines)
     recognized_clean = "".join(char for char, _, _ in char_times)
 
     if not script_clean or not recognized_clean:
         raise RuntimeError("台词或识别结果为空，无法对齐。")
+
+    anchor_chars = _matching_anchor_chars(script_clean, recognized_clean)
+    minimum_anchor_chars = 1 if len(script_clean) < 20 else max(2, round(len(script_clean) * 0.01))
+    if anchor_chars < minimum_anchor_chars:
+        raise RuntimeError("确认正文与音频识别结果整段无法映射；请检查是否选错音频文件。")
 
     script_to_audio_char = _map_script_chars_to_audio_chars(script_clean, recognized_clean)
     total_audio_chars = len(char_times)
@@ -156,6 +177,11 @@ def align_with_whisper(
         script_cursor += len(line_clean)
 
     return result
+
+
+def _matching_anchor_chars(script: str, recognized: str) -> int:
+    matcher = SequenceMatcher(a=script, b=recognized, autojunk=False)
+    return sum(block.size for block in matcher.get_matching_blocks())
 
 
 def save_timings(timings: list[LineTiming], path: Path) -> None:

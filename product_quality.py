@@ -818,13 +818,14 @@ def write_product_package_manifest(
 ) -> dict[str, Any]:
     files: list[dict[str, Any]] = []
     for package, directory in (("base", base_dir), ("advanced", advanced_dir)):
-        for path in sorted(directory.iterdir()):
+        for path in sorted(directory.rglob("*")):
             if path.is_file():
-                source = source_map.get(f"{package}:{path.name}")
+                package_relative = path.relative_to(directory)
+                source = source_map.get(f"{package}:{package_relative}")
                 files.append({
                     "package": package,
                     "relative_path": str(path.relative_to(product_root)),
-                    "role": _role_for_product_file(path.name),
+                    "role": _role_for_product_file(str(package_relative)),
                     "sha256": file_sha256(path),
                     "source_path": str(source) if source else "",
                     "source_sha256": file_sha256(source) if source and source.is_file() else "",
@@ -918,7 +919,7 @@ def product_package_manifest_issues(manifest_path: Path) -> list[str]:
         key = (str(item.get("package")), str(item.get("role")))
         if key[1] == "unknown":
             issues.append(f"product_unknown_role:{rel}")
-        if key in seen and key[1] not in {"background_video"}:
+        if key in seen and key[1] not in {"background_video", "dynamic_ppt_media"}:
             issues.append(f"product_duplicate_role:{key[0]}:{key[1]}")
         seen.add(key)
         if not path.is_file() or item.get("sha256") != file_sha256(path):
@@ -940,17 +941,29 @@ def product_package_manifest_issues(manifest_path: Path) -> list[str]:
         str(path.resolve())
         for directory in (Path(str(payload.get("base_directory"))), Path(str(payload.get("advanced_directory"))))
         if directory.is_dir()
-        for path in directory.iterdir()
+        for path in directory.rglob("*")
         if path.is_file()
     }
     if recorded_files != actual_customer_files:
         issues.append("product_file_inventory_mismatch")
     required_base = {"customer_manuscript", "music", "reading_annotation", "demo", "background_image"}
-    required_advanced = required_base | {"ppt_with_subtitles", "ppt_without_subtitles", "background_video_with_subtitles", "background_video_without_subtitles", "a_only_video"}
+    required_advanced = required_base | {"background_video_with_subtitles", "background_video_without_subtitles", "a_only_video"}
     for package, required in (("base", required_base), ("advanced", required_advanced)):
         roles = {role for pkg, role in seen if pkg == package}
         for role in sorted(required - roles):
             issues.append(f"product_required_role_missing:{package}:{role}")
+        if package == "advanced":
+            legacy_ppt = {"ppt_with_subtitles", "ppt_without_subtitles"}
+            dynamic_ppt = {
+                "ppt_with_subtitles_auto", "ppt_without_subtitles_auto",
+                "ppt_with_subtitles_control", "ppt_without_subtitles_control",
+            }
+            if not legacy_ppt.issubset(roles) and not dynamic_ppt.issubset(roles):
+                issues.append("product_required_ppt_set_missing:advanced")
+            if dynamic_ppt.issubset(roles):
+                for dependency in ("story_ppt_plan", "qa_dynamic_ppt_report"):
+                    if dependency not in dependencies:
+                        issues.append(f"product_dependency_missing:{dependency}")
     by_role = {
         (str(item.get("package")), str(item.get("role"))): str(item.get("sha256") or "")
         for item in payload.get("files", []) if isinstance(item, dict)
@@ -1015,6 +1028,8 @@ def product_package_review_payload_issues(
 
 
 def _role_for_product_file(name: str) -> str:
+    if "PPT动态素材" in Path(name).parts:
+        return "dynamic_ppt_media"
     if "故事文稿" in name:
         return "customer_manuscript"
     if "故事配乐" in name:
@@ -1025,6 +1040,14 @@ def _role_for_product_file(name: str) -> str:
         return "demo"
     if "背景图片" in name:
         return "background_image"
+    if "故事PPT" in name and "含字幕" in name and "自动播放" in name:
+        return "ppt_with_subtitles_auto"
+    if "故事PPT" in name and "无字幕" in name and "自动播放" in name:
+        return "ppt_without_subtitles_auto"
+    if "故事PPT" in name and "含字幕" in name and "人工控场" in name:
+        return "ppt_with_subtitles_control"
+    if "故事PPT" in name and "无字幕" in name and "人工控场" in name:
+        return "ppt_without_subtitles_control"
     if "故事PPT" in name and "含字幕" in name:
         return "ppt_with_subtitles"
     if "故事PPT" in name and "无字幕" in name:

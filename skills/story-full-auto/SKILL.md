@@ -1,135 +1,53 @@
 ---
 name: story-full-auto
-description: Run the local green-screen story production Agent from a single source video through resumable, budgeted, independently reviewed delivery. Use when the user attaches or names a horizontal green-screen narration video and asks to produce a complete story, continue an existing story job, check progress, resume after an external blocker, or generate the morning delivery report.
+description: 用用户确认的故事文本和已调色横屏绿幕视频，在当前 Codex 任务中轻量编排 R2V 正文、Suno 配乐、RVM 抠像、双账号发布视频、资料包、动态 PPT 与封面。适用于新建、续做或检查完整故事生产；不调用旧 story_agent.py 后台流程。
 ---
 
-# Full-auto story production
+# Codex 原生故事生产
 
-Treat Codex as the operator and `story_agent.py` as the durable state machine. Keep the old workbench as a diagnostic fallback; do not ask the user to click through it during a normal run.
+当前 Sol 任务是唯一指挥官。把现有 Python 模块当作确定性工具，让 Luna 子任务执行边界清晰的生产工作；不要启动嵌套 `codex exec`、旧 `story_agent.py`、Dashboard 或旧阶段恢复流程。
 
-## Direct story-body video with R2V
+## 输入边界
 
-When planning or generating story-body background video, invoke `skills/story-r2v-director/SKILL.md` and follow its asset, continuity, state-transition, prompt, and whole-video review contracts.
+- 只接受用户确认且不允许改写的故事文本，以及已经调色、可直接使用的横屏绿幕视频。
+- 从视频提取音频作为时间轴权威。语音识别和强制对齐只定位时间，绝不能修改确认文本。
+- 局部对齐失败时用前后有效锚点估算；仅在音频为空、文件错误或整段正文无法形成单调时间轴时暂停。
+- 原始文本和视频只读保存；所有派生物写入新项目目录。
 
-- Use Reference-to-Video for the story body. Do not make the planner choose between I2V and R2V shot by shot.
-- Keep I2V/card rendering only for title, moral, or other typography-locked screens outside the story body.
-- Derive each paid story-body task from a semantically complete audio window that fits a native 6- or 10-second generation and allowed whole-clip retime. Do not create one task per sentence, static image, action beat, or desired shot size.
-- Build each request from separate runtime character, empty-environment, and entry-state prop references. Do not require precomposed story illustrations for the R2V body.
-- Validate the resulting `story_r2v_plan.json` before any paid submission. Preserve its hashes and decisions for downstream assembly and review.
+## 启动和恢复
 
-## Start from one video
+1. 提取干净音频并确认文本可以形成完整时间轴。
+2. 使用 `story_run.py init` 创建 `99_项目状态/story_run.json`。
+3. 读取 [Codex 原生工作流](references/codex-native-workflow.md)，由 Sol 一次完成总导演计划并分派并行工作包。
+4. 每完成一个当前有效产物，用 `story_run.py record` 登记路径、输入哈希、供应商任务号和实际付费金额。
+5. 恢复时只运行 `story_run.py status`；直接复用输入哈希未变化的产物，不重新规划或重做上游。
+6. 交付前读取 [交付合同](references/delivery-contract.md)，用 `story_run.py finalize` 重新核对文件与 SHA-256。
 
-1. Confirm the source is a horizontal green-screen narration video. Do not require a separate script, narration, or music file.
-   For a promotion-counted run, do not add user-provided story text, narration, music, images, clips, or prebuilt package files after submission. `submit` records a single-input contract; source editing must record every derived text, clean-video, and clean-audio hash against the original video and edit-decision hash.
-2. From the project root, submit it:
+`story_run.py` 只维护六个工作包：导演计划、R2V 视觉、音乐、真人抠像、产品素材、最终交付。不得把旧阶段列表复制到新账本。
 
-```bash
-python3 story_agent.py submit \
-  --video "/absolute/path/to/greenscreen.mp4" \
-  --lut "/absolute/path/to/input-look.cube" \
-  --soft-budget 50 \
-  --hard-budget 100
-```
+## 专业模块路由
 
-3. Capture `job_id` and `project_dir` from the JSON response.
-4. Start the durable background supervisor. It defaults to the DAG scheduler and may run the visual, music, and release-asset branches concurrently while preserving dependency joins:
+- 正文视觉必须读取并遵循 `skills/story-r2v-director/SKILL.md`；正文统一 R2V，片头、寓意和锁字卡仍使用既有 I2V/卡片流程。
+- 配乐调用 `$suno-story-score`，通常合并为 2–4 个情绪段并自主选择候选；不要求用户试听。
+- 朗读标注调用 `$story-performance-script`，确认文本除主持人脱敏外逐字保留。
+- RVM、主账号/宝库号 A/B/C、A 镜锚点、边框遮罩、水印、封面和资料包直接调用现有工程模块及其配置，不在技能中复述或改写这些规则。
+- 生成动态 PPT 时读取 [完整动态 PPT](references/dynamic-ppt.md)。
 
-```bash
-python3 story_agent.py start --job "<job_id>"
-```
+## 审核边界
 
-Use `--scheduler linear` only for compatibility diagnosis. Limit concurrency explicitly when the machine or external services need it:
+- 付费前：一个新的独立上下文审核完整导演计划一次。
+- RVM：Luna 生成候选和 `keying_search.json`，新的独立 Sol 上下文审核并锁定一次；通过前不得渲染全片。
+- R2V：每镜先做机器完整性检查；全部镜头完成后再做一次整组独立视觉审核，不逐镜反复审美打分。
+- 最终：双账号视频、资料包、动态 PPT 和封面组成一个交付审核包；封面仍遵循已有六图机器 QA 与视觉审核。
+- 所有独立审核必须分数至少 85、关键错误为空并绑定当前产物 SHA-256。
 
-```bash
-python3 story_agent.py start --job "<job_id>" --scheduler dag --max-parallel 3
-```
+## 付费与停止
 
-## Use the prepared acceleration entry
+- 默认软预算 ¥50 仅提示，硬预算 ¥100 禁止新的付费调用。付费前先读取账本剩余额度，完成后登记实际金额。
+- 同一 R2V 镜头默认一次生成；严重失败最多定点重做一次，且必须改变资产、节拍或提示词。
+- 登录、CAPTCHA、付款、密钥或平台风控只阻塞所属分支；不要反复重启同一操作。
+- 计划锁定后十分钟内仍未发出首个真实视觉任务时停止诊断，不能继续消耗模型额度却没有付费任务回执。
 
-Use this only when the user supplies both (a) a complete, already color-restored clean horizontal green-screen video and (b) a UTF-8 `.txt`/`.md` or `.docx` manuscript they manually confirmed. Do not pass a LUT; the Agent must not restore color or automatically remove takes again.
+## 完成条件
 
-```bash
-python3 story_agent.py submit \
-  --input-mode prepared \
-  --video "/absolute/path/to/restored-clean-greenscreen.mp4" \
-  --confirmed-text "/absolute/path/to/confirmed-story.txt"
-python3 story_agent.py start --job "<job_id>"
-```
-
-The Agent copies both inputs without altering the originals, binds their SHA-256 values, changes only line breaks when deriving the storyboard text, extracts narration, and continues from project setup. Any hash drift blocks the run before paid work. A prepared run can be production-valid but must never count toward the three single-source default-entry promotion samples.
-
-Use the returned job ID for every later operation. Never infer completion from the terminal process alone.
-When running from the desktop sandbox, the supervisor may need scoped approval because child `codex exec` processes write the existing `~/.codex` state database. If the log reports a read-only state database, rerun the same `start` command with that narrow approval; do not broaden the sandbox or use `danger-full-access`.
-
-## Monitor and recover
-
-Check durable state:
-
-```bash
-python3 story_agent.py status --job "<job_id>"
-```
-
-Use the returned `remaining_work`, ETA range, `retries_and_failures`, cumulative runtime, heartbeat, and `recovery_action`; do not replace these durable fields with guesses from terminal output. There is no fixed runtime deadline.
-For DAG jobs, also inspect `ready_stages`, `branches`, `branch_blockers`, and the critical-path ETA. A CAPTCHA or account issue blocks only its branch while independent branches continue; the overall job becomes blocked only when no runnable branch remains.
-
-If a run stops, read `99_项目状态/agent_morning_report.md` and the newest log before acting. Resume only after resolving the named external state:
-
-```bash
-python3 story_agent.py resume --job "<job_id>"
-python3 story_agent.py start --job "<job_id>"
-```
-
-If `music/suno_cli_blocker.md` says the background Codex process has no Browser tool, execute the generated Suno handoff from the primary Codex task using an authenticated browser. Save every named download in `suno_downloads`; then resume. Do not keep restarting the background child and do not bypass login or CAPTCHA.
-
-Cancel without deleting products or source material:
-
-```bash
-python3 story_agent.py cancel --job "<job_id>"
-```
-
-## Enforce review integrity
-
-- Require a structured reviewer artifact with `approved: true`, score at least 85, no critical errors, and a matching SHA-256 for the reviewed artifact.
-- Use a fresh Codex execution for reviewer stages. Do not expose producer reasoning or an earlier reviewer conclusion.
-- Reject stale approval files after an artifact changes.
-- Never treat file existence, a zero exit code, or a producer self-description as quality approval.
-- Preserve original media and every edit decision. Never overwrite the submitted source.
-- Require `qa_source_report.json` to bind the source video, selected LUT, edit decisions, clean video, and clean audio hashes, with clean-media durations matching the retained intervals. A text-review approval alone cannot release stale media.
-- Keep the submitted 4K source unchanged; use a maximum 1920-pixel-wide yuv420p clean working copy unless the user explicitly requests a different working resolution.
-- Stop new paid work at the hard budget. Above the soft budget, skip non-critical extra candidates and cosmetic retries.
-- Require `qa_music_report.json` to pass with current input hashes before final assembly; a music file existing by itself is not enough.
-- Treat CAPTCHA, expired login, payment/credits, missing credentials, and account risk controls as external blockers. Network/API/Codex transient failures may retry only up to the configured attempt limit.
-- Read the default video API credential from `TOAPIS_API_KEY`. Never place the real key in CLI arguments, manifests, handoffs, or logs; keep legacy providers available only as explicit adapters.
-- On macOS, the runner also checks the Keychain service `story-agent.TOAPIS_API_KEY` for the current account. Ask the user to enter a new key through a local hidden prompt when neither source is configured; never relay a chat-visible key into a shell command.
-
-## Finish
-
-Generate the final summary:
-
-```bash
-python3 story_agent.py report --job "<job_id>"
-```
-
-Read [references/delivery-contract.md](references/delivery-contract.md) before claiming completion. If any required artifact or review evidence is absent, report the job as partial or blocked and continue the task when possible.
-
-For a candidate production run, ask the user to perform the real morning final review. Only after the user explicitly reports the result and actual elapsed review time, bind that evidence to the current delivery files:
-
-```bash
-python3 story_agent.py signoff \
-  --job "<job_id>" \
-  --result pass \
-  --minutes 8.5 \
-  --notes "无需修改"
-```
-
-Never invent or auto-pass a human signoff. A changed video, cover, copy, or package invalidates the signoff bundle.
-
-Check the three-story promotion gate with:
-
-```bash
-python3 story_agent.py qualification \
-  --projects-root "auto-project/runs" \
-  --output "FULL_AUTO_PROMOTION_REPORT.md"
-```
-
-Only projects that preserve the single-green-screen input contract, were launched through `start`, have every Agent stage passed, contain no reviewed product predating the unattended launch, retain current independent-review hashes, cost no more than ¥50, have a valid cumulative-runtime record, have distinct source-video hashes/story names, and have a passing human final review of at most 10 minutes count toward the 3-story target. Do not make the Agent the default entry until the report says `ready_for_default_entry: true`.
+只有当六个工作包均为 `done`、交付合同中的全部文件存在、当前哈希有效且最终独立审核通过时，才能执行 `finalize` 并宣称完成。

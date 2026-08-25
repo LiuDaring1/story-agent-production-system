@@ -20,6 +20,7 @@ from product_package import (
     validate_annotation_coverage,
 )
 from product_quality import (
+    _role_for_product_file,
     annotation_review_payload_issues,
     annotation_receipt_issues,
     atomic_write_json,
@@ -47,6 +48,19 @@ def timing(index: int, text: str, start: float) -> LineTiming:
 
 
 class ProductQualityTests(unittest.TestCase):
+    def test_dynamic_ppt_roles_distinguish_playback_and_subtitle_modes(self) -> None:
+        expected = {
+            "故事PPT：故事（含字幕·自动播放）.pptx": "ppt_with_subtitles_auto",
+            "故事PPT：故事（无字幕·自动播放）.pptx": "ppt_without_subtitles_auto",
+            "故事PPT：故事（含字幕·人工控场）.pptx": "ppt_with_subtitles_control",
+            "故事PPT：故事（无字幕·人工控场）.pptx": "ppt_without_subtitles_control",
+        }
+        self.assertEqual({name: _role_for_product_file(name) for name in expected}, expected)
+        self.assertEqual(
+            _role_for_product_file("PPT动态素材/001-S01.mp4"),
+            "dynamic_ppt_media",
+        )
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)

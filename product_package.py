@@ -13,7 +13,7 @@ import time
 import zipfile
 from dataclasses import asdict, dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from docx import Document
 from docx.enum.section import WD_ORIENT
@@ -199,6 +199,19 @@ def main() -> None:
     parser.add_argument("--semantic-contract-spec", type=Path, help="已审核合同编译出的资料包内容选择规格")
     parser.add_argument("--project-dir", type=Path, help="required_v1 项目根目录，用于重新验证语义计划")
     parser.add_argument("--artifact-semantic-plan", type=Path, help="逐产物语义呈现计划")
+    parser.add_argument("--dynamic-ppt-plan", type=Path, help="story-ppt-plan-v1：每页完整静音镜头视频和字幕")
+    parser.add_argument("--dynamic-ppt-node", type=Path, help="load_workspace_dependencies 返回的 Node.js 绝对路径")
+    parser.add_argument("--dynamic-ppt-node-modules", type=Path, help="load_workspace_dependencies 返回的 Node.js packages 绝对路径")
+    parser.add_argument(
+        "--dynamic-ppt-embed-media",
+        action="store_true",
+        help="仅在 WPS 无法稳定读取共享相对路径时，把媒体内嵌进四个 PPTX",
+    )
+    parser.add_argument(
+        "--dynamic-ppt-builder",
+        type=Path,
+        default=Path(__file__).resolve().parent / "skills" / "story-full-auto" / "scripts" / "build_dynamic_story_ppt.mjs",
+    )
     args = parser.parse_args()
 
     build_product_package(args)
@@ -597,6 +610,26 @@ def build_product_package(args: argparse.Namespace) -> None:
         total_duration=narration_duration,
         semantic_card_positions=ppt_semantic_cards,
     )
+    dynamic_ppt_outputs: dict[str, Path] = {}
+    if args.dynamic_ppt_plan:
+        if args.dynamic_ppt_node is None or args.dynamic_ppt_node_modules is None:
+            raise ValueError(
+                "动态 PPT 必须提供 --dynamic-ppt-node 和 --dynamic-ppt-node-modules，"
+                "两者必须直接使用 load_workspace_dependencies 返回的绝对路径"
+            )
+        from dynamic_story_ppt import build_dynamic_story_ppts
+
+        dynamic_ppt_outputs = build_dynamic_story_ppts(
+            source_plan_path=args.dynamic_ppt_plan.expanduser(),
+            music_path=music_path,
+            output_dir=assets_dir,
+            work_dir=work_dir / "dynamic_ppt_work",
+            node=args.dynamic_ppt_node.expanduser(),
+            node_modules=args.dynamic_ppt_node_modules.expanduser(),
+            builder_source=args.dynamic_ppt_builder.expanduser(),
+            subtitle_layout=ppt_subtitle_layout,
+            embed_media=getattr(args, "dynamic_ppt_embed_media", False),
+        )
     build_story_ppt(
         story_name,
         ppt_images,
@@ -704,6 +737,23 @@ def build_product_package(args: argparse.Namespace) -> None:
         ppt_with_sub=ppt_with_sub,
         ppt_no_sub=ppt_no_sub,
         a_only_video=a_only_video if a_only_video.exists() else None,
+        include_legacy_ppts=not bool(dynamic_ppt_outputs),
+        additional_advanced_items=(
+            [
+                (path, path.name)
+                for key, path in dynamic_ppt_outputs.items()
+                if key not in {"plan", "qa_report", "media_dir"}
+            ]
+            + (
+                [
+                    (path, str(Path("PPT动态素材") / path.name))
+                    for path in sorted(dynamic_ppt_outputs["media_dir"].iterdir())
+                    if path.is_file()
+                ]
+                if dynamic_ppt_outputs and not getattr(args, "dynamic_ppt_embed_media", False)
+                else []
+            )
+        ),
         backup_root=(work_dir / "package_backups") if semantic_plan is not None else None,
     )
     if semantic_plan is not None:
@@ -721,6 +771,9 @@ def build_product_package(args: argparse.Namespace) -> None:
             "background_without_subtitles": bg_no_sub,
             "timings_source": formal_timings_path,
         }
+        if dynamic_ppt_outputs:
+            dependencies["story_ppt_plan"] = dynamic_ppt_outputs["plan"]
+            dependencies["qa_dynamic_ppt_report"] = dynamic_ppt_outputs["qa_report"]
         write_product_package_manifest(
             work_dir / "product_package_manifest.json",
             product_root=output_root,
@@ -2323,6 +2376,8 @@ def create_package_dirs(
     ppt_with_sub: Path,
     ppt_no_sub: Path,
     a_only_video: Path | None = None,
+    include_legacy_ppts: bool = True,
+    additional_advanced_items: Sequence[tuple[Path, str]] = (),
     backup_root: Path | None = None,
     product_package_port: ProductPackagePort | None = None,
 ) -> tuple[Path, Path, dict[str, Path]]:
@@ -2338,11 +2393,15 @@ def create_package_dirs(
     advanced_items = base_items + [
         (bg_with_sub, f"背景视频：{story_name}（含字幕）.mp4"),
         (bg_no_sub, f"背景视频：{story_name}（无字幕）.mp4"),
-        (ppt_with_sub, f"故事PPT：{story_name}（含字幕）.pptx"),
-        (ppt_no_sub, f"故事PPT：{story_name}（无字幕）.pptx"),
     ]
+    if include_legacy_ppts:
+        advanced_items.extend([
+            (ppt_with_sub, f"故事PPT：{story_name}（含字幕）.pptx"),
+            (ppt_no_sub, f"故事PPT：{story_name}（无字幕）.pptx"),
+        ])
     if a_only_video is not None:
         advanced_items.append((a_only_video, f"A镜无人物背景视频：{story_name}.mp4"))
+    advanced_items.extend(additional_advanced_items)
 
     planned_items = [
         ("base", source, base_dir / filename) for source, filename in base_items
@@ -2384,7 +2443,7 @@ def create_package_dirs(
     if result.production_eligible is not True:
         raise RuntimeError("资料包 mock 结果不可作为正式客户资料包")
     source_map = {
-        f"{variant}:{destination.name}": source
+        f"{variant}:{destination.relative_to(base_dir if variant == 'base' else advanced_dir)}": source
         for variant, source, destination in planned_items
     }
     print(f"已生成基础版：{base_dir}")
@@ -2412,6 +2471,7 @@ def _execute_product_package_filesystem(
         for item in request.source_artifacts:
             source = Path(str(item["source_path"]))
             destination = Path(str(item["destination_path"]))
+            destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination)
             artifacts.append(
                 {

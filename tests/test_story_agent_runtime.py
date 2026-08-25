@@ -1923,6 +1923,44 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(manifest["agent"]["status"], "pending")
             self.assertEqual(manifest["agent"]["pause"]["stage"], "story_images_review")
 
+    def test_bounded_dag_filters_ready_independent_branches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：DAG有界短测"
+            manifest = init_project(project, story_name="DAG有界短测", slug="bounded-dag")
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="DAG有界短测",
+                slug="bounded-dag",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="handoff",
+                codex_model="",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+                scheduler="dag",
+                max_parallel=2,
+                stop_after_stage="story_images_review",
+            )
+            agent = StoryAgent(context)
+            completed = {
+                "import_inbox",
+                "source_edit",
+                "source_text_correction",
+                "source_edit_review",
+                "setup_project",
+                "story_contract",
+                "story_contract_review",
+            }
+            self.assertNotIn("music_request", agent._bounded_stage_names())
+            self.assertNotIn("release_assets", agent._bounded_stage_names())
+            self.assertEqual(
+                agent._ready_dag_stages(manifest, completed, set()),
+                ["artifact_semantic_plan"],
+            )
+
     def test_codex_subtask_failure_retries_in_a_new_attempt(self) -> None:
         class CodexFailOnceAgent(StoryAgent):
             calls = 0

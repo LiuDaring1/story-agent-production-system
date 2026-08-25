@@ -13,6 +13,7 @@ from artifact_semantic_plan import (
     ARTIFACTS,
     artifact_semantic_plan_is_current,
     compile_artifact_semantic_plan,
+    complete_missing_semantic_mappings,
     load_current_artifact_semantic_plan,
     plan_binding,
     presentation_windows,
@@ -175,7 +176,9 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
         with patch.object(mock, "analyze", wraps=mock.analyze) as analyze:
             result = agent._stage_artifact_semantic_plan(manifest)
         self.assertEqual(result.status, "done")
-        self.assertEqual(analyze.call_count, 2)
+        # One pass verifies the locked contract covers the actual semantic
+        # source; the writer and current-plan loader each compile once more.
+        self.assertEqual(analyze.call_count, 3)
         after = {path.relative_to(project) for path in project.rglob("*") if path.is_file()}
         self.assertEqual(after - before, {semantic_plan_path(project).relative_to(project)})
         self.assertFalse(any("semantic_manifest" in str(path) for path in after))
@@ -284,6 +287,48 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
             "光长得好看是不够的，能帮助大家才是真正的美。",
         )
         self.assertFalse(plan["pre_roll_diagnostic"]["suspected"])
+
+    def test_runtime_completes_only_missing_mapping_pairs_before_review(self) -> None:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        project, manifest = _new_project(Path(temporary.name))
+        source = Path(manifest["inputs"]["story_text"])
+        source.write_text(
+            "大家好，我是绵羊姐姐。\n"
+            "今天给大家讲《通用测试故事》。\n"
+            "主角走进森林。\n"
+            "小朋友们，要认真观察。\n",
+            encoding="utf-8",
+        )
+        from story_project import project_paths, write_manifest
+        write_manifest(project_paths(project), manifest)
+        contract = _contract(project, manifest, ("story_body",))
+        _agent, paths = _lock_contract(project, manifest, contract_payload=contract)
+        fake = MockStorySemanticsAdapter(
+            kinds=("host_intro", "story_announcement", "story_body", "moral")
+        )
+
+        added = complete_missing_semantic_mappings(paths["contract"], source, fake)
+        self.assertEqual(len(added), 21)
+        updated = json.loads(paths["contract"].read_text(encoding="utf-8"))
+        mappings = updated["contracts"]["semantic_artifacts"]["mappings"]
+        self.assertEqual(len(mappings), 28)
+        body = [item for item in mappings if item["semantic_kind"] == "story_body"]
+        self.assertTrue(all(item["provenance"] == _provenance() for item in body))
+        moral_visual = next(
+            item
+            for item in mappings
+            if item["semantic_kind"] == "moral" and item["artifact"] == "background_visual"
+        )
+        self.assertEqual(moral_visual["action"], "visual_substitute")
+        self.assertEqual(moral_visual["mutual_exclusion_group"], "moral_presentation")
+
+        _agent, _paths = _lock_contract(project, manifest, contract_payload=updated)
+        plan = compile_artifact_semantic_plan(project, source, fake)
+        self.assertEqual(
+            {item["card_kind"] for item in plan["visual_cards"]},
+            {"title_card", "moral_card"},
+        )
 
     def test_storyboard_plan_requires_semantic_plan_binding(self) -> None:
         temporary, project, manifest, source, agent = self._fixture()

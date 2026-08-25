@@ -66,6 +66,7 @@ from story_contract_runtime import (
 from story_contract_consumers import compile_cover_spec
 from artifact_semantic_plan import (
     artifact_semantic_plan_is_current,
+    complete_missing_semantic_mappings,
     load_current_artifact_semantic_plan,
     plan_binding as artifact_semantic_plan_binding,
     semantic_plan_path,
@@ -543,6 +544,30 @@ class StoryAgent:
         print(f"PAUSED: 已通过 {target} 门禁，未启动下游阶段。")
         return 0
 
+    def _bounded_stage_names(self) -> set[str]:
+        """Return the target stage and its transitive prerequisites.
+
+        A bounded DAG canary must not start an independent branch merely
+        because that branch happens to be ready before the requested gate.
+        """
+
+        target = self.context.stop_after_stage.strip()
+        if not target:
+            return set(STORY_STAGE_SEQUENCE)
+        if target not in STORY_STAGE_DEPENDENCIES:
+            raise AgentRuntimeError(f"未知 stop-after-stage：{target}")
+        allowed: set[str] = set()
+
+        def include(stage: str) -> None:
+            if stage in allowed:
+                return
+            allowed.add(stage)
+            for dependency in STORY_STAGE_DEPENDENCIES[stage]:
+                include(dependency)
+
+        include(target)
+        return allowed
+
     def _run_linear(self, max_steps: int) -> int:
         with job_lock(self.context.project_dir):
             manifest = self._manifest()
@@ -753,7 +778,10 @@ class StoryAgent:
     def _ready_dag_stages(self, manifest: dict[str, Any], completed: set[str], blocked: set[str]) -> list[str]:
         stages = manifest.get("agent", {}).get("stages", {})
         ready: list[str] = []
+        allowed = self._bounded_stage_names()
         for name in STORY_STAGE_SEQUENCE:
+            if name not in allowed:
+                continue
             if name in completed or name in blocked:
                 continue
             record = stages.get(name, {}) if isinstance(stages, dict) else {}
@@ -2158,6 +2186,87 @@ class StoryAgent:
                 write_manifest(self.context.paths, current)
         return result
 
+    def _complete_contract_semantic_mappings(
+        self,
+        manifest: dict[str, Any],
+        *,
+        invalidate_current_review: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Fill the fixed semantic mapping matrix from the actual line source.
+
+        Model-authored mappings are preserved.  Only absent kind/artifact pairs
+        are appended.  If this repairs an already reviewed contract, the old
+        review evidence is archived and the lock is revoked before re-review.
+        """
+
+        source = self._artifact_semantic_source(manifest)
+        if source is None:
+            raise ValueError("缺少可读的逐行语义源，不能补齐合同语义映射")
+        paths = contract_paths(self.context.project_dir)
+        old_contract = paths["contract"].read_bytes()
+        old_summary = paths["summary"].read_bytes() if paths["summary"].is_file() else b""
+        semantics_port = self._modules().story_semantics()
+        added = complete_missing_semantic_mappings(paths["contract"], source, semantics_port)
+        if not added:
+            return []
+
+        archive: Path | None = None
+        if invalidate_current_review:
+            archive = (
+                self.context.paths.status
+                / "rejected"
+                / "story_contract"
+                / f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:8]}-semantic-mapping"
+            )
+            archive.mkdir(parents=True, exist_ok=True)
+            (archive / "story_production_contract.json").write_bytes(old_contract)
+            if old_summary:
+                (archive / "story_production_contract.md").write_bytes(old_summary)
+            for name, path in (
+                ("story_contract.lock.json", paths["lock"]),
+                ("story_contract_bundle.json", paths["bundle"]),
+                ("story_contract_review_review.json", paths["review"]),
+            ):
+                if path.exists():
+                    shutil.move(str(path), str(archive / name))
+            (archive / "archive_reason.txt").write_text(
+                "Runtime 补齐实际语义源所需的固定 kind/artifact 映射；旧审核哈希失效，必须重新独立审核。\n",
+                encoding="utf-8",
+            )
+
+        note = (
+            "\n## Runtime 固定语义映射\n\n"
+            f"- 根据实际逐行语义源 `{source}` 补齐 {len(added)} 个缺失映射。\n"
+            "- 仅补齐缺项；模型已有映射保持不变。\n"
+        )
+        with paths["summary"].open("a", encoding="utf-8") as summary:
+            summary.write(note)
+        receipt_dir = paths["directory"] / "semantic_mapping_completions"
+        receipt = receipt_dir / f"{int(time.time())}-{uuid.uuid4().hex[:8]}.json"
+        save_json(
+            receipt,
+            {
+                "schema_version": "story-contract-semantic-mapping-completion/v1",
+                "source": str(source),
+                "source_sha256": file_sha256(source),
+                "contract_sha256_before": hashlib.sha256(old_contract).hexdigest(),
+                "contract_sha256_after": file_sha256(paths["contract"]),
+                "added_mappings": [
+                    {
+                        "semantic_kind": item["semantic_kind"],
+                        "artifact": item["artifact"],
+                        "action": item["action"],
+                        "subtitle_policy": item["subtitle_policy"],
+                    }
+                    for item in added
+                ],
+                "invalidated_review": invalidate_current_review,
+                "archived_review": str(archive) if archive else "",
+                "completed_at": now(),
+            },
+        )
+        return added
+
     def _stage_story_contract(self, manifest: dict[str, Any]) -> StageResult:
         if self._legacy_contract_policy(manifest):
             return StageResult("done", "V3 冻结项目采用 legacy_passthrough，不补写或重做合同。")
@@ -2174,12 +2283,14 @@ class StoryAgent:
         story_text = Path(str(manifest.get("inputs", {}).get("story_text") or ""))
         if not story_text.is_file():
             return StageResult("blocked", "缺少可信故事文本，无法生成 Story Production Contract。")
+        semantic_source = self._artifact_semantic_source(manifest)
         paths["handoff"].write_text(
             "\n".join(
                 [
                     "# Story Production Contract 生成任务",
                     "",
                     f"- 故事文本：`{story_text}`",
+                    f"- 实际逐行语义源：`{semantic_source or story_text}`",
                     f"- Runtime 可信来源链：`{paths['trusted_inputs']}`",
                     f"- 根 Schema：`{ROOT / 'schemas/story_contract/v1/story_production_contract.schema.json'}`",
                     f"- 输出 JSON：`{paths['contract']}`",
@@ -2210,7 +2321,7 @@ class StoryAgent:
                 "尺度优先 qualitative_relation；只有可信依据或机器布局需要时才写宽容数值区间及 numeric_basis。",
                 "如果多个角色会在同一画面出现，world_scale.relationships 只覆盖有故事或布局必要的宽松视觉层级；不得为所有角色两两建立无依据的总排序。儿童卡通允许为了表演和可读性适度夸张小角色，不能按现实物种厘米比例机械判定。已有用户批准母版时，定性关系应忠于母版实际画面，不得仅凭现实常识写成 much_smaller。环境或动作参照不是角色尺度证明，不要求为其另画尺度图。",
                 "release_layout 只能登记可信来源链能复核的画布或布局默认；没有画布收据时不要凭经验补写精确比例变体。",
-                "semantic_artifacts.mappings 必须按语义源中实际出现的 semantic_kind，完整覆盖 demo_subtitles、background_visual、background_subtitles、sales_subtitles、ppt、customer_manuscript、reading_annotation 七类产物；不得缺项或私自留给下游默认补齐。",
+                "semantic_artifacts 以 handoff 中的实际逐行语义源为准。只写有明确非默认选择或事实依据的映射；不要耗费推理枚举重复的固定笛卡尔积。Runtime 会在本阶段末只追加缺失的 semantic_kind/artifact 默认映射，并在独立审核前做确定性完整性校验。",
                 "语义源中若有‘故事告诉我们’、对受众的总结性教训或独立寓意，必须拆成 semantic_kind=moral 并单独建立七类产物 mapping，不得并入 story_body。",
                 "标题或道理若用 visual_substitute，必须给出唯一 mutual_exclusion_group；同组 background_subtitles 必须 action=exclude 且 subtitle_policy=hide。Demo 必须按自身 mapping 决定，不借用销售版规则。",
                 "所有视觉验证需求只写进对应合同 section；不要把多状态道具画成一张总表，也不要创建 contracts/previews 文件。",
@@ -2232,6 +2343,10 @@ class StoryAgent:
         trusted = json.loads(paths["trusted_inputs"].read_text(encoding="utf-8"))
         bind_contract_visual_style_to_trusted_default(paths["contract"], trusted)
         defer_contract_visual_samples(paths["contract"], paths["deferred_previews"])
+        try:
+            self._complete_contract_semantic_mappings(manifest)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            return StageResult("blocked", f"合同固定语义映射补齐失败：{exc}", paths["contract"])
         issues = contract_runtime_issues(self.context.project_dir)
         if issues:
             return StageResult("blocked", "合同机器校验或可信来源校验失败：" + "；".join(issues[:12]), paths["contract"])
@@ -2458,6 +2573,10 @@ class StoryAgent:
         )
         bind_contract_visual_style_to_trusted_default(paths["contract"], trusted)
         defer_contract_visual_samples(paths["contract"], paths["deferred_previews"])
+        try:
+            self._complete_contract_semantic_mappings(manifest)
+        except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+            return StageResult("blocked", f"合同定向修订后的固定语义映射补齐失败：{exc}", paths["contract"])
         if file_sha256(paths["contract"]) == old_contract_sha:
             return StageResult("blocked", "合同自动修订没有改变被拒绝的合同哈希。", paths["contract"])
         issues = contract_runtime_issues(self.context.project_dir)
@@ -2474,6 +2593,16 @@ class StoryAgent:
         if not self.context.execute:
             return StageResult("done", "dry-run：将从已锁定合同确定性编译逐产物语义呈现计划。")
         try:
+            added = self._complete_contract_semantic_mappings(
+                manifest,
+                invalidate_current_review=True,
+            )
+            if added:
+                return StageResult(
+                    "retrying",
+                    f"Runtime 补齐 {len(added)} 个固定语义映射并撤销旧合同锁；将重新独立审核，不重生成整份合同。",
+                    contract_paths(self.context.project_dir)["contract"],
+                )
             semantics_port = self._modules().story_semantics()
             path = write_artifact_semantic_plan(self.context.project_dir, source, semantics_port)
             load_current_artifact_semantic_plan(self.context.project_dir, source, semantics_port)

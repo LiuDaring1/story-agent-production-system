@@ -41,6 +41,108 @@ PROVENANCE_SOURCES = frozenset({"task_input", "project_config", "brand_or_global
 CARD_KINDS = {"title": "title_card", "moral": "moral_card"}
 
 
+def semantic_kinds_in_source(
+    semantic_source: Path | str,
+    semantics_port: StorySemanticsPort | None = None,
+    *,
+    story_id: str = "",
+) -> tuple[str, ...]:
+    """Return semantic kinds in source order using the production classifier.
+
+    Contract generation and plan compilation must inspect the same line-oriented
+    source.  Keeping this deterministic avoids a contract that describes only
+    the story body while the downstream plan also sees a host introduction or
+    story announcement from confirmed subtitles.
+    """
+
+    source = Path(semantic_source).resolve()
+    lines = _source_lines(source)
+    source_sha256 = hashlib.sha256(source.read_bytes()).hexdigest()
+    port = semantics_port or build_story_semantics_registry().story_semantics()
+    result = port.analyze(
+        StorySemanticsRequest(
+            source_path=source,
+            source_sha256=source_sha256,
+            normalized_lines=tuple(lines),
+            story_id=story_id,
+            compiler_version=STORY_SEMANTICS_COMPILER_VERSION,
+            attempt_id="contract-semantic-mapping-coverage",
+        )
+    )
+    kind_by_line = _semantic_kind_by_line(result, source, source_sha256, lines)
+    return tuple(dict.fromkeys(kind_by_line[index] for index in range(1, len(lines) + 1)))
+
+
+def complete_missing_semantic_mappings(
+    contract_path: Path | str,
+    semantic_source: Path | str,
+    semantics_port: StorySemanticsPort | None = None,
+) -> list[dict[str, Any]]:
+    """Append only absent required mappings using a fixed runtime policy.
+
+    Existing producer choices remain untouched.  The function owns only the
+    repetitive cross product required by the downstream compiler, preventing a
+    language model omission from surviving a high-scoring contract review.
+    """
+
+    target = Path(contract_path)
+    contract = json.loads(target.read_text(encoding="utf-8"))
+    section = contract.get("contracts", {}).get("semantic_artifacts", {})
+    mappings = section.get("mappings")
+    if not isinstance(mappings, list):
+        raise ValueError("semantic_artifacts.mappings must be an array")
+    kinds = semantic_kinds_in_source(
+        semantic_source,
+        semantics_port,
+        story_id=str(contract.get("story", {}).get("story_id") or ""),
+    )
+    existing: set[tuple[str, str]] = set()
+    for raw in mappings:
+        if not isinstance(raw, Mapping):
+            continue
+        kind = str(raw.get("semantic_kind") or "")
+        artifact = str(raw.get("artifact") or "")
+        existing.add((kind, artifact))
+        if artifact == "demo":
+            existing.add((kind, "demo_subtitles"))
+
+    added: list[dict[str, Any]] = []
+    for kind in kinds:
+        for artifact in ARTIFACTS:
+            if (kind, artifact) in existing:
+                continue
+            mapping: dict[str, Any] = {
+                "semantic_kind": kind,
+                "artifact": artifact,
+                "action": "include",
+                "subtitle_policy": "show" if artifact.endswith("subtitles") else "inherit",
+                "provenance": {
+                    "source": "agent_inference",
+                    "source_ref": "artifact-semantic-mapping-default/v1",
+                },
+            }
+            if artifact == "background_visual" and kind in CARD_KINDS:
+                mapping.update(
+                    action="visual_substitute",
+                    visual_substitute=f"{kind}_card",
+                    mutual_exclusion_group=f"{kind}_presentation",
+                )
+            elif artifact == "background_subtitles" and kind in CARD_KINDS:
+                mapping.update(
+                    action="exclude",
+                    subtitle_policy="hide",
+                    mutual_exclusion_group=f"{kind}_presentation",
+                )
+            elif artifact == "sales_subtitles" and kind == "title":
+                mapping.update(action="exclude", subtitle_policy="hide")
+            mappings.append(mapping)
+            added.append(mapping)
+            existing.add((kind, artifact))
+    if added:
+        write_json_atomic(target, contract)
+    return added
+
+
 def semantic_plan_path(project_root: Path | str) -> Path:
     return Path(project_root) / "99_项目状态" / "story_contract" / "artifact_semantic_plan.json"
 

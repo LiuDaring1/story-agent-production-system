@@ -275,10 +275,19 @@ def product_quality_review_issues(
     issues: list[str] = []
     if not isinstance(quality, Mapping) or quality.get("passed") is not True:
         return ["product_quality must pass"]
+    def dimension_has_evidence(item: Mapping[str, Any]) -> bool:
+        if item.get("evidence") or item.get("observations") or item.get("conclusion") or item.get("conclusions"):
+            return True
+        relationships = item.get("relationships")
+        return isinstance(relationships, list) and bool(relationships) and all(
+            isinstance(row, Mapping) and row.get("passed") is True and row.get("evidence")
+            for row in relationships
+        )
+
     actual_dimensions = {
         str(item.get("dimension") or "")
         for item in quality.get("dimensions", [])
-        if isinstance(item, Mapping) and item.get("passed") is True and item.get("evidence")
+        if isinstance(item, Mapping) and item.get("passed") is True and dimension_has_evidence(item)
     }
     expected_dimensions = set(profile.get("product_quality", []))
     if expected_dimensions - actual_dimensions:
@@ -1225,7 +1234,12 @@ def visual_sample_review_payload_issues(payload: Mapping[str, Any], plan: Mappin
         for item in matrix
         if isinstance(matrix, list)
         and isinstance(item, Mapping)
-        and (item.get("evidence") or item.get("observations") or item.get("conclusion"))
+        and (
+            item.get("evidence")
+            or item.get("observations")
+            or item.get("conclusion")
+            or item.get("conclusions")
+        )
     } if isinstance(matrix, list) else set()
     if sample_ids - covered:
         issues.append("evidence_matrix missing samples: " + ",".join(sorted(sample_ids - covered)))

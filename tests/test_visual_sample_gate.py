@@ -502,11 +502,23 @@ class VisualSampleGateTests(unittest.TestCase):
             review["evidence_matrix"] = [
                 {
                     "sample_id": item["sample_id"],
-                    "observations": ["file opened and inspected"],
-                    "conclusion": "sample passes its scoped contract",
+                    "conclusions": ["file opened and inspected", "sample passes its scoped contract"],
                 }
                 for item in plan["requirements"]
             ]
+            scale_dimension = next(
+                (
+                    item
+                    for item in review["product_quality"]["dimensions"]
+                    if item["dimension"] == "scale_readability"
+                ),
+                None,
+            )
+            if scale_dimension is not None:
+                scale_dimension.pop("evidence", None)
+                scale_dimension["relationships"] = [
+                    {"relationship_id": "fixture", "passed": True, "evidence": "ground plane and size are clear"}
+                ]
             self.assertEqual(visual_sample_review_payload_issues(review, plan), [])
 
     def test_retry_uses_quarantined_image_and_approved_mother_references(self) -> None:

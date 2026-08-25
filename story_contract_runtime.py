@@ -342,16 +342,28 @@ def contract_review_payload_issues(payload: Mapping[str, Any]) -> list[str]:
             continue
         section = str(item.get("section") or "")
         evidence = item.get("evidence")
-        if section not in REQUIRED_CONTRACT_SECTIONS:
-            issues.append(f"evidence_matrix[{index}].section 非法：{section or '<empty>'}")
-        else:
+        if section in REQUIRED_CONTRACT_SECTIONS:
             covered.add(section)
-        if not (
-            isinstance(evidence, str)
-            and evidence.strip()
-            or isinstance(evidence, list)
-            and any(str(value).strip() for value in evidence)
-        ):
+        elif not section:
+            issues.append(f"evidence_matrix[{index}].section 不能为空")
+            continue
+        else:
+            # Auxiliary rows such as review_boundary may document audit scope,
+            # but never satisfy one of the seven required contract sections.
+            continue
+        direct_evidence = (
+            isinstance(evidence, str) and bool(evidence.strip())
+            or isinstance(evidence, list) and any(str(value).strip() for value in evidence)
+        )
+        structured_evidence = (
+            isinstance(item.get("conclusion"), str)
+            and bool(str(item.get("conclusion")).strip())
+            and isinstance(item.get("contract_paths"), list)
+            and any(str(value).strip() for value in item["contract_paths"])
+            and isinstance(item.get("trusted_evidence"), list)
+            and any(str(value).strip() for value in item["trusted_evidence"])
+        )
+        if not direct_evidence and not structured_evidence:
             issues.append(f"evidence_matrix[{index}].evidence 不能为空")
     missing = sorted(set(REQUIRED_CONTRACT_SECTIONS) - covered)
     if missing:

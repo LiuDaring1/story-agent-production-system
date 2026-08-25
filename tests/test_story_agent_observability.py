@@ -169,7 +169,7 @@ class StoryAgentObservabilityTests(unittest.TestCase):
                 read_only=True,
             )
             payload = agent.status_payload()
-            self.assertEqual(payload["story_agent_version"], "3.6.2-canary.3")
+            self.assertEqual(payload["story_agent_version"], "3.6.2-canary.4")
             self.assertTrue(payload["supervisor"]["running"])
             self.assertEqual(payload["supervisor"]["pid"], os.getpid())
             self.assertEqual(payload["supervisor"]["effective_status"], "waiting_for_user")

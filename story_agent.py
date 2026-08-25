@@ -2397,6 +2397,28 @@ class StoryAgent:
         if not paths["summary"].is_file():
             return StageResult("blocked", "合同缺少人类可读说明，不能独立审核。", paths["contract"])
         bundle = write_review_bundle(paths["bundle"], artifacts)
+        try:
+            cached_review = json.loads(paths["review"].read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            cached_review = None
+        if isinstance(cached_review, dict):
+            try:
+                cached_score = float(cached_review.get("score") or 0)
+            except (TypeError, ValueError):
+                cached_score = 0
+            if (
+                not contract_review_payload_issues(cached_review)
+                and cached_review.get("approved") is True
+                and cached_score >= 85
+                and not cached_review.get("critical_errors")
+                and cached_review.get("artifact_sha256") == file_sha256(bundle)
+            ):
+                lock = write_contract_lock(self.context.project_dir, bundle=bundle, review=paths["review"])
+                return StageResult(
+                    "done",
+                    f"复用当前哈希的独立合同审核并由 Runtime 锁定：{cached_score:g} 分",
+                    lock,
+                )
         result, payload = self._structured_review(
             stage="story_contract_review",
             label="Story Production Contract 独立审核",

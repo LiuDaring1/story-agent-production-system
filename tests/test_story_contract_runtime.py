@@ -372,6 +372,10 @@ class StoryContractRuntimeTests(unittest.TestCase):
             self.assertEqual(result.status, "done")
             self.assertTrue(agent._has_story_contract_review(manifest))
             self.assertTrue(contract_lock_is_current(project, bundle=paths["bundle"], review=paths["review"]))
+            with patch.object(agent, "_structured_review", side_effect=AssertionError("must reuse current review")):
+                reused = agent._stage_story_contract_review(manifest)
+            self.assertEqual(reused.status, "done")
+            self.assertIn("复用当前哈希", reused.message)
             paths["summary"].write_text("# 被篡改的说明\n", encoding="utf-8")
             self.assertFalse(agent._has_story_contract_review(manifest))
 
@@ -379,6 +383,40 @@ class StoryContractRuntimeTests(unittest.TestCase):
         payload = {"evidence_matrix": [{"section": "visual_style", "evidence": "contracts.visual_style"}]}
         issues = contract_review_payload_issues(payload)
         self.assertTrue(any("缺少合同节" in issue for issue in issues), issues)
+
+    def test_contract_review_accepts_structured_evidence_and_auxiliary_scope_row(self) -> None:
+        sections = (
+            "semantic_artifacts",
+            "visual_style",
+            "characters",
+            "world_scale",
+            "story_state",
+            "brand",
+            "release_layout",
+        )
+        payload = {
+            "approved": True,
+            "score": 96,
+            "critical_errors": [],
+            "evidence_matrix": [
+                {
+                    "section": section,
+                    "conclusion": "该节与可信输入一致。",
+                    "contract_paths": [f"/contracts/{section}"],
+                    "trusted_evidence": [{"file": "trusted.json", "path": "/sources/0"}],
+                }
+                for section in sections
+            ]
+            + [
+                {
+                    "section": "review_boundary",
+                    "conclusion": "只审核文本合同。",
+                    "contract_paths": ["/preview_assets"],
+                    "trusted_evidence": [{"file": "contract.json", "path": "/preview_assets"}],
+                }
+            ]
+        }
+        self.assertEqual(contract_review_payload_issues(payload), [])
 
     def test_rejected_contract_review_requires_explicit_revision_sections(self) -> None:
         payload = {

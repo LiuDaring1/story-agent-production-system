@@ -58,8 +58,8 @@ def build_start_preflight_report(
     deadline_enabled = bool(timing.get("runtime_deadline_enabled", False))
     deadline = float(timing.get("deadline_hours") or 0.0)
     check(
-        "fixed_runtime_deadline_disabled",
-        not deadline_enabled and deadline == 0.0,
+        "fixed_runtime_deadline_configured",
+        deadline_enabled and deadline == 10.0,
         f"runtime_deadline_enabled={deadline_enabled}, deadline_hours={deadline:.2f}",
     )
 

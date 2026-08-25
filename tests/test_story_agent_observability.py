@@ -200,10 +200,10 @@ class StoryAgentObservabilityTests(unittest.TestCase):
                 },
                 "budget": {"spent": 0, "reserved": 0, "hard_limit": 100},
                 "timing": {
-                    "runtime_deadline_enabled": False,
-                    "deadline_policy": "disabled",
-                    "deadline_hours": 0,
-                    "remaining_deadline_hours": None,
+                    "runtime_deadline_enabled": True,
+                    "deadline_policy": "deliver_best_valid",
+                    "deadline_hours": 10,
+                    "remaining_deadline_hours": 10,
                 },
                 "evidence": {"manifest": str(manifest)},
                 "artifact_progress": {},
@@ -220,6 +220,24 @@ class StoryAgentObservabilityTests(unittest.TestCase):
             self.assertFalse(report["provider_calls_made"])
             self.assertFalse(report["start_authorized"])
             self.assertTrue(report["requires_user_confirmation"])
+
+            snapshot["timing"] = {
+                "runtime_deadline_enabled": False,
+                "deadline_policy": "disabled",
+                "deadline_hours": 0,
+                "remaining_deadline_hours": None,
+            }
+            invalid = build_start_preflight_report(
+                snapshot,
+                code_paths=(code,),
+                module_profile="production-default",
+                module_execution_mode="production",
+            )
+            self.assertFalse(invalid["passed"])
+            deadline_check = next(
+                item for item in invalid["checks"] if item["name"] == "fixed_runtime_deadline_configured"
+            )
+            self.assertFalse(deadline_check["passed"])
 
     def test_status_counts_unbound_disk_images_as_stale_not_current(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -1,0 +1,227 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "story-r2v-plan-v1",
+  "title": "Story R2V Director Plan",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "story_id",
+    "source_audio",
+    "policies",
+    "assets",
+    "continuity_groups",
+    "shots"
+  ],
+  "properties": {
+    "schema_version": {"const": "story-r2v-plan-v1"},
+    "story_id": {"type": "string", "minLength": 1},
+    "source_audio": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["path", "sha256", "duration_seconds"],
+      "properties": {
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "duration_seconds": {"type": "number", "exclusiveMinimum": 0}
+      }
+    },
+    "policies": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "body_generation_mode",
+        "duration_choices",
+        "max_reference_images",
+        "min_retime_ratio",
+        "max_retime_ratio",
+        "max_attempts_per_shot"
+      ],
+      "properties": {
+        "body_generation_mode": {"const": "reference_to_video"},
+        "duration_choices": {
+          "type": "array",
+          "minItems": 2,
+          "maxItems": 2,
+          "prefixItems": [{"const": 6}, {"const": 10}],
+          "items": false
+        },
+        "max_reference_images": {"type": "integer", "minimum": 1, "maximum": 7},
+        "min_retime_ratio": {"type": "number", "minimum": 0.5, "maximum": 1},
+        "max_retime_ratio": {"type": "number", "minimum": 1, "maximum": 1.5},
+        "max_attempts_per_shot": {"type": "integer", "minimum": 1, "maximum": 2}
+      }
+    },
+    "assets": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/asset"}
+    },
+    "continuity_groups": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/continuityGroup"}
+    },
+    "shots": {
+      "type": "array",
+      "minItems": 1,
+      "items": {"$ref": "#/$defs/shot"}
+    }
+  },
+  "$defs": {
+    "asset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "asset_id",
+        "kind",
+        "path",
+        "sha256",
+        "runtime_eligible",
+        "contains_characters"
+      ],
+      "properties": {
+        "asset_id": {"type": "string", "minLength": 1},
+        "kind": {"enum": ["character", "environment", "prop", "style"]},
+        "path": {"type": "string", "minLength": 1},
+        "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "runtime_eligible": {"type": "boolean"},
+        "contains_characters": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "identity_id": {"type": "string", "minLength": 1},
+        "prop_id": {"type": "string", "minLength": 1},
+        "state_id": {"type": "string", "minLength": 1},
+        "design_source_kind": {"enum": ["single_view", "three_view_sheet", "expression_sheet", "composite_scene", "isolated_prop", "empty_environment", "style_anchor"]},
+        "appearance_summary": {"type": "string"},
+        "scale_class": {"type": "string"}
+      }
+    },
+    "continuityGroup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "group_id",
+        "environment_asset_id",
+        "location",
+        "time_of_day",
+        "lighting",
+        "anchors"
+      ],
+      "properties": {
+        "group_id": {"type": "string", "minLength": 1},
+        "environment_asset_id": {"type": "string", "minLength": 1},
+        "location": {"type": "string", "minLength": 1},
+        "time_of_day": {"type": "string", "minLength": 1},
+        "lighting": {"type": "string", "minLength": 1},
+        "anchors": {
+          "type": "array",
+          "minItems": 1,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "scene_change_basis": {"type": "string"}
+      }
+    },
+    "cameraPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_size", "end_size", "movement", "axis", "screen_direction", "internal_cut"],
+      "properties": {
+        "start_size": {"type": "string", "minLength": 1},
+        "end_size": {"type": "string", "minLength": 1},
+        "movement": {"type": "string", "minLength": 1},
+        "axis": {"type": "string", "minLength": 1},
+        "screen_direction": {"enum": ["left_to_right", "right_to_left", "toward_camera", "away_from_camera", "stationary", "mixed"]},
+        "internal_cut": {"const": false}
+      }
+    },
+    "beat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["start_second", "end_second", "source_text", "performance", "visible_characters", "camera"],
+      "properties": {
+        "start_second": {"type": "number", "minimum": 0},
+        "end_second": {"type": "number", "exclusiveMinimum": 0},
+        "source_text": {"type": "string", "minLength": 1},
+        "performance": {"type": "string", "minLength": 1},
+        "visible_characters": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "audio_speaker": {"type": "string"},
+        "visual_focus": {"type": "string"},
+        "listener_reaction": {"type": "string"},
+        "prop_action": {"type": "string"},
+        "camera": {"type": "string", "minLength": 1}
+      }
+    },
+    "propTransition": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["prop_id", "before_state", "visible_trigger_action", "after_state", "exit_evidence", "next_shot_asset_id"],
+      "properties": {
+        "prop_id": {"type": "string", "minLength": 1},
+        "before_state": {"type": "string", "minLength": 1},
+        "visible_trigger_action": {"type": "string", "minLength": 1},
+        "after_state": {"type": "string", "minLength": 1},
+        "exit_evidence": {"type": "string", "minLength": 1},
+        "next_shot_asset_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "shot": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "shot_id",
+        "generation_mode",
+        "source_start",
+        "source_end",
+        "story_text",
+        "provider_seconds",
+        "reference_asset_ids",
+        "continuity_group",
+        "relation_to_previous",
+        "initial_visible_characters",
+        "entering_characters",
+        "exiting_characters",
+        "camera_plan",
+        "entry_state",
+        "exit_state",
+        "performance_beats",
+        "prop_state_transitions",
+        "prompt"
+      ],
+      "properties": {
+        "shot_id": {"type": "string", "minLength": 1},
+        "generation_mode": {"const": "reference_to_video"},
+        "source_start": {"type": "number", "minimum": 0},
+        "source_end": {"type": "number", "exclusiveMinimum": 0},
+        "story_text": {"type": "string", "minLength": 1},
+        "provider_seconds": {"enum": [6, 10]},
+        "reference_asset_ids": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 7,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "continuity_group": {"type": "string", "minLength": 1},
+        "relation_to_previous": {"enum": ["first", "same_scene_continuation", "same_scene_angle_change", "reaction_cut", "match_action", "new_scene"]},
+        "initial_visible_characters": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "entering_characters": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "exiting_characters": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "audio_speaker": {"type": "string"},
+        "visual_focus": {"type": "string"},
+        "camera_plan": {"$ref": "#/$defs/cameraPlan"},
+        "entry_state": {"type": "object"},
+        "exit_state": {"type": "object"},
+        "performance_beats": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/beat"}},
+        "prop_state_transitions": {"type": "array", "items": {"$ref": "#/$defs/propTransition"}},
+        "prompt": {"type": "string", "minLength": 1}
+      }
+    }
+  }
+}

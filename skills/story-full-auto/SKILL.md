@@ -7,6 +7,16 @@ description: Run the local green-screen story production Agent from a single sou
 
 Treat Codex as the operator and `story_agent.py` as the durable state machine. Keep the old workbench as a diagnostic fallback; do not ask the user to click through it during a normal run.
 
+## Direct story-body video with R2V
+
+When planning or generating story-body background video, invoke `skills/story-r2v-director/SKILL.md` and follow its asset, continuity, state-transition, prompt, and whole-video review contracts.
+
+- Use Reference-to-Video for the story body. Do not make the planner choose between I2V and R2V shot by shot.
+- Keep I2V/card rendering only for title, moral, or other typography-locked screens outside the story body.
+- Derive each paid story-body task from a semantically complete audio window that fits a native 6- or 10-second generation and allowed whole-clip retime. Do not create one task per sentence, static image, action beat, or desired shot size.
+- Build each request from separate runtime character, empty-environment, and entry-state prop references. Do not require precomposed story illustrations for the R2V body.
+- Validate the resulting `story_r2v_plan.json` before any paid submission. Preserve its hashes and decisions for downstream assembly and review.
+
 ## Start from one video
 
 1. Confirm the source is a horizontal green-screen narration video. Do not require a separate script, narration, or music file.

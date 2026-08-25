@@ -1,0 +1,6 @@
+interface:
+  display_name: "故事 R2V 导演"
+  short_description: "用独立资产、音频分镜与连续性规则导演故事正文视频"
+  default_prompt: "Use $story-r2v-director to plan an audio-aligned R2V-only story sequence from reusable character, environment, and prop assets."
+policy:
+  allow_implicit_invocation: true

@@ -1096,6 +1096,34 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             for name, value in locked.items():
                 self.assertEqual(env[name], value)
 
+    def test_run_with_project_dir_preserves_manifest_story_name_and_slug(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：显示标题"
+            init_project(project, story_name="合同中的标题", slug="stable-short-slug")
+            argv = [
+                "story_agent.py",
+                "run",
+                "--project-dir",
+                str(project),
+                "--max-steps",
+                "1",
+                "--module-profile",
+                "production-default",
+                "--module-execution-mode",
+                "production",
+            ]
+            with (
+                patch.object(sys, "argv", argv),
+                patch("story_agent.StoryAgent") as story_agent,
+                self.assertRaises(SystemExit) as exit_context,
+            ):
+                story_agent.return_value.run.return_value = 0
+                story_agent_main()
+            self.assertEqual(exit_context.exception.code, 0)
+            context = story_agent.call_args.args[0]
+            self.assertEqual(context.story_name, "合同中的标题")
+            self.assertEqual(context.slug, "stable-short-slug")
+
     def test_worker_shadow_three_way_merge_preserves_disjoint_updates_and_rejects_collision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：merge"

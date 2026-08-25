@@ -9845,6 +9845,7 @@ def main() -> None:
         )
         if args.job:
             args.project_dir = JobRegistry(args.registry).resolve(args.job)
+        if args.project_dir is not None:
             existing_manifest = load_manifest(project_paths(args.project_dir)) or {}
             existing_story = existing_manifest.get("story", {}) if isinstance(existing_manifest.get("story"), dict) else {}
             args.story_name = args.story_name or str(existing_story.get("name") or "")

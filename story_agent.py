@@ -16,7 +16,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Mapping
 
 from PIL import Image, ImageDraw
 from story_module_registry import (
@@ -53,7 +53,10 @@ from story_contract_runtime import (
     contract_paths,
     contract_review_artifacts,
     contract_review_payload_issues,
+    contract_review_retry_sections,
     contract_runtime_issues,
+    defer_contract_visual_samples,
+    enforce_targeted_contract_revision,
     legacy_passthrough_allowed,
     mark_contract_consumer_completed,
     write_contract_consumer_context,
@@ -74,6 +77,7 @@ from visual_sample_gate import (
     product_quality_review_issues,
     visual_sample_asset_paths,
     visual_sample_binding,
+    visual_sample_generation_jobs,
     visual_sample_lock_is_current,
     visual_sample_machine_issues,
     visual_sample_paths,
@@ -1600,6 +1604,26 @@ class StoryAgent:
             attempt = running_attempts.get(name, {}) if isinstance(running_attempts.get(name), dict) else {}
             review = record.get("review") if isinstance(record.get("review"), dict) else {}
             request_id = str(record.get("request_id") or attempt.get("attempt_id") or "")
+            duration_seconds = self._record_duration_seconds(record, running=running)
+            baseline_estimate = int(
+                record.get("estimated_remaining_seconds")
+                or STAGE_ESTIMATES_MINUTES.get(name, 0) * 60
+            )
+            if running and duration_seconds is not None:
+                dynamic_estimate = max(0, baseline_estimate - duration_seconds)
+                estimate_status = "overdue" if duration_seconds > baseline_estimate else "counting_down"
+            elif effective == "passed":
+                dynamic_estimate = 0
+                estimate_status = "complete"
+            else:
+                dynamic_estimate = baseline_estimate
+                estimate_status = "baseline"
+            status_explanation = ""
+            if effective == "stale":
+                status_explanation = (
+                    "上次通过的产物已被后续修订或当前哈希/后置条件取代；看板保留旧记录作审计，"
+                    "但不会把它当成当前有效结果。"
+                )
             row = {
                 "stage": name,
                 "branch": STAGE_BRANCHES.get(name, "other"),
@@ -1609,7 +1633,7 @@ class StoryAgent:
                 "infrastructure_attempts": int(record.get("infrastructure_attempts") or 0),
                 "quality_attempts": int(record.get("quality_attempts") or 0),
                 "attempt_id": str(attempt.get("attempt_id") or ""),
-                "duration_seconds": self._record_duration_seconds(record, running=running),
+                "duration_seconds": duration_seconds,
                 "provider": str(record.get("provider") or ""),
                 "request_id": request_id,
                 "actual_cost": float(record.get("actual_cost") or 0.0),
@@ -1623,7 +1647,9 @@ class StoryAgent:
                     if isinstance(record.get("retry_files"), list)
                     else review.get("retry_files") if isinstance(review.get("retry_files"), list) else []
                 ),
-                "estimated_remaining_seconds": int(record.get("estimated_remaining_seconds") or 0),
+                "estimated_remaining_seconds": dynamic_estimate,
+                "estimate_status": estimate_status,
+                "status_explanation": status_explanation,
                 "postconditions": record.get("postconditions", {}),
                 "input_hashes": record.get("input_hashes", {}),
                 "output_hashes": record.get("output_hashes", {}),
@@ -2136,10 +2162,6 @@ class StoryAgent:
         if self._legacy_contract_policy(manifest):
             return StageResult("done", "V3 冻结项目采用 legacy_passthrough，不补写或重做合同。")
         paths = contract_paths(self.context.project_dir)
-        style_references = self._approved_style_reference_paths()
-        approved_preview_manifest = (
-            self.context.paths.status / "style_references" / "approved_preview_manifest.json"
-        )
         paths["directory"].mkdir(parents=True, exist_ok=True)
         if paths["contract"].is_file() and contract_runtime_issues(self.context.project_dir):
             self._archive_story_contract_attempt("runtime_invalid_or_trusted_input_drift")
@@ -2163,18 +2185,9 @@ class StoryAgent:
                     f"- 输出 JSON：`{paths['contract']}`",
                     f"- 输出说明：`{paths['summary']}`",
                     "",
-                    "必须按故事实际需要决定预览资产；无角色不得生成角色卡，无可靠尺度依据不得编造数值比例。",
-                    "需要视觉预览时必须使用原生 ImageGen 生成真实设计小样；禁止用 Pillow、SVG、HTML、几何图形或其他程序绘图冒充视觉小样。",
-                    *( ["以下是用户确认的整体风格参考，仅用于角色可爱度、3D 动画感和渲染质感，不复制具体角色：", *[f"- `{path}`" for path in style_references]] if style_references else [] ),
-                    *(
-                        [
-                            f"- 已存在用户批准的预览清单：`{approved_preview_manifest}`",
-                            "- 清单中 replace_allowed=false 时，必须原样复用其 path 与 sha256 写入合同 preview_assets，禁止重生、改写或替换这些文件。",
-                            "- 同一个批准文件可以在清单中承担多个预览角色；这表示复用同一身份母版，不得为每个角色另生成一张图。",
-                        ]
-                        if approved_preview_manifest.is_file()
-                        else []
-                    ),
+                    "本阶段只生成文本/JSON 规则，preview_assets 必须是空数组。",
+                    "禁止在合同阶段调用 ImageGen、生成视觉小样或要求审核像素级状态；视觉证据统一由后续 visual_samples 阶段按预算生成。",
+                    "无角色不得编造角色；无可靠尺度依据不得编造数值比例。",
                 ]
             )
             + "\n",
@@ -2191,18 +2204,16 @@ class StoryAgent:
                 "你自己的分析、视觉补全和推断一律标记 agent_inference；禁止伪装成高优先级来源。",
                 "视觉风格只能由用户/项目配置的明确选择决定；必须把可信来源链 /resolved_image_style 中的 key、label 和 prompt 原样绑定到 visual_style.style_profile，不得根据故事类型、标题或文本关键词换风格。",
                 "角色身份锚点只锁定原文明确说明或用户明确指定的特征。未指定的外观不写成合同硬约束，由图像模型按已选整体风格完成角色设计。",
-                "角色卡、尺度锚点、风格锚点、布局预览按故事实际需要条件生成；无需预览的类型不要创建占位。一个已批准文件覆盖多个角色时必须复用同一路径和哈希，不能把逻辑检查角色误解成多张独立图片。",
+                "合同只声明后续需要验证的角色、尺度、状态和布局规则；preview_assets 必须写 []，本阶段不得调用 ImageGen 或生成任何小样。",
                 "story_state 必须覆盖会被消耗、撕下、打碎、修复、交付或逐步减少的关键道具。每个状态要精确写明仍存在的数量、成员、颜色或完整性，并把不应再出现的旧状态写入 forbidden，不能只写‘发生变化’。",
                 "每个不可逆的实体状态迁移必须在 transition 写 must_show_action=true、action_subject 和 action_object；触发动作必须来自原文，不得编造。只有瞬间跳切、明确离屏事件或抽象状态才可写 must_show_action=false。",
                 "尺度优先 qualitative_relation；只有可信依据或机器布局需要时才写宽容数值区间及 numeric_basis。",
                 "如果多个角色会在同一画面出现，world_scale.relationships 只覆盖有故事或布局必要的宽松视觉层级；不得为所有角色两两建立无依据的总排序。儿童卡通允许为了表演和可读性适度夸张小角色，不能按现实物种厘米比例机械判定。已有用户批准母版时，定性关系应忠于母版实际画面，不得仅凭现实常识写成 much_smaller。环境或动作参照不是角色尺度证明，不要求为其另画尺度图。",
-                "scale_anchor 的 content_refs 只能列出该图实际可比较的角色大小关系；啄木鸟在树上、青蛙在稻田、蜜蜂采蜜等环境/动作关系不得为了凑覆盖率塞入尺度预览。",
                 "release_layout 只能登记可信来源链能复核的画布或布局默认；没有画布收据时不要凭经验补写精确比例变体。",
                 "semantic_artifacts.mappings 必须按语义源中实际出现的 semantic_kind，完整覆盖 demo_subtitles、background_visual、background_subtitles、sales_subtitles、ppt、customer_manuscript、reading_annotation 七类产物；不得缺项或私自留给下游默认补齐。",
                 "语义源中若有‘故事告诉我们’、对受众的总结性教训或独立寓意，必须拆成 semantic_kind=moral 并单独建立七类产物 mapping，不得并入 story_body。",
                 "标题或道理若用 visual_substitute，必须给出唯一 mutual_exclusion_group；同组 background_subtitles 必须 action=exclude 且 subtitle_policy=hide。Demo 必须按自身 mapping 决定，不借用销售版规则。",
-                "如实际生成预览文件，写入项目 99_项目状态/contracts/previews 下，并在合同记录项目相对 path 和真实 SHA-256。",
-                "需要预览时使用原生 ImageGen 生成真实设计小样；禁止用 Pillow、SVG、HTML、几何图形或代码图表冒充。不需要的预览就不要声明 required。",
+                "所有视觉验证需求只写进对应合同 section；不要把多状态道具画成一张总表，也不要创建 contracts/previews 文件。",
                 f"写入 `{paths['contract']}` 和便于人读的 `{paths['summary']}`。不要写合同锁，锁只能由 Runtime 在独立审核通过后生成。",
             ]
         )
@@ -2220,6 +2231,7 @@ class StoryAgent:
             return StageResult("blocked", "合同生成任务未写入 JSON 与说明文档。", paths["handoff"])
         trusted = json.loads(paths["trusted_inputs"].read_text(encoding="utf-8"))
         bind_contract_visual_style_to_trusted_default(paths["contract"], trusted)
+        defer_contract_visual_samples(paths["contract"], paths["deferred_previews"])
         issues = contract_runtime_issues(self.context.project_dir)
         if issues:
             return StageResult("blocked", "合同机器校验或可信来源校验失败：" + "；".join(issues[:12]), paths["contract"])
@@ -2247,10 +2259,11 @@ class StoryAgent:
             images=images,
             rubric=(
                 "逐项审核七类合同是否忠于可信输入、是否把推断错误伪装成高优先级来源、语义/角色/状态/尺度/品牌/布局是否互相一致；"
-                "预览资产必须按故事实际需要条件存在，不得为了模板造角色或假精度。"
-                "视觉风格必须与可信来源链 /resolved_image_style/prompt 原样一致；角色美感按整体效果与已通过参考图判断，不得增设固定配色公式。"
-                "world_scale 只审核合同声明的宽松画面层级是否可读，并结合儿童卡通的镜头表演、透视和可读性判断；不得用现实物种厘米比例反推硬门槛，也不得因蜜蜂、青蛙等小角色为动画可读性适度放大而判错。环境或动作参照不要求独立尺度小样。"
-                "必须提供 evidence_matrix，逐节引用合同 JSON 路径、可信来源记录及必要预览文件。"
+                "本阶段只审核文本合同；preview_assets 必须为空，视觉质量与像素级状态留给后续 visual_samples 独立审核。"
+                "视觉风格只核对其声明是否原样绑定可信来源链 /resolved_image_style/prompt；本阶段没有图片，缺少视觉证据不得作为拒绝理由，也不得审核角色美感。"
+                "world_scale 只审核宽松层级声明是否有故事或布局必要性、来源优先级是否诚实；尺度在实际画面中是否可读留给 visual_samples，不得在本阶段索要尺度图。"
+                "Schema 与可信来源格式已由 Runtime 确定性校验，不要重复审 Schema 文件。必须提供 evidence_matrix，逐节引用合同 JSON 路径与可信来源记录。"
+                "若 approved=false，还必须输出 retry_contract_sections，只列需要修订的七类顶层合同节；未列出的节由 Runtime 强制恢复，不能随整份文档一起重写。"
             ),
         )
         if payload is None:
@@ -2267,16 +2280,12 @@ class StoryAgent:
         if result.status != "done":
             paths["lock"].unlink(missing_ok=True)
             quality_attempts = self._story_contract_quality_attempts(paths["review"])
-            if self._can_retry_stage(
-                "story_contract_review",
-                critical=True,
-                attempts_override=quality_attempts,
-            ):
+            if self._can_retry_contract_review(quality_attempts):
                 revision = self._revise_story_contract_after_review(manifest, payload)
                 if revision.status == "done":
                     return StageResult(
                         "retrying",
-                        "已按独立审核意见自动修订合同与必要视觉小样，将使用新哈希重新审核。",
+                        "已按独立审核意见完成唯一一次定向文本修订，将使用新哈希重新审核。",
                         revision.handoff,
                     )
                 return revision
@@ -2299,6 +2308,8 @@ class StoryAgent:
             "story_production_contract.md": paths["summary"],
             "story_contract_trusted_inputs.json": paths["trusted_inputs"],
             "story_contract_handoff.md": paths["handoff"],
+            "deferred_visual_samples.json": paths["deferred_previews"],
+            "contract_revision_scope.json": paths["revision_scope"],
             "story_contract.lock.json": paths["lock"],
             "story_contract_bundle.json": paths["bundle"],
             "story_contract_review_review.json": paths["review"],
@@ -2378,6 +2389,13 @@ class StoryAgent:
         write_trusted_input_chain(paths["trusted_inputs"], trusted)
         archived_contract = archive / "story_production_contract.json"
         archived_review = archive / "story_contract_review_review.json"
+        allowed_sections = contract_review_retry_sections(review_payload)
+        if not allowed_sections:
+            return StageResult(
+                "blocked",
+                "合同审核拒绝但未声明 retry_contract_sections，拒绝扩大为整份合同重写。",
+                archived_review,
+            )
         paths["handoff"].write_text(
             "\n".join(
                 [
@@ -2389,12 +2407,14 @@ class StoryAgent:
                     f"- 根 Schema：`{ROOT / 'schemas/story_contract/v1/story_production_contract.schema.json'}`",
                     f"- 新合同 JSON：`{paths['contract']}`",
                     f"- 新说明：`{paths['summary']}`",
+                    f"- 本轮唯一允许修改的合同节：`{', '.join(allowed_sections)}`",
+                    "- Runtime 会把未列入上述清单的合同节原样恢复；不要借修订机会重写整份合同。",
                     "- 只修正审核指出的问题及其直接一致性影响，不得篡改可信故事事实。",
                     "- visual_style.style_profile 必须原样继承可信来源链 /resolved_image_style 的 key、label 和 prompt；故事类型和文本关键词不得改变风格。",
                     "- 角色只锁定可信来源明确特征；未指定的外观不写成合同硬约束，由图像模型按已选整体风格完成。",
                     "- world_scale 只保留故事和构图确有必要的宽松层级。儿童卡通可为表演与可读性适度夸张小角色；不得按现实厘米比例硬判，也不得为了环境/动作参照再生成尺度图。用户批准母版是当前视觉关系依据。",
-                    "- 复用批准清单中的两张唯一参考；禁止按审核意见另生成第三张尺度或角色参考。",
-                    "- 需要的视觉小样必须使用原生 ImageGen；禁止 Pillow/SVG/HTML/几何代码图。不需要则取消 required 声明。",
+                    "- preview_assets 必须保持 []；本阶段不得调用 ImageGen、生成或修改视觉小样。",
+                    "- 状态、角色、尺度与布局只修订 JSON 规则；视觉证据由后续 visual_samples 阶段生成。",
                     "- 不要修改独立审核文件，不要生成合同锁。",
                     "",
                     "## 审核结构化意见",
@@ -2412,14 +2432,32 @@ class StoryAgent:
             handoff=paths["handoff"],
             prompt=(
                 "你是合同修订生产者。完整读取 handoff、被拒绝合同、当前可信来源链与独立审核，"
-                "生成新合同和说明。必要的真实视觉小样仅用原生 ImageGen 生成。"
+                "只对审核指出的 JSON 路径及直接一致性影响做一次定向修订，并生成新合同和说明。"
+                "禁止调用 ImageGen，preview_assets 必须为 []。"
             ),
         )
         if result.status != "done":
             return result
         if not paths["contract"].is_file() or not paths["summary"].is_file():
             return StageResult("blocked", "合同自动修订未写入 JSON 与说明文档。", paths["handoff"])
+        try:
+            enforce_targeted_contract_revision(
+                archived_contract,
+                paths["contract"],
+                allowed_sections=allowed_sections,
+                receipt_path=paths["revision_scope"],
+            )
+        except (OSError, ValueError, KeyError, json.JSONDecodeError) as exc:
+            return StageResult("blocked", f"合同定向修订边界校验失败：{exc}", paths["contract"])
+        paths["summary"].write_text(
+            paths["summary"].read_text(encoding="utf-8")
+            + "\n## Runtime 定向修订边界\n\n"
+            + f"- 允许修改：{', '.join(allowed_sections)}\n"
+            + "- 其余合同节已从被拒绝版本逐值恢复，防止整份合同漂移。\n",
+            encoding="utf-8",
+        )
         bind_contract_visual_style_to_trusted_default(paths["contract"], trusted)
+        defer_contract_visual_samples(paths["contract"], paths["deferred_previews"])
         if file_sha256(paths["contract"]) == old_contract_sha:
             return StageResult("blocked", "合同自动修订没有改变被拒绝的合同哈希。", paths["contract"])
         issues = contract_runtime_issues(self.context.project_dir)
@@ -2467,6 +2505,7 @@ class StoryAgent:
             paths["assets"].mkdir(parents=True, exist_ok=True)
             paths["handoff"].parent.mkdir(parents=True, exist_ok=True)
             projection = json.loads(context.read_text(encoding="utf-8"))["contract_projection"]
+            generation_jobs = visual_sample_generation_jobs(plan, projection, missing)
             paths["handoff"].write_text(
                 "\n".join(
                     [
@@ -2474,29 +2513,26 @@ class StoryAgent:
                         "",
                         "只生成计划中 fulfillment=supplemental_sample 且 asset=null 的小样；禁止生成正式分镜图片。",
                         f"- 小样计划：`{plan_path}`",
-                        f"- 合同投影：`{context}`",
                         f"- 输出目录：`{paths['assets']}`",
-                        "- 必须完整遵守 visual_style、characters、world_scale、story_state。",
+                        "- 每张图只读取下方对应 sample_id 的 relevant_contract；完整合同仅作 Runtime 哈希绑定，不是要求一张小样同时展示全部内容。",
                         "- 仅当计划确实要求角色间尺度小样时，检查宽松的画面层级和透视可读性；儿童卡通允许为表演适度放大小角色，不按现实厘米比例机械处理。环境/动作参照不生成尺度小样。",
                         "- 不得擅自新增会成为跨镜头身份锚点的特殊标记、固定配饰、徽记，或违反合同/角色设定的非意图结构。",
                         "- 允许不违背合同的正常人体/动物结构、时代和场景合理的普通服饰及非身份性自然细节；这些推断细节不得升级为永久身份锚点。合同 required/forbidden 始终优先。",
                         "- 不得生成文字、标题、字幕、水印或 Logo。",
                         "- 每张只验证该 sample_id 的合同约束；不要扩展故事事实。",
+                        "- style_anchor 同时作为风格与角色身份母版，不要再为每个角色分别画一张重复参考。",
+                        "- 每个 state_anchor 必须是一张只呈现一个指定状态的独立图片；严禁把 F0～Fn 或所有状态挤在一张接触表里。",
+                        "- strategy=targeted_regeneration 时只修审核指出的缺陷；strategy=single_state_single_asset 或 simplify_to_single_subject_contract_evidence 时必须减少同图约束并改变实现方法，禁止照搬上一轮提示词和版式。",
                         *( ["- 以下图片是用户确认的整体风格参考，必须用作 ImageGen 参考图，不复制具体角色：", *[f"  - `{path}`" for path in style_references]] if style_references else [] ),
-                        "",
-                        "## 当前完整视觉投影",
-                        "```json",
-                        json.dumps(projection, ensure_ascii=False, indent=2, sort_keys=True),
-                        "```",
                         "",
                         "## 身份扩展禁令",
                         "```json",
                         json.dumps(plan["identity_expansion_policy"], ensure_ascii=False, indent=2, sort_keys=True),
                         "```",
                         "",
-                        "## 本轮缺失小样",
+                        "## 本轮逐图最小生成任务",
                         "```json",
-                        json.dumps(missing, ensure_ascii=False, indent=2, sort_keys=True),
+                        json.dumps(generation_jobs, ensure_ascii=False, indent=2, sort_keys=True),
                         "```",
                     ]
                 )
@@ -2564,7 +2600,7 @@ class StoryAgent:
         style_references = self._approved_style_reference_paths()
         bundle = write_review_bundle(
             paths["bundle"],
-            [paths["plan"], machine_qa, context, contract_paths(self.context.project_dir)["contract"], *style_references, *assets],
+            [paths["plan"], machine_qa, context, *style_references, *assets],
         )
         result, payload = self._structured_review(
             stage="visual_sample_review",
@@ -2573,7 +2609,7 @@ class StoryAgent:
             images=[*style_references, *assets],
             rubric=(
                 "这是批量生图前门禁，审核必须分三层并在 JSON 中分别写 machine_completeness、contract_adherence、product_quality。"
-                "machine_completeness 必须 passed=true 且引用文件/哈希证据；contract_adherence.checks 必须逐项覆盖计划要求的 visual_style、characters、world_scale、story_state；"
+                "machine_completeness 必须 passed=true 且引用文件/哈希证据；contract_adherence.checks 只覆盖各 sample_id 的 relevant_contract，不要求单张图或同一张总表展现完整状态序列；完整状态序列仍由正式 JSON 合同约束。"
                 "product_quality.dimensions 必须逐项覆盖计划中的风格中性维度；有角色时覆盖 character_design_fit、identity_coherence、anatomical_coherence。"
                 "如 product_quality 包含 scale_readability，逐 relationship_id 检查宽松画面层级、落点、前后景与透视是否清楚；儿童卡通为表演和可读性适度放大小角色是允许的，不使用现实厘米比例作为门禁。"
                 f"{ANATOMICAL_COHERENCE_REVIEW_RULE}"
@@ -2589,26 +2625,35 @@ class StoryAgent:
         if result.status == "done" and not special_issues:
             lock = write_visual_sample_lock(self.context.project_dir)
             return StageResult("done", f"视觉小样三层审核通过并锁定：{payload.get('score')} 分", lock)
+        request_payload: dict[str, Any] = {}
+        can_retry = False
         if payload is not None:
             try:
                 request = write_visual_sample_supplemental_request(self.context.project_dir, plan, payload)
                 request_payload = json.loads(request.read_text(encoding="utf-8"))
+                can_retry = self._can_retry_visual_sample_review(request_payload)
                 retry_ids = set(request_payload.get("sample_ids", []))
-                quarantine = paths["directory"] / "rejected" / time.strftime("%Y%m%d-%H%M%S")
-                for item in plan["requirements"]:
-                    if item["sample_id"] not in retry_ids or item["fulfillment"] != "supplemental_sample":
-                        continue
-                    source = self.context.project_dir / item["expected_path"]
-                    if source.is_file():
-                        quarantine.mkdir(parents=True, exist_ok=True)
-                        shutil.move(str(source), str(quarantine / source.name))
+                if can_retry:
+                    quarantine = paths["directory"] / "rejected" / time.strftime("%Y%m%d-%H%M%S")
+                    for item in plan["requirements"]:
+                        if item["sample_id"] not in retry_ids or item["fulfillment"] != "supplemental_sample":
+                            continue
+                        source = self.context.project_dir / item["expected_path"]
+                        if source.is_file():
+                            quarantine.mkdir(parents=True, exist_ok=True)
+                            shutil.move(str(source), str(quarantine / source.name))
             except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
                 pass
         message = "视觉小样审核未通过"
         if special_issues:
             message += "：" + "；".join(special_issues)
-        if self._can_retry_stage("visual_sample_review", critical=True):
-            return StageResult("retrying", message + "；只重做失败小样，不进入批量生图。", paths["review"])
+        if can_retry:
+            strategies = request_payload.get("generation_strategy_by_sample", {})
+            return StageResult(
+                "retrying",
+                message + f"；只重做失败小样，并切换生成策略：{strategies}。",
+                paths["review"],
+            )
         return StageResult("blocked", message, paths["review"])
 
     def _stage_source_edit(self, manifest: dict[str, Any]) -> StageResult:
@@ -6175,6 +6220,22 @@ class StoryAgent:
         )
         return attempts < limit
 
+    @staticmethod
+    def _can_retry_contract_review(quality_attempts: int) -> bool:
+        defaults = load_config().get("agent_defaults", {})
+        max_revisions = max(0, int(defaults.get("contract_review_max_revisions", 1)))
+        # quality_attempts includes the initial reviewed contract.  A value of
+        # one therefore means the single targeted revision is still available.
+        return max(1, int(quality_attempts)) <= max_revisions
+
+    @staticmethod
+    def _can_retry_visual_sample_review(request: Mapping[str, Any]) -> bool:
+        defaults = load_config().get("agent_defaults", {})
+        max_attempts = max(1, int(defaults.get("visual_sample_max_attempts", 3)))
+        configured_receipt_limit = max(1, int(request.get("max_total_attempts") or max_attempts))
+        failed_attempts = max(1, int(request.get("failed_attempt_count") or 1))
+        return failed_attempts < min(max_attempts, configured_receipt_limit)
+
     def _quarantine_story_images(self, indices: list[int]) -> list[int]:
         image_dir = self._image_dir()
         staging_images = self._codex_stage_dir("codex_story_images") / "images"
@@ -7686,11 +7747,17 @@ class StoryAgent:
                 sinks=sinks,
             )
         elif runtime_status == "retrying":
+            if stage == "story_contract_review":
+                recovery_message = f"{stage}：将执行唯一一次定向文本修订；不会在合同阶段生图。{result.message}"
+            elif stage == "visual_sample_review":
+                recovery_message = f"{stage}：只重做审核点名的小样，并更换失败策略。{result.message}"
+            else:
+                recovery_message = f"{stage} 将在新 attempt 中自动恢复：{result.message}"
             emit_notification(
                 self.context.project_dir,
                 category="automatic_recovery",
                 severity="warning",
-                message=f"{stage} 将在新 attempt 中自动恢复：{result.message}",
+                message=recovery_message,
                 dedupe_key=f"{job_id}:{stage}:retrying:{notification_fingerprint}",
                 recovery_mode="automatic",
                 stage=stage,

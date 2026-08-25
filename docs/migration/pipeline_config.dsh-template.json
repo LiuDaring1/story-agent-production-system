@@ -130,6 +130,8 @@
     "review_pass_score": 85,
     "max_retries": 2,
     "max_critical_retries": 3,
+    "contract_review_max_revisions": 1,
+    "visual_sample_max_attempts": 3,
     "max_attempts": 2,
     "max_critical_attempts": 3,
     "whisper_model": "small",

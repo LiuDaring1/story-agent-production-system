@@ -34,6 +34,7 @@ from story_contract_runtime import (
     contract_consumer_context_is_current,
     contract_consumer_path,
     contract_diagnostics,
+    enforce_targeted_contract_revision,
     legacy_passthrough_allowed,
     locked_contract_binding,
     mark_contract_consumer_completed,
@@ -234,6 +235,34 @@ class StoryContractRuntimeTests(unittest.TestCase):
             self.assertIn("可信来源", result.message)
             self.assertFalse(paths["lock"].exists())
 
+    def test_contract_generation_is_text_only_and_defers_worker_previews(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            agent = StoryAgent(_context(project))
+            paths = contract_paths(project)
+
+            def fake_task(**kwargs):
+                handoff = paths["handoff"].read_text(encoding="utf-8")
+                self.assertIn("preview_assets 必须是空数组", handoff)
+                self.assertIn("禁止在合同阶段调用 ImageGen", handoff)
+                self.assertIn("不得调用 ImageGen", kwargs["prompt"])
+                save_json(paths["contract"], _runtime_valid_contract(project, manifest))
+                paths["summary"].write_text("# Text-only Contract\n", encoding="utf-8")
+                return StageResult("done", "generated")
+
+            with patch.object(agent, "_codex_task", side_effect=fake_task):
+                result = agent._stage_story_contract(manifest)
+            self.assertEqual(result.status, "done", result.message)
+            contract = json.loads(paths["contract"].read_text(encoding="utf-8"))
+            self.assertEqual(contract["preview_assets"], [])
+            receipt = json.loads(paths["deferred_previews"].read_text(encoding="utf-8"))
+            self.assertEqual(receipt["policy"], "deferred_to_visual_samples")
+            self.assertTrue(receipt["deferred_preview_assets"])
+
+    def test_contract_review_allows_only_one_targeted_revision(self) -> None:
+        self.assertTrue(StoryAgent._can_retry_contract_review(1))
+        self.assertFalse(StoryAgent._can_retry_contract_review(2))
+
     def test_generator_cannot_rewrite_runtime_trusted_chain(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, manifest = _new_project(Path(directory))
@@ -326,6 +355,70 @@ class StoryContractRuntimeTests(unittest.TestCase):
         issues = contract_review_payload_issues(payload)
         self.assertTrue(any("缺少合同节" in issue for issue in issues), issues)
 
+    def test_rejected_contract_review_requires_explicit_revision_sections(self) -> None:
+        payload = {
+            "approved": False,
+            "evidence_matrix": [
+                {"section": section, "evidence": f"contracts.{section}"}
+                for section in (
+                    "semantic_artifacts", "visual_style", "characters", "world_scale",
+                    "story_state", "brand", "release_layout",
+                )
+            ],
+        }
+        issues = contract_review_payload_issues(payload)
+        self.assertTrue(any("retry_contract_sections" in issue for issue in issues), issues)
+
+    def test_runtime_restores_sections_outside_targeted_contract_revision(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rejected_path = root / "rejected.json"
+            revised_path = root / "revised.json"
+            receipt_path = root / "scope.json"
+            rejected = valid_contract(with_characters=True)
+            revised = json.loads(json.dumps(rejected))
+            revised["story"]["title"] = "worker drifted title"
+            revised["contracts"]["characters"]["rules"].append(
+                {
+                    "rule_id": "characters.targeted_fix",
+                    "value": "allowed change",
+                    "provenance": {
+                        "source": "agent_inference",
+                        "source_ref": "agent_inference.targeted_fix",
+                        "confidence": 0.8,
+                    },
+                }
+            )
+            revised["contracts"]["brand"]["rules"].append(
+                {
+                    "rule_id": "brand.unrelated_drift",
+                    "value": "must be discarded",
+                    "provenance": {
+                        "source": "agent_inference",
+                        "source_ref": "agent_inference.unrelated_drift",
+                        "confidence": 0.8,
+                    },
+                }
+            )
+            save_json(rejected_path, rejected)
+            save_json(revised_path, revised)
+            enforce_targeted_contract_revision(
+                rejected_path,
+                revised_path,
+                allowed_sections=("characters",),
+                receipt_path=receipt_path,
+            )
+            guarded = json.loads(revised_path.read_text(encoding="utf-8"))
+            self.assertEqual(guarded["story"], rejected["story"])
+            self.assertEqual(guarded["contracts"]["brand"], rejected["contracts"]["brand"])
+            self.assertNotEqual(
+                guarded["contracts"]["characters"], rejected["contracts"]["characters"]
+            )
+            self.assertEqual(guarded["preview_assets"], [])
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            self.assertEqual(receipt["allowed_sections"], ["characters"])
+            self.assertIn("brand", receipt["restored_sections"])
+
     def test_rejected_contract_review_triggers_bounded_automatic_revision(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, manifest = _new_project(Path(directory))
@@ -346,6 +439,7 @@ class StoryContractRuntimeTests(unittest.TestCase):
                     "retry_indices": [],
                     "retry_files": [],
                     "retry_instructions": ["regenerate the required preview"],
+                    "retry_contract_sections": ["story_state"],
                     "evidence_matrix": [
                         {"section": section, "evidence": f"contracts.{section}"}
                         for section in (

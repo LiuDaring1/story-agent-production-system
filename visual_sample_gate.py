@@ -24,8 +24,10 @@ from story_module_registry import build_visual_design_registry
 
 
 VISUAL_SAMPLE_SCHEMA_VERSION = "1.0"
-VISUAL_SAMPLE_COMPILER_VERSION = "m2-2a1.1.3"
+VISUAL_SAMPLE_COMPILER_VERSION = "m2-2a1.1.4"
 VISUAL_SAMPLE_LOCK_VERSION = 1
+VISUAL_SAMPLE_MAX_ATTEMPTS = 3
+MAX_STATE_SAMPLE_ASSETS = 3
 VISUAL_SAMPLE_SCHEMA_PATH = (
     Path(__file__).resolve().parent
     / "schemas"
@@ -118,6 +120,7 @@ def _preview_covers(preview: Mapping[str, Any], kind: str, refs: list[str], root
 def _sample_requirement(
     *,
     root: Path,
+    sample_id: str,
     kind: str,
     reason: str,
     contract_paths_: list[str],
@@ -131,7 +134,7 @@ def _sample_requirement(
     if reused is not None:
         asset = _ready_asset(root / str(reused["path"]), root)
         return {
-            "sample_id": kind,
+            "sample_id": sample_id,
             "kind": kind,
             "need_reason": reason,
             "contract_paths": contract_paths_,
@@ -141,9 +144,9 @@ def _sample_requirement(
             "expected_path": str(reused["path"]),
             "asset": asset,
         }
-    target = root / "99_项目状态" / "visual_samples" / "assets" / f"{kind}.png"
+    target = root / "99_项目状态" / "visual_samples" / "assets" / f"{sample_id}.png"
     return {
-        "sample_id": kind,
+        "sample_id": sample_id,
         "kind": kind,
         "need_reason": reason,
         "contract_paths": contract_paths_,
@@ -153,6 +156,81 @@ def _sample_requirement(
         "expected_path": _project_relative(target, root),
         "asset": _ready_asset(target, root),
     }
+
+
+def _safe_sample_id(kind: str, *parts: str) -> str:
+    raw = "__".join((kind, *(str(part) for part in parts if str(part))))
+    safe = "".join(character if character.isascii() and (character.isalnum() or character in "-_") else "-" for character in raw)
+    while "--" in safe:
+        safe = safe.replace("--", "-")
+    safe = safe.strip("-_") or kind
+    if len(safe) > 112:
+        suffix = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+        safe = f"{safe[:99].rstrip('-_')}__{suffix}"
+    return safe
+
+
+def _mother_character_ids(character_rows: list[Any], *, limit: int = 3) -> list[str]:
+    """Select a small cast for the one shared identity/style mother reference."""
+
+    ranked: list[tuple[int, int, str]] = []
+    for index, item in enumerate(character_rows):
+        if not isinstance(item, Mapping):
+            continue
+        character_id = str(item.get("character_id") or "")
+        if not character_id:
+            continue
+        role = str(item.get("role") or "").lower()
+        if any(token in role for token in ("protagonist", "hero", "lead", "main", "主角")):
+            priority = 0
+        elif any(token in role for token in ("guide", "helper", "beneficiary", "伙伴", "帮助")):
+            priority = 1
+        elif any(token in role for token in ("incidental", "group", "群", "路人")):
+            priority = 3
+        else:
+            priority = 2
+        ranked.append((priority, index, character_id))
+    return [item[2] for item in sorted(ranked)[: max(0, limit)]]
+
+
+def _representative_state_rows(state_rows: list[Any]) -> list[tuple[int, int, Mapping[str, Any], Mapping[str, Any]]]:
+    """Choose a bounded set of standalone state proofs, never one giant contact sheet.
+
+    The complete state sequence remains authoritative JSON consumed by formal
+    storyboard generation.  Samples are only representative visual anchors.
+    Long discrete sequences get initial/middle/final assets for the most complex
+    machine; simpler stories get one changed-state asset per machine, capped by
+    ``MAX_STATE_SAMPLE_ASSETS``.
+    """
+
+    machines: list[tuple[int, Mapping[str, Any], list[Mapping[str, Any]]]] = []
+    for machine_index, machine in enumerate(state_rows):
+        if not isinstance(machine, Mapping):
+            continue
+        states = [item for item in machine.get("states", []) if isinstance(item, Mapping)]
+        if states:
+            machines.append((machine_index, machine, states))
+    if not machines:
+        return []
+    machines.sort(
+        key=lambda item: (
+            -len(item[2]),
+            -len(item[1].get("transitions", [])) if isinstance(item[1].get("transitions"), list) else 0,
+            str(item[1].get("machine_id") or ""),
+        )
+    )
+    primary_index, primary, primary_states = machines[0]
+    if len(primary_states) >= 4:
+        indices = sorted({0, (len(primary_states) - 1) // 2, len(primary_states) - 1})
+        return [
+            (primary_index, state_index, primary, primary_states[state_index])
+            for state_index in indices[:MAX_STATE_SAMPLE_ASSETS]
+        ]
+    selected: list[tuple[int, int, Mapping[str, Any], Mapping[str, Any]]] = []
+    for machine_index, machine, states in machines[:MAX_STATE_SAMPLE_ASSETS]:
+        state_index = len(states) - 1 if len(states) > 1 else 0
+        selected.append((machine_index, state_index, machine, states[state_index]))
+    return selected
 
 
 def compile_product_quality_profile(projection: Mapping[str, Any]) -> dict[str, Any]:
@@ -288,6 +366,7 @@ def compile_visual_sample_plan(
     characters = projection.get("characters", {})
     character_rows = characters.get("characters", []) if isinstance(characters, Mapping) else []
     character_ids = [str(item["character_id"]) for item in character_rows if isinstance(item, Mapping)]
+    mother_character_ids = _mother_character_ids(character_rows)
     scale = projection.get("world_scale", {})
     scale_rows = scale.get("relationships", []) if isinstance(scale, Mapping) else []
     # Environment/action references guide scene composition but do not need a
@@ -309,38 +388,56 @@ def compile_visual_sample_plan(
         candidate = json.loads(request_path.read_text(encoding="utf-8"))
         if (
             isinstance(candidate, dict)
-            and candidate.get("version") == 1
+            and candidate.get("version") == 2
             and candidate.get("story_contract_dependency_sha256")
             == context["story_contract_dependency_sha256"]
             and isinstance(candidate.get("sample_ids"), list)
         ):
-            forced = {str(item) for item in candidate["sample_ids"] if str(item) in SAMPLE_KINDS}
+            forced = {str(item) for item in candidate["sample_ids"] if str(item)}
             supplemental_request = candidate
     except (OSError, json.JSONDecodeError):
         pass
 
+    # New contracts are text-only and therefore create one combined style/cast
+    # mother reference. Historical locked contracts may already have separate
+    # style and character previews; preserve and reuse those files instead of
+    # forcing a needless migration-time ImageGen call.
+    reuse_separate_character_preview = bool(mother_character_ids) and any(
+        _preview_covers(item, "style_anchor", [], root) for item in previews
+    ) and any(
+        _preview_covers(item, "character_sheet", mother_character_ids, root)
+        for item in previews
+    )
+    style_refs = [] if reuse_separate_character_preview else mother_character_ids
     requirements = [
         _sample_requirement(
             root=root,
+            sample_id="style_anchor",
             kind="style_anchor",
-            reason="Every visual story needs one reviewed style and rendering-quality anchor before batch generation.",
-            contract_paths_=["contracts.visual_style"],
-            refs=[],
+            reason=(
+                "One shared mother reference proves the selected style, rendering quality, and recurring "
+                "character identity before batch generation. It is not a separate image per character."
+                if mother_character_ids
+                else "Every visual story needs one reviewed style and rendering-quality anchor before batch generation."
+            ),
+            contract_paths_=["contracts.visual_style", *( ["contracts.characters"] if mother_character_ids else [] )],
+            refs=style_refs,
             previews=previews,
             force_supplemental="style_anchor" in forced,
         )
     ]
-    if characters.get("mode") == "present" and character_ids:
+    if reuse_separate_character_preview:
         requirements.append(
             _sample_requirement(
                 root=root,
+                sample_id="character_sheet",
                 kind="character_sheet",
                 reason=(
-                    "Recurring contract-declared characters need identity and contract/style-consistent "
-                    "anatomical-coherence evidence."
+                    "Historical reviewed character identity preview is retained for compatibility; "
+                    "new text-only contracts use the shared style mother reference instead."
                 ),
                 contract_paths_=["contracts.characters"],
-                refs=character_ids,
+                refs=mother_character_ids,
                 previews=previews,
                 force_supplemental="character_sheet" in forced,
             )
@@ -349,6 +446,7 @@ def compile_visual_sample_plan(
         requirements.append(
             _sample_requirement(
                 root=root,
+                sample_id="scale_anchor",
                 kind="scale_anchor",
                 reason="Declared qualitative or evidence-backed scale relationships need a visual comparison.",
                 contract_paths_=["contracts.world_scale"],
@@ -357,16 +455,27 @@ def compile_visual_sample_plan(
                 force_supplemental="scale_anchor" in forced,
             )
         )
-    if state_ids:
+    for machine_index, state_index, machine, state_row in _representative_state_rows(state_rows):
+        machine_id = str(machine.get("machine_id") or f"machine-{machine_index}")
+        state_id = str(state_row.get("state_id") or f"state-{state_index}")
+        sample_id = _safe_sample_id("state_anchor", machine_id, state_id)
         requirements.append(
             _sample_requirement(
                 root=root,
+                sample_id=sample_id,
                 kind="state_anchor",
-                reason="State-changing entities need visual evidence for every declared state before batch generation.",
-                contract_paths_=["contracts.story_state"],
-                refs=state_ids,
+                reason=(
+                    f"Standalone representative proof for state {state_id!r} of machine {machine_id!r}. "
+                    "Generate only this one state in this image; the complete sequence remains structured JSON "
+                    "for formal scene generation, never an all-states contact sheet."
+                ),
+                contract_paths_=[
+                    f"contracts.story_state.machines[{machine_index}]",
+                    f"contracts.story_state.machines[{machine_index}].states[{state_index}]",
+                ],
+                refs=[machine_id, state_id],
                 previews=previews,
-                force_supplemental="state_anchor" in forced,
+                force_supplemental=sample_id in forced,
             )
         )
 
@@ -459,17 +568,22 @@ def validate_visual_sample_plan(payload: Mapping[str, Any]) -> list[str]:
     if not isinstance(rows, list) or not rows:
         issues.append("requirements")
         rows = []
-    seen: set[str] = set()
+    seen_ids: set[str] = set()
+    seen_kinds: set[str] = set()
     for index, item in enumerate(rows):
         path = f"requirements[{index}]"
         if not isinstance(item, Mapping):
             issues.append(path)
             continue
         kind = str(item.get("kind") or "")
-        if kind not in SAMPLE_KINDS or kind in seen:
+        if kind not in SAMPLE_KINDS:
             issues.append(path + ".kind")
-        seen.add(kind)
-        if item.get("sample_id") != kind or item.get("fulfillment") not in {"contract_preview", "supplemental_sample"}:
+        seen_kinds.add(kind)
+        sample_id = str(item.get("sample_id") or "")
+        if not sample_id or sample_id in seen_ids:
+            issues.append(path + ".sample_id")
+        seen_ids.add(sample_id)
+        if item.get("fulfillment") not in {"contract_preview", "supplemental_sample"}:
             issues.append(path + ".identity")
         expected_item_fields = {
             "sample_id", "kind", "need_reason", "contract_paths", "content_refs",
@@ -488,7 +602,7 @@ def validate_visual_sample_plan(payload: Mapping[str, Any]) -> list[str]:
             or len(str(asset.get("sha256") or "")) != 64
         ):
             issues.append(path + ".asset")
-    if "style_anchor" not in seen:
+    if "style_anchor" not in seen_kinds:
         issues.append("requirements.style_anchor")
     policy = payload.get("identity_expansion_policy")
     if (
@@ -621,6 +735,133 @@ def visual_sample_asset_paths(project_root: Path | str, plan: Mapping[str, Any])
     return [root / str(item["expected_path"]) for item in plan.get("requirements", []) if isinstance(item, Mapping)]
 
 
+def visual_sample_generation_jobs(
+    plan: Mapping[str, Any],
+    projection: Mapping[str, Any],
+    requirements: list[Mapping[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project the full contract down to the exact constraint set for each sample."""
+
+    supplemental = plan.get("supplemental_request")
+    strategies = (
+        supplemental.get("generation_strategy_by_sample", {})
+        if isinstance(supplemental, Mapping)
+        and isinstance(supplemental.get("generation_strategy_by_sample"), Mapping)
+        else {}
+    )
+    visual_style = projection.get("visual_style", {})
+    characters = projection.get("characters", {})
+    world_scale = projection.get("world_scale", {})
+    story_state = projection.get("story_state", {})
+    machines = story_state.get("machines", []) if isinstance(story_state, Mapping) else []
+    character_rows = characters.get("characters", []) if isinstance(characters, Mapping) else []
+
+    def project_characters(wanted_ids: set[str]) -> dict[str, Any]:
+        if not isinstance(characters, Mapping):
+            return {"mode": "none", "characters": []}
+        projected = {
+            key: value
+            for key, value in characters.items()
+            if key != "characters"
+        }
+        projected["characters"] = [
+            row
+            for row in character_rows
+            if isinstance(row, Mapping) and str(row.get("character_id") or "") in wanted_ids
+        ]
+        return projected
+
+    mother_ids = {
+        str(value)
+        for requirement in plan.get("requirements", [])
+        if isinstance(requirement, Mapping) and requirement.get("kind") == "style_anchor"
+        for value in requirement.get("content_refs", [])
+    }
+    jobs: list[dict[str, Any]] = []
+    for item in requirements:
+        sample_id = str(item.get("sample_id") or "")
+        kind = str(item.get("kind") or "")
+        relevant: dict[str, Any] = {"visual_style": visual_style}
+        relevant_character_ids = set(mother_ids if kind in {"style_anchor", "character_sheet"} else ())
+        if kind == "scale_anchor":
+            wanted = {str(value) for value in item.get("content_refs", [])}
+            relationships = world_scale.get("relationships", []) if isinstance(world_scale, Mapping) else []
+            selected_relationships = [
+                row
+                for row in relationships
+                if isinstance(row, Mapping) and str(row.get("relationship_id") or "") in wanted
+            ]
+            relevant["world_scale"] = {
+                "rules": world_scale.get("rules", []) if isinstance(world_scale, Mapping) else [],
+                "relationships": selected_relationships,
+            }
+            for row in selected_relationships:
+                for field in ("subject", "reference"):
+                    value = str(row.get(field) or "")
+                    if value.startswith("character:"):
+                        relevant_character_ids.add(value.split(":", 1)[1])
+        if kind == "state_anchor":
+            refs = [str(value) for value in item.get("content_refs", [])]
+            machine_id = refs[0] if refs else ""
+            state_id = refs[1] if len(refs) > 1 else ""
+            machine = next(
+                (
+                    row
+                    for row in machines
+                    if isinstance(row, Mapping) and str(row.get("machine_id") or "") == machine_id
+                ),
+                {},
+            )
+            states = machine.get("states", []) if isinstance(machine, Mapping) else []
+            selected_state = next(
+                (
+                    row
+                    for row in states
+                    if isinstance(row, Mapping) and str(row.get("state_id") or "") == state_id
+                ),
+                {},
+            )
+            transitions = machine.get("transitions", []) if isinstance(machine, Mapping) else []
+            relevant["representative_story_state"] = {
+                "machine_id": machine_id,
+                "entity_ref": machine.get("entity_ref") if isinstance(machine, Mapping) else None,
+                "initial_state": machine.get("initial_state") if isinstance(machine, Mapping) else None,
+                "selected_state": selected_state,
+                "adjacent_transitions": [
+                    row
+                    for row in transitions
+                    if isinstance(row, Mapping)
+                    and state_id in {str(row.get("from") or ""), str(row.get("to") or "")}
+                ],
+                "sampling_rule": (
+                    "Render exactly this one selected state as a standalone asset. The full sequence is "
+                    "structured production data and must not be squeezed into this image."
+                ),
+            }
+            entity_text = str(machine.get("entity_ref") or "") if isinstance(machine, Mapping) else ""
+            for row in character_rows:
+                if not isinstance(row, Mapping):
+                    continue
+                character_id = str(row.get("character_id") or "")
+                display_name = str(row.get("display_name") or "")
+                if character_id and (
+                    character_id in entity_text or display_name and display_name in entity_text
+                ):
+                    relevant_character_ids.add(character_id)
+        relevant["characters"] = project_characters(relevant_character_ids)
+        jobs.append(
+            {
+                "sample_id": sample_id,
+                "kind": kind,
+                "expected_path": item.get("expected_path"),
+                "need_reason": item.get("need_reason"),
+                "strategy": str(strategies.get(sample_id) or "baseline_single_asset"),
+                "relevant_contract": relevant,
+            }
+        )
+    return jobs
+
+
 def visual_sample_machine_issues(project_root: Path | str, plan: Mapping[str, Any]) -> list[str]:
     root = Path(project_root)
     issues: list[str] = []
@@ -700,14 +941,77 @@ def write_visual_sample_supplemental_request(
     requested &= required_ids
     if not requested:
         requested = required_ids
+    previous: dict[str, Any] = {}
+    try:
+        candidate = json.loads(paths["supplemental_request"].read_text(encoding="utf-8"))
+        if (
+            isinstance(candidate, dict)
+            and candidate.get("version") == 2
+            and candidate.get("story_contract_dependency_sha256")
+            == plan.get("story_contract_dependency_sha256")
+        ):
+            previous = candidate
+    except (OSError, json.JSONDecodeError):
+        pass
+    failure_source = {
+        "p0_errors": review.get("p0_errors", []),
+        "critical_errors": review.get("critical_errors", []),
+        "issues": review.get("issues", []),
+        "retry_sample_ids": sorted(requested),
+        "retry_instructions": review.get("retry_instructions", []),
+    }
+    fingerprint = hashlib.sha256(canonical_json_bytes(failure_source)).hexdigest()
+    history = [
+        dict(item)
+        for item in previous.get("failure_history", [])
+        if isinstance(item, Mapping)
+    ]
+    previous_fingerprints = {str(item.get("fingerprint") or "") for item in history}
+    failed_attempt_count = int(previous.get("failed_attempt_count") or 0) + 1
+    requirement_by_id = {
+        str(item.get("sample_id")): item
+        for item in plan.get("requirements", [])
+        if isinstance(item, Mapping)
+    }
+    if failed_attempt_count == 1:
+        strategy_by_sample = {sample_id: "targeted_regeneration" for sample_id in sorted(requested)}
+    else:
+        strategy_by_sample = {
+            sample_id: (
+                "single_state_single_asset"
+                if str(requirement_by_id.get(sample_id, {}).get("kind") or "") == "state_anchor"
+                else "simplify_to_single_subject_contract_evidence"
+            )
+            for sample_id in sorted(requested)
+        }
+    repeated_failure = fingerprint in previous_fingerprints
+    history.append(
+        {
+            "failed_attempt": failed_attempt_count,
+            "fingerprint": fingerprint,
+            "sample_ids": sorted(requested),
+            "strategy_changed": failed_attempt_count > 1 or repeated_failure,
+        }
+    )
     payload = {
-        "version": 1,
+        "version": 2,
         "story_contract_dependency_sha256": plan["story_contract_dependency_sha256"],
         "source_visual_sample_plan_sha256": file_sha256(paths["plan"]),
         "source_review_bundle_sha256": file_sha256(paths["bundle"]),
         "source_review_sha256": file_sha256(paths["review"]),
         "sample_ids": sorted(requested),
-        "reason": "independent_review_found_existing_preview_insufficient",
+        "failed_attempt_count": failed_attempt_count,
+        "max_total_attempts": VISUAL_SAMPLE_MAX_ATTEMPTS,
+        "next_generation_attempt": failed_attempt_count + 1,
+        "failure_fingerprint": fingerprint,
+        "repeated_failure": repeated_failure,
+        "generation_strategy_by_sample": strategy_by_sample,
+        "failure_history": history[-VISUAL_SAMPLE_MAX_ATTEMPTS:],
+        "reason": (
+            "independent_review_failed_change_strategy"
+            if failed_attempt_count > 1 or repeated_failure
+            else "independent_review_failed_targeted_retry"
+        ),
     }
     return write_json_atomic(paths["supplemental_request"], payload)
 
@@ -806,6 +1110,7 @@ __all__ = [
     "compile_product_quality_profile", "compile_visual_sample_plan", "load_current_visual_sample_plan",
     "product_quality_review_issues",
     "validate_visual_sample_plan", "visual_sample_asset_paths", "visual_sample_binding",
+    "visual_sample_generation_jobs",
     "visual_sample_lock_is_current", "visual_sample_machine_issues",
     "visual_sample_paths", "visual_sample_plan_is_current",
     "visual_sample_review_payload_issues", "visual_sample_schema_parity_issues",

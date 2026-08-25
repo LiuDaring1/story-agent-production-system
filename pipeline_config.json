@@ -142,6 +142,8 @@
     "review_pass_score": 85,
     "max_retries": 2,
     "max_critical_retries": 3,
+    "contract_review_max_revisions": 1,
+    "visual_sample_max_attempts": 3,
     "video_review_systemic_failure_fraction": 0.333333,
     "video_review_editorial_fallback_after_retries": 1,
     "max_attempts": 2,

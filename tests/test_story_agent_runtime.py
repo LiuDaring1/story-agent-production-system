@@ -39,6 +39,7 @@ from story_agent_runtime import (
     AgentRuntimeError,
     BudgetExceeded,
     BudgetLedger,
+    JobCancelled,
     JobRegistry,
     existing_artifact_hashes,
     ensure_manifest_v2,
@@ -214,6 +215,31 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(receipt["to"], runtime_code_identity())
             self.assertEqual(receipt["project_manifest_sha256_after"], file_sha256(paths.manifest))
             assert_runnable(migrated, project)
+
+    def test_cancelled_idle_project_can_migrate_without_implicit_resume(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：取消后显式版本迁移"
+            init_project(project, story_name="取消后显式版本迁移", slug="cancelled-migration")
+            paths = project_paths(project)
+            manifest = ensure_manifest_v2(load_manifest(paths) or {})
+            old_revision = "c" * 40
+            manifest["agent"]["code_identity"]["git_revision"] = old_revision
+            manifest["agent"]["status"] = "cancelled"
+            manifest["agent"]["cancel_requested"] = True
+            write_manifest(paths, manifest)
+
+            migrated, receipt_path = migrate_code_binding(
+                project,
+                expected_old_revision=old_revision,
+                migrated_by="test",
+                reason="upgrade while remaining explicitly cancelled",
+            )
+            self.assertEqual(migrated["agent"]["code_identity"], runtime_code_identity())
+            self.assertEqual(migrated["agent"]["status"], "cancelled")
+            self.assertTrue(migrated["agent"]["cancel_requested"])
+            self.assertTrue(receipt_path.is_file())
+            with self.assertRaises(JobCancelled):
+                assert_runnable(migrated, project)
     def test_library_release_receipt_uses_variant_specific_demo_bindings(self) -> None:
         common = {
             "demo_render_manifest_sha256": "a" * 64,

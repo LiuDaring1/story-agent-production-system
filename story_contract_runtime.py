@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import os
@@ -57,6 +58,8 @@ def contract_paths(project_root: Path | str) -> dict[str, Path]:
         "summary": contracts / "story_production_contract.md",
         "trusted_inputs": contracts / "story_contract_trusted_inputs.json",
         "handoff": contracts / "story_contract_handoff.md",
+        "deferred_previews": contracts / "deferred_visual_samples.json",
+        "revision_scope": contracts / "contract_revision_scope.json",
         "lock": contracts / "story_contract.lock.json",
         "bundle": reviews / "story_contract_bundle.json",
         "review": reviews / "story_contract_review_review.json",
@@ -186,6 +189,39 @@ def bind_contract_visual_style_to_trusted_default(
     return contract_path
 
 
+def defer_contract_visual_samples(contract_path: Path, receipt_path: Path) -> Path | None:
+    """Keep the contract stage text-only and defer generated previews to the sample gate.
+
+    Contract generation defines *what* must stay consistent.  It must not spend
+    ImageGen calls trying to prove every state before the independently bounded
+    visual-sample stage.  If a worker nevertheless emits preview bindings, retain
+    their complete audit record in ``99_项目状态`` and deterministically remove the
+    bindings from the active contract.  The referenced files are never deleted.
+    """
+
+    payload = json.loads(contract_path.read_text(encoding="utf-8"))
+    previews = payload.get("preview_assets")
+    if not isinstance(previews, list):
+        raise ValueError("contract preview_assets must be an array")
+    if not previews:
+        return None
+    source_sha256 = _file_sha256(contract_path)
+    receipt = {
+        "version": 1,
+        "policy": "deferred_to_visual_samples",
+        "source_contract_file_sha256": source_sha256,
+        "deferred_preview_assets": previews,
+        "note": (
+            "The active Story Production Contract is text-only. These worker-produced "
+            "preview bindings were preserved for audit but are not approved production references."
+        ),
+    }
+    save_json(receipt_path, receipt)
+    payload["preview_assets"] = []
+    save_json(contract_path, payload)
+    return receipt_path
+
+
 def contract_runtime_issues(project_root: Path | str) -> list[str]:
     root = Path(project_root)
     paths = contract_paths(root)
@@ -235,26 +271,110 @@ def contract_review_payload_issues(payload: Mapping[str, Any]) -> list[str]:
     missing = sorted(set(REQUIRED_CONTRACT_SECTIONS) - covered)
     if missing:
         issues.append("evidence_matrix 缺少合同节：" + ",".join(missing))
+    if payload.get("approved") is not True:
+        raw_sections = payload.get("retry_contract_sections")
+        if not isinstance(raw_sections, list) or not raw_sections:
+            issues.append("审核拒绝时 retry_contract_sections 必须列出需要定向修订的合同节")
+        else:
+            normalized = [str(value).strip() for value in raw_sections]
+            invalid = sorted(
+                {
+                    value
+                    for value in normalized
+                    if value not in REQUIRED_CONTRACT_SECTIONS
+                }
+            )
+            if invalid:
+                issues.append("retry_contract_sections 包含非法合同节：" + ",".join(invalid))
+            if len(set(normalized)) != len(normalized):
+                issues.append("retry_contract_sections 不得重复")
     return issues
+
+
+def contract_review_retry_sections(payload: Mapping[str, Any]) -> tuple[str, ...]:
+    """Return the review-declared, top-level contract revision boundary."""
+
+    raw_sections = payload.get("retry_contract_sections")
+    if not isinstance(raw_sections, list):
+        return ()
+    return tuple(
+        section
+        for section in REQUIRED_CONTRACT_SECTIONS
+        if section in {str(value).strip() for value in raw_sections}
+    )
+
+
+def enforce_targeted_contract_revision(
+    rejected_contract_path: Path | str,
+    revised_contract_path: Path | str,
+    *,
+    allowed_sections: tuple[str, ...] | list[str],
+    receipt_path: Path | str,
+) -> Path:
+    """Restore every section outside an independently reviewed retry scope.
+
+    The revision worker may rewrite a complete JSON document for convenience,
+    but it is not trusted to widen the change.  Runtime owns the immutable
+    identity fields and copies every unapproved section byte-for-value from the
+    rejected contract before the normal schema/provenance validators run.
+    """
+
+    rejected_path = Path(rejected_contract_path)
+    revised_path = Path(revised_contract_path)
+    receipt = Path(receipt_path)
+    rejected = json.loads(rejected_path.read_text(encoding="utf-8"))
+    revised = json.loads(revised_path.read_text(encoding="utf-8"))
+    if not isinstance(rejected, dict) or not isinstance(revised, dict):
+        raise ValueError("contract revision inputs must be JSON objects")
+    rejected_contracts = rejected.get("contracts")
+    revised_contracts = revised.get("contracts")
+    if not isinstance(rejected_contracts, Mapping) or not isinstance(revised_contracts, dict):
+        raise ValueError("contract revision inputs must contain contracts objects")
+    allowed = tuple(dict.fromkeys(str(value).strip() for value in allowed_sections))
+    if not allowed:
+        raise ValueError("targeted contract revision requires at least one allowed section")
+    invalid = sorted(set(allowed) - set(REQUIRED_CONTRACT_SECTIONS))
+    if invalid:
+        raise ValueError("invalid targeted contract revision sections: " + ",".join(invalid))
+
+    candidate_sha256 = _file_sha256(revised_path)
+    for key in ("schema_version", "contract_id", "story"):
+        revised[key] = copy.deepcopy(rejected[key])
+    restored_sections = [
+        section for section in REQUIRED_CONTRACT_SECTIONS if section not in allowed
+    ]
+    for section in restored_sections:
+        revised_contracts[section] = copy.deepcopy(rejected_contracts[section])
+    revised["preview_assets"] = []
+    save_json(revised_path, revised)
+    save_json(
+        receipt,
+        {
+            "version": 1,
+            "policy": "independent_review_targeted_sections_only",
+            "rejected_contract_sha256": _file_sha256(rejected_path),
+            "worker_candidate_sha256": candidate_sha256,
+            "guarded_contract_sha256": _file_sha256(revised_path),
+            "allowed_sections": list(allowed),
+            "restored_sections": restored_sections,
+            "runtime_owned_fields": ["schema_version", "contract_id", "story", "preview_assets"],
+        },
+    )
+    return receipt
 
 
 def contract_review_artifacts(project_root: Path | str) -> tuple[list[Path], list[Path]]:
     root = Path(project_root)
     paths = contract_paths(root)
     contract = load_story_contract(paths["contract"])
-    artifacts = [paths["contract"], paths["summary"], paths["trusted_inputs"]]
-    story_text_value = _load_manifest_story_text(root)
-    if story_text_value is not None:
-        artifacts.append(story_text_value)
-    artifacts.extend(sorted(SCHEMA_ROOT.glob("*.schema.json")))
-    images: list[Path] = []
-    for preview in contract.get("preview_assets", []):
-        if isinstance(preview, Mapping) and preview.get("path"):
-            target = root / str(preview["path"])
-            if target.is_file():
-                artifacts.append(target)
-                images.append(target)
-    return artifacts, images
+    # Schema and provenance have already passed deterministic validators.  The
+    # trusted-input receipt already embeds the exact story text and its hash, so
+    # attaching the source file and every schema again only duplicates context.
+    # Keep the independent semantic review focused on three hash-bound artifacts.
+    # Historical contracts may still contain hash-valid preview bindings; they
+    # remain readable for compatibility but are deliberately not attached to
+    # this review. New contracts are normalized to preview_assets=[].
+    return [paths["contract"], paths["summary"], paths["trusted_inputs"]], []
 
 
 def expected_contract_lock(
@@ -809,6 +929,9 @@ __all__ = [
     "contract_paths",
     "contract_review_artifacts",
     "contract_review_payload_issues",
+    "contract_review_retry_sections",
+    "defer_contract_visual_samples",
+    "enforce_targeted_contract_revision",
     "contract_runtime_issues",
     "expected_contract_lock",
     "legacy_eligibility_receipt",

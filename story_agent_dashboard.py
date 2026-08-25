@@ -55,7 +55,7 @@ def render_dashboard_html(*, poll_seconds: float = 2.0) -> str:
       font-size:11px; text-transform:uppercase; }}
     .passed,.completed {{ color:var(--ok); }} .running,.reviewing {{ color:var(--accent); }}
     .blocked,.warning,.waiting_for_user {{ color:var(--warn); }}
-    .failed,.critical,.terminal_bug {{ color:var(--bad); }} .stale,.retrying {{ color:var(--stale); }}
+    .failed,.critical,.terminal_bug {{ color:var(--bad); }} .stale,.retrying,.superseded {{ color:var(--stale); }}
     .pending,.cancelled {{ color:var(--muted); }}
     progress {{ width:100%; height:8px; accent-color:var(--accent); }}
     .timeline {{ display:grid; gap:8px; }}
@@ -158,9 +158,10 @@ function render(snapshot) {{
   (((snapshot.dag || {{}}).edges) || []).forEach(edge => (dependencies[edge.to] ||= []).push(edge.from));
   document.getElementById("stages").innerHTML = rows.map(row => '<tr><td>'+esc(row.branch)+'</td><td>'+esc(row.stage)+
     '</td><td>'+esc((dependencies[row.stage] || []).join(", ") || "—")+'</td><td>'+badge(row.effective_status)+'</td><td>'+esc(row.attempts)+' (I'+esc(row.infrastructure_attempts || 0)+'/Q'+esc(row.quality_attempts || 0)+')</td><td>'+esc(row.duration_seconds == null ? "—" : row.duration_seconds+"s")+
-    ' / '+esc(row.estimated_remaining_seconds == null ? "—" : row.estimated_remaining_seconds+"s")+
+    ' / '+esc(row.estimate_status === "overdue" ? "原估算已过期" : (row.estimated_remaining_seconds == null ? "—" : row.estimated_remaining_seconds+"s"))+
     '</td><td>'+esc(row.provider || "—")+(row.request_id ? '<br><code>'+esc(row.request_id)+'</code>' : "")+
     '</td><td>¥'+Number(row.actual_cost || 0).toFixed(2)+'</td><td><strong>'+esc(row.why_running || row.message || "")+'</strong>'+
+    (row.status_explanation ? '<br><span class="muted">'+esc(row.status_explanation)+'</span>' : '')+
     '<br><span class="muted">retry_scope: '+esc(row.retry_scope || "—")+
     (((row.retry_files || []).length) ? ' · '+esc(row.retry_files.join(", ")) : "")+'</span>'+
     ((row.artifacts || []).length ? '<br>'+artifact(row.artifacts[0]) : "")+'</td></tr>').join("");

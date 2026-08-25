@@ -3,6 +3,7 @@ import unittest
 from story_agent_runtime import (
     STAGE_BRANCHES,
     STAGE_ESTIMATES_MINUTES,
+    STAGE_RESOURCES,
     STAGE_WRITE_SETS,
     STORY_STAGE_DEPENDENCIES,
     STORY_STAGE_SEQUENCE,
@@ -46,6 +47,8 @@ class StageDagInvariantTests(unittest.TestCase):
         self.assertIn("release_preview", STORY_STAGE_DEPENDENCIES["product_package"])
         self.assertEqual(STORY_STAGE_DEPENDENCIES["package_release"], ("release_preview",))
         self.assertNotIn("product_package_review", STORY_STAGE_DEPENDENCIES["package_release"])
+        self.assertEqual(STAGE_RESOURCES["story_contract"], ("codex_exec",))
+        self.assertEqual(STAGE_RESOURCES["visual_samples"], ("codex_exec", "imagegen"))
 
 
 if __name__ == "__main__":

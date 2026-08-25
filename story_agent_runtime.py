@@ -31,7 +31,7 @@ from story_contract_runtime import (
 MANIFEST_VERSION = 2
 DEFAULT_SOFT_BUDGET_CNY = 50.0
 DEFAULT_HARD_BUDGET_CNY = 100.0
-STORY_AGENT_RELEASE_VERSION = "3.6.1-canary"
+STORY_AGENT_RELEASE_VERSION = "3.6.2-canary"
 # V3.6 targets an overnight run.  At the deadline the scheduler freezes new
 # aesthetic retries and exposes the best hash-valid output; it does not launch
 # final_delivery/doctor or restart the full DAG.
@@ -296,7 +296,7 @@ STAGE_WRITE_SETS = {
 }
 
 STAGE_RESOURCES = {
-    "story_contract": ("codex_exec", "imagegen"),
+    "story_contract": ("codex_exec",),
     "story_contract_review": ("codex_exec",),
     "visual_samples": ("codex_exec", "imagegen"),
     "visual_sample_review": ("codex_exec",),
@@ -2404,7 +2404,13 @@ def migrate_code_binding(
             "project_manifest_sha256_after": after_sha256,
         }
         save_json(receipt_path, receipt)
-        assert_runnable(manifest, paths.root)
+        # Migration is deliberately allowed while an idle project is cancelled
+        # or blocked.  It updates only the audited code binding; callers still
+        # use ``resume`` explicitly before execution.  Calling assert_runnable
+        # here used to raise *after* both manifest and receipt had been written,
+        # falsely reporting failure for a migration that had already happened.
+        if manifest["agent"].get("code_identity") != new_identity:
+            raise AgentRuntimeError("代码绑定迁移写入后校验失败")
         return manifest, receipt_path
 
 

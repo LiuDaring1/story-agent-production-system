@@ -294,13 +294,16 @@ class VisualSampleGateTests(unittest.TestCase):
 
     def test_mock_visual_design_reaches_story_agent_consumer_without_second_contract(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
-            project, manifest, agent, _context = _fixture(
+            project, manifest, agent, context = _fixture(
                 Path(directory), state=False, preview_kinds=("style_anchor", "character_sheet", "scale_anchor")
             )
             mock = MockVisualDesignAdapter()
             registry = ModuleRegistry(profile_name="mock-visual-design")
             registry.register("visual_design", mock)
             agent._module_registry = registry
+            for item in compile_visual_sample_plan(project, context)["requirements"]:
+                if item["fulfillment"] == "supplemental_sample":
+                    _image(project / item["expected_path"])
             before = {path.relative_to(project) for path in project.rglob("*") if path.is_file()}
             with patch.object(mock, "resolve", wraps=mock.resolve) as resolve:
                 result = agent._stage_visual_samples(manifest)
@@ -325,9 +328,9 @@ class VisualSampleGateTests(unittest.TestCase):
     def test_schema_parity_determinism_and_conditional_sample_matrix(self) -> None:
         cases = [
             (False, False, False, {"style_anchor"}),
-            (True, False, False, {"style_anchor", "character_sheet"}),
-            (True, True, False, {"style_anchor", "character_sheet", "scale_anchor"}),
-            (True, True, True, {"style_anchor", "character_sheet", "scale_anchor", "state_anchor"}),
+            (True, False, False, {"style_anchor"}),
+            (True, True, False, {"style_anchor", "scale_anchor"}),
+            (True, True, True, {"style_anchor", "scale_anchor", "state_anchor"}),
         ]
         self.assertEqual(visual_sample_schema_parity_issues(), [])
         for characters, scale, state, expected in cases:
@@ -359,11 +362,12 @@ class VisualSampleGateTests(unittest.TestCase):
             plan = compile_visual_sample_plan(project, context)
             by_kind = {item["kind"]: item for item in plan["requirements"]}
             self.assertEqual(by_kind["style_anchor"]["fulfillment"], "contract_preview")
+            self.assertIn("shared mother reference", by_kind["style_anchor"]["need_reason"])
             self.assertEqual(by_kind["character_sheet"]["fulfillment"], "contract_preview")
             self.assertEqual(by_kind["scale_anchor"]["fulfillment"], "contract_preview")
             self.assertEqual(by_kind["state_anchor"]["fulfillment"], "supplemental_sample")
 
-    def test_state_anchor_reuses_approved_state_reference_without_another_image(self) -> None:
+    def test_aggregate_state_sheet_is_not_reused_for_a_standalone_state_sample(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             project, manifest = _new_project(root)
@@ -396,8 +400,82 @@ class VisualSampleGateTests(unittest.TestCase):
 
             plan = compile_visual_sample_plan(project, context)
             by_kind = {item["kind"]: item for item in plan["requirements"]}
-            self.assertEqual(by_kind["state_anchor"]["fulfillment"], "contract_preview")
-            self.assertEqual(by_kind["state_anchor"]["expected_path"], str(state_path.relative_to(project)))
+            self.assertEqual(by_kind["state_anchor"]["fulfillment"], "supplemental_sample")
+            self.assertNotEqual(by_kind["state_anchor"]["expected_path"], str(state_path.relative_to(project)))
+            self.assertEqual(len(by_kind["state_anchor"]["content_refs"]), 2)
+
+    def test_long_state_sequence_compiles_three_standalone_representative_assets(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project, manifest = _new_project(root)
+            contract = _visual_contract(project, manifest, preview_kinds=())
+            machine = contract["contracts"]["story_state"]["machines"][0]
+            provenance = copy.deepcopy(machine["provenance"])
+            machine["initial_state"] = "state_0"
+            machine["states"] = [
+                {
+                    "state_id": f"state_{index}",
+                    "description": f"Generic finite-prop state {index}.",
+                    "required": [f"remaining count is {7 - index}"],
+                    "forbidden": [f"previous state {max(0, index - 1)}"],
+                    "provenance": copy.deepcopy(provenance),
+                }
+                for index in range(8)
+            ]
+            machine["transitions"] = []
+            _agent, _paths = _lock_contract(project, manifest, contract_payload=contract)
+            context = write_contract_consumer_context(project, "storyboard_images")
+
+            plan = compile_visual_sample_plan(project, context)
+            states = [item for item in plan["requirements"] if item["kind"] == "state_anchor"]
+            self.assertEqual(len(states), 3)
+            self.assertEqual([item["content_refs"][1] for item in states], ["state_0", "state_3", "state_7"])
+            self.assertEqual(len({item["sample_id"] for item in states}), 3)
+            self.assertTrue(all("contact sheet" in item["need_reason"] for item in states))
+
+    def test_repeated_visual_defect_changes_strategy_and_stops_after_three_total_attempts(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, _manifest, agent, context = _fixture(Path(directory), preview_kinds=())
+            plan = _ready_plan(project, context)
+            paths = visual_sample_paths(project)
+            write_visual_sample_machine_qa(project, plan)
+            write_review_bundle(
+                paths["bundle"],
+                [paths["plan"], paths["machine_qa"], context, *[project / item["expected_path"] for item in plan["requirements"]]],
+            )
+            state_sample = next(item for item in plan["requirements"] if item["kind"] == "state_anchor")
+            review = _passing_review(plan, paths["bundle"])
+            review.update(
+                approved=False,
+                score=76,
+                p0_errors=["state_contradiction"],
+                retry_sample_ids=[state_sample["sample_id"]],
+                retry_instructions=["The selected finite-prop state is wrong."],
+            )
+            save_json(paths["review"], review)
+
+            first_path = write_visual_sample_supplemental_request(project, plan, review)
+            first = json.loads(first_path.read_text(encoding="utf-8"))
+            self.assertEqual(first["failed_attempt_count"], 1)
+            self.assertEqual(
+                first["generation_strategy_by_sample"][state_sample["sample_id"]],
+                "targeted_regeneration",
+            )
+            self.assertTrue(agent._can_retry_visual_sample_review(first))
+
+            second_path = write_visual_sample_supplemental_request(project, plan, review)
+            second = json.loads(second_path.read_text(encoding="utf-8"))
+            self.assertTrue(second["repeated_failure"])
+            self.assertEqual(
+                second["generation_strategy_by_sample"][state_sample["sample_id"]],
+                "single_state_single_asset",
+            )
+            self.assertTrue(agent._can_retry_visual_sample_review(second))
+
+            third_path = write_visual_sample_supplemental_request(project, plan, review)
+            third = json.loads(third_path.read_text(encoding="utf-8"))
+            self.assertEqual(third["failed_attempt_count"], 3)
+            self.assertFalse(agent._can_retry_visual_sample_review(third))
 
     def test_environment_only_relationships_do_not_multiply_scale_reference_images(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -412,7 +490,7 @@ class VisualSampleGateTests(unittest.TestCase):
             plan = compile_visual_sample_plan(project, context)
             self.assertNotIn("scale_anchor", {item["kind"] for item in plan["requirements"]})
 
-    def test_worker_handoff_contains_full_projection_and_identity_expansion_ban(self) -> None:
+    def test_worker_handoff_contains_only_per_sample_projection_and_identity_expansion_ban(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, manifest, agent, context = _fixture(Path(directory))
             captured = {}
@@ -420,8 +498,10 @@ class VisualSampleGateTests(unittest.TestCase):
             def fake_task(**kwargs):
                 captured.update(kwargs)
                 handoff = visual_sample_paths(project)["handoff"].read_text(encoding="utf-8")
-                for name in ("visual_style", "characters", "world_scale", "story_state"):
+                for name in ("visual_style", "characters", "world_scale", "representative_story_state"):
                     self.assertIn(f'"{name}"', handoff)
+                self.assertNotIn("## 当前完整视觉投影", handoff)
+                self.assertIn("严禁把 F0～Fn 或所有状态挤在一张接触表里", handoff)
                 self.assertIn("不得擅自新增会成为跨镜头身份锚点的特殊标记", handoff)
                 self.assertIn("时代和场景合理的普通服饰", handoff)
                 self.assertIn("不得升级为永久身份锚点", handoff)
@@ -485,16 +565,16 @@ class VisualSampleGateTests(unittest.TestCase):
             review.update(
                 approved=False,
                 score=82,
-                retry_sample_ids=["character_sheet"],
+                retry_sample_ids=["scale_anchor"],
                 p0_errors=["character_identity_mismatch"],
             )
             save_json(paths["review"], review)
             write_visual_sample_supplemental_request(project, plan, review)
             replacement = compile_visual_sample_plan(project, context)
             by_kind = {item["kind"]: item for item in replacement["requirements"]}
-            self.assertEqual(by_kind["character_sheet"]["fulfillment"], "supplemental_sample")
+            self.assertEqual(by_kind["character_sheet"]["fulfillment"], "contract_preview")
             self.assertEqual(by_kind["style_anchor"]["fulfillment"], "contract_preview")
-            self.assertEqual(by_kind["scale_anchor"]["fulfillment"], "contract_preview")
+            self.assertEqual(by_kind["scale_anchor"]["fulfillment"], "supplemental_sample")
 
     def test_review_lock_is_hash_bound_and_sample_tamper_invalidates_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

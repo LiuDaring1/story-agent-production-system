@@ -107,7 +107,7 @@ class StoryContractConsumerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "official asset"):
                 compile_demo_render_spec(context, root / "bad.json", official_logo_path=other)
 
-    def test_storyboard_handoff_carries_five_sections_and_plan_is_projection_bound(self) -> None:
+    def test_storyboard_plan_carries_five_sections_while_batch_request_stays_projection_bound(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, manifest = _new_project(Path(directory))
             agent, _paths = _lock_contract(project, manifest, contract_payload=semantic_contract_fixture(project, manifest, ("title", "story_body")))
@@ -129,8 +129,14 @@ class StoryContractConsumerTests(unittest.TestCase):
                 handoff=staging / "handoff.md", staging_images=staging / "images",
                 staging_storyboard=storyboard, story_lines=["主角出发。"], indices=[1],
             )
+            batch_request = json.loads(
+                (staging / "generic-contract_story_images_batch_01_01.json").read_text(encoding="utf-8")
+            )
             for section in projection:
-                self.assertIn(f'"{section}"', prompt)
+                self.assertNotIn(f'"{section}"', prompt)
+                self.assertNotIn(section, batch_request)
+            self.assertEqual(batch_request["shots"], [{"scene": 1, "story_text": "主角出发。"}])
+            self.assertEqual(batch_request["generation_policy"]["do_not_replan_story"], True)
             shot = {
                 "scene": 1, "story_text": "主角出发。", "narrative_function": "setup",
                 "shot_size": "wide", "focal_character": "主角", "visible_characters": ["主角"],

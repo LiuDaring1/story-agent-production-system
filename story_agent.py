@@ -308,6 +308,7 @@ class AgentContext:
             "recovery_controller",
             "source_edit_review",
             "story_contract_review",
+            "story_image_control_plan",
             "visual_sample_review",
             "story_images_review",
             "video_prompt_review",
@@ -3236,6 +3237,18 @@ class StoryAgent:
             if has_unbound_images:
                 self._invalidate_story_image_derivatives(staging_images)
         self._sync_story_images_from_staging(staging, staging_storyboard, staging_images)
+        control_result = self._ensure_story_image_control(
+            handoff=handoff,
+            staging=staging,
+            staging_images=staging_images,
+            staging_storyboard=staging_storyboard,
+            story_lines=story_lines,
+            contract_context=contract_context,
+            authoritative_storyboard_sha=authoritative_storyboard_sha,
+        )
+        if control_result is not None:
+            return control_result
+        self._sync_story_images_from_staging(staging, staging_storyboard, staging_images)
         missing = self._missing_story_image_indices(story_lines)
         if not missing:
             if contract_context is not None and not self._story_image_generation_complete(
@@ -3247,19 +3260,27 @@ class StoryAgent:
 
         batch_size = max(1, self.context.codex_story_image_batch_size)
         batch = missing[:batch_size]
+        batch_request = self._write_story_image_batch_request(
+            staging=staging,
+            staging_images=staging_images,
+            staging_storyboard=staging_storyboard,
+            story_lines=story_lines,
+            indices=batch,
+        )
         batch_prompt = self._story_images_batch_prompt(
             handoff=handoff,
             staging_images=staging_images,
             staging_storyboard=staging_storyboard,
             story_lines=story_lines,
             indices=batch,
+            batch_request=batch_request,
         )
         result = self._execute_image_generation(
             artifact_id=f"story-images-{batch[0]:02d}-{batch[-1]:02d}",
             operation="generate_story_images",
             stage=f"codex_story_images_{batch[0]:02d}_{batch[-1]:02d}",
             label=f"Codex 原生故事批量出图 {len(batch)} 张",
-            handoff=handoff,
+            handoff=batch_request,
             prompt=batch_prompt,
             output_targets=tuple(
                 staging_images / self._story_image_filename(index) for index in batch
@@ -3269,6 +3290,22 @@ class StoryAgent:
                     "role": "authoritative_storyboard",
                     "path": str(staging_storyboard),
                     "sha256": authoritative_storyboard_sha,
+                },
+                *(
+                    (
+                        {
+                            "role": "validated_story_image_control_plan",
+                            "path": str(staging / f"{self.context.slug}_storyboard_plan.json"),
+                            "sha256": file_sha256(staging / f"{self.context.slug}_storyboard_plan.json"),
+                        },
+                    )
+                    if (staging / f"{self.context.slug}_storyboard_plan.json").is_file()
+                    else ()
+                ),
+                {
+                    "role": "runtime_compiled_batch_request",
+                    "path": str(batch_request),
+                    "sha256": file_sha256(batch_request),
                 },
                 *(
                     (
@@ -5751,6 +5788,448 @@ class StoryAgent:
     def _story_image_filename(self, index: int) -> str:
         return f"{self.context.slug}_scene_{index:02d}.png"
 
+    def _story_image_control_seed_path(self) -> Path:
+        return self._codex_stage_dir("codex_story_images") / f"{self.context.slug}_storyboard_plan.seed.json"
+
+    def _story_image_control_draft_path(self) -> Path:
+        return self._codex_stage_dir("codex_story_images") / f"{self.context.slug}_storyboard_plan.model.json"
+
+    def _story_image_control_input_sha256(
+        self,
+        *,
+        staging_storyboard: Path,
+        contract_context: Path | None,
+    ) -> str:
+        semantic_path = self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"
+        sample_lock = visual_sample_paths(self.context.project_dir)["lock"]
+        inputs = {
+            "runtime_code_sha256": file_sha256(ROOT / "story_agent.py"),
+            "authoritative_storyboard_sha256": file_sha256(staging_storyboard),
+            "contract_context_sha256": file_sha256(contract_context) if contract_context and contract_context.is_file() else "",
+            "artifact_semantic_plan_sha256": file_sha256(semantic_path) if semantic_path.is_file() else "",
+            "visual_sample_lock_sha256": file_sha256(sample_lock) if sample_lock.is_file() else "",
+        }
+        return hashlib.sha256(
+            json.dumps(inputs, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        ).hexdigest()
+
+    def _write_story_image_control_seed(
+        self,
+        *,
+        staging_storyboard: Path,
+        story_lines: list[str],
+        contract_context: Path | None,
+    ) -> Path:
+        """Write the immutable, code-owned skeleton before any model planning.
+
+        This makes scene numbering, source text and dependency hashes immediately
+        observable and keeps the model from spending tokens copying fixed fields.
+        The seed is deliberately not a production plan; only the compiled and
+        validated ``*_storyboard_plan.json`` can unlock image generation.
+        """
+
+        semantic_source = self._artifact_semantic_source(self._manifest())
+        semantic_path = self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"
+        sample_paths = visual_sample_paths(self.context.project_dir)
+        payload: dict[str, Any] = {
+            "schema_version": "story_image_control_seed_v1",
+            "status": "draft",
+            "authoritative_storyboard_path": str(staging_storyboard),
+            "authoritative_storyboard_sha256": file_sha256(staging_storyboard),
+            "contract_context_path": str(contract_context or ""),
+            "contract_context_sha256": file_sha256(contract_context) if contract_context and contract_context.is_file() else "",
+            "artifact_semantic_plan_path": str(semantic_path if semantic_path.is_file() else ""),
+            "artifact_semantic_plan_sha256": file_sha256(semantic_path) if semantic_path.is_file() else "",
+            "visual_sample_plan_path": str(sample_paths["plan"] if sample_paths["plan"].is_file() else ""),
+            "visual_sample_lock_path": str(sample_paths["lock"] if sample_paths["lock"].is_file() else ""),
+            "model_draft_output": str(self._story_image_control_draft_path()),
+            "compiled_output": str(self._codex_stage_dir("codex_story_images") / f"{self.context.slug}_storyboard_plan.json"),
+            "shots": [
+                {"scene": index, "story_text": text}
+                for index, text in enumerate(story_lines, start=1)
+            ],
+        }
+        if semantic_source is not None:
+            payload["artifact_semantic_source_path"] = str(semantic_source)
+            payload["artifact_semantic_source_sha256"] = file_sha256(semantic_source)
+        target = self._story_image_control_seed_path()
+        save_json(target, payload)
+        return target
+
+    def _compile_story_image_control_plan(
+        self,
+        *,
+        draft: Path,
+        target: Path,
+        staging_storyboard: Path,
+        story_lines: list[str],
+        contract_context: Path | None,
+    ) -> bool:
+        """Compile model-authored shot decisions with code-owned bindings."""
+
+        try:
+            candidate = json.loads(draft.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return False
+        rows = candidate.get("shots", []) if isinstance(candidate, dict) else candidate
+        if not isinstance(rows, list) or len(rows) != len(story_lines):
+            return False
+        for index, (row, text) in enumerate(zip(rows, story_lines), start=1):
+            if not isinstance(row, dict):
+                return False
+            try:
+                scene = int(row.get("scene"))
+            except (TypeError, ValueError):
+                return False
+            if scene != index or str(row.get("story_text") or "").strip() != text:
+                return False
+        payload: dict[str, Any] = dict(candidate) if isinstance(candidate, dict) else {}
+        payload["shots"] = rows
+        payload["authoritative_storyboard_path"] = str(staging_storyboard)
+        payload["authoritative_storyboard_sha256"] = file_sha256(staging_storyboard)
+        if not self._legacy_contract_policy(self._manifest()):
+            try:
+                if contract_context is None:
+                    return False
+                expected = json.loads(contract_context.read_text(encoding="utf-8"))
+                semantic_source = self._artifact_semantic_source(self._manifest())
+                if semantic_source is None:
+                    return False
+                semantic_path = self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"
+                semantic_plan = load_current_artifact_semantic_plan(self.context.project_dir, semantic_source)
+                bindings = {
+                    **artifact_semantic_plan_binding(semantic_path, semantic_plan),
+                    **visual_sample_binding(self.context.project_dir),
+                }
+            except (OSError, ValueError, KeyError, TypeError, json.JSONDecodeError):
+                return False
+            for field in (
+                "contract_schema_version",
+                "story_contract_sha256",
+                "story_contract_dependency_sha256",
+                "contract_projection",
+            ):
+                payload[field] = expected.get(field)
+            payload.update(bindings)
+        save_json(target, payload)
+        return self._storyboard_plan_valid(target, staging_storyboard)
+
+    def _story_image_control_prompt(
+        self,
+        *,
+        seed: Path,
+        staging: Path,
+        staging_storyboard: Path,
+        contract_context: Path | None,
+        attempt: int,
+    ) -> str:
+        semantic_path = self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"
+        sample_paths = visual_sample_paths(self.context.project_dir)
+        draft = self._story_image_control_draft_path()
+        visual_bible = staging / f"{self.context.slug}_visual_bible.md"
+        mode = (
+            "这是第二次且最后一次定向修订。读取现有 model draft，只修复缺失/矛盾字段；不要重写已正确内容。"
+            if attempt > 1
+            else "这是首次一次性规划。"
+        )
+        return "\n".join(
+            [
+                "只完成一次性的故事出图控制计划，不生成任何图片，不调用 ImageGen，也不运行视频、音乐或发布流程。",
+                mode,
+                "固定字段、镜头编号、原文和依赖哈希由 Runtime 编译；你只负责逐镜导演判断，禁止修改权威分镜。",
+                "",
+                f"- Runtime seed：`{seed}`",
+                f"- 只读权威分镜：`{staging_storyboard}`",
+                f"- 已审核合同消费者上下文：`{contract_context or ''}`",
+                f"- 逐产物语义计划：`{semantic_path if semantic_path.is_file() else ''}`",
+                f"- 已审核视觉小样计划：`{sample_paths['plan'] if sample_paths['plan'].is_file() else ''}`",
+                f"- 已审核视觉小样锁：`{sample_paths['lock'] if sample_paths['lock'].is_file() else ''}`",
+                f"- 已审核视觉小样资产目录：`{sample_paths['assets']}`",
+                f"- 逐镜模型草稿输出：`{draft}`",
+                f"- 视觉圣经输出：`{visual_bible}`",
+                "",
+                "先读取上述真实文件。不要把合同 JSON 大段复制到草稿，Runtime 会注入固定绑定。",
+                "草稿顶层写 shots；每一镜的 scene 与 story_text 必须逐字对应 seed，不得合并、扩写、删减或换序。",
+                "每镜必须包含 narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description、scale_basis、current_story_state、visual_state_evidence。",
+                "还必须包含 speaker、listener、narrative_focus、emotion、shot_intent、transition_reason、location_state、character_knowledge、required_visible_actions、state_transition_evidence。",
+                "动作控制必须包含 subject_action、environment_motion、camera_motion、entry_state、exit_state、screen_direction、adjacent_handoff、expected_motion，并额外写可直接用于图生视频的 video_prompt。",
+                "screen_direction 只能是 left_to_right/right_to_left/toward_camera/away_from_camera/stationary/mixed；expected_motion={primary,subject_level,environment_level,camera_level,rationale}，primary 只能是 subject/environment/camera/quiet，三个 level 只能是 none/low/moderate/high。",
+                "location_state={location_id,time_of_day,change_from_previous,change_cue}；character_knowledge 要为每个 visible_characters 成员写 {aware_of:[...],unaware_of:[...],gaze_target}，aware 与 unaware 不得冲突。",
+                "scale_basis={applicable:boolean,relationship_ids:[...],evidence 或 reason}；current_story_state 与 visual_state_evidence 必须逐 machine_id 覆盖合同里的全部状态机。",
+                "required_visible_actions 每项写 {machine_id,action,subject,object,visibility}，visibility 只能是 in_frame/implied/not_applicable；发生状态迁移时 state_transition_evidence[machine_id]={from,to,visibility,evidence}。",
+                "adjacent_handoff 必须包含 boolean 的 allows_direction_change 与 allows_state_transition；entry_state、exit_state、adjacent_handoff、expected_motion 都必须是 JSON 对象。",
+                "连续发生且原文没有转场的镜头必须保持同一地点、时间和场景锚点；只有原文有明确线索时才能换地点或时间。",
+                "角色在发现某事之前不得提前看向、回应或配合它。有限道具的状态变化要使用合同 machine_id/state_id，并在 required_visible_actions 明确展示触发动作；这里是通用规则，不得写死某个故事或某种道具。",
+                "状态复杂时不要要求 ImageGen 在一张多宫格里同时证明全部状态；逐镜只引用当前状态和最近通过的母状态参考。",
+                "同一角色、同一连续场景和同一道具必须复用 appearance_id、continuity_group 和可识别场景锚点；景别可以变化，但身份、尺度和状态不能漂移。",
+                "video_prompt 只写当前镜头的表演、表情、关键道具运动、镜头运动和少量禁止项，不复制画风长描述。",
+                "完成后只报告两个实际写入文件；不要开始生图。",
+            ]
+        )
+
+    def _write_story_video_controls_from_plan(self, *, staging: Path, plan: Path) -> None:
+        """Compile reviewed per-shot motion decisions into downstream CSV/MD."""
+
+        payload = json.loads(plan.read_text(encoding="utf-8"))
+        rows = payload.get("shots", []) if isinstance(payload, dict) else payload
+        csv_path = staging / f"{self.context.slug}_flow_video_prompts.csv"
+        md_path = staging / f"{self.context.slug}_flow_video_prompts.md"
+        clips_path = staging / f"{self.context.slug}_flow_clip_names.csv"
+        compiled: list[dict[str, Any]] = []
+        for row in rows:
+            scene = int(row["scene"])
+            prompt = str(row.get("video_prompt") or "").strip()
+            if not prompt:
+                motion = [
+                    str(row.get("subject_action") or "").strip(),
+                    str(row.get("environment_motion") or "").strip(),
+                    str(row.get("camera_motion") or "").strip(),
+                ]
+                prompt = "参考当前图片，" + "；".join(value for value in motion if value)
+                prompt += "。保持角色、服装、场景和道具状态不变，不新增文字或水印。"
+            compiled.append(
+                {
+                    "scene": scene,
+                    "story_text": str(row.get("story_text") or ""),
+                    "visual_description": str(row.get("visual_description") or ""),
+                    "prompt": prompt,
+                }
+            )
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        with csv_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["scene", "story_text", "visual_description", "prompt"])
+            writer.writeheader()
+            writer.writerows(compiled)
+        md_path.write_text(
+            "# 逐镜图生视频提示词\n\n"
+            + "\n\n".join(
+                f"## 镜头 {item['scene']:02d}\n\n{item['prompt']}" for item in compiled
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        with clips_path.open("w", encoding="utf-8-sig", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=["scene", "image_filename", "target_video_filename"])
+            writer.writeheader()
+            for item in compiled:
+                scene = int(item["scene"])
+                writer.writerow(
+                    {
+                        "scene": scene,
+                        "image_filename": self._story_image_filename(scene),
+                        "target_video_filename": f"{scene:02d}_{short_slug(self.context.slug)}.mp4",
+                    }
+                )
+
+    def _ensure_story_image_control(
+        self,
+        *,
+        handoff: Path,
+        staging: Path,
+        staging_images: Path,
+        staging_storyboard: Path,
+        story_lines: list[str],
+        contract_context: Path | None,
+        authoritative_storyboard_sha: str,
+    ) -> StageResult | None:
+        plan = staging / f"{self.context.slug}_storyboard_plan.json"
+        if self._has_story_visual_control():
+            if plan.is_file():
+                self._write_story_video_controls_from_plan(staging=staging, plan=plan)
+            return None
+        progress = self.state.setdefault("codex_story_images", {})
+        control_input_sha256 = self._story_image_control_input_sha256(
+            staging_storyboard=staging_storyboard,
+            contract_context=contract_context,
+        )
+        if progress.get("control_plan_input_sha256") != control_input_sha256:
+            progress["control_plan_attempts"] = 0
+            progress["control_plan_input_sha256"] = control_input_sha256
+        attempts = int(progress.get("control_plan_attempts") or 0)
+        if attempts >= 2:
+            return StageResult(
+                "blocked",
+                "一次性逐镜控制计划连续两次未通过确定性 Schema/连续性校验；已停止自动重写，尚未调用 ImageGen。",
+                handoff,
+            )
+        attempt = attempts + 1
+        progress.update(
+            {
+                "control_plan_attempts": attempt,
+                "control_plan_status": "running",
+                "why_running": "一次性编译逐镜导演计划；本步骤不调用 ImageGen，完成后正式出图只读取本批字段。",
+                "updated_at": now(),
+            }
+        )
+        self._save_state()
+        seed = self._write_story_image_control_seed(
+            staging_storyboard=staging_storyboard,
+            story_lines=story_lines,
+            contract_context=contract_context,
+        )
+        self._record_event(
+            "story_image_control_plan",
+            {
+                "status": "running",
+                "message": f"正在生成一次性逐镜控制计划（第 {attempt}/2 次）；不调用 ImageGen。Runtime seed 已落盘：{seed}",
+                "stage": "codex_story_images",
+            },
+        )
+        result = self._codex_task(
+            stage="story_image_control_plan",
+            label="一次性故事出图控制计划",
+            handoff=seed,
+            prompt=self._story_image_control_prompt(
+                seed=seed,
+                staging=staging,
+                staging_storyboard=staging_storyboard,
+                contract_context=contract_context,
+                attempt=attempt,
+            ),
+        )
+        if result.status != "done":
+            progress["control_plan_status"] = result.status
+            progress["updated_at"] = now()
+            self._save_state()
+            return result
+        if not staging_storyboard.is_file() or file_sha256(staging_storyboard) != authoritative_storyboard_sha:
+            self._ensure_storyboard_from_lines(staging_storyboard, story_lines)
+            progress["control_plan_status"] = "rejected_storyboard_rewrite"
+            self._save_state()
+            return StageResult("retrying", "控制计划生产者改写了只读权威分镜；已恢复原文，尚未调用 ImageGen。", handoff)
+        compiled = self._compile_story_image_control_plan(
+            draft=self._story_image_control_draft_path(),
+            target=plan,
+            staging_storyboard=staging_storyboard,
+            story_lines=story_lines,
+            contract_context=contract_context,
+        )
+        visual_bible = staging / f"{self.context.slug}_visual_bible.md"
+        if not compiled or not visual_bible.is_file() or not visual_bible.read_text(encoding="utf-8", errors="ignore").strip():
+            progress["control_plan_status"] = "invalid"
+            progress["updated_at"] = now()
+            self._save_state()
+            return StageResult(
+                "retrying",
+                f"一次性逐镜控制计划第 {attempt}/2 次未通过确定性 Schema/连续性校验；下一次只定向修订控制文件，不调用 ImageGen。",
+                handoff,
+            )
+        self._write_story_video_controls_from_plan(staging=staging, plan=plan)
+        progress.update({"control_plan_status": "validated", "updated_at": now()})
+        self._save_state()
+        self._record_event(
+            "story_image_control_plan",
+            {
+                "status": "passed",
+                "message": "一次性逐镜控制计划已通过确定性校验；正式图片批次将只执行已锁定的逐镜字段。",
+                "stage": "codex_story_images",
+            },
+        )
+        return None
+
+    def _story_image_retry_instructions(self, indices: list[int]) -> list[str]:
+        retry_lines: list[str] = []
+        review_path = self.context.paths.status / "reviews" / "story_images_review_review.json"
+        if not review_path.exists():
+            return retry_lines
+        try:
+            review_payload = json.loads(review_path.read_text(encoding="utf-8"))
+            instructions = review_payload.get("retry_instructions", {}) if isinstance(review_payload, dict) else {}
+            if isinstance(instructions, dict):
+                return [
+                    f"镜头 {index}：{instructions.get(str(index), instructions.get(index, ''))}"
+                    for index in indices
+                    if instructions.get(str(index), instructions.get(index, ""))
+                ]
+            if isinstance(instructions, list):
+                for item in instructions:
+                    if isinstance(item, dict):
+                        scene = item.get("scene")
+                        instruction = str(item.get("instruction") or "").strip()
+                        if scene in indices and instruction:
+                            retry_lines.append(f"镜头 {scene}：{instruction}")
+                        continue
+                    if not isinstance(item, str):
+                        continue
+                    normalized = item.strip()
+                    if any(normalized.startswith((f"第{index}镜", f"镜头{index}", f"镜头 {index}")) for index in indices):
+                        retry_lines.append(normalized)
+        except (OSError, json.JSONDecodeError):
+            return []
+        return retry_lines
+
+    def _write_story_image_batch_request(
+        self,
+        *,
+        staging: Path,
+        staging_images: Path,
+        staging_storyboard: Path,
+        story_lines: list[str],
+        indices: list[int],
+    ) -> Path:
+        plan = staging / f"{self.context.slug}_storyboard_plan.json"
+        rows: list[dict[str, Any]] = []
+        if plan.is_file():
+            try:
+                payload = json.loads(plan.read_text(encoding="utf-8"))
+                all_rows = payload.get("shots", []) if isinstance(payload, dict) else payload
+                if isinstance(all_rows, list):
+                    wanted = set(indices)
+                    rows = [row for row in all_rows if isinstance(row, dict) and int(row.get("scene") or 0) in wanted]
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                rows = []
+        if len(rows) != len(indices):
+            rows = [
+                {
+                    "scene": index,
+                    "story_text": story_lines[index - 1] if 0 < index <= len(story_lines) else "",
+                }
+                for index in indices
+            ]
+        sample_assets = visual_sample_paths(self.context.project_dir)["assets"]
+        references = [
+            {"path": str(path.resolve()), "sha256": file_sha256(path), "role": "approved_visual_sample"}
+            for path in sorted(sample_assets.glob("*"))
+            if path.is_file() and path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
+        ]
+        references.extend(
+            {"path": str(path), "sha256": file_sha256(path), "role": "user_approved_style_reference"}
+            for path in self._approved_style_reference_paths()
+        )
+        prior_images = [
+            path
+            for path in sorted(staging_images.glob(f"{self.context.slug}_scene_*.png"))
+            if path.is_file()
+        ]
+        request = {
+            "schema_version": "story_image_batch_request_v1",
+            "operation": "generate_only",
+            "story_title": self.context.story_name,
+            "batch_indices": indices,
+            "authoritative_storyboard_path": str(staging_storyboard),
+            "authoritative_storyboard_sha256": file_sha256(staging_storyboard),
+            "validated_storyboard_plan_path": str(plan),
+            "validated_storyboard_plan_sha256": file_sha256(plan) if plan.is_file() else "",
+            "visual_bible_path": str(staging / f"{self.context.slug}_visual_bible.md"),
+            "shots": rows,
+            "approved_references": references,
+            "available_prior_scene_references": [
+                {"path": str(path), "sha256": file_sha256(path)} for path in prior_images
+            ],
+            "retry_instructions": self._story_image_retry_instructions(indices),
+            "output_targets": [str(staging_images / self._story_image_filename(index)) for index in indices],
+            "generation_policy": {
+                "max_attempts_per_scene": 2,
+                "change_strategy_after_first_failure": True,
+                "do_not_replan_story": True,
+                "do_not_modify_control_files": True,
+                "one_independent_16_9_image_per_target": True,
+            },
+        }
+        target = staging / f"{self.context.slug}_story_images_batch_{indices[0]:02d}_{indices[-1]:02d}.json"
+        save_json(target, request)
+        return target
+
     def _story_images_batch_prompt(
         self,
         *,
@@ -5759,131 +6238,33 @@ class StoryAgent:
         staging_storyboard: Path,
         story_lines: list[str],
         indices: list[int],
+        batch_request: Path | None = None,
     ) -> str:
-        retry_lines: list[str] = []
-        review_path = self.context.paths.status / "reviews" / "story_images_review_review.json"
-        if review_path.exists():
-            try:
-                review_payload = json.loads(review_path.read_text(encoding="utf-8"))
-                instructions = review_payload.get("retry_instructions", {}) if isinstance(review_payload, dict) else {}
-                if isinstance(instructions, dict):
-                    retry_lines = [
-                        f"- 镜头 {index}：{instructions.get(str(index), instructions.get(index, ''))}"
-                        for index in indices
-                        if instructions.get(str(index), instructions.get(index, ""))
-                    ]
-                elif isinstance(instructions, list):
-                    for item in instructions:
-                        if isinstance(item, dict):
-                            scene = item.get("scene")
-                            instruction = str(item.get("instruction") or "").strip()
-                            if scene in indices and instruction:
-                                retry_lines.append(f"- 第{scene}镜：{instruction}")
-                            continue
-                        if not isinstance(item, str):
-                            continue
-                        normalized = item.strip()
-                        for index in indices:
-                            if normalized.startswith((f"第{index}镜", f"镜头{index}", f"镜头 {index}")):
-                                retry_lines.append(f"- {normalized}")
-                                break
-            except (OSError, json.JSONDecodeError):
-                retry_lines = []
-        lines = [
-                "请执行这份由工作台同源模板生成的儿童故事出图任务：",
-                f"`{handoff}`",
-                "",
-                "这是全自动 Agent 模式，不需要向用户确认分镜。状态机已经写好并锁定分镜文本；必须只读使用该文件，绝对不得改写、合并、删减或重排任何一行。",
-                "可以创建或更新视觉圣经和图生视频提示词文件，然后连续生成图片；镜头编号必须逐行对应锁定分镜。",
-                f"必须先写入机器可读分镜计划：`{staging_images.parent / (self.context.slug + '_storyboard_plan.json')}`。每镜包含 scene、story_text、narrative_function、shot_size、focal_character、visible_characters、excluded_characters、continuity_group、appearance_ids、visual_description、speaker、listener、narrative_focus、emotion、shot_intent、transition_reason、location_state、character_knowledge、required_visible_actions、state_transition_evidence；story_text 必须逐行等于锁定分镜。无说话者/听话者时写 none。",
-                "镜头选择必须依据人物关系、说话者/听话者、情绪变化和叙事重点；不机械地逢对白就正反打，也不得让整段对白始终保持同一多人全景。",
-                "连续发生且原文没有转场的镜头必须沿用同一个 continuity_group、location_state.location_id 和 time_of_day；若确有地点或时间变化，change_from_previous=true 且 change_cue 必须逐字指出原文中的转场依据，禁止为了画面多样性擅自换到室内、黄昏或另一地点。",
-                "character_knowledge 必须逐一记录可见角色的 aware_of、unaware_of 和 gaze_target。角色在发现某事之前不得看向、回应或配合它；偷吃、躲藏、误会、秘密等信息差要同时约束静帧构图和图生视频表演。",
-                "required_visible_actions 用对象数组记录 machine_id、action、subject、object、visibility。合同中 must_show_action=true 的迁移，当前镜必须把触发动作明确画在画面里，不能只画动作后的结果，也不能把动作前状态与目的地结果揉成一张图。state_transition_evidence 必须逐状态机记录 from、to、visibility、evidence。",
-                "机器可读分镜计划的顶层还必须原样记录合同请求清单中的 contract_schema_version、story_contract_sha256、story_contract_dependency_sha256 和 contract_projection，并把逐镜列表放在 shots 字段；contract_projection 不得删减、改写或用模型推断覆盖。",
-                "机器可读分镜计划还必须原样记录当前逐产物语义呈现计划的 artifact_semantic_plan_sha256、artifact_semantic_plan_schema_version、artifact_semantic_plan_dependency_sha256；缺失或旧绑定将被 Runtime 拒绝。",
-                "机器可读分镜计划还必须原样记录 visual_sample_schema_version、visual_sample_plan_sha256、visual_sample_review_bundle_sha256、visual_sample_lock_sha256；旧小样或旧审核绑定将被 Runtime 拒绝。",
-                "每镜必须记录 scale_basis、current_story_state、visual_state_evidence。scale_basis 必须说明是否适用、引用合同 relationship_id 或说明不适用原因；有状态机时必须逐 machine_id 记录当前 state_id 及可见/不可见证据。",
-                "每镜还必须写机器可读视频动作字段 subject_action、environment_motion、camera_motion、entry_state、exit_state、screen_direction、adjacent_handoff、expected_motion。顶层 screen_direction 只能是 left_to_right、right_to_left、toward_camera、away_from_camera、stationary、mixed 之一，不得写自由文本。expected_motion.primary 只能是 subject/environment/camera/quiet，并分别声明 subject/environment/camera 的 none/low/moderate/high 预期和理由；adjacent_handoff 必须显式包含 boolean 类型的 allows_direction_change 与 allows_state_transition，相邻镜头用同一 handoff 标识承接 entry/exit、视线与移动方向。连续性用于稳定身份、状态、尺度和故事逻辑，不能靠完全静止逃避动作。",
-                "不得丢弃、缩写或覆盖合同角色、风格、尺度、状态约束；不得擅自新增会成为跨镜头身份锚点的特殊标记、固定配饰、徽记，或违反合同/角色设定的非意图结构。",
-                "允许不违背合同的正常人体/动物结构、时代和场景合理普通服饰及非身份性自然细节，但推断细节不得升级为永久身份锚点；合同 required/forbidden 始终优先。",
-                "每个唱歌、关键发言、关键动作或明显受挫的角色都要获得焦点镜头；连续场景要安排建立全景、表演者中近景、反应镜头等景别变化，不能所有角色都和主角挤在同一种双人中景。",
-                "为反复出现的角色固定 appearance_id；生成后续镜头时必须同时引用风格锚点和该角色最近一张已通过图片，禁止只靠文字重新随机生成角色。",
-                "图生视频提示词文件的 CSV 必须包含 `scene,story_text,visual_description,prompt`；`prompt` 要作为后续图生视频 API 和审核页直接使用的最终提示词。图生视频已经有当前图片作为视觉约束，只写具体动作、表情、道具运动、镜头运动和少量禁止项，不要复制文生图视觉圣经、服装细节或画风长描述，也不能用“角色动作自然克制、镜头缓慢推进或轻移”之类通用模板充数。",
-                "",
-                f"本轮应补齐这些镜头编号：{', '.join(str(i) for i in indices)}。",
-                "若目标镜头 PNG 已存在且只是视觉圣经/分镜计划缺失，不要重新生图；读取现有图片补齐控制文件即可。",
-                f"图片暂存目录：`{staging_images}`",
-                f"分镜文本暂存：`{staging_storyboard}`",
-                f"分镜文件当前 SHA-256：`{file_sha256(staging_storyboard)}`；完成返回前必须保持完全不变。",
-        ]
-        if retry_lines:
-            lines.extend(["", "这是独立视觉审核给出的强制重做要求，必须逐条落实：", *retry_lines])
-        lines.extend(
+        if batch_request is None:
+            batch_request = self._write_story_image_batch_request(
+                staging=staging_images.parent,
+                staging_images=staging_images,
+                staging_storyboard=staging_storyboard,
+                story_lines=story_lines,
+                indices=indices,
+            )
+        return "\n".join(
             [
-                "请使用任务书指定的稳定命名 `{slug}_scene_XX.png`，不要使用旧的 `{slug}_XX.png` 命名。",
-                "如果 imagegen 默认保存到 `$CODEX_HOME/generated_images/...`，生成后把每张最终 PNG 复制到任务书指定的暂存目录。",
-                "完成后只用简短中文说明生成成功的文件路径，以及任何未能完成的镜头编号。",
+                "这是已经完成策划后的正式图片执行批次。只生成图片，不再分析整部故事，不创建或修改分镜计划、视觉圣经、合同、图生视频提示词或权威分镜。",
+                f"Runtime 编译的本批唯一请求：`{batch_request}`",
+                f"原任务书仅供背景查询：`{handoff}`；若其中要求先规划，以本批请求中的 do_not_replan_story=true 为准，因为一次性控制计划已经通过 Runtime 校验。",
+                "",
+                "必须先读取本批 JSON。shots、approved_references、available_prior_scene_references、retry_instructions 和 output_targets 都是只读固定字段。",
+                "逐镜单独调用 ImageGen，生成一张独立 16:9 成片；不得生成多宫格、联系表、占位图或后期拼字。",
+                "每镜同时使用已审核风格/角色/尺度/状态小样，以及同一角色最近一张已生成场景图作为真实图像参考；不能只把参考图概括成文字后丢弃。",
+                "有限道具只呈现该镜 shots.current_story_state 指定的当前状态；发生状态迁移时必须把 required_visible_actions 的触发动作画出来，不要试图在一张图里展示全部状态。",
+                "同一连续场景保持 location_state、continuity_group、时间、光线和可识别场景锚点；角色尚未知情时遵守 character_knowledge，不得提前看见或回应。",
+                "每镜最多两次生成尝试；第一次仍不满足本镜约束时必须改变参考图、构图或拆解表达策略，禁止用同一提示词机械重试。第二次仍失败就保留证据并报告该镜未完成，不得无限重画。",
+                f"只处理镜头：{', '.join(str(index) for index in indices)}。每生成完一张立即复制到请求中对应 output_target，不要等整批结束后再统一落盘。",
+                "不得改写任何 `*_storyboard_lines.txt`、`*_storyboard_plan.json`、`*_visual_bible.md` 或 visual_sample 文件。",
+                "完成后只简短列出已经落盘的目标和未完成编号。",
             ]
         )
-        style_references = self._approved_style_reference_paths()
-        if style_references:
-            lines.extend(
-                [
-                    "",
-                    "以下是用户确认的整体风格参考。每次 ImageGen 必须将它们中的可爱 3D 动画感与已审核视觉小样一起作为参考，不复制具体角色或构图：",
-                    *[f"- `{path}`" for path in style_references],
-                ]
-            )
-        context_path = contract_consumer_path(self.context.project_dir, "storyboard_images")
-        if context_path.is_file() and not self._legacy_contract_policy(self._manifest()):
-            try:
-                projection = json.loads(context_path.read_text(encoding="utf-8"))["contract_projection"]
-            except (OSError, KeyError, json.JSONDecodeError):
-                projection = None
-            if isinstance(projection, dict):
-                lines.extend([
-                    "", "以下是本轮最终生产指令必须完整遵守的五类合同投影：",
-                    "```json", json.dumps(projection, ensure_ascii=False, indent=2, sort_keys=True), "```",
-                ])
-        if not self._legacy_contract_policy(self._manifest()):
-            source = self._artifact_semantic_source(self._manifest())
-            if source is not None:
-                try:
-                    plan_path = self.context.paths.status / "story_contract" / "artifact_semantic_plan.json"
-                    plan = load_current_artifact_semantic_plan(self.context.project_dir, source)
-                    lines.extend([
-                        "", "以下三个逐产物语义计划绑定字段必须原样写入 storyboard plan 顶层：",
-                        "```json", json.dumps(artifact_semantic_plan_binding(plan_path, plan), ensure_ascii=False, indent=2, sort_keys=True), "```",
-                    ])
-                except (OSError, ValueError, KeyError, TypeError):
-                    lines.extend(["", "ERROR: 当前逐产物语义计划无效，禁止继续生成分镜计划。"])
-            try:
-                context = contract_consumer_path(self.context.project_dir, "storyboard_images")
-                sample_plan = load_current_visual_sample_plan(self.context.project_dir, context)
-                sample_paths = visual_sample_paths(self.context.project_dir)
-                lines.extend(
-                    [
-                        "",
-                        "以下是已通过审核的条件式视觉小样计划、资产与强制绑定。必须作为真实出图参考，不得仅抄字段：",
-                        "```json",
-                        json.dumps(
-                            {
-                                "binding": visual_sample_binding(self.context.project_dir),
-                                "requirements": sample_plan["requirements"],
-                                "identity_expansion_policy": sample_plan["identity_expansion_policy"],
-                                "lock": str(sample_paths["lock"]),
-                            },
-                            ensure_ascii=False,
-                            indent=2,
-                            sort_keys=True,
-                        ),
-                        "```",
-                    ]
-                )
-            except (OSError, ValueError, KeyError, TypeError):
-                lines.extend(["", "ERROR: 当前视觉小样锁无效，禁止生成正式图片。"])
-        return "\n".join(lines)
 
     def _approved_style_reference_paths(self) -> list[Path]:
         """Return user-approved project-local style references in stable order."""

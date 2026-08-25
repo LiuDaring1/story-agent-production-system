@@ -274,9 +274,106 @@ class StoryAgentRuntimeTests(unittest.TestCase):
         )
         self.assertEqual(context.codex_route("video_review"), ("commander", "gpt-5.6-sol", "xhigh"))
         self.assertEqual(context.codex_route("visual_sample_review"), ("commander", "gpt-5.6-sol", "xhigh"))
+        self.assertEqual(context.codex_route("story_image_control_plan"), ("commander", "gpt-5.6-sol", "xhigh"))
         self.assertEqual(context.codex_route("visual_samples"), ("worker", "gpt-5.6-luna", "max"))
         self.assertEqual(context.codex_route("codex_story_images"), ("worker", "gpt-5.6-luna", "max"))
         self.assertEqual(context.codex_route("generate_videos"), ("worker", "gpt-5.6-luna", "max"))
+
+    def test_story_image_control_is_planned_once_before_imagegen_batches(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：一次性控制"
+            manifest = as_frozen_v3_legacy(init_project(project, story_name="一次性控制", slug="control-once"))
+            paths = project_paths(project)
+            source = paths.inputs / "control-once_source.txt"
+            source.write_text("第一镜。\n第二镜。\n", encoding="utf-8")
+            manifest["inputs"]["story_text"] = str(source)
+            write_manifest(paths, manifest)
+            context = AgentContext(
+                project_dir=project,
+                inbox=None,
+                story_name="一次性控制",
+                slug="control-once",
+                execute=True,
+                update_latest_episode=False,
+                codex_mode="cli",
+                codex_model="gpt-5.6-sol",
+                codex_sandbox="workspace-write",
+                codex_approval="never",
+                codex_path="codex",
+                codex_timeout=30,
+                codex_worker_model="gpt-5.6-luna",
+            )
+            agent = StoryAgent(context)
+            staging = agent._codex_stage_dir("codex_story_images")
+            staging_images = staging / "images"
+            staging_images.mkdir(parents=True, exist_ok=True)
+            storyboard = staging / "control-once_storyboard_lines.txt"
+            storyboard.write_text("第一镜。\n第二镜。\n", encoding="utf-8")
+            handoff = staging / "handoff.md"
+            handoff.write_text("任务书", encoding="utf-8")
+            calls: list[str] = []
+
+            def write_control(**kwargs):
+                calls.append(kwargs["stage"])
+                self.assertEqual(kwargs["stage"], "story_image_control_plan")
+                self.assertIn("不生成任何图片", kwargs["prompt"])
+                rows = []
+                for scene, text in enumerate(("第一镜。", "第二镜。"), start=1):
+                    rows.append(
+                        {
+                            "scene": scene,
+                            "story_text": text,
+                            "narrative_function": "setup",
+                            "shot_size": "wide",
+                            "focal_character": "主角",
+                            "visible_characters": ["主角"],
+                            "excluded_characters": [],
+                            "continuity_group": "opening",
+                            "appearance_ids": ["hero_v1"],
+                            "visual_description": text,
+                            "scale_basis": {"applicable": False, "relationship_ids": [], "reason": "不适用"},
+                            "current_story_state": {},
+                            "visual_state_evidence": {},
+                            "subject_action": "主角自然行动",
+                            "environment_motion": "环境轻微变化",
+                            "camera_motion": "稳定镜头",
+                            "video_prompt": f"参考当前图片，完成第{scene}镜动作。",
+                        }
+                    )
+                agent._story_image_control_draft_path().write_text(
+                    json.dumps({"shots": rows}, ensure_ascii=False), encoding="utf-8"
+                )
+                (staging / "control-once_visual_bible.md").write_text("# 视觉圣经\n", encoding="utf-8")
+                return StageResult("done", "control ready")
+
+            with patch.object(agent, "_codex_task", side_effect=write_control):
+                result = agent._ensure_story_image_control(
+                    handoff=handoff,
+                    staging=staging,
+                    staging_images=staging_images,
+                    staging_storyboard=storyboard,
+                    story_lines=["第一镜。", "第二镜。"],
+                    contract_context=None,
+                    authoritative_storyboard_sha=file_sha256(storyboard),
+                )
+            self.assertIsNone(result)
+            self.assertEqual(calls, ["story_image_control_plan"])
+            self.assertTrue((staging / "control-once_storyboard_plan.seed.json").is_file())
+            self.assertTrue((staging / "control-once_storyboard_plan.json").is_file())
+            self.assertTrue((staging / "control-once_flow_video_prompts.csv").is_file())
+            self.assertFalse(any(staging_images.glob("*.png")))
+
+            with patch.object(agent, "_codex_task", side_effect=AssertionError("control replanned")):
+                second = agent._ensure_story_image_control(
+                    handoff=handoff,
+                    staging=staging,
+                    staging_images=staging_images,
+                    staging_storyboard=storyboard,
+                    story_lines=["第一镜。", "第二镜。"],
+                    contract_context=None,
+                    authoritative_storyboard_sha=file_sha256(storyboard),
+                )
+            self.assertIsNone(second)
 
     def test_prepared_entry_binds_clean_video_and_confirmed_text_hashes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1329,16 +1426,11 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertIn("1/2", result.message)
             self.assertEqual(captured["stage"], "codex_story_images_01_02")
             self.assertEqual(captured["label"], "Codex 原生故事批量出图 2 张")
-            self.assertEqual(
-                captured["prompt"],
-                agent._story_images_batch_prompt(
-                    handoff=captured["handoff"],
-                    staging_images=staging_root / "images",
-                    staging_storyboard=staging_root / "image-batch_storyboard_lines.txt",
-                    story_lines=["第一镜。", "第二镜。"],
-                    indices=[1, 2],
-                ),
-            )
+            batch_request = captured["handoff"]
+            self.assertEqual(batch_request.name, "image-batch_story_images_batch_01_02.json")
+            self.assertIn(str(batch_request), captured["prompt"])
+            self.assertIn("只生成图片，不再分析整部故事", captured["prompt"])
+            self.assertNotIn("以下是本轮最终生产指令必须完整遵守的五类合同投影", captured["prompt"])
 
     def test_story_image_batch_rejects_producer_storyboard_rewrite(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1473,9 +1565,10 @@ class StoryAgentRuntimeTests(unittest.TestCase):
                 story_lines=["第三镜。", "第四镜。"],
                 indices=[3],
             )
-            self.assertIn("这是独立视觉审核给出的强制重做要求", prompt)
-            self.assertIn("第3镜：不得出现兔妈妈。", prompt)
-            self.assertNotIn("第4镜：只保留小兔子。", prompt)
+            self.assertIn("Runtime 编译的本批唯一请求", prompt)
+            request = json.loads((staging / "retry-list_story_images_batch_03_03.json").read_text(encoding="utf-8"))
+            self.assertEqual(request["retry_instructions"], ["镜头 3：不得出现兔妈妈。"])
+            self.assertNotIn("第4镜：只保留小兔子。", json.dumps(request, ensure_ascii=False))
 
     def test_story_image_review_completion_enforces_product_quality_schema(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

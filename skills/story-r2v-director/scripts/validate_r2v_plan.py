@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "story-r2v-plan-v1"
+SCHEMA_VERSION = "story-r2v-plan-v2"
 BODY_MODE = "reference_to_video"
 PROVIDER_DURATIONS = {6, 10}
 RELATIONS = {
@@ -27,6 +27,47 @@ RUNTIME_FORBIDDEN_SOURCES = {
     "three_view_sheet",
     "expression_sheet",
     "composite_scene",
+    "ensemble_design_master",
+}
+SHOT_SIZES = {
+    "extreme_wide",
+    "wide",
+    "medium_wide",
+    "medium",
+    "medium_close",
+    "close",
+    "extreme_close",
+    "insert",
+}
+CROWD_MODES = {"none", "anonymous_background", "recurring_cohort", "identity_critical_ensemble"}
+FACE_READABILITY = {"background_unreadable", "secondary", "identity_clear"}
+CUT_TYPES = {
+    "direct",
+    "shot_reverse_shot",
+    "reaction",
+    "match_action",
+    "eyeline_match",
+    "graphic_match",
+    "scene_transition",
+}
+CONTINUITY_DIMENSIONS = {
+    "axis",
+    "eyeline",
+    "screen_direction",
+    "spatial_relation",
+    "character_state",
+    "prop_state",
+    "action_phase",
+    "lighting",
+}
+DELIBERATE_CHANGES = {
+    "shot_size",
+    "camera_angle",
+    "visual_focus",
+    "subject",
+    "action_phase",
+    "location",
+    "time",
 }
 EPSILON = 0.01
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
@@ -108,7 +149,7 @@ def _validate_policies(plan: dict[str, Any], errors: list[str]) -> dict[str, Any
 
 
 def _validate_assets(assets: dict[str, dict[str, Any]], errors: list[str]) -> None:
-    valid_kinds = {"character", "environment", "prop", "style"}
+    valid_kinds = {"character", "population", "environment", "prop", "style"}
     for asset_id, asset in assets.items():
         path = f"assets[{asset_id!r}]"
         _required_text(asset, "path", path, errors)
@@ -131,6 +172,13 @@ def _validate_assets(assets: dict[str, dict[str, Any]], errors: list[str]) -> No
                 errors.append(f"{path}.identity_id: character assets require an identity id")
             elif contains != [identity]:
                 errors.append(f"{path}.contains_characters: runtime character asset must contain only {identity!r}")
+        elif kind == "population":
+            if not isinstance(asset.get("population_id"), str) or not asset.get("population_id"):
+                errors.append(f"{path}.population_id: population assets require a population id")
+            if contains:
+                errors.append(f"{path}.contains_characters: population assets cannot stand in for named identities")
+            if asset.get("runtime_eligible") and asset.get("design_source_kind") != "population_archetype":
+                errors.append(f"{path}.design_source_kind: runtime population assets must use 'population_archetype'")
         elif kind == "environment" and contains:
             errors.append(f"{path}.contains_characters: environment assets must be empty scenes")
         elif kind == "prop":
@@ -199,6 +247,198 @@ def _validate_beats(
         errors.append(
             f"{shot_path}.performance_beats: must cover the full {provider_seconds:g}s provider duration"
         )
+
+
+def _validate_crowd_plan(
+    shot: dict[str, Any],
+    shot_path: str,
+    selected_assets: list[dict[str, Any]],
+    selected_identities: set[str],
+    errors: list[str],
+) -> None:
+    crowd = shot.get("crowd_plan")
+    if not isinstance(crowd, dict):
+        errors.append(f"{shot_path}.crowd_plan: must be an object")
+        return
+    mode = crowd.get("mode")
+    if mode not in CROWD_MODES:
+        errors.append(f"{shot_path}.crowd_plan.mode: unsupported mode {mode!r}")
+    target_count = crowd.get("target_count")
+    if target_count is not None and (
+        not isinstance(target_count, int) or isinstance(target_count, bool) or target_count < 0
+    ):
+        errors.append(f"{shot_path}.crowd_plan.target_count: must be null or a non-negative integer")
+    critical = crowd.get("identity_critical_characters")
+    if not isinstance(critical, list):
+        errors.append(f"{shot_path}.crowd_plan.identity_critical_characters: must be an array")
+        critical = []
+    else:
+        unknown = set(critical) - selected_identities
+        if unknown:
+            errors.append(
+                f"{shot_path}.crowd_plan.identity_critical_characters: each identity needs a selected character asset; missing {sorted(unknown)}"
+            )
+
+    declared_population_ids = crowd.get("population_asset_ids")
+    if not isinstance(declared_population_ids, list):
+        errors.append(f"{shot_path}.crowd_plan.population_asset_ids: must be an array")
+        declared_population_ids = []
+    selected_population_ids = [
+        asset.get("asset_id") for asset in selected_assets if asset.get("kind") == "population"
+    ]
+    if len(selected_population_ids) > 1:
+        errors.append(f"{shot_path}.reference_asset_ids: select at most one population archetype")
+    if set(declared_population_ids) != set(selected_population_ids):
+        errors.append(
+            f"{shot_path}.crowd_plan.population_asset_ids: must exactly match selected population assets"
+        )
+
+    for field in ("placement", "behavior", "face_readability"):
+        _required_text(crowd, field, f"{shot_path}.crowd_plan", errors)
+    if crowd.get("face_readability") not in FACE_READABILITY:
+        errors.append(
+            f"{shot_path}.crowd_plan.face_readability: unsupported value {crowd.get('face_readability')!r}"
+        )
+
+    if mode == "none":
+        if target_count != 0 or critical or declared_population_ids:
+            errors.append(f"{shot_path}.crowd_plan: mode 'none' requires count 0 and no crowd identities/assets")
+    elif mode == "anonymous_background":
+        if target_count is not None and target_count < 2:
+            errors.append(f"{shot_path}.crowd_plan.target_count: an anonymous crowd requires at least two people")
+        if critical:
+            errors.append(f"{shot_path}.crowd_plan: anonymous background cannot contain identity-critical characters")
+        if crowd.get("face_readability") == "identity_clear":
+            errors.append(f"{shot_path}.crowd_plan.face_readability: anonymous faces cannot be identity-clear")
+    elif mode == "recurring_cohort":
+        if target_count is not None and target_count < 2:
+            errors.append(f"{shot_path}.crowd_plan.target_count: a cohort requires at least two people")
+        if len(declared_population_ids) != 1:
+            errors.append(f"{shot_path}.crowd_plan: a recurring non-identity cohort needs one population archetype")
+    elif mode == "identity_critical_ensemble":
+        if len(critical) < 2:
+            errors.append(f"{shot_path}.crowd_plan: an identity-critical ensemble needs at least two named identities")
+        if target_count is not None and target_count != len(critical):
+            errors.append(f"{shot_path}.crowd_plan.target_count: must equal the number of critical identities")
+        if declared_population_ids:
+            errors.append(f"{shot_path}.crowd_plan: a population archetype cannot replace critical identities")
+        if crowd.get("face_readability") != "identity_clear":
+            errors.append(f"{shot_path}.crowd_plan.face_readability: critical ensemble faces must be identity-clear")
+
+
+def _validate_frame_envelope(frame: Any, path: str, errors: list[str]) -> None:
+    if not isinstance(frame, dict):
+        errors.append(f"{path}: must be an object")
+        return
+    if frame.get("shot_size") not in SHOT_SIZES:
+        errors.append(f"{path}.shot_size: unsupported shot size {frame.get('shot_size')!r}")
+    for field in (
+        "camera_angle",
+        "visual_focus",
+        "subject_layout",
+        "eyeline",
+        "action_phase",
+        "acceptable_variation",
+    ):
+        _required_text(frame, field, path, errors)
+    if not isinstance(frame.get("state_summary"), dict):
+        errors.append(f"{path}.state_summary: must be an object")
+
+
+def _validate_cut_contract(
+    shot: dict[str, Any],
+    next_shot: dict[str, Any] | None,
+    shot_path: str,
+    groups: dict[str, dict[str, Any]],
+    errors: list[str],
+) -> None:
+    contract = shot.get("cut_to_next")
+    if next_shot is None:
+        if contract is not None:
+            errors.append(f"{shot_path}.cut_to_next: the last shot must use null")
+        return
+    if not isinstance(contract, dict):
+        errors.append(f"{shot_path}.cut_to_next: every non-final shot needs a cut contract")
+        return
+    if contract.get("next_shot_id") != next_shot.get("shot_id"):
+        errors.append(f"{shot_path}.cut_to_next.next_shot_id: must point to the immediate next shot")
+    _required_text(contract, "motivation", f"{shot_path}.cut_to_next", errors)
+    cut_type = contract.get("cut_type")
+    if cut_type not in CUT_TYPES:
+        errors.append(f"{shot_path}.cut_to_next.cut_type: unsupported cut type {cut_type!r}")
+    next_relation = next_shot.get("relation_to_previous")
+    expected_relations = {
+        "reaction": "reaction_cut",
+        "match_action": "match_action",
+        "scene_transition": "new_scene",
+    }
+    if cut_type in expected_relations and next_relation != expected_relations[cut_type]:
+        errors.append(
+            f"{shot_path}.cut_to_next.cut_type: {cut_type!r} requires next relation {expected_relations[cut_type]!r}"
+        )
+    if next_relation == "new_scene" and cut_type != "scene_transition":
+        errors.append(f"{shot_path}.cut_to_next.cut_type: a new scene requires 'scene_transition'")
+
+    bindings = contract.get("continuity_bindings")
+    if not isinstance(bindings, list) or not bindings:
+        errors.append(f"{shot_path}.cut_to_next.continuity_bindings: must be a non-empty array")
+    else:
+        dimensions: list[Any] = []
+        for index, binding in enumerate(bindings):
+            path = f"{shot_path}.cut_to_next.continuity_bindings[{index}]"
+            if not isinstance(binding, dict):
+                errors.append(f"{path}: must be an object")
+                continue
+            dimensions.append(binding.get("dimension"))
+            if binding.get("dimension") not in CONTINUITY_DIMENSIONS:
+                errors.append(f"{path}.dimension: unsupported continuity dimension {binding.get('dimension')!r}")
+            outgoing = binding.get("outgoing_value")
+            incoming = binding.get("incoming_value")
+            _required_text(binding, "outgoing_value", path, errors)
+            _required_text(binding, "incoming_value", path, errors)
+            required = binding.get("match_required")
+            if not isinstance(required, bool):
+                errors.append(f"{path}.match_required: must be a boolean")
+            elif required and outgoing != incoming:
+                errors.append(f"{path}: a required continuity match must use equal outgoing and incoming values")
+            elif not required and outgoing == incoming:
+                errors.append(f"{path}: an intentional change must use different outgoing and incoming values")
+        if _duplicates(dimensions):
+            errors.append(f"{shot_path}.cut_to_next.continuity_bindings: dimensions must be unique")
+
+    changes = contract.get("deliberate_changes")
+    if not isinstance(changes, list) or not changes:
+        errors.append(f"{shot_path}.cut_to_next.deliberate_changes: must name at least one intentional change")
+        return
+    unknown_changes = set(changes) - DELIBERATE_CHANGES
+    if unknown_changes:
+        errors.append(
+            f"{shot_path}.cut_to_next.deliberate_changes: unsupported changes {sorted(unknown_changes)}"
+        )
+    current_frame = shot.get("closing_frame")
+    next_frame = next_shot.get("opening_frame")
+    if not isinstance(current_frame, dict) or not isinstance(next_frame, dict):
+        return
+    field_map = {
+        "shot_size": "shot_size",
+        "camera_angle": "camera_angle",
+        "visual_focus": "visual_focus",
+        "subject": "subject_layout",
+        "action_phase": "action_phase",
+    }
+    for change in changes:
+        field = field_map.get(change)
+        if field and current_frame.get(field) == next_frame.get(field):
+            errors.append(
+                f"{shot_path}.cut_to_next.deliberate_changes: {change!r} is declared but both frame envelopes are identical"
+            )
+    if "location" in changes or "time" in changes:
+        current_group = groups.get(shot.get("continuity_group"), {})
+        next_group = groups.get(next_shot.get("continuity_group"), {})
+        if "location" in changes and current_group.get("location") == next_group.get("location"):
+            errors.append(f"{shot_path}.cut_to_next.deliberate_changes: location did not change")
+        if "time" in changes and current_group.get("time_of_day") == next_group.get("time_of_day"):
+            errors.append(f"{shot_path}.cut_to_next.deliberate_changes: time did not change")
 
 
 def _validate_prop_transitions(
@@ -273,7 +513,8 @@ def validate_plan(plan: Any) -> list[str]:
     _validate_groups(groups, assets, errors)
 
     previous_shot: dict[str, Any] | None = None
-    for index, (shot_id, shot) in enumerate(shots.items()):
+    shot_items = list(shots.items())
+    for index, (shot_id, shot) in enumerate(shot_items):
         path = f"shots[{shot_id!r}]"
         _required_text(shot, "story_text", path, errors)
         if shot.get("generation_mode") != BODY_MODE:
@@ -377,6 +618,8 @@ def validate_plan(plan: Any) -> list[str]:
         if isinstance(initial, list) and isinstance(entering, list) and set(initial) & set(entering):
             errors.append(f"{path}: a character cannot be both initially visible and entering")
 
+        _validate_crowd_plan(shot, path, selected_assets, selected_identities, errors)
+
         camera_plan = shot.get("camera_plan")
         if not isinstance(camera_plan, dict):
             errors.append(f"{path}.camera_plan: must be an object")
@@ -389,6 +632,10 @@ def validate_plan(plan: Any) -> list[str]:
         for field in ("entry_state", "exit_state"):
             if not isinstance(shot.get(field), dict):
                 errors.append(f"{path}.{field}: must be an object")
+        _validate_frame_envelope(shot.get("opening_frame"), f"{path}.opening_frame", errors)
+        _validate_frame_envelope(shot.get("closing_frame"), f"{path}.closing_frame", errors)
+        next_shot = shot_items[index + 1][1] if index + 1 < len(shot_items) else None
+        _validate_cut_contract(shot, next_shot, path, groups, errors)
 
         _validate_beats(shot, path, selected_identities, errors)
         _validate_prop_transitions(shot, path, selected_assets, assets, errors)

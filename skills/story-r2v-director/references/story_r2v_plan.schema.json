@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "story-r2v-plan-v1",
+  "$id": "story-r2v-plan-v2",
   "title": "Story R2V Director Plan",
   "type": "object",
   "additionalProperties": false,
@@ -14,7 +14,7 @@
     "shots"
   ],
   "properties": {
-    "schema_version": {"const": "story-r2v-plan-v1"},
+    "schema_version": {"const": "story-r2v-plan-v2"},
     "story_id": {"type": "string", "minLength": 1},
     "source_audio": {
       "type": "object",
@@ -82,7 +82,7 @@
       ],
       "properties": {
         "asset_id": {"type": "string", "minLength": 1},
-        "kind": {"enum": ["character", "environment", "prop", "style"]},
+        "kind": {"enum": ["character", "population", "environment", "prop", "style"]},
         "path": {"type": "string", "minLength": 1},
         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "runtime_eligible": {"type": "boolean"},
@@ -92,9 +92,10 @@
           "items": {"type": "string", "minLength": 1}
         },
         "identity_id": {"type": "string", "minLength": 1},
+        "population_id": {"type": "string", "minLength": 1},
         "prop_id": {"type": "string", "minLength": 1},
         "state_id": {"type": "string", "minLength": 1},
-        "design_source_kind": {"enum": ["single_view", "three_view_sheet", "expression_sheet", "composite_scene", "isolated_prop", "empty_environment", "style_anchor"]},
+        "design_source_kind": {"enum": ["single_view", "three_view_sheet", "expression_sheet", "composite_scene", "population_archetype", "ensemble_design_master", "isolated_prop", "empty_environment", "style_anchor"]},
         "appearance_summary": {"type": "string"},
         "scale_class": {"type": "string"}
       }
@@ -135,6 +136,58 @@
         "axis": {"type": "string", "minLength": 1},
         "screen_direction": {"enum": ["left_to_right", "right_to_left", "toward_camera", "away_from_camera", "stationary", "mixed"]},
         "internal_cut": {"const": false}
+      }
+    },
+    "crowdPlan": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "target_count", "identity_critical_characters", "population_asset_ids", "placement", "behavior", "face_readability"],
+      "properties": {
+        "mode": {"enum": ["none", "anonymous_background", "recurring_cohort", "identity_critical_ensemble"]},
+        "target_count": {"type": ["integer", "null"], "minimum": 0},
+        "identity_critical_characters": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "population_asset_ids": {"type": "array", "maxItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "placement": {"type": "string", "minLength": 1},
+        "behavior": {"type": "string", "minLength": 1},
+        "face_readability": {"enum": ["background_unreadable", "secondary", "identity_clear"]}
+      }
+    },
+    "frameEnvelope": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["shot_size", "camera_angle", "visual_focus", "subject_layout", "eyeline", "action_phase", "state_summary", "acceptable_variation"],
+      "properties": {
+        "shot_size": {"enum": ["extreme_wide", "wide", "medium_wide", "medium", "medium_close", "close", "extreme_close", "insert"]},
+        "camera_angle": {"type": "string", "minLength": 1},
+        "visual_focus": {"type": "string", "minLength": 1},
+        "subject_layout": {"type": "string", "minLength": 1},
+        "eyeline": {"type": "string", "minLength": 1},
+        "action_phase": {"type": "string", "minLength": 1},
+        "state_summary": {"type": "object"},
+        "acceptable_variation": {"type": "string", "minLength": 1}
+      }
+    },
+    "continuityBinding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["dimension", "outgoing_value", "incoming_value", "match_required"],
+      "properties": {
+        "dimension": {"enum": ["axis", "eyeline", "screen_direction", "spatial_relation", "character_state", "prop_state", "action_phase", "lighting"]},
+        "outgoing_value": {"type": "string", "minLength": 1},
+        "incoming_value": {"type": "string", "minLength": 1},
+        "match_required": {"type": "boolean"}
+      }
+    },
+    "cutContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["next_shot_id", "cut_type", "motivation", "continuity_bindings", "deliberate_changes"],
+      "properties": {
+        "next_shot_id": {"type": "string", "minLength": 1},
+        "cut_type": {"enum": ["direct", "shot_reverse_shot", "reaction", "match_action", "eyeline_match", "graphic_match", "scene_transition"]},
+        "motivation": {"type": "string", "minLength": 1},
+        "continuity_bindings": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/continuityBinding"}},
+        "deliberate_changes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["shot_size", "camera_angle", "visual_focus", "subject", "action_phase", "location", "time"]}}
       }
     },
     "beat": {
@@ -187,7 +240,11 @@
         "initial_visible_characters",
         "entering_characters",
         "exiting_characters",
+        "crowd_plan",
         "camera_plan",
+        "opening_frame",
+        "closing_frame",
+        "cut_to_next",
         "entry_state",
         "exit_state",
         "performance_beats",
@@ -213,9 +270,13 @@
         "initial_visible_characters": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
         "entering_characters": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
         "exiting_characters": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "crowd_plan": {"$ref": "#/$defs/crowdPlan"},
         "audio_speaker": {"type": "string"},
         "visual_focus": {"type": "string"},
         "camera_plan": {"$ref": "#/$defs/cameraPlan"},
+        "opening_frame": {"$ref": "#/$defs/frameEnvelope"},
+        "closing_frame": {"$ref": "#/$defs/frameEnvelope"},
+        "cut_to_next": {"anyOf": [{"$ref": "#/$defs/cutContract"}, {"type": "null"}]},
         "entry_state": {"type": "object"},
         "exit_state": {"type": "object"},
         "performance_beats": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/beat"}},

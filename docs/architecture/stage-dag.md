@@ -1,6 +1,8 @@
 # V3.5 当前的 38 阶段 DAG
 
-权威定义位于 `story_agent_runtime.py` 的 `STORY_STAGE_SEQUENCE`、`STORY_STAGE_DEPENDENCIES`、`STAGE_WRITE_SETS` 和 `STAGE_RESOURCES`。
+> **Legacy V3 文档。** 该 DAG 已退役，只用于历史审计和兼容测试。当前 Codex 原生系统没有固定阶段图，见 [`codex-native-story-pipeline.md`](codex-native-story-pipeline.md)。
+
+历史权威定义位于 `legacy/story_agent_v3/story_agent_runtime.py` 的 `STORY_STAGE_SEQUENCE`、`STORY_STAGE_DEPENDENCIES`、`STAGE_WRITE_SETS` 和 `STAGE_RESOURCES`。
 
 ## 阶段表
 

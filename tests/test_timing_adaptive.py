@@ -237,9 +237,10 @@ class AdaptiveTimingTests(unittest.TestCase):
                     "adapters": {
                         "configured_provider": {
                             "runner": "run_image_video_jobs.py",
-                            "model": "grok-video-1.5",
-                            "min_seconds": 1,
-                            "max_seconds": 15,
+                            "model": "grok-video-1.0",
+                            "min_seconds": 6,
+                            "max_seconds": 10,
+                            "duration_choices": [6, 10],
                         }
                     },
                 }
@@ -251,8 +252,9 @@ class AdaptiveTimingTests(unittest.TestCase):
             command = list(workflow.call_args.args[0])
             self.assertIn("--duration-mode", command)
             self.assertEqual(command[command.index("--duration-mode") + 1], "adaptive-seconds")
-            self.assertEqual(command[command.index("--min-generation-seconds") + 1], "1")
-            self.assertEqual(command[command.index("--max-generation-seconds") + 1], "15")
+            self.assertEqual(command[command.index("--min-generation-seconds") + 1], "6")
+            self.assertEqual(command[command.index("--max-generation-seconds") + 1], "10")
+            self.assertEqual(command[command.index("--generation-duration-choices") + 1], "6,10")
 
 
 if __name__ == "__main__":

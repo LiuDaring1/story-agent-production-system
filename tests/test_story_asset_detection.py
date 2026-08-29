@@ -49,7 +49,29 @@ class StoryAssetDetectionTests(unittest.TestCase):
                 outputs = create_theme_asset_request(root)
             request = outputs["request"].read_text(encoding="utf-8")
             self.assertIn("时长文案：3分钟", request)
+            self.assertIn("禁止用 SVG", request)
             self.assertEqual(load_manifest(paths)["story"]["duration_text"], "3分钟")
+
+    def test_stale_theme_outputs_are_archived_before_a_new_imagegen_request(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "故事剪辑：测试故事"
+            paths = project_paths(root)
+            manifest = init_project(root, story_name="测试故事", slug="test-story")
+            manifest["story"]["age_range"] = "3-6岁"
+            manifest["story"].setdefault("manual_overrides", {})["age_range"] = True
+            write_manifest(paths, manifest)
+            theme = paths.release / "theme_assets"
+            theme.mkdir(parents=True, exist_ok=True)
+            stale = theme / "main_release_plate_top.png"
+            stale.write_bytes(b"stale-generated-panel")
+
+            outputs = create_theme_asset_request(root)
+
+            self.assertFalse(stale.exists())
+            archived = list((paths.status / "rejected" / "theme_assets").glob("*/main_release_plate_top.png"))
+            self.assertEqual(len(archived), 1)
+            self.assertEqual(archived[0].read_bytes(), b"stale-generated-panel")
+            self.assertTrue(outputs["request"].is_file())
 
 
 if __name__ == "__main__":

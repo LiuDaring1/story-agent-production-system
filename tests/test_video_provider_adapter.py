@@ -17,9 +17,6 @@ from story_workflow import run_generate_until_complete
 from story_video_synthesizer.toapis_video import (
     DEFAULT_MODEL as TOAPIS_DEFAULT_MODEL,
     DEFAULT_SECONDS as TOAPIS_DEFAULT_SECONDS,
-    MAX_SECONDS as TOAPIS_MAX_SECONDS,
-    MIN_SECONDS as TOAPIS_MIN_SECONDS,
-    MAX_PROMPT_CHARS as TOAPIS_MAX_PROMPT_CHARS,
     DEFAULT_USER_AGENT,
     GROK_VIDEO_1_0_DEFAULT_SECONDS,
     GROK_VIDEO_1_0_MAX_REFERENCE_IMAGES,
@@ -29,8 +26,6 @@ from story_video_synthesizer.toapis_video import (
     extract_toapis_video_url,
 )
 from run_image_video_jobs import (
-    TOAPIS_OPERATIONAL_MIN_SECONDS,
-    TOAPIS_SAFE_PROVIDER_PROMPT_CHARS,
     provider_prompt_for_row,
     reset_retryable_failed_row,
     row_duration_value,
@@ -42,6 +37,18 @@ from story_video_synthesizer.volcengine_video import CreateTaskResult, QueryTask
 
 
 class VideoProviderAdapterTests(unittest.TestCase):
+    def test_formal_runner_has_no_serial_whole_batch_switch(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        process = subprocess.run(
+            [sys.executable, str(root / "run_image_video_jobs.py"), "--help"],
+            cwd=root,
+            text=True,
+            capture_output=True,
+        )
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertNotIn("submit-all-first", process.stdout)
+        self.assertNotIn("no-submit-all-first", process.stdout)
+
     def test_toapis_provider_prompt_strips_internal_audit_context(self) -> None:
         full = (
             "公鸡轻轻低头，镜头缓慢推近。\n"
@@ -51,29 +58,41 @@ class VideoProviderAdapterTests(unittest.TestCase):
         )
         row = {"scene": "05", "prompt": full}
         self.assertEqual(
-            provider_prompt_for_row(row, model="grok-video-1.5", is_toapis=True),
+            provider_prompt_for_row(row, model="grok-video-1.0", is_toapis=True),
             "公鸡轻轻低头，镜头缓慢推近。",
         )
         self.assertEqual(row["prompt"], full)
 
-    def test_grok_video_1_0_uses_same_short_provider_prompt_boundary(self) -> None:
-        full = "公鸡甩头。\n[STORY_CONTRACT_V1]{\"large\":\"internal\"}"
+    def test_grok_video_1_0_preserves_full_reviewed_prose_before_internal_context(self) -> None:
+        reviewed = "公鸡甩头后收拢翅膀，镜头缓慢推近，花枝轻微摇动。" * 8
+        full = reviewed + "\n[STORY_CONTRACT_V1]{\"large\":\"internal\"}"
         row = {"scene": "05", "prompt": full}
         self.assertEqual(
             provider_prompt_for_row(row, model="grok-video-1.0", is_toapis=True),
-            "公鸡甩头。",
+            reviewed,
         )
         self.assertEqual(row["prompt"], full)
 
-    def test_toapis_provider_prompt_rejects_oversized_prose_before_submission(self) -> None:
-        with self.assertRaisesRegex(ValueError, "缺少可安全压缩"):
+    def test_grok_video_1_0_preserves_long_reviewed_prompt(self) -> None:
+        reviewed = "动" * 3000
+        self.assertEqual(
             provider_prompt_for_row(
-                {"scene": "05", "prompt": "动" * (TOAPIS_MAX_PROMPT_CHARS + 1)},
+                {"scene": "05", "prompt": reviewed},
+                model="grok-video-1.0",
+                is_toapis=True,
+            ),
+            reviewed,
+        )
+
+    def test_toapis_provider_prompt_rejects_removed_model(self) -> None:
+        with self.assertRaisesRegex(ValueError, "只允许 grok-video-1.0"):
+            provider_prompt_for_row(
+                {"scene": "05", "prompt": "正常提示词"},
                 model="grok-video-1.5",
                 is_toapis=True,
             )
 
-    def test_toapis_provider_prompt_compiles_long_review_text_from_structured_motion(self) -> None:
+    def test_toapis_provider_prompt_does_not_compact_reviewed_director_prose(self) -> None:
         row = {
             "scene": "08",
             "prompt": "很长的审核提示。" * 100 + "\n[STORY_CONTRACT_V1]{}",
@@ -81,14 +100,8 @@ class VideoProviderAdapterTests(unittest.TestCase):
             "camera_motion": "镜头轻推近公鸡脸部后停住。",
             "environment_motion": "花枝和叶片轻微摇动。",
         }
-        compact = provider_prompt_for_row(row, model="grok-video-1.5", is_toapis=True)
-        self.assertLessEqual(
-            len(compact.encode("utf-16-le")) // 2,
-            TOAPIS_SAFE_PROVIDER_PROMPT_CHARS,
-        )
-        self.assertIn("公鸡短促哼一声", compact)
-        self.assertIn("镜头轻推近", compact)
-        self.assertIn("保持首图角色、物体数量、外观和画风", compact)
+        actual = provider_prompt_for_row(row, model="grok-video-1.0", is_toapis=True)
+        self.assertEqual(actual, "很长的审核提示。" * 100)
         self.assertIn("[STORY_CONTRACT_V1]", row["prompt"])
 
     def test_targeted_retry_prompt_reaches_provider_unchanged(self) -> None:
@@ -100,7 +113,7 @@ class VideoProviderAdapterTests(unittest.TestCase):
             "previous_provider_prompt_sha256": "a" * 64,
         }
         self.assertEqual(
-            provider_prompt_for_row(row, model="grok-video-1.5", is_toapis=True),
+            provider_prompt_for_row(row, model="grok-video-1.0", is_toapis=True),
             retry,
         )
 
@@ -113,27 +126,20 @@ class VideoProviderAdapterTests(unittest.TestCase):
             "previous_provider_prompt_sha256": __import__("hashlib").sha256(retry.encode("utf-8")).hexdigest(),
         }
         with self.assertRaisesRegex(ValueError, "完全相同"):
-            provider_prompt_for_row(row, model="grok-video-1.5", is_toapis=True)
+            provider_prompt_for_row(row, model="grok-video-1.0", is_toapis=True)
 
-    def test_toapis_request_body_rejects_oversized_prompt(self) -> None:
-        with self.assertRaisesRegex(ValueError, "不能超过 1200 字符"):
+    def test_toapis_request_body_rejects_removed_model(self) -> None:
+        with self.assertRaisesRegex(ValueError, "只允许 grok-video-1.0"):
             build_toapis_task_body(
                 model="grok-video-1.5",
-                prompt="动" * (TOAPIS_MAX_PROMPT_CHARS + 1),
+                prompt="正常提示词",
                 image_url="https://example.com/frame.png",
             )
 
-    def test_toapis_runner_validates_all_prompt_lengths_before_paid_submission(self) -> None:
+    def test_toapis_runner_rejects_removed_model_before_paid_submission(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             images, videos, jobs = self._write_grok_jobs_fixture(root)
-            with jobs.open(encoding="utf-8-sig", newline="") as handle:
-                rows = list(csv.DictReader(handle))
-            rows[1]["prompt"] = "动" * (TOAPIS_MAX_PROMPT_CHARS + 1)
-            with jobs.open("w", encoding="utf-8-sig", newline="") as handle:
-                writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
-                writer.writeheader()
-                writer.writerows(rows)
 
             class FakeClient:
                 calls = 0
@@ -154,35 +160,15 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 "--base-url", "https://toapis.com/v1",
                 "--model", "grok-video-1.5",
                 "--api-key", "test-secret",
-                "--submit-all-first",
                 "--submit-only",
             ]
             with (
                 patch.object(sys, "argv", argv),
                 patch.object(run_image_video_jobs, "ToAPIsVideoClient", FakeClient),
-                self.assertRaisesRegex(ValueError, "缺少可安全压缩"),
+                self.assertRaisesRegex(ValueError, "只允许 grok-video-1.0"),
             ):
                 run_image_video_jobs.main()
             self.assertEqual(FakeClient.calls, 0)
-
-    def test_grok_row_seconds_prioritize_generation_duration_and_clamp_integer_range(self) -> None:
-        for row, expected in [
-            ({"generation_duration": "5", "duration": "9"}, "5"),
-            ({"duration": "8.01"}, "9"),
-            ({"duration": "15"}, "15"),
-            ({"duration": "0.2"}, "1"),
-            ({"duration": "99"}, "15"),
-        ]:
-            self.assertEqual(
-                resolve_row_generation_seconds(
-                    row,
-                    model="grok-video-1.5",
-                    fallback_seconds="8",
-                    min_seconds=1,
-                    max_seconds=15,
-                ),
-                expected,
-            )
 
     def test_grok_video_1_0_selects_only_six_or_ten_seconds_per_scene(self) -> None:
         for requested, expected in [
@@ -214,27 +200,6 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 expected,
             )
 
-    def test_toapis_runner_applies_user_authorized_four_second_operational_floor(self) -> None:
-        self.assertEqual(TOAPIS_OPERATIONAL_MIN_SECONDS, 4)
-        self.assertEqual(
-            row_request_seconds(
-                {"generation_duration": "2", "target_duration": "2"},
-                model="grok-video-1.5",
-                is_toapis=True,
-                fallback_seconds="8",
-            ),
-            "4",
-        )
-        self.assertEqual(
-            row_request_seconds(
-                {"generation_duration": "7"},
-                model="grok-video-1.5",
-                is_toapis=True,
-                fallback_seconds="8",
-            ),
-            "7",
-        )
-
     def test_legacy_models_keep_global_seconds_fallback(self) -> None:
         row = {"generation_duration": "5", "duration": "9"}
         self.assertEqual(
@@ -246,7 +211,7 @@ class VideoProviderAdapterTests(unittest.TestCase):
             "10",
         )
         self.assertEqual(
-            row_request_seconds(row, model="grok-video-1.5", is_toapis=False, fallback_seconds="10"),
+            row_request_seconds(row, model="other-provider-model", is_toapis=False, fallback_seconds="10"),
             "10",
         )
 
@@ -288,19 +253,18 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 "--base-url",
                 "https://toapis.com/v1",
                 "--model",
-                "grok-video-1.5",
+                "grok-video-1.0",
                 "--seconds",
-                "8",
+                "6",
                 "--dry-run",
             ]
             with patch.object(sys, "argv", argv), contextlib.redirect_stdout(output):
                 run_image_video_jobs.main()
             rendered = output.getvalue()
-            self.assertEqual(rendered.count('"seconds": "5"'), 1)
-            self.assertEqual(rendered.count('"seconds": "9"'), 1)
-            self.assertEqual(rendered.count('"seconds": "15"'), 1)
+            self.assertEqual(rendered.count('"seconds": "6"'), 1)
+            self.assertEqual(rendered.count('"seconds": "10"'), 2)
 
-    def test_grok_submit_all_first_passes_each_row_seconds(self) -> None:
+    def test_grok_batch_first_passes_each_native_row_seconds(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             images, videos, jobs = self._write_grok_jobs_fixture(root)
@@ -325,17 +289,16 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 "--base-url",
                 "https://toapis.com/v1",
                 "--model",
-                "grok-video-1.5",
+                "grok-video-1.0",
                 "--api-key",
                 "test-secret",
                 "--seconds",
-                "8",
-                "--submit-all-first",
+                "6",
                 "--submit-only",
             ]
             with patch.object(sys, "argv", argv), patch.object(run_image_video_jobs, "ToAPIsVideoClient", FakeClient):
                 run_image_video_jobs.main()
-            self.assertEqual(calls, ["5", "9", "15"])
+            self.assertEqual(calls, ["6", "10", "10"])
 
     def test_contract_gate_failure_happens_before_any_paid_create_task(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -372,7 +335,7 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 "--images-dir", str(images),
                 "--videos-dir", str(videos),
                 "--base-url", "https://toapis.com/v1",
-                "--model", "grok-video-1.5",
+                "--model", "grok-video-1.0",
                 "--api-key", "test-secret",
                 "--submit-only",
             ]
@@ -494,16 +457,17 @@ class VideoProviderAdapterTests(unittest.TestCase):
             runner.write_text("pass\n", encoding="utf-8")
             config = {
                 "video_api": {
-                    "provider": "toapis_grok",
+                    "provider": "toapis_grok_1_0",
                     "adapters": {
-                        "toapis_grok": {
+                        "toapis_grok_1_0": {
                             "runner": "runner.py",
-                            "model": "grok-video-1.5",
-                            "estimated_cost_cny_per_clip": 0.08,
+                            "model": "grok-video-1.0",
+                            "estimated_cost_cny_per_clip": 0.06,
                             "estimated_cost_cny_per_second": 0.01,
-                            "default_seconds": 8,
-                            "min_seconds": 1,
-                            "max_seconds": 15,
+                            "default_seconds": 6,
+                            "min_seconds": 6,
+                            "max_seconds": 10,
+                            "duration_choices": [6, 10],
                             "default_resolution": "720p",
                             "default_ratio": "16:9",
                         }
@@ -511,37 +475,34 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 }
             }
             selected = resolve_video_provider(config, root)
-            self.assertEqual(selected.default_seconds, 8.0)
-            self.assertEqual(selected.min_seconds, 1.0)
-            self.assertEqual(selected.max_seconds, 15.0)
+            self.assertEqual(selected.default_seconds, 6.0)
+            self.assertEqual(selected.min_seconds, 6.0)
+            self.assertEqual(selected.max_seconds, 10.0)
+            self.assertEqual(selected.duration_choices, (6.0, 10.0))
             self.assertEqual(selected.default_resolution, "720p")
             self.assertEqual(selected.default_ratio, "16:9")
-            self.assertEqual(selected.estimate_cost(), 0.08)
+            self.assertEqual(selected.estimate_cost(), 0.06)
             self.assertEqual(selected.estimate_cost(12), 0.12)
 
-    def test_toapis_grok_video_15_defaults_to_eight_seconds_720p_and_16_9(self) -> None:
+    def test_toapis_defaults_to_grok_video_1_0_six_seconds_720p_and_16_9(self) -> None:
         body = build_toapis_task_body(
             model=TOAPIS_DEFAULT_MODEL,
             prompt="小动物轻轻眨眼",
             image_url="https://files.example/scene.png",
         )
-        self.assertEqual(TOAPIS_DEFAULT_MODEL, "grok-video-1.5")
-        self.assertEqual(TOAPIS_DEFAULT_SECONDS, "8")
-        self.assertEqual(body["seconds"], "8")
+        self.assertEqual(TOAPIS_DEFAULT_MODEL, "grok-video-1.0")
+        self.assertEqual(TOAPIS_DEFAULT_SECONDS, "6")
+        self.assertEqual(body["seconds"], "6")
         self.assertEqual(body["resolution"], "720p")
         self.assertEqual(body["aspect_ratio"], "16:9")
 
-    def test_toapis_grok_video_15_rejects_seconds_outside_one_to_fifteen(self) -> None:
-        self.assertEqual(TOAPIS_MIN_SECONDS, 1)
-        self.assertEqual(TOAPIS_MAX_SECONDS, 15)
-        for seconds in ("0", "16", "-1", "not-a-number"):
-            with self.assertRaises(ValueError):
-                build_toapis_task_body(
-                    model=TOAPIS_DEFAULT_MODEL,
-                    prompt="测试",
-                    image_url="https://files.example/scene.png",
-                    seconds=seconds,
-                )
+    def test_toapis_removed_grok_video_1_5_is_blocked(self) -> None:
+        with self.assertRaisesRegex(ValueError, "只允许 grok-video-1.0"):
+            build_toapis_task_body(
+                model="grok-video-1.5",
+                prompt="测试",
+                image_url="https://files.example/scene.png",
+            )
 
     def test_toapis_grok_video_1_0_defaults_to_six_and_rejects_other_durations(self) -> None:
         body = build_toapis_task_body(
@@ -650,25 +611,25 @@ class VideoProviderAdapterTests(unittest.TestCase):
         self.assertEqual(created.task_id, "provider-task-123")
         request.assert_not_called()
 
-    def test_legacy_toapis_model_keeps_opaque_seconds_values_compatible(self) -> None:
-        body = build_toapis_task_body(
-            model="grok-video-3",
-            prompt="测试",
-            image_url="https://files.example/scene.png",
-            seconds="provider-default",
-        )
-        self.assertEqual(body["seconds"], "provider-default")
+    def test_unknown_toapis_model_is_not_accepted_as_legacy(self) -> None:
+        with self.assertRaisesRegex(ValueError, "只允许 grok-video-1.0"):
+            build_toapis_task_body(
+                model="grok-video-3",
+                prompt="测试",
+                image_url="https://files.example/scene.png",
+                seconds="provider-default",
+            )
 
     def test_toapis_adapter_passes_only_secret_environment_name(self) -> None:
         root = Path(__file__).resolve().parents[1]
         config = {
             "video_api": {
-                "provider": "toapis_grok",
+                "provider": "toapis_grok_1_0",
                 "adapters": {
-                    "toapis_grok": {
+                    "toapis_grok_1_0": {
                         "runner": "run_image_video_jobs.py",
                         "base_url": "https://toapis.com/v1",
-                        "model": "grok-video-3",
+                        "model": "grok-video-1.0",
                         "api_key_env": "TOAPIS_API_KEY",
                         "estimated_cost_cny_per_clip": 3.0,
                     }
@@ -678,13 +639,13 @@ class VideoProviderAdapterTests(unittest.TestCase):
         selected = resolve_video_provider(config, root)
         self.assertEqual(
             selected.runner_args(),
-            ["--base-url", "https://toapis.com/v1", "--model", "grok-video-3", "--api-key-env", "TOAPIS_API_KEY"],
+            ["--base-url", "https://toapis.com/v1", "--model", "grok-video-1.0", "--api-key-env", "TOAPIS_API_KEY"],
         )
         self.assertNotIn("sk-", " ".join(selected.runner_args()))
 
     def test_toapis_request_and_nested_result_contract(self) -> None:
         body = build_toapis_task_body(
-            model="grok-video-3",
+            model="grok-video-1.0",
             prompt="大象缓慢抬起前腿",
             image_url="https://files.example/scene.png",
             seconds="10",
@@ -730,7 +691,7 @@ class VideoProviderAdapterTests(unittest.TestCase):
             patch.object(client, "_request", return_value={"id": "created-123"}) as request,
         ):
             created = client.create_task(
-                model="grok-video-3",
+                model="grok-video-1.0",
                 prompt="大象缓慢走动",
                 image_path=Path("01.png"),
                 extra_body={"client_business_id": "story-stable-id"},

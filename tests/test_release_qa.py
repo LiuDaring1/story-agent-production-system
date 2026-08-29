@@ -6,6 +6,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
@@ -14,6 +15,7 @@ from release_video import (
     person_tail_pad_seconds,
     probe_video_size,
     release_plate_integrity_issues,
+    render_static_assets,
     safe_watermark_motion_expressions,
     story_frame_integrity_issues,
     validate_release_assets,
@@ -64,7 +66,11 @@ class ReleaseQaTests(unittest.TestCase):
         self.assertTrue(expressions[3].startswith("H-h-20-"))
 
     def test_person_tail_padding_is_deterministic_and_clones_last_frame(self) -> None:
-        self.assertEqual(person_tail_pad_seconds(12.03, 12.0), 0.0)
+        # A nominally equal stream can still have its final decoded PTS one
+        # frame before the container duration, so keep one safety frame.
+        self.assertAlmostEqual(person_tail_pad_seconds(12.0, 12.0), 0.04, places=6)
+        self.assertAlmostEqual(person_tail_pad_seconds(12.03, 12.0), 0.04, places=6)
+        self.assertEqual(person_tail_pad_seconds(12.05, 12.0), 0.0)
         # A stream that is a few frames short receives a small deterministic
         # clone window instead of allowing ffmpeg to synthesize an EOF frame.
         self.assertAlmostEqual(person_tail_pad_seconds(11.96, 12.0), 0.08, places=6)
@@ -141,9 +147,30 @@ class ReleaseQaTests(unittest.TestCase):
             (x + width - 80, y - 80, x + width + 80, y + 80),
             fill=(255, 180, 80, 255),
         )
-        draw.line((x + width, y, x + width, y + height), fill=(255, 180, 80, 255), width=4)
+        # Production frames also need a continuous inner masking lip that
+        # overlaps the video rectangle; outer decoration alone is insufficient.
+        draw.rounded_rectangle(
+            (x - 8, y - 8, x + width + 8, y + height + 8),
+            radius=28,
+            outline=(255, 220, 150, 255),
+            width=22,
+        )
         issues = story_frame_integrity_issues(image, window)
         self.assertFalse(issues)
+
+    def test_story_frame_integrity_rejects_closed_but_hairline_mask(self) -> None:
+        image = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(image)
+        window = (210, 270, 910, 512)
+        x, y, width, height = window
+        draw.rounded_rectangle(
+            (x, y, x + width, y + height),
+            radius=24,
+            outline=(255, 180, 80, 255),
+            width=3,
+        )
+        issues = story_frame_integrity_issues(image, window)
+        self.assertTrue(any("masking_lip_too_thin" in issue for issue in issues), issues)
 
     def test_release_asset_validation_prepares_reused_frame_for_b_window(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -197,6 +224,12 @@ class ReleaseQaTests(unittest.TestCase):
                 outline=(105, 70, 36, 255),
                 width=18,
             )
+            draw.rounded_rectangle(
+                (x - 8, y - 8, x + width + 8, y + height + 8),
+                radius=28,
+                outline=(255, 220, 150, 255),
+                width=22,
+            )
             image.save(frame_path)
             config = SimpleNamespace(
                 plate_image=None,
@@ -208,6 +241,30 @@ class ReleaseQaTests(unittest.TestCase):
             )
 
             validate_release_assets(config)
+
+    def test_library_static_assets_have_no_phantom_story_frame_dependency(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            panel = root / "panel.png"
+            Image.new("RGBA", (16, 16), (255, 255, 255, 255)).save(panel)
+            config = SimpleNamespace(
+                variant="library",
+                frame_image=None,
+                plate_image=None,
+                story_box=(210, 270, 910, 512),
+                frame_image_b=None,
+                b_story_box=(356, 180, 1209, 680),
+                b_windows=(),
+                main_top_panel=panel,
+                main_bottom_panel=panel,
+                library_top_panel=panel,
+                library_bottom_panel=panel,
+                antipiracy_logo=panel,
+                tail_notice_text="",
+            )
+            with patch("release_video.render_default_frame", side_effect=AssertionError("unused")):
+                assets = render_static_assets(config, root)
+            self.assertIsNone(assets["frame"])
 
     def test_new_project_exposes_fixed_ten_hour_delivery_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

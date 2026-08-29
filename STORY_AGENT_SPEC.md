@@ -1,5 +1,9 @@
 # Story Production Agent 规格书
 
+> **已退役 / Legacy。** 本文描述的固定阶段 Story Agent 已归档到
+> `legacy/story_agent_v3/`，仅供历史审计和迁移回归。当前唯一生产架构见
+> `docs/architecture/codex-native-story-pipeline.md`，不得用本文启动新故事。
+
 ## 目标
 
 在保留现有工作台和 `story_workflow.py` 的前提下，新增一条 Codex 原生总控链路：用户把故事文本、旁白/绿幕原片等素材放入投喂区后，Agent 自己循环推进项目，直到生成发布视频、发布物料、资料包、QA 报告和 `总交付清单.md`。
@@ -147,6 +151,6 @@ python3 story_agent.py qualification --projects-root "auto-project/runs"
 
 `submit` 同时创建 `agent.input_contract`：唯一用户内容输入只能是一段绿幕原片；LUT 只作为处理配置记录。源剪辑生成的故事文本、清洁绿幕和清洁旁白必须分别绑定原片 SHA-256 与当前剪辑决定 SHA-256。转正核验拒绝后来加入的脚本、旁白、音乐、图片等人工输入，也拒绝未全部通过的 Agent 阶段，以及修改时间早于无人值守启动的预置审核产物。
 
-当前真实工程验证与转正计数分别见 `SHADOW_PRODUCTION_REPORT.md` 和 `FULL_AUTO_PROMOTION_REPORT.md`。第一条《大象和蚂蚁》验证了完整交付，但由于运行发生在工程调试过程、没有 `start` 证据和人工终审记录，当前转正计数诚实保持为 0/3。
+历史工程验证与转正计数分别见 `legacy/story_agent_v3/docs/SHADOW_PRODUCTION_REPORT_2026-07-13.md` 和 `legacy/story_agent_v3/docs/FULL_AUTO_PROMOTION_REPORT_2026-07-13.md`。第一条《大象和蚂蚁》验证了完整交付，但由于运行发生在工程调试过程、没有 `start` 证据和人工终审记录，当时转正计数诚实保持为 0/3。
 
 故障注入回归覆盖死进程锁回收、活锁保护、API 无进展、目标镜头缺失、Codex 子任务失败、Suno 浏览器/登录失效、磁盘不足和取消/续跑。额外 MP4 不得掩盖 jobs CSV 中命名目标的缺失。

@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
-from PIL import Image, ImageDraw, ImageFont, ImageStat
+from PIL import Image, ImageChops, ImageDraw, ImageFilter, ImageFont, ImageStat, ImageOps
 
 from story_video_synthesizer.image_video import IMAGE_EXTENSIONS, sorted_image_files
 from story_video_synthesizer.media import VIDEO_EXTENSIONS, probe_duration
@@ -42,9 +42,24 @@ from cover_quality import (
 ROOT = Path(__file__).resolve().parent
 CONFIG_PATH = ROOT / "pipeline_config.json"
 MAIN_PACKAGE_REFERENCE_MANIFEST = ROOT / "assets" / "references" / "main_vertical_package_reference.json"
-MAIN_PACKAGE_PROMPT_VERSION = "story-main-package-fixed-prompt/v2"
-MAIN_PACKAGE_RECEIPT_SCHEMA_VERSION = "story-main-package-generation/v2"
+MAIN_PACKAGE_PROMPT_VERSION = "story-main-package-fixed-prompt/v3"
+MAIN_PACKAGE_RECEIPT_SCHEMA_VERSION = "story-main-package-generation/v5"
 MAIN_PACKAGE_PANEL_SIZE = (2304, 888)
+THEME_ASSET_GENERATED_FILENAMES = (
+    "main_release_plate.png",
+    "main_release_plate_top.png",
+    "main_release_plate_bottom.png",
+    "library_release_plate.png",
+    "library_release_plate_top.png",
+    "library_release_plate_bottom.png",
+    "main_background_16x9.png",
+    "story_frame_source.png",
+    "story_frame_a.png",
+    "main_package_spec.json",
+    "main_package_generation_receipt.json",
+    "theme_assets_imagegen_request.md",
+    "theme_assets_codex_handoff.txt",
+)
 MANIFEST_NAME = "project_manifest.json"
 STATUS_DIR_NAME = "99_项目状态"
 AUDIO_EXTENSIONS = {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}
@@ -130,9 +145,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     },
     "video_api": {
         "provider": "toapis_grok_1_0",
-        "fallback_provider": "toapis_grok",
         "browser_provider_name": "Flow",
-        "submit_all_first": True,
         "max_submit_first": 20,
         "adapters": {
             "toapis_grok_1_0": {
@@ -148,26 +161,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "duration_choices": [6, 10],
                 "default_resolution": "720p",
                 "default_ratio": "16:9",
-            },
-            "toapis_grok": {
-                "runner": "run_image_video_jobs.py",
-                "base_url": "https://toapis.com/v1",
-                "model": "grok-video-1.5",
-                "api_key_env": "TOAPIS_API_KEY",
-                "estimated_cost_cny_per_clip": 0.08,
-                "estimated_cost_cny_per_second": 0.01,
-                "default_seconds": 8,
-                "min_seconds": 4,
-                "max_seconds": 15,
-                "default_resolution": "720p",
-                "default_ratio": "16:9",
-            },
-            "qingyun_api": {
-                "runner": "run_image_video_jobs.py",
-                "base_url": "https://api.qingyuntop.top/v1",
-                "model": "grok-video-3-10s",
-                "api_key_env": "QINGYUN_API_KEY",
-                "estimated_cost_cny_per_clip": 3.0,
             },
             "mock_local": {
                 "runner": "mock_video_provider.py",
@@ -186,10 +179,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "deadline_behavior": "deliver_best_valid",
         "max_full_resolution_encodes": 1,
         "review_pass_score": 85,
-        "max_retries": 2,
-        "max_critical_retries": 3,
-        "max_attempts": 2,
-        "max_critical_attempts": 3,
         "whisper_model": "small",
         "working_video_max_width": 0,
         "proxy_video_max_width": 1280,
@@ -502,7 +491,18 @@ def is_user_input_asset(paths: ProjectPaths, path: Path) -> bool:
         relative_parts = path.relative_to(paths.root).parts
     except ValueError:
         return False
-    return not any(part in generated_dirs for part in relative_parts[:-1])
+    directory_parts = relative_parts[:-1]
+    if any(part in generated_dirs for part in directory_parts):
+        return False
+    # Story-full-auto projects may use story-specific production folders such as
+    # ``02_背景动画`` or ``04_配乐与音频`` in addition to the canonical names
+    # above.  Treat every numbered production folder as generated, while keeping
+    # the dedicated ``00_输入素材`` folder eligible for authoritative inputs.
+    if directory_parts:
+        top_level = directory_parts[0]
+        if re.match(r"^\d{2}_", top_level) and top_level != PROJECT_DIRS["inputs"]:
+            return False
+    return True
 
 
 def choose_first(files: list[Path], extensions: set[str], preferred_tokens: tuple[str, ...]) -> Path | None:
@@ -1169,6 +1169,8 @@ def main_package_fixed_prompt_template() -> str:
         "可随故事类型克制调整配色、字体和少量主题元素，但不得变成资料包商品页；主账号与宝库号必须一眼可区分。"
         "参考图里的历史故事、煮酒论英雄、4分50秒、8岁以上及示例人物只用于理解结构，"
         "不得出现在新图。文字必须原生融入图像，禁止生成空板后再由程序叠字。"
+        "只要本次任务已经触发，就必须针对当前任务书实际重新执行 ImageGen 生成或参考图编辑；"
+        "不得因为目标路径已有旧图而跳过生成、沿用旧版本上下板或只重写回执。"
         "不要生成中间视频区域，不要生成完整竖屏成图，不要添加二维码、平台 UI、陌生 Logo、人物或吉祥物。"
         "这张参考图不得用于片头卡、寓意卡或六比例营销封面。"
     )
@@ -1177,6 +1179,8 @@ def main_package_fixed_prompt_template() -> str:
 def build_main_package_spec(
     *,
     reference: dict[str, Any],
+    frame_reference: dict[str, Any],
+    frame_story_box: tuple[int, int, int, int],
     story_type: str,
     story_title: str,
     duration: str,
@@ -1200,6 +1204,13 @@ def build_main_package_spec(
         "reference_asset": reference["asset_path"],
         "reference_sha256": reference["sha256"],
         "reference_role": "main_vertical_package",
+        "frame_reference_asset": frame_reference["asset_path"],
+        "frame_reference_sha256": frame_reference["sha256"],
+        "frame_reference_role": "geometry_only_not_theme_or_ornament",
+        "frame_story_box": list(frame_story_box),
+        "frame_source_background": "#FF00FF",
+        "frame_source_mode": "imagegen_magenta_chroma_source",
+        "frame_design_policy": "redesign_from_current_story_theme",
         **values,
         "top_plate": {"path": str(top_panel), "size": list(MAIN_PACKAGE_PANEL_SIZE)},
         "bottom_plate": {"path": str(bottom_panel), "size": list(MAIN_PACKAGE_PANEL_SIZE)},
@@ -1207,7 +1218,7 @@ def build_main_package_spec(
         "fixed_prompt_version": MAIN_PACKAGE_PROMPT_VERSION,
         "fixed_prompt_template_sha256": hashlib.sha256(template.encode("utf-8")).hexdigest(),
         "fixed_prompt": template.format(**values),
-        "required_imagegen_inputs": ["reference_asset", "fixed_prompt"],
+        "required_imagegen_inputs": ["reference_asset", "frame_reference_asset", "fixed_prompt"],
         "ocr_validation": "required",
         "reference_content_leak_check": "required",
         "render_usage_proof": "required_before_release_qa",
@@ -1222,9 +1233,22 @@ def create_theme_asset_request(project_dir: Path) -> dict[str, Path]:
     manifest = detect_project_assets(paths.root, extract_audio=False)
     story = manifest["story"]
     assets_dir = paths.release / "theme_assets"
+    existing_generated = any((assets_dir / name).exists() for name in THEME_ASSET_GENERATED_FILENAMES)
+    if existing_generated:
+        existing_issues = main_package_receipt_issues(paths)
+        if existing_issues:
+            archive_invalid_theme_assets(paths, existing_issues)
     assets_dir.mkdir(parents=True, exist_ok=True)
     config = load_config()
     reference = load_main_package_reference(config)
+    frame_reference_path = Path(str(config.get("brand_assets", {}).get("frame_reference") or "")).expanduser()
+    if not frame_reference_path.is_file():
+        raise FileNotFoundError(f"故事框几何参考图不存在：{frame_reference_path}")
+    frame_reference = {
+        "asset_path": str(frame_reference_path.resolve()),
+        "sha256": hashlib.sha256(frame_reference_path.read_bytes()).hexdigest(),
+    }
+    frame_story_box = parse_box(str(config.get("release_defaults", {}).get("story_box", "210,270,910,512")))
     theme = infer_theme_text(manifest)
     duration_text = str(story.get("duration_text") or "").strip()
     if not duration_text:
@@ -1258,6 +1282,8 @@ def create_theme_asset_request(project_dir: Path) -> dict[str, Path]:
         raise ValueError("age_range_user_input_required: 请先由用户指定适合年龄，再生成主账号包装")
     package_spec = build_main_package_spec(
         reference=reference,
+        frame_reference=frame_reference,
+        frame_story_box=frame_story_box,
         story_type=str(story.get("story_type") or "儿童故事"),
         story_title=str(story.get("name") or ""),
         duration=duration_text,
@@ -1314,9 +1340,11 @@ def build_theme_asset_handoff(request_path: Path) -> str:
         "同时使用其中 fixed_prompt；不得只读文字后丢弃参考图。底板拆成上半包装图和下半包装图分别生成，中间由程序保留固定 16:9 空挡，"
         "不要让 imagegen 直接生成整张 1080x1440 底板。上/下素材里的文字仍必须由 Codex 原生生成。\n"
         "6. 允许用 Pillow 只做后处理：裁切、三段拼接、尺寸整理、透明通道和 QA；不允许用 Pillow 添加、覆盖或修正底板文字。\n"
-        "7. 故事框只生成一个统一源图和一个透明 PNG；A/B 景复用同一个框，具体缩放与摆放放到发布视频合成环节处理，"
-        "不要在第 12 步生成两套故事框或机械裁坏 B 框。\n"
-        "8. 最终文件必须保存到任务书指定的绝对路径，文件名完全一致；并按任务书写出 main_package_generation_receipt.json，记录参考图、Prompt、任务书、主账号背景、故事框源图/透明框和上下图哈希，OCR、示例内容泄漏检查、主/宝库号角色区分审核和 attempt_count（1–3，首次加最多两轮定向修正）。\n"
+        "7. 故事框必须把 main_package_spec.json 的 frame_reference_asset 作为几何参考输入，但只能继承占位、开口比例和实用边框厚度；"
+        "不得继承参考图的羊角、祥云、道具或其他故事主题。框体必须按当前故事从零重新设计。ImageGen 源图的整张底色（框内和框外）"
+        "必须是纯 #FF00FF 洋红，禁止棋盘格、白底或直接透明输出；透明 PNG 只能由该洋红源图做固定色键/Alpha 后处理得到。"
+        "A/B 景复用同一个框，具体缩放与摆放放到发布视频合成环节处理。禁止使用 SVG、HTML、Canvas、Pillow 或 FFmpeg 从零绘制框体。\n"
+        "8. 最终文件必须保存到任务书指定的绝对路径，文件名完全一致；并按任务书写出 main_package_generation_receipt.json，记录参考图、Prompt、任务书、主账号背景、故事框源图/透明框和四张上下包装图哈希，OCR、示例内容泄漏检查、主/宝库号角色区分审核、背景清洁审核、generation_methods、svg_used=false 和 attempt_count（1–3，首次加最多两轮定向修正）。\n"
         "9. 主题素材通过 QA 后，只生成抠像候选与站立/大手势短样本，用来确定人物大小、初始 X 轴、抠像边缘和背景融合；不要在本阶段重复运行完整发布预演。\n"
         "10. 把最终布局和抠像参数写回桌面故事项目的 04_发布视频/keying/keying_preset.json。后续 release_preview 阶段会用完整背景成片、同一正式合成代码和最终 Demo 参数自动抽渲代表帧，并展示到 Dashboard；不要求用户半夜点击批准。\n"
         "11. 只处理发布视觉定版，不要改分镜、图生视频、配乐、背景成片，也不要编码完整发布视频；自动预检通过后，状态机才允许一次正式全片编码。"
@@ -1367,7 +1395,7 @@ def build_theme_asset_imagegen_request(
 主账号生成回执：{output_paths['main_package_receipt']}
 ```
 
-## 主账号包装的必需双输入
+## 必需参考输入
 
 - 必需参考图：`{package_spec['reference_asset']}`
 - 参考图 SHA-256：`{package_spec['reference_sha256']}`
@@ -1380,6 +1408,13 @@ def build_theme_asset_imagegen_request(
 ```
 
 如果参考图缺失或 SHA 不符，立即返回 `package_reference_missing`，不得凭空设计新包装。该参考图只用于主账号上下包装板，不得用于片头、寓意卡或六比例营销封面。
+
+- 故事框几何参考图：`{package_spec['frame_reference_asset']}`
+- 故事框几何参考 SHA-256：`{package_spec['frame_reference_sha256']}`
+- 参考图角色：`geometry_only_not_theme_or_ornament`
+- A 景窗口：`{','.join(str(value) for value in package_spec['frame_story_box'])}`
+
+故事框参考图只锁定占位、16:9 开口比例和实用边框厚度。不得照抄参考图的羊角、祥云、道具、配色或任何旧故事装饰；必须按当前故事主题重新设计。
 
 ## 本期信息
 
@@ -1449,11 +1484,12 @@ def build_theme_asset_imagegen_request(
 生成 1920x1080 背景图，用于放置左侧故事视频框和右侧真人绿幕人物。背景图本身只提供环境氛围，不能自带故事框。
 
 要求：
-- 背景与本期故事主题强相关，必须开阔、连续、有明确场景感，整体漂亮但低复杂度，不能喧宾夺主。
+- 背景与本期故事主题强相关，必须开阔、连续、有明确场景感，清晰、有可辨识细节但不能喧宾夺主。
 - 背景必须是同一个横向展开的完整场景，不允许左右分区、半边纸面、半边色块、明显留白面板、舞台幕布感或“半屏设计”。
 - 控制细节密度，避免拥挤纹样、密集道具、强装饰、复杂建筑群、标题栏或可被误认为视频窗口的矩形容器。
-- 右侧要给真人留出干净空间，左侧要给故事框留出空间；但只能通过浅景深、低细节、低对比、开阔景别和自然光雾来实现，不能做成独立面板或空白块。
-- 不要出现真实人物、字幕、水印、平台 UI。
+- 右侧要给真人留出干净空间，左侧要给故事框留出空间；只能通过构图、开阔景别、自然光线和元素疏密来实现，不能靠全局高斯模糊、独立面板或空白块。
+- 交付的是可复用清晰原图，禁止预先虚化、柔焦、压暗或添加暗角；Demo 若需要虚化，必须在合成阶段生成私有派生图。
+- 不要出现真实人物、字幕、水印、平台 UI、Logo、角标、徽章或右上角/四角装饰贴纸。
 - 不要画任何故事视频框、边框、牌匾、标题栏、空白卡片或可被误认为视频窗口的矩形容器；故事框会由后期透明 PNG 叠加。
 
 ## 4. 统一故事框源图
@@ -1461,14 +1497,18 @@ def build_theme_asset_imagegen_request(
 生成一张 1920x1080 的统一故事框源图，供后处理导出一个透明故事框。A/B 景复用同一个框，具体缩放与摆放放到发布视频合成环节处理。
 
 要求：
-- 参考边框素材 `{frame_reference}` 的比例和风格，做成更贴合本期故事的定制框。
-- 框外与框内开口都通过同一种纯色抠图底（建议亮洋红）去底，后处理不得再额外裁出一个矩形透明洞。
+- 把 `{package_spec['frame_reference_asset']}` 作为 imagegen 的几何参考输入，只继承占位、16:9 开口比例和实用边框厚度；不得继承其主题造型或装饰。
+- 根据《{story_name}》的具体人物、道具、场景和情绪从零设计一套新的框体。禁止只在旧框上换花、换角标，禁止保留旧故事的羊角、祥云、书画道具、动物食物或其他主题元素。
+- 整张 1920x1080 源图必须使用完全一致的纯洋红 `#FF00FF` 底色，包括框外区域和框内开口。禁止棋盘格、白底、渐变底、透明预览或直接透明输出。
+- 透明 PNG 只能由上述 ImageGen 洋红源图做固定色键/Alpha 后处理得到；后处理不得重新设计、增删或移动框体元素，也不得额外裁出一个矩形透明洞。
 - 合成逻辑是“故事视频在下，透明故事框在上”，由不规则框体自然遮挡视频边缘；不要把内缘硬切成直角矩形。
 - 故事框必须是完整闭合的四边矩形框：上、下、左、右四条边和四个角都要完整在画布内，不能生成 L 形、缺左边、缺底边、局部出画或被裁断的框。
 - 框体必须围绕 A 景窗口 `{story_box}`，窗口四周都应能看到框体；不要把右边框放到远离窗口的位置。
 - 装饰元素围绕窗口，不能遮挡窗口。
 - 保留 Logo 安全区，后续会叠加 `{logo}`。
 - 源图按 A 景窗口构图（参考 `{story_box}`），确保框细节完整可读。
+- 框体必须由 ImageGen 直接生成或参考图编辑为栅格位图。禁止用 SVG、HTML、Canvas、Pillow、FFmpeg drawbox/drawtext 或其他程序绘图方式制作框体。
+- 程序只负责对纯洋红源图去底和尺寸整理，不能重新设计框体。
 
 ## 5. A/B 使用规则
 
@@ -1485,8 +1525,11 @@ def build_theme_asset_imagegen_request(
 - 背景图是 1920x1080，且不能自带故事框。
 - 故事框源图为单一设计；只导出一个 1920x1080 透明 PNG，A/B 在发布视频合成环节复用。
 - 文件已经保存到任务书指定路径。
-- `main_package_generation_receipt.json` 使用 `story-main-package-generation/v2`，必须声明 imagegen 同时接收了参考图和固定 Prompt，绑定任务书、上下图、主账号背景、故事框源图与透明框 SHA-256，逐项记录 OCR 观察值并确认示例故事名/时长/年龄/人物没有泄漏；`attempt_count` 为 1–3。
+- `main_package_generation_receipt.json` 使用 `story-main-package-generation/v5`，必须声明 imagegen 同时接收了主账号包装参考图、故事框几何参考图和固定 Prompt，绑定任务书、四张上下包装图、主账号背景、故事框洋红源图与透明框 SHA-256，逐项记录主/宝库号 OCR 观察值并确认示例故事名/时长/年龄/人物没有泄漏；`attempt_count` 为 1–3。
+- 回执写 `generation_methods`：主账号上下图为 `imagegen_reference_edit`，宝库号上下图为 `imagegen_raster` 或 `imagegen_reference_edit`，故事框源图为 `imagegen_raster` 或 `imagegen_reference_edit`，透明框只能为 `raster_alpha_postprocess`；并明确写 `svg_used=false`。
 - 回执必须写 `story_identity`，并在 `account_role_review` 中确认：参考图的简洁层级被保留、主账号没有做成宝库号资料包商品页、信息层级清楚，并附具体 evidence。
+- 回执必须写 `background_clean_review`，其中 `passed`、`not_preblurred`、`no_vignette`、`no_logo_badge_or_corner_emblem`、`no_text_or_watermark` 均为 true，并附具体 evidence。
+- 回执必须写 `frame_design_review`，其中 `passed`、`frame_reference_attached`、`geometry_preserved`、`current_story_redesign`、`no_reference_theme_leak`、`solid_magenta_source` 均为 true，并附具体 evidence。
 """
 
 
@@ -1536,6 +1579,8 @@ def main_package_receipt_issues(paths: ProjectPaths) -> list[str]:
         {
             "top_plate": theme_dir / "main_release_plate_top.png",
             "bottom_plate": theme_dir / "main_release_plate_bottom.png",
+            "library_top_plate": theme_dir / "library_release_plate_top.png",
+            "library_bottom_plate": theme_dir / "library_release_plate_bottom.png",
             "main_background": theme_dir / "main_background_16x9.png",
             "story_frame_source": theme_dir / "story_frame_source.png",
             "story_frame_a": theme_dir / "story_frame_a.png",
@@ -1556,6 +1601,21 @@ def main_package_generation_receipt_issues(
         issues.append("main_package_generation_receipt_schema_invalid")
     if receipt.get("imagegen_reference_attached") is not True:
         issues.append("main_package_reference_not_attached_to_imagegen")
+    if receipt.get("svg_used") is not False:
+        issues.append("main_package_svg_or_unverified_vector_workflow_forbidden")
+    generation_methods = receipt.get("generation_methods") if isinstance(receipt.get("generation_methods"), Mapping) else {}
+    allowed_methods = {
+        "top_plate": {"imagegen_reference_edit"},
+        "bottom_plate": {"imagegen_reference_edit"},
+        "library_top_plate": {"imagegen_raster", "imagegen_reference_edit"},
+        "library_bottom_plate": {"imagegen_raster", "imagegen_reference_edit"},
+        "main_background": {"imagegen_raster", "imagegen_reference_edit"},
+        "story_frame_source": {"imagegen_raster", "imagegen_reference_edit"},
+        "story_frame_a": {"raster_alpha_postprocess"},
+    }
+    for key in expected_outputs:
+        if key in allowed_methods and generation_methods.get(key) not in allowed_methods[key]:
+            issues.append(f"main_package_generation_method_invalid:{key}")
     try:
         attempt_count = int(receipt.get("attempt_count") or 0)
     except (TypeError, ValueError):
@@ -1564,6 +1624,8 @@ def main_package_generation_receipt_issues(
         issues.append("main_package_generation_attempt_count_invalid")
     for field in (
         "reference_asset", "reference_sha256", "fixed_prompt_template_sha256",
+        "frame_reference_asset", "frame_reference_sha256", "frame_reference_role",
+        "frame_story_box", "frame_source_background", "frame_source_mode", "frame_design_policy",
         "theme_request_path", "theme_request_sha256",
     ):
         if receipt.get(field) != spec.get(field):
@@ -1591,6 +1653,32 @@ def main_package_generation_receipt_issues(
             issues.append(f"main_package_account_role_review_failed:{field}")
     if not str(role_review.get("evidence") or "").strip():
         issues.append("main_package_account_role_review_evidence_missing")
+    background_review = (
+        receipt.get("background_clean_review")
+        if isinstance(receipt.get("background_clean_review"), Mapping)
+        else {}
+    )
+    for field in (
+        "passed", "not_preblurred", "no_vignette",
+        "no_logo_badge_or_corner_emblem", "no_text_or_watermark",
+    ):
+        if background_review.get(field) is not True:
+            issues.append(f"main_package_background_clean_review_failed:{field}")
+    if not str(background_review.get("evidence") or "").strip():
+        issues.append("main_package_background_clean_review_evidence_missing")
+    frame_review = (
+        receipt.get("frame_design_review")
+        if isinstance(receipt.get("frame_design_review"), Mapping)
+        else {}
+    )
+    for field in (
+        "passed", "frame_reference_attached", "geometry_preserved",
+        "current_story_redesign", "no_reference_theme_leak", "solid_magenta_source",
+    ):
+        if frame_review.get(field) is not True:
+            issues.append(f"main_package_frame_design_review_failed:{field}")
+    if not str(frame_review.get("evidence") or "").strip():
+        issues.append("main_package_frame_design_review_evidence_missing")
     outputs = receipt.get("outputs") if isinstance(receipt.get("outputs"), Mapping) else {}
     for key, path in expected_outputs.items():
         item = outputs.get(key) if isinstance(outputs.get(key), Mapping) else {}
@@ -1613,7 +1701,52 @@ def main_package_generation_receipt_issues(
     leak = receipt.get("reference_content_leak_check") if isinstance(receipt.get("reference_content_leak_check"), Mapping) else {}
     if leak.get("passed") is not True or leak.get("leaked_items") not in ([], None):
         issues.append("main_package_reference_content_leak")
+    if {"library_top_plate", "library_bottom_plate"} & set(expected_outputs):
+        library_ocr = receipt.get("library_ocr_validation") if isinstance(receipt.get("library_ocr_validation"), Mapping) else {}
+        expected_library_text = {
+            "story_title": str(spec.get("story_title") or ""),
+            "duration": str(spec.get("duration") or ""),
+            "age_range": str(spec.get("age_range") or ""),
+            "package_items": ["背景视频", "PPT", "配乐", "文稿", "示范视频", "朗读标注"],
+        }
+        if library_ocr.get("passed") is not True:
+            issues.append("library_package_ocr_not_passed")
+        if library_ocr.get("expected") != expected_library_text or library_ocr.get("observed") != expected_library_text:
+            issues.append("library_package_ocr_text_mismatch")
     return sorted(set(issues))
+
+
+def archive_invalid_theme_assets(paths: ProjectPaths, issues: list[str]) -> Path | None:
+    """Move a stale generated asset family aside before a new ImageGen task.
+
+    Keeping invalid files at the canonical target paths encourages a producer
+    to treat existence as completion.  Archiving is recoverable and only
+    touches known generated outputs; user inputs and unrelated theme files are
+    left in place.
+    """
+
+    theme_dir = paths.release / "theme_assets"
+    candidates = [theme_dir / name for name in THEME_ASSET_GENERATED_FILENAMES]
+    existing = [path for path in candidates if path.exists()]
+    if not existing:
+        return None
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    archive = paths.status / "rejected" / "theme_assets" / f"{stamp}-{uuid.uuid4().hex[:8]}"
+    archive.mkdir(parents=True, exist_ok=False)
+    archived: list[dict[str, str]] = []
+    for source in existing:
+        target = archive / source.name
+        shutil.move(str(source), str(target))
+        archived.append({"source": str(source), "archived_to": str(target)})
+    save_json(
+        archive / "invalidation.json",
+        {
+            "schema_version": "story-theme-assets-invalidation/v1",
+            "issues": sorted(set(issues)),
+            "archived": archived,
+        },
+    )
+    return archive
 
 
 def qa_theme_assets(paths: ProjectPaths, assets: list[Path] | None = None, *, strict: bool = False) -> Path:
@@ -1634,6 +1767,7 @@ def qa_theme_assets(paths: ProjectPaths, assets: list[Path] | None = None, *, st
             theme_dir / "library_release_plate_bottom.png",
             theme_dir / "library_release_plate.png",
             theme_dir / "main_background_16x9.png",
+            theme_dir / "story_frame_source.png",
             theme_dir / "story_frame_a.png",
         ]
     expected_sizes = {
@@ -1645,6 +1779,7 @@ def qa_theme_assets(paths: ProjectPaths, assets: list[Path] | None = None, *, st
         "library_release_plate.png": (1080, 1440),
         "release_plate_placeholder.png": (1080, 1440),
         "main_background_16x9.png": (1920, 1080),
+        "story_frame_source.png": (1920, 1080),
         "story_frame_a.png": (1920, 1080),
     }
     expected_windows = {
@@ -1668,6 +1803,8 @@ def qa_theme_assets(paths: ProjectPaths, assets: list[Path] | None = None, *, st
                 if path.name in expected_windows:
                     notes.extend(qa_story_frame_image(image, expected_windows[path.name]))
                     notes.extend(story_frame_integrity_issues(image, expected_windows[path.name]))
+                if path.name == "story_frame_source.png":
+                    notes.extend(qa_story_frame_source(image))
                 if path.name == "main_background_16x9.png":
                     notes.extend(qa_main_background_image(image))
                 rows.append({"index": str(index), "file": str(path), "status": "warning" if notes else "ok", "notes": f"{width}x{height} {'；'.join(notes)}"})
@@ -1726,6 +1863,7 @@ def _normalize_existing_story_frame(frame_path: Path, window: tuple[int, int, in
 def export_frame_from_source(source: Path, output: Path, window: tuple[int, int, int, int]) -> None:
     with Image.open(source).convert("RGB") as source_image:
         frame = cover_crop(source_image, (1920, 1080))
+    frame = normalize_magenta_frame_source(frame)
     frame_rgba = chroma_to_alpha(frame)
     frame_rgba = fit_frame_to_window(frame_rgba, window)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -1733,25 +1871,74 @@ def export_frame_from_source(source: Path, output: Path, window: tuple[int, int,
 
 
 def fit_frame_to_window(frame: Image.Image, window: tuple[int, int, int, int]) -> Image.Image:
-    """Align a complete generated frame around the target story window."""
+    """Align a closed frame by its aperture so it actually masks video edges.
+
+    The old implementation stretched the frame's outer alpha bounding box to a
+    fixed rectangle.  That ignored the generated aperture and could leave a
+    visible strip of background between a rounded inner edge and the video.
+    The production contract is the opposite: the transparent aperture is the
+    anchor, and the opaque frame must overlap the video on all four sides.
+    """
     frame = frame.convert("RGBA")
     bbox = frame.getchannel("A").getbbox()
     if bbox is None:
         return frame
     x, y, width, height = window
-    margin_x = 112
-    margin_y = 116
-    target = (
-        max(0, x - margin_x),
-        max(0, y - margin_y),
-        min(frame.width, x + width + margin_x),
-        min(frame.height, y + height + margin_y),
+    aperture = center_transparent_component_bbox(frame)
+    if aperture is None:
+        margin_x = 112
+        margin_y = 116
+        target = (
+            max(0, x - margin_x),
+            max(0, y - margin_y),
+            min(frame.width, x + width + margin_x),
+            min(frame.height, y + height + margin_y),
+        )
+        subject = frame.crop(bbox)
+        fitted = subject.resize((target[2] - target[0], target[3] - target[1]), Image.Resampling.LANCZOS)
+        out = Image.new("RGBA", frame.size, (0, 0, 0, 0))
+        out.alpha_composite(fitted, (target[0], target[1]))
+        return out
+
+    ax1, ay1, ax2, ay2 = aperture
+    overlap_x = max(18, min(36, round(width * 0.028)))
+    overlap_y = max(14, min(28, round(height * 0.035)))
+    target_aperture = (
+        x + overlap_x,
+        y + overlap_y,
+        x + width - overlap_x,
+        y + height - overlap_y,
     )
-    subject = frame.crop(bbox)
-    fitted = subject.resize((target[2] - target[0], target[3] - target[1]), Image.Resampling.LANCZOS)
+    scale_x = (target_aperture[2] - target_aperture[0]) / max(1, ax2 - ax1)
+    scale_y = (target_aperture[3] - target_aperture[1]) / max(1, ay2 - ay1)
+    fitted = frame.resize(
+        (max(1, round(frame.width * scale_x)), max(1, round(frame.height * scale_y))),
+        Image.Resampling.LANCZOS,
+    )
+    paste_x = round(target_aperture[0] - ax1 * scale_x)
+    paste_y = round(target_aperture[1] - ay1 * scale_y)
     out = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-    out.alpha_composite(fitted, (target[0], target[1]))
+    out.alpha_composite(fitted, (paste_x, paste_y))
     return out
+
+
+def center_transparent_component_bbox(frame: Image.Image, alpha_threshold: int = 8) -> tuple[int, int, int, int] | None:
+    """Return the closed transparent aperture containing the canvas centre."""
+
+    alpha = frame.convert("RGBA").getchannel("A")
+    transparent = alpha.point(lambda value: 255 if value <= alpha_threshold else 0)
+    center = (frame.width // 2, frame.height // 2)
+    if transparent.getpixel(center) == 0:
+        return None
+    flooded = transparent.copy()
+    ImageDraw.floodfill(flooded, center, 128, thresh=0)
+    component = flooded.point(lambda value: 255 if value == 128 else 0)
+    bbox = component.getbbox()
+    if bbox is None:
+        return None
+    if bbox[0] <= 0 or bbox[1] <= 0 or bbox[2] >= frame.width or bbox[3] >= frame.height:
+        return None
+    return bbox
 
 
 def export_frame_b_from_a(
@@ -1791,17 +1978,53 @@ def cover_crop(image: Image.Image, size: tuple[int, int]) -> Image.Image:
     return resized.crop((x, y, x + dst_w, y + dst_h))
 
 
+def connected_magenta_background_mask(image: Image.Image) -> Image.Image:
+    """Select only magenta connected to the opening or canvas exterior.
+
+    Color-keying every magenta-like pixel damages legitimate pink/purple story
+    ornaments.  The production source has two background components: the
+    closed centre aperture and the exterior around the frame.  Flooding from
+    those known seeds removes the key background while preserving enclosed
+    theme colors.
+    """
+
+    rgb = image.convert("RGB")
+    candidate = Image.new("L", rgb.size, 0)
+    source_pixels = rgb.load()
+    candidate_pixels = candidate.load()
+    for py in range(rgb.height):
+        for px in range(rgb.width):
+            red, green, blue = source_pixels[px, py]
+            if red >= 170 and blue >= 160 and green <= 120 and ((red + blue) / 2 - green) >= 85:
+                candidate_pixels[px, py] = 255
+    seeds = [
+        (rgb.width // 2, rgb.height // 2),
+        (0, 0), (rgb.width - 1, 0), (0, rgb.height - 1), (rgb.width - 1, rgb.height - 1),
+    ]
+    for seed in seeds:
+        if candidate.getpixel(seed) == 255:
+            ImageDraw.floodfill(candidate, seed, 128, thresh=0)
+    return candidate.point(lambda value: 255 if value == 128 else 0)
+
+
+def normalize_magenta_frame_source(image: Image.Image) -> Image.Image:
+    """Normalize only the connected chroma background to exact #FF00FF."""
+
+    rgb = image.convert("RGB")
+    mask = connected_magenta_background_mask(rgb)
+    normalized = rgb.copy()
+    normalized.paste(Image.new("RGB", rgb.size, (255, 0, 255)), mask=mask)
+    return normalized
+
+
 def chroma_to_alpha(image: Image.Image, key: tuple[int, int, int] = (255, 0, 255), threshold: int = 72) -> Image.Image:
-    rgba = image.convert("RGBA")
-    pixels = rgba.load()
-    for y in range(rgba.height):
-        for x in range(rgba.width):
-            r, g, b, a = pixels[x, y]
-            dist = abs(r - key[0]) + abs(g - key[1]) + abs(b - key[2])
-            if dist < threshold or (r > 170 and b > 160 and g < 120):
-                pixels[x, y] = (r, g, b, 0)
-            elif r > 140 and b > 135 and g < 145:
-                pixels[x, y] = (r, g, b, max(0, min(a, int((dist - threshold) * 3))))
+    del key, threshold  # Compatibility parameters; topology now defines the safe key region.
+    normalized = normalize_magenta_frame_source(image)
+    mask = connected_magenta_background_mask(normalized)
+    rgba = normalized.convert("RGBA")
+    alpha = Image.new("L", rgba.size, 255)
+    alpha.paste(0, mask=mask)
+    rgba.putalpha(alpha)
     return rgba
 
 
@@ -1848,6 +2071,18 @@ def qa_story_frame_image(image: Image.Image, window: tuple[int, int, int, int]) 
     if image.size[0] < x + width or image.size[1] < y + height:
         notes.append("故事视频窗口超出画布")
         return notes
+    aperture = center_transparent_component_bbox(image)
+    if aperture is None:
+        notes.append("故事框没有闭合的中央透明开口")
+    else:
+        ax1, ay1, ax2, ay2 = aperture
+        if ax1 < x or ay1 < y or ax2 > x + width or ay2 > y + height:
+            notes.append("故事框内开口超出视频窗口，圆角/异形边缘可能露出背景缝")
+        overlap = (ax1 - x, ay1 - y, x + width - ax2, y + height - ay2)
+        if min(overlap) < 8:
+            notes.append("故事框压住视频边缘的内侧遮挡带不足")
+        if max(overlap) > max(72, round(min(width, height) * 0.16)):
+            notes.append("故事框内侧遮挡过厚，侵占故事画面")
     inset_x = round(width * 0.16)
     inset_y = round(height * 0.16)
     safe_inner_alpha = alpha.crop((x + inset_x, y + inset_y, x + width - inset_x, y + height - inset_y))
@@ -1863,7 +2098,7 @@ def qa_story_frame_image(image: Image.Image, window: tuple[int, int, int, int]) 
         band = alpha.crop(box)
         pixels = max(1, band.size[0] * band.size[1])
         visible = sum(1 for value in band.getdata() if value > 24)
-        if visible / pixels < 0.012:
+        if visible / pixels < 0.08:
             notes.append(f"故事框{label}缺失或离窗口过远")
     outer_alpha = Image.new("L", image.size, 0)
     outer_alpha.paste(alpha)
@@ -1878,6 +2113,43 @@ def qa_story_frame_image(image: Image.Image, window: tuple[int, int, int, int]) 
     return notes
 
 
+def qa_story_frame_source(image: Image.Image) -> list[str]:
+    """Validate the fixed ImageGen -> magenta source -> keying contract."""
+
+    notes: list[str] = []
+    if image.size != (1920, 1080):
+        notes.append("故事框洋红源图必须规范化为1920x1080")
+    rgb = image.convert("RGB")
+    exact_key = Image.new("L", rgb.size, 0)
+    source_pixels = rgb.load()
+    key_pixels = exact_key.load()
+    exact_count = 0
+    for py in range(rgb.height):
+        for px in range(rgb.width):
+            if source_pixels[px, py] == (255, 0, 255):
+                key_pixels[px, py] = 255
+                exact_count += 1
+    if exact_count / max(1, rgb.width * rgb.height) < 0.40:
+        notes.append("故事框源图没有使用足量的纯#FF00FF洋红底")
+    for point in (
+        (rgb.width // 2, rgb.height // 2),
+        (0, 0), (rgb.width - 1, 0), (0, rgb.height - 1), (rgb.width - 1, rgb.height - 1),
+    ):
+        if rgb.getpixel(point) != (255, 0, 255):
+            notes.append("故事框源图的中央开口和画布外部必须统一为纯#FF00FF")
+            break
+    flooded = exact_key.copy()
+    center = (rgb.width // 2, rgb.height // 2)
+    if flooded.getpixel(center) == 255:
+        ImageDraw.floodfill(flooded, center, 128, thresh=0)
+        aperture = flooded.point(lambda value: 255 if value == 128 else 0).getbbox()
+        if aperture is None or aperture[0] <= 0 or aperture[1] <= 0 or aperture[2] >= rgb.width or aperture[3] >= rgb.height:
+            notes.append("故事框主体没有闭合，中央洋红开口与外部底色连通")
+    else:
+        notes.append("故事框中央不是纯洋红开口")
+    return notes
+
+
 def qa_main_background_image(image: Image.Image) -> list[str]:
     notes: list[str] = []
     if image.mode not in {"RGB", "RGBA"}:
@@ -1886,6 +2158,20 @@ def qa_main_background_image(image: Image.Image) -> list[str]:
     stat = ImageStat.Stat(sample)
     if max(stat.stddev) < 5:
         notes.append("背景图过于单调，疑似占位图")
+    detail_sample = ImageOps.fit(image.convert("RGB"), (320, 180), method=Image.Resampling.LANCZOS)
+    edges = detail_sample.convert("L").filter(ImageFilter.FIND_EDGES).crop((3, 3, 317, 177))
+    edge_mean = ImageStat.Stat(edges).mean[0]
+    if edge_mean < 3.0:
+        notes.append("背景图细节过低，疑似已经整体预模糊")
+    micro = ImageChops.difference(
+        detail_sample,
+        detail_sample.filter(ImageFilter.GaussianBlur(1.2)),
+    ).convert("L").crop((3, 3, 317, 177))
+    micro_mean = ImageStat.Stat(micro).mean[0]
+    histogram = micro.histogram()
+    micro_occupancy = sum(histogram[24:]) / max(1, sum(histogram))
+    if edge_mean > 42.0 or micro_mean > 12.5 or micro_occupancy > 0.14:
+        notes.append("背景图高频细节过密，草叶/碎花/颗粒在视频压缩后容易形成噪点")
     return notes
 
 
@@ -2117,8 +2403,9 @@ def auto_keying(
         "selection_policy": (
             "每条源素材独立抽取全片站立/大手势代表帧，再用连续帧循环记忆生成一次可复用 RVM Alpha 中间片；"
             "从该项目自己的中间片比较 0/1/2 像素内收，独立视觉审核选择兼顾发丝保留与色边清理的候选。"
+            "人物检测框只作测量，任何镜别都不得据此裁切或缩放人物；A镜只允许按开场中性帧原尺寸定轴一次，禁止手势跟踪关键帧。"
             if selected_backend == "rvm"
-            else "背景绿幕波动决定候选中心 similarity；默认保守中心候选（blend=0.04），其余候选只供独立视觉审核比较。人物框不改变示范/C镜原始大小和位置，只用于清除表演安全区外的暗绿幕残边，并为A镜人物版式提供安全裁切。站立与大手势双帧由独立视觉审核最终确认。"
+            else "背景绿幕波动决定候选中心 similarity；默认保守中心候选（blend=0.04），其余候选只供独立视觉审核比较。人物检测框只作边界测量，任何镜别都不得据此裁切或缩放人物；A镜只允许按开场中性帧原尺寸定轴一次，禁止手势跟踪关键帧。站立与大手势双帧由独立视觉审核最终确认。"
         ),
         "visual_review_required": True,
         "visual_review_status": "pending",
@@ -2133,14 +2420,14 @@ def auto_keying(
         "chroma_similarity": recommended.get("similarity", color_recommended["similarity"]),
         "chroma_blend": recommended.get("blend", color_recommended["blend"]),
         "person_crop": None,
-        # Union bbox from standing + large-gesture samples.  Native layouts use
-        # it as an alpha boundary without rescaling/repositioning the performer;
-        # A-shot layout may use it as a safe subject crop.
+        # Union bbox from standing + large-gesture samples is diagnostic only.
+        # It must never become a production crop: a later gesture can extend
+        # beyond any bounded sample set.
         "detected_person_bbox": person_crop,
         "person_grade": "natural",
         "person_beauty": "none" if selected_backend == "rvm" else "light",
         "person_height_ratio": 1.0,
-        "person_x": 1280,
+        "person_x": 0,
         "person_y": 0,
         "bottom_margin": 0,
         "auto_selected": True,
@@ -2155,6 +2442,7 @@ def auto_keying(
         "presenter_gesture_review_frame_seconds": round(float(gesture_frame_seconds), 3),
         "presenter_initial_subject_bbox": standing_person_bbox,
         "presenter_initial_anchor_x": None,
+        "person_layout_policy": "source-native-fixed-anchor/v2",
         "dynamic_repositioning": False,
         "gesture_overlap_policy": "allowed",
         "machine_qa": str(machine_qa_path),
@@ -2766,12 +3054,14 @@ def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) ->
         (qa_publish, "publish"),
     )
     agent_job = bool(manifest.get("agent", {}).get("job_id"))
+    native_story_run = (paths.status / "story_run.json").is_file()
     for qa_func, qa_key in qa_steps:
         existing_report = first_existing(manifest.get("qa", {}).get(qa_key))
-        if agent_job and existing_report is not None:
-            # Independent Agent reviews bind the exact QA report bytes. Rewriting an
-            # already-present report here (often only changing checked_at) would
-            # invalidate a valid review bundle during finalization.
+        if (agent_job or native_story_run) and existing_report is not None:
+            # Independent reviews bind the exact QA report bytes.  Both the
+            # legacy Agent job and the Codex-native story_run ledger therefore
+            # preserve an already-produced report during final delivery;
+            # rewriting only checked_at would invalidate a valid bundle.
             continue
         try:
             qa_func(paths.root)  # type: ignore[arg-type]

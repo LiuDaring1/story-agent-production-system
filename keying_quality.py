@@ -528,7 +528,7 @@ def lock_keying_preset(
     review_path: Path,
     output_path: Path | None = None,
 ) -> Path:
-    from story_agent_runtime import review_bundle_is_current, review_passes
+    from story_evidence import review_bundle_is_current, review_passes
 
     preset = json.loads(preset_path.read_text(encoding="utf-8"))
     qa = json.loads(machine_qa_path.read_text(encoding="utf-8"))
@@ -637,7 +637,7 @@ def keying_preset_lock_issues(preset_path: Path, lock_path: Path | None = None) 
         qa = json.loads(Path(str(lock["machine_qa_path"])).read_text(encoding="utf-8"))
         evidence = json.loads(Path(str(lock["evidence_manifest_path"])).read_text(encoding="utf-8"))
         review = json.loads(Path(str(lock["review_path"])).read_text(encoding="utf-8"))
-        from story_agent_runtime import review_bundle_is_current, review_passes
+        from story_evidence import review_bundle_is_current, review_passes
         bundle = Path(str(lock["review_bundle_path"]))
         if qa.get("passed") is not True or qa.get("critical_errors"):
             issues.append("keying_machine_qa_not_passed")

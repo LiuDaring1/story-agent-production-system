@@ -83,7 +83,7 @@ class DynamicStoryPptIntegrationTests(unittest.TestCase):
                 work_dir=root / "work",
                 node=Path(os.environ["RUNTIME_NODE"]),
                 node_modules=Path(os.environ["RUNTIME_NODE_MODULES"]),
-                builder_source=ROOT / "skills" / "story-full-auto" / "scripts" / "build_dynamic_story_ppt.mjs",
+                builder_source=ROOT / "legacy" / "story_agent_v3" / "retired_story_full_auto_ppt_scripts" / "build_dynamic_story_ppt.mjs",
             )
             variant_keys = {
                 "with_subtitles_auto", "without_subtitles_auto",

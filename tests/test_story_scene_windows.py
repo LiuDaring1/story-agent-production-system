@@ -38,6 +38,5 @@ class StorySceneWindowTests(unittest.TestCase):
         self.assertEqual(b_windows, "")
         self.assertEqual(c_windows, "")
 
-
 if __name__ == "__main__":
     unittest.main()

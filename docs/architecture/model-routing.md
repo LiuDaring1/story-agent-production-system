@@ -1,5 +1,7 @@
 # 模型路由与 Agent 层级
 
+> **部分 Legacy。** 角色原则仍可作为历史参考，但本文中的 `AgentContext` 和固定阶段路由属于已退役 Story Agent。当前调度权在 Codex 前台，见 [`codex-native-story-pipeline.md`](codex-native-story-pipeline.md)。
+
 ## 两角色模型
 
 当前正式设计只有两个认知角色，不是 Sol、Terra、Luna、DeepSeek 四层常驻体系。

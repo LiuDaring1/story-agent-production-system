@@ -1,5 +1,7 @@
 # 运行与恢复手册
 
+> **Legacy V3 手册。** 下列 `story_agent.py` 命令不再用于新故事。当前入口是 Codex 前台 + `story-full-auto`，状态命令见 [`../architecture/codex-native-story-pipeline.md`](../architecture/codex-native-story-pipeline.md)。
+
 ## 环境
 
 推荐 Python 环境必须能导入 `python-docx`、Pillow 和项目依赖。真实生产前确认 FFmpeg、ffprobe、LibreOffice、Codex CLI、Ego Browser 和密钥来源可用。

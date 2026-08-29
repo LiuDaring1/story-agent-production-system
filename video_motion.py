@@ -359,6 +359,11 @@ def write_video_receipt(
         "provider_prompt_sha256": str(row.get("provider_prompt_sha256") or ""),
         "provider_prompt_chars": int(str(row.get("provider_prompt_chars") or "0")),
         "provider_request_seconds": int(str(row.get("provider_request_seconds") or "0")),
+        "generation_mode": str(row.get("generation_mode") or ""),
+        "reference_image_sha256_json": str(row.get("reference_image_sha256_json") or ""),
+        "storyboard_manifest_sha256": str(row.get("storyboard_manifest_sha256") or ""),
+        "storyboard_bundle_sha256": str(row.get("storyboard_bundle_sha256") or ""),
+        "storyboard_review_sha256": str(row.get("storyboard_review_sha256") or ""),
     }
     directory = jobs_csv.expanduser().parent / "video_receipts"
     directory.mkdir(parents=True, exist_ok=True)
@@ -408,6 +413,15 @@ def video_receipt_issues(row: Mapping[str, Any], video_path: Path, *, production
     }
     if str(row.get("provider_prompt_sha256") or ""):
         string_bindings["provider_prompt_sha256"] = "provider_prompt_sha256"
+    for key in (
+        "generation_mode",
+        "reference_image_sha256_json",
+        "storyboard_manifest_sha256",
+        "storyboard_bundle_sha256",
+        "storyboard_review_sha256",
+    ):
+        if str(row.get(key) or ""):
+            string_bindings[key] = key
     for receipt_key, row_key in string_bindings.items():
         if receipt.get(receipt_key) != str(row.get(row_key) or ""):
             issues.append(f"video_receipt_{receipt_key}_mismatch")
@@ -565,8 +579,6 @@ def video_review_policy_issues(
             issues.append(f"retry_instruction_missing:{scene}")
         if not provider_prompt:
             issues.append(f"retry_provider_prompt_missing:{scene}")
-        elif len(provider_prompt.encode("utf-16-le")) // 2 > 120:
-            issues.append(f"retry_provider_prompt_too_long:{scene}")
         if code not in VIDEO_REVIEW_HARD_DEFECT_CODES:
             issues.append(f"retry_hard_defect_code_invalid:{scene}:{code or 'missing'}")
     if instruction_scenes != retry_scenes:

@@ -9,6 +9,7 @@ from unittest.mock import patch
 
 from product_package import (
     AnnotationBlock,
+    DELIVERY_CJK_FONT,
     KeyingPreset,
     add_ppt_subtitle,
     clean_public_story_text,
@@ -21,11 +22,13 @@ from product_package import (
     render_demo_preview_frame,
     render_annotation_blocks_docx,
     render_story_docx,
+    reject_full_subtitle_background,
     validate_annotation_blocks,
     validate_annotation_coverage,
+    validate_customer_background_image,
 )
 from pptx import Presentation
-from PIL import Image, ImageStat
+from PIL import Image, ImageDraw, ImageStat
 from story_project import init_project, project_paths, qa_product, write_manifest
 
 
@@ -62,6 +65,58 @@ def make_package_fixture(project: Path) -> tuple[Path, Path]:
 
 
 class ProductQaTests(unittest.TestCase):
+    def test_customer_background_rejects_preblurred_and_overdense_sources_but_accepts_clear_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            blurred = root / "blurred.png"
+            overdense = root / "overdense.png"
+            clear = root / "clear.png"
+            Image.new("RGB", (1280, 720), (120, 150, 180)).save(blurred)
+            checker = Image.new("RGB", (1280, 720), "white")
+            pixels = checker.load()
+            for y in range(720):
+                for x in range(1280):
+                    if (x // 32 + y // 32) % 2:
+                        pixels[x, y] = (20, 80, 140)
+            checker.save(overdense)
+            clear_image = Image.new("RGB", (1280, 720), (126, 170, 198))
+            clear_pixels = clear_image.load()
+            for y in range(720):
+                for x in range(1280):
+                    clear_pixels[x, y] = (
+                        90 + int(70 * y / 719),
+                        145 + int(55 * y / 719),
+                        185 + int(35 * y / 719),
+                    )
+            # A few broad, crisp scene boundaries keep the reusable source
+            # clear without making a synthetic high-frequency texture pass.
+            for y in range(300, 420):
+                for x in range(190, 1090):
+                    if (x - 640) ** 2 + (y - 360) ** 2 < 250 ** 2:
+                        clear_pixels[x, y] = (58, 125, 78)
+            draw = ImageDraw.Draw(clear_image)
+            for x in range(80, 1240, 145):
+                draw.rounded_rectangle((x, 95, x + 42, 570), radius=18, fill=(78, 111, 72))
+                draw.ellipse((x - 55, 45, x + 105, 220), fill=(72, 142, 82))
+            clear_image.save(clear)
+            with self.assertRaisesRegex(ValueError, "预模糊"):
+                validate_customer_background_image(blurred)
+            with self.assertRaisesRegex(ValueError, "高频细节过密"):
+                validate_customer_background_image(overdense)
+            validate_customer_background_image(clear)
+
+    def test_background_subtitle_validation_uses_single_unmatched_srt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "故事背景视频（含字幕）.mp4"
+            (root / "故事字幕.srt").write_text(
+                "1\n00:00:00,000 --> 00:00:03,000\n大家好，我是绵羊姐姐。\n\n"
+                "2\n00:00:03,000 --> 00:00:06,000\n今天我们讲一个故事。\n",
+                encoding="utf-8",
+            )
+            with self.assertRaisesRegex(ValueError, "开头/结尾"):
+                reject_full_subtitle_background(video)
+
     def test_source_native_layout_is_normalized_without_secondary_shrink(self) -> None:
         filter_text, x, y = compute_source_native_layout((1920, 1080), (1920, 1080), None)
         self.assertEqual(filter_text, "scale=1920:1080")
@@ -144,7 +199,7 @@ class ProductQaTests(unittest.TestCase):
             for path in (story_docx, annotation_docx):
                 with zipfile.ZipFile(path) as archive:
                     document_xml = archive.read("word/document.xml").decode("utf-8")
-                self.assertIn("Arial Unicode MS", document_xml)
+                self.assertIn(DELIVERY_CJK_FONT, document_xml)
                 self.assertNotIn("微软雅黑", document_xml)
                 self.assertNotIn("仿宋", document_xml)
             with zipfile.ZipFile(story_docx) as archive:

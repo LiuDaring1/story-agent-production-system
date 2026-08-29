@@ -561,7 +561,7 @@ def main() -> None:
     parser.add_argument(
         "--builder",
         type=Path,
-        default=Path(__file__).resolve().parent / "skills" / "story-full-auto" / "scripts" / "build_dynamic_story_ppt.mjs",
+        default=Path(__file__).resolve().parent / "legacy" / "story_agent_v3" / "retired_story_full_auto_ppt_scripts" / "build_dynamic_story_ppt.mjs",
     )
     args = parser.parse_args()
     outputs = build_dynamic_story_ppts(

@@ -30,7 +30,7 @@ V3.5 新任务先执行 `story_contract` 与 `story_contract_review`。合同包
 
 ### 当前已知计费问题
 
-ToAPIs Grok Video 1.5 页面以美元和 credits 报价，而当前配置字段名为 `estimated_cost_cny_per_second`。在币种修复、充值换算和账户账单接入完成前，本地“人民币成本”只是错误单位下的估算，不能作为正式结算。
+ToAPIs Grok Video 1.0 的渠道页面以美元或 credits 报价，而当前配置字段仍名为 `estimated_cost_cny_per_second`。在币种修复、充值换算和账户账单接入完成前，本地“人民币成本”只是按项目配置登记的估算；供应商任务响应没有独立账单字段时，成本回执必须明确标注这一点，不能伪装为正式结算。
 
 ## 密钥合同
 

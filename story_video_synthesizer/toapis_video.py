@@ -15,20 +15,14 @@ from story_video_synthesizer.volcengine_video import CreateTaskResult, QueryTask
 
 
 DEFAULT_BASE_URL = "https://toapis.com/v1"
-DEFAULT_MODEL = "grok-video-1.5"
 GROK_VIDEO_1_0_MODEL = "grok-video-1.0"
-DEFAULT_SECONDS = "8"
-GROK_VIDEO_1_0_DEFAULT_SECONDS = "6"
+DEFAULT_MODEL = GROK_VIDEO_1_0_MODEL
+DEFAULT_SECONDS = "6"
+GROK_VIDEO_1_0_DEFAULT_SECONDS = DEFAULT_SECONDS
 GROK_VIDEO_1_0_SECONDS = {6, 10}
 GROK_VIDEO_1_0_MAX_REFERENCE_IMAGES = 7
-MIN_SECONDS = 1
-MAX_SECONDS = 15
 DEFAULT_RESOLUTION = "720p"
 DEFAULT_RATIO = "16:9"
-MAX_PROMPT_CHARS = 1200
-# Keep the historical default for callers that still explicitly request an
-# older Grok Video model.  The new provider default is eight seconds.
-LEGACY_DEFAULT_SECONDS = "10"
 DEFAULT_USER_AGENT = "curl/8.7.1"
 
 
@@ -110,54 +104,40 @@ def build_toapis_reference_task_body(
     return body
 
 
-def _prompt_length(value: str) -> int:
-    """Match the UTF-16 code-unit count enforced by the provider's web input."""
-
-    return len(value.encode("utf-16-le")) // 2
-
-
 def _normalize_prompt(model: str, value: Any) -> str:
+    _require_supported_model(model)
     prompt = str(value or "").strip()
     if not prompt:
         raise ValueError("ToAPIs prompt 不能为空")
-    if model.strip().lower() == DEFAULT_MODEL:
-        length = _prompt_length(prompt)
-        if length > MAX_PROMPT_CHARS:
-            raise ValueError(
-                f"grok-video-1.5 的 prompt 不能超过 {MAX_PROMPT_CHARS} 字符，当前 {length} 字符"
-            )
     return prompt
 
 
 def _default_seconds_for_model(model: str) -> str:
-    normalized = model.strip().lower()
-    if normalized == DEFAULT_MODEL:
-        return DEFAULT_SECONDS
-    if normalized == GROK_VIDEO_1_0_MODEL:
-        return GROK_VIDEO_1_0_DEFAULT_SECONDS
-    return LEGACY_DEFAULT_SECONDS
+    _require_supported_model(model)
+    return DEFAULT_SECONDS
+
+
+def _require_supported_model(model: str) -> None:
+    normalized = str(model).strip().lower()
+    if normalized != GROK_VIDEO_1_0_MODEL:
+        raise ValueError(
+            f"当前 ToAPIs 正式生产只允许 {GROK_VIDEO_1_0_MODEL}，收到：{model!r}"
+        )
 
 
 def _normalize_seconds(model: str, value: Any) -> str:
+    _require_supported_model(model)
     if value is None or str(value).strip() == "":
         value = _default_seconds_for_model(model)
-    normalized_model = model.strip().lower()
-    # Preserve opaque values only for genuinely legacy/unknown models. Grok
-    # Video 1.0 has a documented discrete duration contract and must fail
-    # before a paid request when a caller supplies anything except 6 or 10.
-    if normalized_model not in {DEFAULT_MODEL, GROK_VIDEO_1_0_MODEL}:
-        return str(value)
     try:
         numeric = float(value)
     except (TypeError, ValueError) as exc:
-        raise ValueError(f"ToAPIs seconds 必须是整数（{MIN_SECONDS}–{MAX_SECONDS}）") from exc
+        raise ValueError("grok-video-1.0 的 seconds 只能是 6 或 10 秒") from exc
     if not numeric.is_integer():
-        raise ValueError(f"ToAPIs seconds 必须是整数（{MIN_SECONDS}–{MAX_SECONDS}）")
-    seconds = int(numeric)
-    if normalized_model == GROK_VIDEO_1_0_MODEL and seconds not in GROK_VIDEO_1_0_SECONDS:
         raise ValueError("grok-video-1.0 的 seconds 只能是 6 或 10 秒")
-    if normalized_model == DEFAULT_MODEL and not MIN_SECONDS <= seconds <= MAX_SECONDS:
-        raise ValueError(f"grok-video-1.5 的 seconds 必须在 {MIN_SECONDS}–{MAX_SECONDS} 秒之间")
+    seconds = int(numeric)
+    if seconds not in GROK_VIDEO_1_0_SECONDS:
+        raise ValueError("grok-video-1.0 的 seconds 只能是 6 或 10 秒")
     return str(seconds)
 
 

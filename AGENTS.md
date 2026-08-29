@@ -2,9 +2,10 @@
 
 ## 目标入口
 
-- 正常使用只接受一段横屏绿幕口播原片；脚本、旁白和音乐都应由系统派生或生成。
-- Codex 是用户入口，`story_agent.py` 是持久化执行脊柱；工作台只作故障诊断。
-- 保留所有旧 CLI 兼容，除非迁移测试证明可以安全删除。
+- 唯一生产入口是当前 Codex 前台任务与 `skills/story-full-auto`；正常输入是用户确认的故事文本和已调色横屏绿幕视频。
+- `story_pipeline.py` / `story_run.py` 只维护六个工作包、成本、产物和哈希，不调度固定阶段；创意判断与汇合由当前 Codex 任务负责。
+- 旧 `story_agent.py`、38 阶段 Runtime、Supervisor、Dashboard 和 Recovery 已归档到 `legacy/story_agent_v3/`。根目录同名文件仅为历史导入和回归测试的薄兼容层，不得作为生产入口，不再接受新功能。
+- 工作台和历史 CLI 只作故障取证与旧项目审计；新代码禁止新增对 `legacy.story_agent_v3` 的依赖。
 
 ## 不可破坏规则
 
@@ -14,7 +15,7 @@
 - 文件存在、命令退出码为 0、生产者自述完成均不等于 QA 通过。
 - 审核必须是独立上下文，分数至少 85、关键错误为空，并校验被审产物 SHA-256。
 - 默认软预算 ¥50、硬预算 ¥100、运行时限 10 小时；到时冻结最佳哈希有效版本并停止新增审美返工，仍须保持心跳、取消、磁盘与预算门禁，超过硬预算不得发起新付费调用。
-- 图生视频必须通过 `video_provider_adapter.py` 解析供应商；不要在 `story_agent.py` 或 `story_workflow.py` 写死供应商、模型或密钥。
+- 图生视频必须通过 `video_provider_adapter.py` 解析供应商；不要在 `story_pipeline.py`、`story_run.py` 或 `story_workflow.py` 写死供应商、模型或密钥。
 - 配乐必须通过带输入哈希的 `qa_music_report.json`，不能仅凭音频文件存在进入最终合成。
 - 抠像必须保存 `keying_search.json` 和站立/大手势候选图；独立审核通过前不得渲染全片。
 - 视频片段完成条件必须逐一匹配 jobs CSV 的 `target_video_filename`，不能用目录 MP4 数量代替。
@@ -23,7 +24,8 @@
 
 ## 修改与验证
 
-- 修改 Agent 状态、投喂或审核逻辑后运行：`python3 -m unittest discover -s tests -v`。
-- 修改 CLI 后同时运行：`python3 story_agent.py --help` 和对应子命令 `--help`。
+- 修改原生流水线状态、投喂或审核逻辑后运行：`python3 -m unittest discover -s tests -v`。
+- 修改控制入口后同时运行：`python3 story_pipeline.py --help`、`python3 story_pipeline.py describe` 和对应内部命令 `--help`。
+- 修改 Legacy 兼容层时额外运行 `python3 story_agent.py --help`；这个检查只证明历史兼容，不代表它重新成为生产入口。
 - 修改项目 Skill 后运行 skill-creator 的 `quick_validate.py skills/story-full-auto`。
 - 不使用工作台按钮作为自动化测试证据；优先用临时目录、模拟供应商和故障注入。

@@ -947,23 +947,25 @@ def product_package_manifest_issues(manifest_path: Path) -> list[str]:
     if recorded_files != actual_customer_files:
         issues.append("product_file_inventory_mismatch")
     required_base = {"customer_manuscript", "music", "reading_annotation", "demo", "background_image"}
-    required_advanced = required_base | {"background_video_with_subtitles", "background_video_without_subtitles", "a_only_video"}
+    required_advanced = required_base | {
+        "background_video_with_subtitles",
+        "background_video_without_subtitles",
+        "ppt_with_subtitles",
+        "ppt_without_subtitles",
+        "a_only_video",
+    }
     for package, required in (("base", required_base), ("advanced", required_advanced)):
         roles = {role for pkg, role in seen if pkg == package}
         for role in sorted(required - roles):
             issues.append(f"product_required_role_missing:{package}:{role}")
         if package == "advanced":
-            legacy_ppt = {"ppt_with_subtitles", "ppt_without_subtitles"}
-            dynamic_ppt = {
+            dynamic_roles = {
                 "ppt_with_subtitles_auto", "ppt_without_subtitles_auto",
                 "ppt_with_subtitles_control", "ppt_without_subtitles_control",
+                "dynamic_ppt_media",
             }
-            if not legacy_ppt.issubset(roles) and not dynamic_ppt.issubset(roles):
-                issues.append("product_required_ppt_set_missing:advanced")
-            if dynamic_ppt.issubset(roles):
-                for dependency in ("story_ppt_plan", "qa_dynamic_ppt_report"):
-                    if dependency not in dependencies:
-                        issues.append(f"product_dependency_missing:{dependency}")
+            if roles & dynamic_roles:
+                issues.append("product_dynamic_ppt_not_customer_deliverable")
     by_role = {
         (str(item.get("package")), str(item.get("role"))): str(item.get("sha256") or "")
         for item in payload.get("files", []) if isinstance(item, dict)

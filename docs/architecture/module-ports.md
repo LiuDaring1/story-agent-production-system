@@ -1,4 +1,8 @@
-# Module Ports（V3.5 Milestone 3 engineering implementation complete）
+# Module Ports（Legacy V3.5 工程记录，非当前生产架构）
+
+> 本页记录退役固定阶段 Runtime 的模块化改造历史。当前 Codex 原生生产链见
+> [`execution-chain.md`](execution-chain.md)。根目录保留的中性 Port/质量模块可以被测试或
+> 确定性工具复用，但本文所述 Runtime consumer seam 不属于 `story-full-auto` 的现行编排。
 
 本页记录 Story Agent 的最小模块接口模式。核心原则是“装插座，不换电器”：Runtime 通过 Port 调用当前实现，但不改变 38-stage DAG、供应商、滤镜、质量门禁、重试、预算或 currentness 语义。
 

@@ -26,60 +26,18 @@ from story_video_synthesizer.volcengine_video import (
 from story_video_synthesizer.image_video import validate_image_video_jobs, write_review_page_from_rows
 from story_contract_runtime import assert_request_contract_binding
 from story_video_synthesizer.toapis_video import (
-    DEFAULT_MODEL as TOAPIS_DEFAULT_MODEL,
-    MAX_SECONDS as TOAPIS_MAX_SECONDS,
-    MAX_PROMPT_CHARS as TOAPIS_MAX_PROMPT_CHARS,
     DEFAULT_RATIO as TOAPIS_DEFAULT_RATIO,
     DEFAULT_SECONDS as TOAPIS_DEFAULT_SECONDS,
     DEFAULT_RESOLUTION as TOAPIS_DEFAULT_RESOLUTION,
     GROK_VIDEO_1_0_MODEL,
-    LEGACY_DEFAULT_SECONDS as TOAPIS_LEGACY_DEFAULT_SECONDS,
     ToAPIsVideoClient,
+    build_toapis_reference_task_body,
     build_toapis_task_body,
 )
 
 
 RETRYABLE_STATUSES = {"failed", "error", "cancelled", "canceled", "expired"}
 INTERNAL_PROMPT_MARKERS = ("[STORY_CONTRACT_V1]", "[VIDEO_MOTION_PLAN_V1]")
-# The public model page exposes a 1200-character browser limit, but production
-# task processing has rejected much shorter Chinese prompts.  Keep the provider
-# payload deliberately below the observed failure range while retaining the
-# full reviewed prompt in the jobs CSV.
-TOAPIS_SAFE_PROVIDER_PROMPT_CHARS = 120
-# ToAPIs advertises 1–15 seconds, but the active upstream channels rejected
-# every 2-second Grok Video 1.5 task with "Value must be within the specified
-# range".  Four seconds is the user-authorized canary floor; the assembly
-# pipeline still probes and trims the downloaded source to the narration span.
-TOAPIS_OPERATIONAL_MIN_SECONDS = 4
-TOAPIS_COMPACT_PROMPT_MODELS = {"grok-video-1.0", TOAPIS_DEFAULT_MODEL}
-
-
-def _with_terminal_punctuation(value: str) -> str:
-    text = str(value or "").strip()
-    if text and not text.endswith(("。", "！", "？", ".", "!", "?")):
-        text += "。"
-    return text
-
-
-def compact_provider_prompt(row: dict[str, str], *, max_chars: int) -> str:
-    """Compile reviewed machine fields into short provider prose without truncation."""
-
-    prefix = "以首图为准。"
-    preservation = "保持首图角色、物体数量、外观和画风，不新增文字、水印或畸形肢体。"
-    subject = _with_terminal_punctuation(row.get("subject_action", ""))
-    if not subject:
-        return ""
-    parts = [prefix, subject]
-    prompt = "".join(parts) + preservation
-    if len(prompt.encode("utf-16-le")) // 2 > max_chars:
-        return ""
-    for key in ("camera_motion", "environment_motion"):
-        clause = _with_terminal_punctuation(row.get(key, ""))
-        candidate = "".join(parts) + clause + preservation
-        if clause and len(candidate.encode("utf-16-le")) // 2 <= max_chars:
-            parts.append(clause)
-            prompt = candidate
-    return prompt
 
 
 def provider_prompt_for_row(row: dict[str, str], *, model: str, is_toapis: bool) -> str:
@@ -99,34 +57,19 @@ def provider_prompt_for_row(row: dict[str, str], *, model: str, is_toapis: bool)
             raise ValueError(
                 f"镜头 {row.get('scene', '')} 的硬伤重试 provider prompt 与上次完全相同，禁止重复付费提交"
             )
-    if is_toapis and model.strip().lower() in TOAPIS_COMPACT_PROMPT_MODELS:
+    if is_toapis:
         if not retry_prompt:
             marker_offsets = [prompt.find(marker) for marker in INTERNAL_PROMPT_MARKERS]
             marker_offsets = [offset for offset in marker_offsets if offset >= 0]
             if marker_offsets:
                 prompt = prompt[: min(marker_offsets)].rstrip()
-        length = len(prompt.encode("utf-16-le")) // 2
+    if is_toapis:
+        if model.strip().lower() != GROK_VIDEO_1_0_MODEL:
+            raise ValueError(
+                f"当前 ToAPIs 正式生产只允许 {GROK_VIDEO_1_0_MODEL}，收到：{model!r}"
+            )
         if not prompt:
             raise ValueError(f"镜头 {row.get('scene', '')} 的 ToAPIs provider prompt 为空")
-        if length > TOAPIS_SAFE_PROVIDER_PROMPT_CHARS and not retry_prompt:
-            compact = compact_provider_prompt(row, max_chars=TOAPIS_SAFE_PROVIDER_PROMPT_CHARS)
-            if not compact:
-                raise ValueError(
-                    f"镜头 {row.get('scene', '')} 的 ToAPIs provider prompt 为 {length} 字符，"
-                    f"且缺少可安全压缩到 {TOAPIS_SAFE_PROVIDER_PROMPT_CHARS} 字符的结构化动作字段"
-                )
-            prompt = compact
-            length = len(prompt.encode("utf-16-le")) // 2
-        if retry_prompt and length > TOAPIS_SAFE_PROVIDER_PROMPT_CHARS:
-            raise ValueError(
-                f"镜头 {row.get('scene', '')} 的硬伤重试 provider prompt 为 {length} 字符，"
-                f"超过安全上限 {TOAPIS_SAFE_PROVIDER_PROMPT_CHARS}，禁止静默截断"
-            )
-        if length > TOAPIS_MAX_PROMPT_CHARS:
-            raise ValueError(
-                f"镜头 {row.get('scene', '')} 的 ToAPIs provider prompt 超过 "
-                f"{TOAPIS_MAX_PROMPT_CHARS} 字符限制：{length}"
-            )
     return prompt
 
 
@@ -163,6 +106,9 @@ def toapis_extra_body(jobs_csv: Path, row: dict[str, str], extra_body: dict[str,
                 str(jobs_csv.expanduser().resolve()),
                 row.get("scene", ""),
                 row.get("image_filename", ""),
+                row.get("reference_image_sha256_json", ""),
+                row.get("storyboard_bundle_sha256", ""),
+                row.get("storyboard_review_sha256", ""),
                 row.get("provider_prompt", "") or row.get("prompt", ""),
                 row.get("provider_request_seconds", "") or row.get("generation_duration", "") or row.get("duration", ""),
                 row.get("provider_attempt", "0"),
@@ -225,17 +171,10 @@ def row_request_seconds(row: dict[str, str], *, model: str, is_toapis: bool, fal
 
     if not is_toapis:
         return str(fallback_seconds)
-    operational_minimum = (
-        TOAPIS_OPERATIONAL_MIN_SECONDS
-        if model.strip().lower() == TOAPIS_DEFAULT_MODEL
-        else None
-    )
     return resolve_row_generation_seconds(
         row,
         model=model,
         fallback_seconds=fallback_seconds,
-        min_seconds=operational_minimum,
-        max_seconds=TOAPIS_MAX_SECONDS if operational_minimum is not None else None,
     )
 
 
@@ -243,9 +182,96 @@ def row_extra_body(jobs_csv: Path, row: dict[str, str], extra_body: dict[str, ob
     """Build idempotency metadata without letting extra_body override row seconds."""
 
     payload = toapis_extra_body(jobs_csv, row, extra_body)
-    if str(model).strip().lower() in {TOAPIS_DEFAULT_MODEL, GROK_VIDEO_1_0_MODEL}:
+    if str(model).strip().lower() == GROK_VIDEO_1_0_MODEL:
         payload.pop("seconds", None)
     return payload
+
+
+def row_reference_paths(row: dict[str, str]) -> list[Path]:
+    """Return the ordered R2V references recorded by the storyboard compiler."""
+
+    raw = str(row.get("reference_image_paths_json") or "").strip()
+    if not raw:
+        return []
+    try:
+        values = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise ValueError(
+            f"镜头 {row.get('scene', '')} 的 reference_image_paths_json 不是有效 JSON"
+        ) from exc
+    if not isinstance(values, list) or not values:
+        raise ValueError(f"镜头 {row.get('scene', '')} 的 R2V 参考图列表不能为空")
+    paths = [Path(str(value)).expanduser().resolve() for value in values]
+    if len(paths) > 7:
+        raise ValueError(f"镜头 {row.get('scene', '')} 的 R2V 参考图超过 7 张")
+    if len(set(paths)) != len(paths):
+        raise ValueError(f"镜头 {row.get('scene', '')} 的 R2V 参考图重复")
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise ValueError(
+            f"镜头 {row.get('scene', '')} 的 R2V 参考图缺失：{', '.join(missing)}"
+        )
+    storyboard_path = str(row.get("storyboard_image_path") or "").strip()
+    storyboard_reference_mode = str(
+        row.get("storyboard_reference_mode") or "runtime"
+    ).strip()
+    if storyboard_path and storyboard_reference_mode == "runtime":
+        if paths[-1] != Path(storyboard_path).expanduser().resolve():
+            raise ValueError(f"镜头 {row.get('scene', '')} 的 runtime 语义故事板必须是最后一张参考图")
+    elif storyboard_path and storyboard_reference_mode == "director_only":
+        if Path(storyboard_path).expanduser().resolve() in paths:
+            raise ValueError(f"镜头 {row.get('scene', '')} 的 director_only 语义故事板不得上传")
+    elif storyboard_reference_mode not in {"runtime", "director_only"}:
+        raise ValueError(f"镜头 {row.get('scene', '')} 的 storyboard_reference_mode 无效")
+    return paths
+
+
+def create_provider_task(
+    *,
+    client: object,
+    is_toapis: bool,
+    model: str,
+    prompt: str,
+    image_path: Path,
+    reference_paths: list[Path],
+    ratio: str,
+    duration: float,
+    resolution: str | None,
+    frames: int | None,
+    seconds: str,
+    size: str,
+    parameter_style: str,
+    camera_fixed: bool,
+    watermark: bool,
+    extra_body: dict[str, object] | None,
+):
+    if reference_paths:
+        if not is_toapis or not hasattr(client, "create_reference_task"):
+            raise ValueError("Reference-to-Video 任务当前只允许通过 ToAPIs 适配器提交")
+        return client.create_reference_task(
+            model=model,
+            prompt=prompt,
+            reference_paths=reference_paths,
+            ratio=ratio,
+            seconds=seconds,
+            resolution=resolution or size,
+            extra_body=extra_body,
+        )
+    return client.create_task(
+        model=model,
+        prompt=prompt,
+        image_path=image_path,
+        ratio=ratio,
+        duration=duration,
+        resolution=resolution,
+        frames=frames,
+        seconds=seconds,
+        size=size,
+        parameter_style=parameter_style,
+        camera_fixed=camera_fixed,
+        watermark=watermark,
+        extra_body=extra_body,
+    )
 
 
 def _discover_project_root(jobs_csv: Path) -> Path | None:
@@ -274,7 +300,7 @@ def main() -> None:
     parser.add_argument(
         "--seconds",
         default=os.getenv("VIDEO_SECONDS", ""),
-        help="供应商接口生成秒数；ToAPIs grok-video-1.0 仅支持 6/10 秒，1.5 支持 1–15 秒",
+        help="供应商接口生成秒数；ToAPIs grok-video-1.0 仅支持 6/10 秒",
     )
     parser.add_argument("--size", default=os.getenv("VIDEO_SIZE", ""), help="视频清晰度，例如 720P 或 1080P")
     parser.add_argument("--timing-mode", choices=["frames", "duration"], default="frames", help="默认用 frames 支持小数秒")
@@ -289,7 +315,6 @@ def main() -> None:
     parser.add_argument("--max-wait-seconds", default=1800, type=int)
     parser.add_argument("--max-poll-errors", default=12, type=int, help="轮询任务状态时允许的连续临时网络错误次数")
     parser.add_argument("--submit-only", action="store_true", help="只创建任务，不轮询下载")
-    parser.add_argument("--submit-all-first", action="store_true", help="先批量提交待生成任务，再逐个轮询下载；可减少服务端排队导致的串行等待")
     parser.add_argument(
         "--max-submit-first",
         default=int(os.getenv("VIDEO_MAX_SUBMIT_FIRST", "20")),
@@ -310,16 +335,16 @@ def main() -> None:
         )
 
     is_toapis = urlparse(args.base_url).netloc.lower() in {"toapis.com", "www.toapis.com"}
+    if is_toapis and args.model.strip().lower() != GROK_VIDEO_1_0_MODEL:
+        raise ValueError(
+            f"当前 ToAPIs 正式生产只允许 {GROK_VIDEO_1_0_MODEL}，收到：{args.model!r}"
+        )
     configured_model = saved_video_model()
     same_configured_toapis_model = is_toapis and args.model.strip() == configured_model
     if not args.seconds.strip():
         configured_seconds = saved_video_adapter_value("default_seconds", "") if same_configured_toapis_model else ""
         if is_toapis:
-            fallback_seconds = (
-                TOAPIS_DEFAULT_SECONDS
-                if args.model.strip().lower() == TOAPIS_DEFAULT_MODEL
-                else TOAPIS_LEGACY_DEFAULT_SECONDS
-            )
+            fallback_seconds = TOAPIS_DEFAULT_SECONDS
         else:
             fallback_seconds = DEFAULT_SECONDS
         args.seconds = configured_seconds or fallback_seconds
@@ -387,7 +412,7 @@ def main() -> None:
         write_jobs_csv(args.jobs_csv.expanduser(), rows)
 
     batch_submit_limited = False
-    if args.submit_all_first and not args.dry_run and not args.poll_existing:
+    if not args.dry_run and not args.poll_existing:
         assert client is not None
         submitted = 0
         in_flight = sum(
@@ -416,6 +441,7 @@ def main() -> None:
                 )
                 break
             image_path = args.images_dir.expanduser() / row["image_filename"]
+            reference_paths = row_reference_paths(row)
             duration = row_duration_value(row, args.duration)
             frames = int(row["frames"]) if args.timing_mode == "frames" and row.get("frames", "").strip() else None
             request_seconds = row_request_seconds(
@@ -433,10 +459,13 @@ def main() -> None:
                     row["client_business_id"] = str(request_extra.get("client_business_id") or "")
                 if contract_bound:
                     assert_request_contract_binding(project_dir, "image_video", row)
-                created = client.create_task(
+                created = create_provider_task(
+                    client=client,
+                    is_toapis=is_toapis,
                     model=args.model,
                     prompt=request_prompt,
                     image_path=image_path,
+                    reference_paths=reference_paths,
                     ratio=args.ratio,
                     duration=duration,
                     resolution=args.resolution.strip() or None,
@@ -473,7 +502,7 @@ def main() -> None:
             print(f"已刷新审核页：{review_html}")
             return
 
-    if args.submit_all_first and not args.dry_run and (args.max_submit_first or batch_submit_limited):
+    if not args.dry_run and (args.max_submit_first or batch_submit_limited):
         selected_rows = [
             row
             for row in selected_rows
@@ -505,20 +534,35 @@ def main() -> None:
             )
             if args.dry_run:
                 image_path = args.images_dir.expanduser() / row["image_filename"]
+                reference_paths = row_reference_paths(row)
                 request_prompt = provider_prompts[row.get("scene", "")]
                 if is_toapis:
                     request_row = dict(row)
                     bind_provider_request(request_row, request_prompt, request_seconds)
                     request_extra = row_extra_body(args.jobs_csv, request_row, extra_body, model=args.model)
-                    body = build_toapis_task_body(
-                        model=args.model,
-                        prompt=request_prompt,
-                        image_url=f"UPLOAD_REQUIRED:{image_path.name}",
-                        ratio=args.ratio,
-                        seconds=request_seconds,
-                        resolution=args.resolution.strip() or args.size,
-                        extra_body=request_extra,
-                    )
+                    if reference_paths:
+                        body = build_toapis_reference_task_body(
+                            model=args.model,
+                            prompt=request_prompt,
+                            reference_urls=[
+                                f"https://upload.required/{index:02d}-{path.name}"
+                                for index, path in enumerate(reference_paths, start=1)
+                            ],
+                            ratio=args.ratio,
+                            seconds=request_seconds,
+                            resolution=args.resolution.strip() or args.size,
+                            extra_body=request_extra,
+                        )
+                    else:
+                        body = build_toapis_task_body(
+                            model=args.model,
+                            prompt=request_prompt,
+                            image_url=f"UPLOAD_REQUIRED:{image_path.name}",
+                            ratio=args.ratio,
+                            seconds=request_seconds,
+                            resolution=args.resolution.strip() or args.size,
+                            extra_body=request_extra,
+                        )
                 else:
                     body = build_create_task_body(
                         model=args.model,
@@ -546,6 +590,7 @@ def main() -> None:
                 task_id = row.get("task_id", "").strip()
                 if not task_id:
                     image_path = args.images_dir.expanduser() / row["image_filename"]
+                    reference_paths = row_reference_paths(row)
                     print(f"创建任务 {row['scene']}：{row['image_filename']}", flush=True)
                     assert client is not None
                     request_prompt = provider_prompts[row.get("scene", "")]
@@ -555,10 +600,13 @@ def main() -> None:
                         row["client_business_id"] = str(request_extra.get("client_business_id") or "")
                     if contract_bound:
                         assert_request_contract_binding(project_dir, "image_video", row)
-                    created = client.create_task(
+                    created = create_provider_task(
+                        client=client,
+                        is_toapis=is_toapis,
                         model=args.model,
                         prompt=request_prompt,
                         image_path=image_path,
+                        reference_paths=reference_paths,
                         ratio=args.ratio,
                         duration=duration,
                         resolution=args.resolution.strip() or None,

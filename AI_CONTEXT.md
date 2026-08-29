@@ -1,96 +1,77 @@
 # AI 阅读入口
 
-本文是任何新 AI、维护者或审查者理解本工程的最短路径。先读本文，再按任务需要读取链接文档，不要无目的遍历整个仓库、历史运行目录或媒体文件。
+本文是新 Codex 任务、维护者和审查者理解工程的最短路径。当前生产系统与旧 Story Agent 已分家；不要从旧 DAG、工作台或历史运行目录开始理解工程。
 
 ## 一句话定义
 
-这是一个面向儿童故事视频生产的持久化 Agent 系统。正常入口只接受一段横屏绿幕口播原片；系统派生文本、故事画面、图生视频、配乐、横屏成片、竖屏发布视频、封面文案、PPT、朗读标注和客户资料包。
+这是一个由 Codex 前台主导的儿童故事 Agentic Workflow。用户提供确认文本和已调色横屏绿幕视频；Codex 根据真实产物动态规划并调用确定性模块，使用轻量账本、独立审核、QA 和 SHA-256 回执完成视频、发布物料、封面、PPT 与资料包。
 
-Codex 是用户入口，`story_agent.py` 是持久执行脊柱，`story_agent_runtime.py` 定义阶段图、状态、预算、并行资源和审核合同。工作台仅作诊断与旧流程兼容。
+## 唯一入口
+
+- 用户入口：当前 Codex 任务。
+- 生产策略：`skills/story-full-auto/SKILL.md`。
+- 内部控制入口：`story_pipeline.py`。
+- 状态事实源：项目 `99_项目状态/story_run.json`。
+- 旧 `story_agent.py` 不是生产入口；其实现位于 `legacy/story_agent_v3/`。
 
 ## 必读顺序
 
-1. [`AGENTS.md`](AGENTS.md)：不可破坏规则。
-2. [`docs/architecture/overall-architecture.md`](docs/architecture/overall-architecture.md)：五层架构和数据流。
-3. [`docs/architecture/stage-dag.md`](docs/architecture/stage-dag.md)：V3.5 当前的 38 个阶段、依赖和并行边界。
-4. [`docs/architecture/model-routing.md`](docs/architecture/model-routing.md)：Sol/Luna 两角色路由。
-5. [`docs/contracts/review-and-safety.md`](docs/contracts/review-and-safety.md)：审核、哈希、预算和密钥合同。
-6. [`docs/operations/runbook.md`](docs/operations/runbook.md)：提交、启动、恢复、诊断和验证。
-7. [`docs/postmortems/2026-08-lizard-tail.md`](docs/postmortems/2026-08-lizard-tail.md)：《小壁虎借尾巴》真实生产复盘。
-8. [`docs/baselines/V3_BASELINE_2026-08-12.md`](docs/baselines/V3_BASELINE_2026-08-12.md)：正式 V3 能力边界、冻结规则和证据入口。
-9. [`docs/baselines/V3_FEEDBACK_REGISTER_XIAOBIHU.md`](docs/baselines/V3_FEEDBACK_REGISTER_XIAOBIHU.md)：用户终验问题、模块归因和根因。
-10. [`docs/roadmaps/V3.5_QUALITY_AND_MODULARIZATION.md`](docs/roadmaps/V3.5_QUALITY_AND_MODULARIZATION.md)：V3.5 范围与非目标。
-11. [`docs/contracts/story-production-contract.md`](docs/contracts/story-production-contract.md)：合同前置、七类合同、锁和消费者失效语义。
-12. [`docs/roadmaps/V3.5_M2_CLOSEOUT_2026-08-17.md`](docs/roadmaps/V3.5_M2_CLOSEOUT_2026-08-17.md)：Milestone 2 的 16 个实现提交、证据边界和当前安全点。
-13. [`docs/architecture/module-ports.md`](docs/architecture/module-ports.md)：M3-3A、M3-3B 与 M3-3C 十个 Port/Adapter、Product/Quality Policy 边界、Registry、双锁传播与 mock 注入。
-14. [`docs/roadmaps/V3.5_M3_CLOSEOUT_2026-08-19.md`](docs/roadmaps/V3.5_M3_CLOSEOUT_2026-08-19.md)：Milestone 3 的十 Port 对照、离线总回归、行为不变量和收口安全点。
+1. [`AGENTS.md`](AGENTS.md)：不可破坏规则和新旧边界。
+2. [`docs/architecture/execution-chain.md`](docs/architecture/execution-chain.md)：逐步说明谁决策、谁执行、Schema 做什么、结果与记录去哪里。
+3. [`docs/architecture/codex-native-story-pipeline.md`](docs/architecture/codex-native-story-pipeline.md)：当前架构、数据流和观察方法。
+4. [`skills/story-full-auto/SKILL.md`](skills/story-full-auto/SKILL.md)：总生产策略。
+5. [`skills/story-full-auto/references/codex-native-workflow.md`](skills/story-full-auto/references/codex-native-workflow.md)：并行工作包与汇合顺序。
+6. [`skills/story-r2v-director/SKILL.md`](skills/story-r2v-director/SKILL.md)：R2V 导演、资产与连续性规范。
+7. [`skills/story-full-auto/references/delivery-contract.md`](skills/story-full-auto/references/delivery-contract.md)：最终交付合同。
+8. [`legacy/story_agent_v3/LEGACY.md`](legacy/story_agent_v3/LEGACY.md)：仅在审计旧项目或修改兼容层时读取。
 
-## 核心代码地图
+## 当前代码地图
 
-| 文件 | 责任 |
-| --- | --- |
-| `story_agent.py` | 用户任务、阶段执行、DAG worker、模型路由、恢复与 supervisor |
-| `story_agent_runtime.py` | manifest v2、38 阶段 DAG、资源锁、预算、审核与哈希合同 |
-| `story_contracts.py` | Story Production Contract Schema/Python 验证和 provenance 规则 |
-| `story_contract_runtime.py` | 合同生成输入链、审核、锁、消费者 projection/receipt 和只读诊断 |
-| `story_contract_consumers.py` | 六类消费者的最小编译投影和确定性 render/content spec |
-| `artifact_semantic_plan.py` | 从已锁合同确定性编译逐产物语义呈现计划、互斥规则和失效校验 |
-| `visual_sample_gate.py` | 条件式视觉小样计划、三层审核、P0 门禁和确定性小样锁 |
-| `story_workflow.py` | 把阶段翻译为本地脚本、FFmpeg 和产品制作命令 |
-| `story_project.py` | 项目目录、产物检测、机器 QA、交付和内部报告 |
-| `story_semantics.py` | 标题、主持人口播、正文、道理和结尾的语义合同 |
-| `video_provider_adapter.py` | 视频供应商、模型能力、时长与成本接口 |
-| `story_module_ports.py` / `story_module_registry.py` / `story_module_adapters.py` | M3 版本化 Port kernel、显式 Registry、十个 production adapter 与 deterministic mock |
-| `run_image_video_jobs.py` | 视频任务提交、轮询、下载和逐镜时长 |
-| `video_motion.py` | 逐镜动作计划、上下文相关运动 QA、provider receipt 与局部返工证据 |
-| `production_keying.py` / `keying_quality.py` | 正式 keying 滤镜事实源、分区证据、机器 QA 与 preset 锁 |
-| `release_geometry.py` / `release_video.py` | Demo geometry 继承、竖屏布局、画框完整性、尾帧和发布渲染 |
-| `cover_quality.py` | 六张封面血缘、确定性标题/Logo、安全区和 creative base 审核合同 |
-| `product_text_projection.py` / `product_quality.py` / `product_package.py` | public-text 投影、PPT/文稿/标注 currentness、示范视频和客户资料包 |
-| `publish_package.py` | 文案和发布物料兼容入口 |
+| 文件/目录 | 责任 |
+|---|---|
+| `story_pipeline.py` | 唯一受支持的内部状态控制入口；转交轻量账本命令并描述架构 |
+| `story_run.py` | 六个工作包、成本、当前产物、哈希、恢复与最终封口 |
+| `story_evidence.py` | 与旧 Runtime 解耦的通用审核 bundle/currentness 能力 |
+| `shot_storyboard_pipeline.py` | 资产审核后逐镜生成/封存故事板，并同源编译 R2V 与 PPT 消费者 |
+| `static_ppt_contract.py` | 动态导演镜头页数、双版静态 PPT 和客户目录交付回执 |
+| `story_workflow.py` | 确定性工程命令的兼容汇入口，不负责总调度 |
+| `story_project.py` | 项目路径、素材发现、部分 QA 和交付工具 |
+| `video_provider_adapter.py` / `run_image_video_jobs.py` | 视频供应商能力解析、付费前门禁、提交/轮询/下载 |
+| `assemble_r2v_story.py` / `r2v_group_qa.py` / `r2v_local_postfix.py` | R2V 组装、安全后处理和整组 QA |
+| `production_keying.py` / `keying_quality.py` / `rvm_keying.py` | 抠像、候选证据与锁定 |
+| `release_geometry.py` / `release_video.py` | A/B/C 发布布局、故事框遮挡与正式渲染 |
+| `product_package.py` / `product_quality.py` | 示范视频、文稿、朗读标注、PPT 与双版客户资料包 |
+| `publish_package.py` / `cover_quality.py` | 双账号文案与六张封面 |
+| `legacy/story_agent_v3/` | 已退役固定 38 阶段后台系统，只读兼容与审计 |
+
+## 架构边界
+
+- Skill 是策略，不是进程、调度器或完成证据。
+- Codex 前台是唯一指挥官；不得启动嵌套 `codex exec` 或旧 supervisor。
+- `story_pipeline.py` 只保存事实，不替 Codex 作创意判断，也不恢复旧 stage。
+- 小型模块可以复用；任何通用能力应位于根目录中性模块，不得从 Legacy 反向导入。
+- 供应商只能通过 adapter 进入；密钥只能来自环境或安全存储。
+- 文件存在和命令成功不等于 QA 通过。
 
 ## 外部能力
 
 - 图片：Codex ImageGen。
-- 视频：通过 `video_provider_adapter.py`；当前首选 ToAPIs Grok Video 1.0，供应商/模型保持可插拔。
-- 音乐：Ego Browser/Suno，必须经过带输入哈希的音乐 QA。
+- 视频：`video_provider_adapter.py` 解析的供应商，当前主线为 ToAPIs Grok R2V。
+- 音乐：Suno 工作流及带输入哈希的音乐 QA。
 - 媒体：FFmpeg/ffprobe。
-- 文档：LibreOffice、python-docx、PPTX 工具链。
-
-## 两角色模型合同
-
-- 指挥官：`gpt-5.6-sol`，负责关键判断和独立审核。
-- 工人：`gpt-5.6-luna`，负责生产、工具执行和确定性工作。
-- 当前配置使用 Sol Medium 与 Luna High；Max/X-high 只允许在明确升级后使用，不是常规默认值。
-- 独立审核必须与生产上下文隔离，不能让生产者自证完成。
-
-## 不要做
-
-- 不要把真实密钥写入代码、Markdown、日志、manifest 或命令参数。
-- 不要提交 `auto-project/`、媒体、客户资料、浏览器会话或原始对话导出。
-- 不要把文件存在或命令成功当成 QA 通过。
-- 不要绕过 SHA-256 绑定审核或直接手改阶段为 passed。
-- 不要在通用代码中写死具体故事、角色、道理或历史项目路径。
-- 不要删除、覆盖用户原片。
+- 文档和 PPT：python-docx、PPTX/Artifact 工具和 LibreOffice 渲染验证。
 
 ## 修改后的最低验证
 
 ```bash
 python3 -m unittest discover -s tests -v
-python3 story_agent.py --help
+python3 story_pipeline.py --help
+python3 story_pipeline.py describe
+python3 story_pipeline.py status --help
 ```
 
-修改子命令时同时运行对应 `--help`；修改 `skills/story-full-auto` 时运行 skill-creator 的 `quick_validate.py`。
+修改 `skills/story-full-auto` 后运行 skill-creator 的 `quick_validate.py`。只有修改 Legacy 兼容层时才额外运行 `python3 story_agent.py --help`。
 
-## 当前已知重点
+## Legacy 原则
 
-- 《小壁虎借尾巴》已经冻结为正式 V3 基线：工程交付和内部 QA 完成，用户产品验收不通过，现有产物不重做。
-- 最大缺口不是“审核没运行”，而是合同本身未先接受产品意图审核；高分审核无法发现错误画风、奇怪身份标记、尺度、版式和用户审美问题。
-- V3.5 继续使用 Codex + GPT、ImageGen、Grok、Suno 和 FFmpeg；当前没有接 DeepSeek、去 Codex 或做多供应商自动路由。
-- 当前成本字段名以 CNY 表示，但 ToAPIs 模型页按美元报价；在修正前不能把本地估算当作人民币实扣。
-- 优化应先解决可观察性、增量返工、上下文包和真实账单，再比较模型档位。
-- V3.5 Milestone 1 已完成合同前置：新任务在批量生产前必须形成七类合同，由 Luna 起草、Sol 独立审核、Runtime 确定性锁定；V3 冻结项目仅在绑定的历史资格成立时 legacy passthrough。
-- Milestone 2 已完成工程实现：2A 语义计划、条件式视觉小样与风格自适应审核；2B 逐镜动作计划、上下文运动门禁、正式 provider provenance 与单镜返工；2C 生产同链 keying 证据、Demo Logo/字幕/geometry receipt、Release 最小水平修正和确定性布局；2D 封面血缘与品牌排版、creative base 原图审核，以及 PPT/客户文稿/朗读标注/资料包的语义与来源 currentness。
-- M2 的完成口径是“通用质量机制、离线 fixture、模拟 provider 和失效门禁已实现”。真实 ImageGen/Grok/Suno、真实人物素材、完整新故事 canary 和用户产品验收仍未完成，不得把 M2 工程完成写成产品质量已经验证。
-- 当前增量失效只到模块族级，不是完整逐镜头 dependency graph；请求级账本、context pack、Agent tree/可观察性、成本币种/真实账单和细粒度 Runtime 重试仍属于后续 Milestone。
-- V3.5 Milestone 3 engineering implementation 已收口：M3-3A/3B/3C 形成 `StorySemanticsPort`、`VisualDesignPort`、`ImageGeneratorPort`、`VideoGeneratorPort`、`MusicProviderPort`、`KeyerPort`、`ProductPackagePort`、`CompositorPort`、`ReleaseLayoutPort`、`PublishAssetPort` 十个可替换边界，M3-Z 以离线跨 Port smoke、production parity、Schema/Protocol 与完整回归封箱。production-default 仍委托原 classifier、审核锁定的 Story Contract projection、Codex/ImageGen、Codex/Ego Browser/Suno 和原本地 filesystem/FFmpeg/Pillow executor；Product/Quality Policy、持久事实源、Story Production Contract 和 38-stage DAG 未改变。真实新故事 Canary 与用户验收未运行，M4 未开始。
+旧 V3 的固定阶段、后台恢复和 Dashboard 是历史教训，不继续演进。根目录兼容模块暂时保留，以便旧项目、测试和审计仍能导入；新故事、现行 Skill、`story_pipeline.py` 和新模块不得调用它。未来删除 Legacy 必须另有迁移测试证明历史数据和审计证据已有替代。

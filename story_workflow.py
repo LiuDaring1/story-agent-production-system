@@ -35,6 +35,7 @@ from story_contract_consumers import (
     release_argument_overrides,
 )
 from artifact_semantic_plan import load_current_artifact_semantic_plan, semantic_plan_path, selected_line_indices
+from r2v_retry_policy import evaluate_quality_redos
 
 from story_project import (
     auto_keying,
@@ -170,6 +171,12 @@ def main() -> None:
     release_project.add_argument("--project-dir", required=True, type=Path)
     release_project.add_argument("--variant", choices=["auto", "both", "main", "library"], default="auto")
     release_project.add_argument("--story-contract-context", type=Path)
+    release_project.add_argument(
+        "--authorize-binding-repair",
+        default="",
+        metavar="REASON",
+        help="仅用于用户明确授权的规则/技术缺陷修复；必须写明原因，旧成片会自动备份并消耗一次修复额度",
+    )
 
     release_preview = subparsers.add_parser("preview-release-project", help="可选刷新当前发布视频预览帧，不编码完整视频")
     release_preview.add_argument("--project-dir", required=True, type=Path)
@@ -237,7 +244,7 @@ def main() -> None:
     normalize.add_argument("--slug", required=True)
     normalize.add_argument("--count", default=0, type=int)
 
-    pacing = subparsers.add_parser("analyze-pacing", help="分析手动换行分镜是否适合 Grok Video 1.5（1-15 秒，默认 8 秒）图生视频")
+    pacing = subparsers.add_parser("analyze-pacing", help="分析手动换行分镜是否适合 Grok Video 1.0（6/10 秒）图生视频")
     pacing.add_argument("--story-file", required=True, type=Path)
     pacing.add_argument("--output-dir", required=True, type=Path)
     pacing.add_argument("--slug", default="story")
@@ -262,7 +269,7 @@ def main() -> None:
     timing.add_argument("--whisper-model", default="base")
     timing.add_argument("--language", default="zh")
     timing.add_argument("--whisper-model-dir", default=None, type=Path)
-    timing.add_argument("--max-duration", default=8.0, type=float, help="单镜头推荐默认 8 秒；Grok Video 1.5 支持 1-15 秒")
+    timing.add_argument("--max-duration", default=10.0, type=float, help="单镜头推荐上限 10 秒；Grok Video 1.0 支持 6/10 秒")
     timing.add_argument(
         "--duration-mode",
         choices=["fixed", "adaptive", "adaptive-seconds"],
@@ -301,7 +308,6 @@ def main() -> None:
     generate.add_argument("--scenes", default="")
     generate.add_argument("--limit", default=0, type=int)
     generate.add_argument("--dry-run", action="store_true")
-    generate.add_argument("--submit-all-first", action="store_true", help="先批量提交待生成任务，再逐个轮询下载")
     generate.add_argument("--max-submit-first", default=20, type=int, help="批量提交模式下一次最多保留多少个已提交未完成任务；0 表示不限制")
     generate.add_argument("--prompt-review-csv", default="", help="提示词确认页导出的 prompt_review_decisions.csv")
     generate.add_argument("--skip-prompt-review", action="store_true", help="跳过图生视频提示词确认闸门")
@@ -485,6 +491,11 @@ def main() -> None:
     product.add_argument("--preview-times", default="0.8,1.5,2.5,37,92")
     product.add_argument("--music-volume", default=0.22, type=float)
     product.add_argument("--narration-volume", default=1.0, type=float)
+    product.add_argument("--director-plan", type=Path, help="Codex 原生导演计划；封存静态 PPT 模式必填")
+    product.add_argument("--shot-storyboard-compile-receipt", type=Path, help="逐镜故事板同源编译回执")
+    product.add_argument("--static-ppt-plan", type=Path, help="由封存故事板编译的静态 PPT 计划")
+    product.add_argument("--static-ppt-with-subtitles", type=Path, help="已按计划生成的含字幕静态 PPTX")
+    product.add_argument("--static-ppt-without-subtitles", type=Path, help="已按计划生成的无字幕静态 PPTX")
 
     args = parser.parse_args()
     module_profile = resolve_module_profile(args.module_profile)
@@ -587,7 +598,12 @@ def main() -> None:
         report = doctor_project(args.project_dir)
         print(f"已生成工程体检报告：{report}")
     elif args.command == "package-release-project":
-        run_package_release_project(args.project_dir, args.variant, story_contract_context=args.story_contract_context)
+        run_package_release_project(
+            args.project_dir,
+            args.variant,
+            story_contract_context=args.story_contract_context,
+            authorized_binding_repair_reason=args.authorize_binding_repair,
+        )
     elif args.command == "preview-release-project":
         run_package_release_project(args.project_dir, args.variant, preview_times=args.times, preview_person_layouts=args.person_layouts, story_contract_context=args.story_contract_context)
     elif args.command == "release-layout-handoff":
@@ -761,9 +777,7 @@ def main() -> None:
             command.extend(["--limit", str(args.limit)])
         if args.dry_run:
             command.append("--dry-run")
-        if args.submit_all_first:
-            command.append("--submit-all-first")
-            command.extend(["--max-submit-first", str(args.max_submit_first)])
+        command.extend(["--max-submit-first", str(args.max_submit_first)])
         if args.dry_run:
             provider.invoke_batch(command, executor=run_module_command)
         else:
@@ -799,7 +813,6 @@ def main() -> None:
                 args.videos_dir,
                 "--scenes",
                 ",".join(str(scene) for scene in scenes),
-                "--submit-all-first",
                 "--execution-mode",
                 args.execution_mode,
             ],
@@ -1133,6 +1146,15 @@ def main() -> None:
         if args.preview_only:
             command.append("--preview-only")
             command.extend(["--preview-times", args.preview_times])
+        for option, value in (
+            ("--director-plan", args.director_plan),
+            ("--shot-storyboard-compile-receipt", args.shot_storyboard_compile_receipt),
+            ("--static-ppt-plan", args.static_ppt_plan),
+            ("--static-ppt-with-subtitles", args.static_ppt_with_subtitles),
+            ("--static-ppt-without-subtitles", args.static_ppt_without_subtitles),
+        ):
+            if value is not None:
+                command.extend([option, value])
         run_script("product_package.py", *command)
 
 
@@ -1239,6 +1261,7 @@ def release_encode_guard_action(
     binding_fingerprint: str,
     output_is_current: bool,
     max_technical_repairs: int = 1,
+    binding_repair_authorized: bool = False,
 ) -> str:
     """Choose reuse/start/technical-repair without reopening aesthetic loops."""
 
@@ -1248,14 +1271,16 @@ def release_encode_guard_action(
     if (
         same_binding
         and output_is_current
-        and previous.get("status") in {"completed", "adopted_existing"}
+        and previous.get("status") in {"completed", "completed_local_repair", "adopted_existing"}
     ):
         return "reuse"
+    repairs = int(previous.get("technical_repair_count") or 0)
+    if not same_binding and binding_repair_authorized and repairs < max_technical_repairs:
+        return "authorized_binding_repair"
     if not same_binding:
         return "block_binding_change"
-    repairs = int(previous.get("technical_repair_count") or 0)
     if repairs < max_technical_repairs and previous.get("status") in {
-        "running", "running_technical_repair", "failed_or_interrupted",
+        "running", "running_technical_repair", "running_authorized_binding_repair", "failed_or_interrupted",
         "completed", "adopted_existing",
     }:
         return "technical_repair"
@@ -1268,6 +1293,7 @@ def run_package_release_project(
     preview_times: str | None = None,
     preview_person_layouts: str | None = None,
     story_contract_context: Path | None = None,
+    authorized_binding_repair_reason: str = "",
 ) -> None:
     paths = project_paths(project_dir)
     is_preview = preview_times is not None
@@ -1281,7 +1307,7 @@ def run_package_release_project(
         # Full renders are expensive and irreversible enough that a reviewed
         # preview, bound to the exact preset/search/evidence hashes, is a hard
         # prerequisite even when this legacy CLI is invoked directly.
-        from story_agent_runtime import review_bundle_is_current, review_passes
+        from story_evidence import review_bundle_is_current, review_passes
 
         preview_bundle = paths.status / "reviews" / "release_preview_bundle.json"
         preview_review = paths.status / "reviews" / "release_preview_review.json"
@@ -1384,16 +1410,9 @@ def run_package_release_project(
     if story_logo is not None and watermark_logo is not None and story_logo.resolve() == watermark_logo.resolve():
         watermark_logo = None
     antipiracy_logo = first_existing(brand_assets.get("antipiracy_logo"), brand_assets.get("logo"))
-    if (
-        story_contract_context is None
-        and antipiracy_logo is not None
-        and story_logo is not None
-        and antipiracy_logo.resolve() == story_logo.resolve()
-    ):
-        # The reviewed official story Logo is already a deterministic brand
-        # element.  Do not reuse it as the moving anti-piracy watermark and
-        # accidentally show the same official mark twice in one frame.
-        antipiracy_logo = None
+    # Main and library are separate output videos.  The same reviewed program
+    # Logo may therefore be the fixed main mark and the moving library
+    # anti-piracy mark without ever appearing twice in one frame.
     if release_contract_payload is not None:
         story_logo, watermark_logo, antipiracy_logo = contract_release_brand_paths(
             release_contract_payload,
@@ -1434,6 +1453,8 @@ def run_package_release_project(
         if release_defaults.get("b_windows") and frame_a is None:
             missing.append("统一透明故事框 story_frame_a.png")
     if requested_variant in {"both", "library"}:
+        if antipiracy_logo is None:
+            missing.append("宝库号审核通过的移动防盗 Logo antipiracy_logo")
         if library_bg_video is None:
             missing.append("宝库号无字幕背景视频 story_no_subs_bgm.mp4")
         if library_plate is None and story_contract_context is None:
@@ -1653,6 +1674,7 @@ def run_package_release_project(
             previous,
             binding_fingerprint=fingerprint,
             output_is_current=output_is_current,
+            binding_repair_authorized=bool(authorized_binding_repair_reason.strip()),
         )
         if guard_action == "reuse":
             print(f"复用已绑定的 {selected_variant} 正式发布视频：{output}", flush=True)
@@ -1681,13 +1703,43 @@ def run_package_release_project(
             })
             print(f"保留并接管已有 {selected_variant} 正式发布视频：{output}", flush=True)
             return
-        technical_repair = guard_action == "technical_repair"
+        authorized_binding_repair = guard_action == "authorized_binding_repair"
+        technical_repair = guard_action in {"technical_repair", "authorized_binding_repair"}
         technical_repair_count = int(previous.get("technical_repair_count") or 0) + int(technical_repair)
+        repair_authorization: dict[str, Any] = {}
+        if authorized_binding_repair:
+            if not output_is_current:
+                raise RuntimeError(
+                    f"authorized_binding_repair_requires_current_output:{selected_variant}; "
+                    "旧成片与门禁 SHA 不一致，不能建立可追溯备份。"
+                )
+            backup_dir = paths.status / "release_encode_backups"
+            backup_dir.mkdir(parents=True, exist_ok=True)
+            backup = backup_dir / f"{selected_variant}_{recorded_sha[:12]}.mp4"
+            if not backup.is_file():
+                shutil.copy2(output, backup)
+            backup_sha = sha256_file(backup)
+            if backup_sha != recorded_sha:
+                raise RuntimeError(f"authorized_binding_repair_backup_sha_mismatch:{selected_variant}")
+            repair_authorization = {
+                "repair_authorization": {
+                    "reason": authorized_binding_repair_reason.strip(),
+                    "authorized_at": datetime.now().isoformat(timespec="seconds"),
+                    "previous_binding_fingerprint": str(previous.get("binding_fingerprint") or ""),
+                    "previous_output_sha256": recorded_sha,
+                    "backup": str(backup),
+                    "backup_sha256": backup_sha,
+                }
+            }
         started_at = datetime.now().isoformat(timespec="seconds")
         save_json(guard, {
             "schema_version": "story-release-encode-guard/v1",
             "variant": selected_variant,
-            "status": "running_technical_repair" if technical_repair else "running",
+            "status": (
+                "running_authorized_binding_repair"
+                if authorized_binding_repair
+                else "running_technical_repair" if technical_repair else "running"
+            ),
             "attempt_count": 1,
             "technical_repair_count": technical_repair_count,
             "max_technical_repairs": 1,
@@ -1696,6 +1748,7 @@ def run_package_release_project(
             "input_artifact_hashes": file_bindings,
             "output": str(output),
             "started_at": started_at,
+            **repair_authorization,
         })
         try:
             run_script("release_video.py", *command)
@@ -1714,6 +1767,7 @@ def run_package_release_project(
                 "started_at": started_at,
                 "finished_at": datetime.now().isoformat(timespec="seconds"),
                 "error": f"{type(exc).__name__}: {exc}",
+                **repair_authorization,
             })
             raise
         if not output.is_file() or output.stat().st_size <= 0:
@@ -1732,6 +1786,7 @@ def run_package_release_project(
             "output_sha256": sha256_file(output),
             "started_at": started_at,
             "finished_at": datetime.now().isoformat(timespec="seconds"),
+            **repair_authorization,
         })
 
     if requested_variant in {"both", "main"}:
@@ -1766,8 +1821,8 @@ def reset_release_preview_dir(preview_dir: Path) -> None:
 def important_preview_images(preview_dir: Path) -> list[Path]:
     names = [
         "preview_contact_sheet.png",
-        "main_002s_a_h84.png",
-        "main_002s_a_h90.png",
+        "main_002s_a_native_anchor.png",
+        "main_002s_a_native_right.png",
         "main_037s_b.png",
         "library_002s.png",
         "library_037s.png",
@@ -1904,15 +1959,14 @@ def run_release_layout_handoff(project_dir: Path, times: str, person_layouts: st
         "```",
         "",
         "## 自动候选布局",
-        "- h78: person_height_ratio=0.78, person_x=1280, person_y=252",
-        "- h84: person_height_ratio=0.84, person_x=1230, person_y=220",
-        "- h90: person_height_ratio=0.90, person_x=1190, person_y=188",
-        "- h96: person_height_ratio=0.96, person_x=1160, person_y=154",
+        "- native_left/native_anchor/native_right：全部保持 1920×1080 抠像层 1:1，仅比较水平锚点",
+        "- detected_person_bbox 只作测量，禁止用作裁切框",
+        "- A 镜使用开场中性帧确定唯一固定 X；后续大手势保持人物层位置不变",
         "",
         "## Codex 应执行",
         "1. 先看 preview_contact_sheet.png，再逐张查看候选 A 镜、B 镜和宝库号预览。",
-        "2. 选出最终人像布局，必要时微调 person_x/person_y/person_height_ratio。",
-        "3. 写回 keying_preset.json；后续普通预览只看最终参数，不再保留候选猜参数。",
+        "2. 以开头中性帧人物中轴对齐右侧空白矩形中心，只计算一次固定 person_x。",
+        "3. 使用 person_height_ratio=1.0、person_crop=null、person_y=0 和一个固定 person_x；整段沿用同一位置。",
         "4. 再运行 preview-release-project 确认最终预览，确认后才点击工作台 ⑭ 正式编码。",
     ]
     handoff.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -1933,7 +1987,10 @@ def run_publish_package_project(
     story = manifest["story"]
     outputs = manifest["outputs"]
     inputs = manifest["inputs"]
-    story_text = first_existing(inputs.get("story_text"))
+    # New native runs bind the immutable confirmed TXT/MD in story_run.json.
+    # Prefer that hash-checked source over a customer DOCX discovered at the
+    # project root; publish_package.py intentionally consumes plain text.
+    story_text = confirmed_text_from_story_run(paths.status) or first_existing(inputs.get("story_text"))
     main_video = first_existing(outputs.get("main_release_video"), paths.release / "主账号发布视频.mp4")
     library_video = first_existing(outputs.get("library_release_video"), paths.release / "宝库号发布视频.mp4")
     if story_text is None:
@@ -2207,12 +2264,21 @@ def run_product_package_project(
     inputs = manifest["inputs"]
     outputs = manifest["outputs"]
     story_text = first_existing(inputs.get("story_text"))
+    confirmed_story_text = confirmed_text_from_story_run(paths.status)
     story_document_text = first_existing(outputs.get("consumer_manuscript"), story_text)
-    script_lines = first_existing(inputs.get("story_text"), paths.inputs / "story_source.txt")
+    script_lines = first_existing(confirmed_story_text, inputs.get("story_text"), paths.inputs / "story_source.txt")
     narration = first_existing(inputs.get("narration"), inputs.get("extracted_narration"))
     music = first_existing(paths.video_jobs / "music" / f"{story.get('slug')}_background_music.mp3", inputs.get("music"))
-    images_dir = paths.video_jobs / "images" if (paths.video_jobs / "images").exists() else paths.images / "images"
-    bg_with_sub = first_existing(outputs.get("background_video_with_sub"), paths.assembly / "story_sales_subs_bgm.mp4")
+    sealed_images_dir = sealed_storyboard_images_dir(paths.status)
+    images_dir = first_existing(
+        sealed_images_dir,
+        paths.video_jobs / "images",
+        paths.images / "images",
+    )
+    # Customer packages use the body-only sales subtitle projection.  The
+    # generic background_video_with_sub may also contain opening/closing
+    # presenter text and is therefore only a fallback.
+    bg_with_sub = first_existing(paths.assembly / "story_sales_subs_bgm.mp4", outputs.get("background_video_with_sub"))
     bg_no_sub = first_existing(outputs.get("background_video_no_sub"), paths.assembly / "story_no_subs_bgm.mp4")
     greenscreen = first_existing(inputs.get("greenscreen_video"))
     keying_preset = first_existing(outputs.get("keying_preset"), paths.release / "keying" / "keying_preset.json")
@@ -2229,6 +2295,7 @@ def run_product_package_project(
     # captions/timings without changing the document or annotation source.
     storyboard_text = first_existing(
         inputs.get("storyboard_text"),
+        confirmed_story_text,
         paths.inputs / f"{story.get('slug')}_storyboard_text.txt",
         story_text,
     )
@@ -2312,6 +2379,22 @@ def run_product_package_project(
         "--demo-logo-y",
         str(release_defaults.get("story_logo_y", 44)),
     ]
+    static_ppt_inputs = {
+        "--director-plan": first_existing(paths.status / "director" / "story_r2v_plan_draft.json"),
+        "--shot-storyboard-compile-receipt": first_existing(
+            paths.status / "storyboards" / "shot_storyboard_compile_receipt.json"
+        ),
+        "--static-ppt-plan": first_existing(paths.status / "product" / "static_ppt_plan.json"),
+        "--static-ppt-with-subtitles": first_existing(
+            paths.product / "构建中" / f"{story.get('name')}_静态故事PPT_含字幕.pptx"
+        ),
+        "--static-ppt-without-subtitles": first_existing(
+            paths.product / "构建中" / f"{story.get('name')}_静态故事PPT_无字幕.pptx"
+        ),
+    }
+    if all(static_ppt_inputs.values()):
+        for option, value in static_ppt_inputs.items():
+            command.extend([option, value])
     if story_contract_context is not None:
         # The semantic plan supersedes the older static product selector for
         # required_v1 projects. Loading revalidates lock, source and recompilation.
@@ -2360,6 +2443,51 @@ def run_product_package_project(
         qa_product(paths.root)
 
 
+def confirmed_text_from_story_run(status_dir: Path) -> Path | None:
+    """Return the hash-bound confirmed text from the native story ledger."""
+
+    run_file = status_dir / "story_run.json"
+    try:
+        payload = json.loads(run_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    record = payload.get("inputs", {}).get("confirmed_text", {})
+    if not isinstance(record, dict):
+        return None
+    path = Path(str(record.get("path") or "")).expanduser()
+    expected = str(record.get("sha256") or "").lower()
+    if path.suffix.lower() not in {".txt", ".md"} or not path.is_file() or len(expected) != 64:
+        return None
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return path if digest == expected else None
+
+
+def sealed_storyboard_images_dir(status_dir: Path) -> Path | None:
+    """Return the common directory of the current sealed storyboard images."""
+
+    manifest_path = status_dir / "storyboards" / "storyboard_manifest_sealed.json"
+    try:
+        payload = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    entries = payload.get("entries")
+    if payload.get("status") != "sealed" or not isinstance(entries, list) or not entries:
+        return None
+    images: list[Path] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            return None
+        path = Path(str(entry.get("image_path") or "")).expanduser()
+        expected = str(entry.get("image_sha256") or "").lower()
+        if not path.is_file() or len(expected) != 64:
+            return None
+        if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            return None
+        images.append(path)
+    parents = {path.parent.resolve() for path in images}
+    return next(iter(parents)) if len(parents) == 1 else None
+
+
 def build_product_text_sources_from_story_source(story_text: Path, subtitles_srt: Path, output_dir: Path) -> tuple[Path, Path]:
     story_lines = [
         line.strip()
@@ -2367,6 +2495,7 @@ def build_product_text_sources_from_story_source(story_text: Path, subtitles_srt
         if line.strip()
     ]
     cues = parse_simple_srt(subtitles_srt)
+    story_lines = _trim_story_source_opening_absent_from_subtitles(story_lines, cues)
     output_dir.mkdir(parents=True, exist_ok=True)
     patched_timings: list[dict] = []
     subtitle_start = _find_story_subtitle_start(cues, story_lines)
@@ -2421,6 +2550,42 @@ def build_product_text_sources_from_story_source(story_text: Path, subtitles_srt
     script_path.write_text("\n".join(story_lines) + "\n", encoding="utf-8")
     timings_path.write_text(json.dumps(patched_timings, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     return script_path, timings_path
+
+
+def _trim_story_source_opening_absent_from_subtitles(
+    story_lines: list[str],
+    cues: list[tuple[float, float, str]],
+) -> list[str]:
+    """Drop only a semantic opening prefix already handled by a title slot.
+
+    The native ledger's confirmed text may include a spoken title while the
+    assembled body subtitle SRT intentionally starts after the independent
+    title interval.  Product PPT timing consumes the body SRT, so it must use
+    the matching body suffix without treating the confirmed title as corrupt.
+    """
+
+    if not story_lines or not cues:
+        return story_lines
+    semantics = classify_story(story_lines)
+    opening_kinds = {
+        SemanticKind.TITLE,
+        SemanticKind.HOST_INTRO,
+        SemanticKind.STORY_ANNOUNCEMENT,
+    }
+    semantic_prefix_end = 0
+    for line_index in range(len(story_lines)):
+        if semantics.kind_at(line_index + 1) not in opening_kinds:
+            break
+        semantic_prefix_end = line_index + 1
+    subtitle_stream = "".join(normalize_story_text_for_alignment(cue[2]) for cue in cues)
+    matching_boundaries: list[int] = []
+    for boundary in range(semantic_prefix_end + 1):
+        candidate = "".join(
+            normalize_story_text_for_alignment(line) for line in story_lines[boundary:]
+        )
+        if candidate and subtitle_stream.startswith(candidate):
+            matching_boundaries.append(boundary)
+    return story_lines[max(matching_boundaries):] if matching_boundaries else story_lines
 
 
 def _find_story_subtitle_start(
@@ -2711,6 +2876,9 @@ def reset_redo_scenes(jobs_csv: Path, videos_dir: Path, decisions_csv: Path) -> 
         rows = list(reader)
         fieldnames = list(reader.fieldnames or [])
 
+    policy_rows = [row for row in rows if row.get("retry_policy_version", "").strip()]
+    approvals = evaluate_quality_redos(policy_rows, decisions) if policy_rows else {}
+
     backup_dir = videos_dir / ("_review_redo_backup_" + time.strftime("%Y%m%d_%H%M%S"))
     backup_dir.mkdir(parents=True, exist_ok=True)
     for row in rows:
@@ -2726,6 +2894,21 @@ def reset_redo_scenes(jobs_csv: Path, videos_dir: Path, decisions_csv: Path) -> 
                 row[key] = ""
         row["status"] = "todo"
         decision = decisions.get(f"{scene:02d}", {})
+        approval = approvals.get(f"{scene:02d}")
+        if approval is not None:
+            row["quality_retry_count"] = str(approval.next_retry_count)
+            row["quality_version"] = str(approval.next_retry_count + 1)
+            row["provider_attempt"] = str(int(row.get("provider_attempt") or "0") + 1)
+            row["retry_defect_code"] = approval.defect_code
+            row["retry_evidence"] = approval.evidence
+            row["retry_root_cause"] = approval.root_cause
+            row["retry_strategy"] = approval.retry_strategy
+            row["retry_defect_severity"] = approval.severity
+            row["v3_escalation_approved"] = (
+                "true" if approval.v3_escalation_approved else "false"
+            )
+            row["batch_retry_calibration_status"] = approval.batch_calibration_status
+            row["batch_retry_calibration_notes"] = approval.batch_calibration_notes
         row["notes"] = decision.get("notes", row.get("notes", ""))
         reviewed_prompt = _review_prompt(row, decision)
         if row.get("continuity_state") or row.get("visual_continuity_state"):
@@ -2735,7 +2918,12 @@ def reset_redo_scenes(jobs_csv: Path, videos_dir: Path, decisions_csv: Path) -> 
         row["review_status"] = "redo"
         row["review_notes"] = row["notes"]
 
-    for key in ["prompt", "review_status", "review_notes"]:
+    for key in [
+        "prompt", "notes", "review_status", "review_notes", "quality_retry_count", "quality_version",
+        "retry_defect_code", "retry_evidence", "retry_root_cause", "retry_strategy",
+        "retry_defect_severity", "v3_escalation_approved",
+        "batch_retry_calibration_status", "batch_retry_calibration_notes",
+    ]:
         if key not in fieldnames:
             fieldnames.append(key)
     with jobs_csv.open("w", encoding="utf-8-sig", newline="") as file:

@@ -150,18 +150,10 @@ class ProtocolOnlyFake:
 
 
 class ProductPackagePortTests(unittest.TestCase):
-    def test_dynamic_ppt_quartet_replaces_legacy_pair_in_advanced_package(self) -> None:
+    def test_static_ppt_pair_cannot_be_disabled_by_legacy_flag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             sources = package_sources(root)
-            dynamic: list[tuple[Path, str]] = []
-            for label in ("含字幕·自动播放", "无字幕·自动播放", "含字幕·人工控场", "无字幕·人工控场"):
-                path = root / "sources" / f"dynamic-{label}.pptx"
-                path.write_bytes(label.encode("utf-8"))
-                dynamic.append((path, f"故事PPT：通用故事（{label}）.pptx"))
-            shared_clip = root / "sources" / "001-S01.mp4"
-            shared_clip.write_bytes(b"shared-clip")
-            dynamic.append((shared_clip, "PPT动态素材/001-S01.mp4"))
             _base, advanced, _source_map = create_package_dirs(
                 story_name="通用故事",
                 output_root=root / "products",
@@ -176,13 +168,33 @@ class ProductPackagePortTests(unittest.TestCase):
                 ppt_no_sub=sources["ppt_no_sub"],
                 a_only_video=sources["a_only_video"],
                 include_legacy_ppts=False,
-                additional_advanced_items=dynamic,
             )
             names = {path.name for path in advanced.iterdir()}
-            self.assertTrue({Path(filename).name for _path, filename in dynamic if "/" not in filename}.issubset(names))
-            self.assertNotIn("故事PPT：通用故事（含字幕）.pptx", names)
-            self.assertNotIn("故事PPT：通用故事（无字幕）.pptx", names)
-            self.assertEqual((advanced / "PPT动态素材" / "001-S01.mp4").read_bytes(), b"shared-clip")
+            self.assertIn("故事PPT：通用故事（含字幕）.pptx", names)
+            self.assertIn("故事PPT：通用故事（无字幕）.pptx", names)
+
+    def test_dynamic_ppt_assets_are_rejected_from_customer_package(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = package_sources(root)
+            clip = root / "sources" / "001-S01.mp4"
+            clip.write_bytes(b"shared-clip")
+            with self.assertRaisesRegex(ValueError, "禁止动态 PPT"):
+                create_package_dirs(
+                    story_name="通用故事",
+                    output_root=root / "products",
+                    story_docx=sources["story_docx"],
+                    music=sources["music"],
+                    annotation_docx=sources["annotation_docx"],
+                    demo_video=sources["demo_video"],
+                    background_image=sources["background_image"],
+                    bg_with_sub=sources["bg_with_sub"],
+                    bg_no_sub=sources["bg_no_sub"],
+                    ppt_with_sub=sources["ppt_with_sub"],
+                    ppt_no_sub=sources["ppt_no_sub"],
+                    a_only_video=sources["a_only_video"],
+                    additional_advanced_items=[(clip, "PPT动态素材/001-S01.mp4")],
+                )
 
     def test_schema_and_python_validator_have_parity(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

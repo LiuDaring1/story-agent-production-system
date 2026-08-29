@@ -84,6 +84,14 @@ class FullAutoContractTests(unittest.TestCase):
             "reuse",
         )
         self.assertEqual(
+            release_encode_guard_action(
+                {**completed, "status": "completed_local_repair"},
+                binding_fingerprint=fingerprint,
+                output_is_current=True,
+            ),
+            "reuse",
+        )
+        self.assertEqual(
             release_encode_guard_action(completed, binding_fingerprint=fingerprint, output_is_current=False),
             "technical_repair",
         )
@@ -91,10 +99,28 @@ class FullAutoContractTests(unittest.TestCase):
             release_encode_guard_action(completed, binding_fingerprint="b" * 64, output_is_current=False),
             "block_binding_change",
         )
+        self.assertEqual(
+            release_encode_guard_action(
+                completed,
+                binding_fingerprint="b" * 64,
+                output_is_current=True,
+                binding_repair_authorized=True,
+            ),
+            "authorized_binding_repair",
+        )
         exhausted = {**completed, "status": "failed_or_interrupted", "technical_repair_count": 1}
         self.assertEqual(
             release_encode_guard_action(exhausted, binding_fingerprint=fingerprint, output_is_current=False),
             "block_repair_limit",
+        )
+        self.assertEqual(
+            release_encode_guard_action(
+                exhausted,
+                binding_fingerprint="b" * 64,
+                output_is_current=True,
+                binding_repair_authorized=True,
+            ),
+            "block_binding_change",
         )
 
     def test_future_projects_keep_the_official_demo_logo_by_default(self) -> None:
@@ -110,15 +136,13 @@ class FullAutoContractTests(unittest.TestCase):
         self.assertEqual(defaults["target_delivery_seconds"], 36000)
         self.assertEqual(defaults["max_full_resolution_encodes"], 1)
 
-    def test_video_provider_defaults_to_grok_10_with_selectable_15_fallback(self) -> None:
+    def test_video_provider_defaults_to_grok_10_without_15_fallback(self) -> None:
         video_api = load_config()["video_api"]
         self.assertEqual(video_api["provider"], "toapis_grok_1_0")
-        self.assertEqual(video_api["fallback_provider"], "toapis_grok")
         self.assertEqual(video_api["adapters"][video_api["provider"]]["model"], "grok-video-1.0")
-        self.assertEqual(
-            video_api["adapters"][video_api["fallback_provider"]]["model"],
-            "grok-video-1.5",
-        )
+        self.assertNotIn("fallback_provider", video_api)
+        self.assertNotIn("submit_all_first", video_api)
+        self.assertEqual(set(video_api["adapters"]), {"toapis_grok_1_0", "mock_local"})
 
     def test_release_and_product_package_split_after_shared_real_material_preview(self) -> None:
         self.assertLess(STORY_STAGE_SEQUENCE.index("release_preview"), STORY_STAGE_SEQUENCE.index("product_package"))

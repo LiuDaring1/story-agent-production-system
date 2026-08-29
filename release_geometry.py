@@ -5,9 +5,8 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-
 RELEASE_GEOMETRY_SCHEMA_VERSION = "story-release-geometry/v1"
-RELEASE_GEOMETRY_COMPILER_VERSION = "1.4.0"
+RELEASE_GEOMETRY_COMPILER_VERSION = "1.5.0"
 DEMO_PRESENTER_GEOMETRY_SCHEMA_VERSION = "story-demo-presenter-geometry/v1"
 
 

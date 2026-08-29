@@ -9,6 +9,7 @@ from .align import LineTiming, sanitize_script_line
 
 SUBTITLE_PUNCTUATION_RE = re.compile(r"[\s，。！？、；：“”‘’《》【】（）(),.!?;:\"'…—-]+")
 SPLIT_PUNCTUATION_RE = re.compile(r"[，。！？、；：,.!?;:]+")
+NUMERIC_COMMA_SENTINEL = "\uf000"
 
 
 @dataclass(frozen=True)
@@ -66,7 +67,19 @@ def clean_subtitle_text(text: str) -> str:
 
 
 def _split_line(text: str, max_chars: int) -> list[str]:
-    raw_parts = [part for part in SPLIT_PUNCTUATION_RE.split(text) if part.strip()]
+    # A comma inside a number is a grouping mark, not a subtitle break.  The
+    # old generic punctuation split turned ``18,000年`` into an isolated
+    # follow-up cue ``000年``, which is especially misleading for children.
+    protected = re.sub(
+        r"(?<=\d),(?=\d)",
+        NUMERIC_COMMA_SENTINEL,
+        text,
+    )
+    raw_parts = [
+        part.replace(NUMERIC_COMMA_SENTINEL, ",")
+        for part in SPLIT_PUNCTUATION_RE.split(protected)
+        if part.strip()
+    ]
     if not raw_parts:
         raw_parts = [text]
 

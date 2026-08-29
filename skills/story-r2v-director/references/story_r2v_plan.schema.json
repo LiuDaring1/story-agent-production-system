@@ -1,6 +1,6 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "story-r2v-plan-v2",
+  "$id": "story-r2v-plan-v3",
   "title": "Story R2V Director Plan",
   "type": "object",
   "additionalProperties": false,
@@ -14,7 +14,7 @@
     "shots"
   ],
   "properties": {
-    "schema_version": {"const": "story-r2v-plan-v2"},
+    "schema_version": {"const": "story-r2v-plan-v3"},
     "story_id": {"type": "string", "minLength": 1},
     "source_audio": {
       "type": "object",
@@ -49,7 +49,12 @@
         "max_reference_images": {"type": "integer", "minimum": 1, "maximum": 7},
         "min_retime_ratio": {"type": "number", "minimum": 0.5, "maximum": 1},
         "max_retime_ratio": {"type": "number", "minimum": 1, "maximum": 1.5},
-        "max_attempts_per_shot": {"type": "integer", "minimum": 1, "maximum": 2}
+        "max_attempts_per_shot": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 2,
+          "description": "Default autonomous quality versions (V1 plus at most one evidence-based V2). Exceptional V3 is governed by the separate 10% escalation gate and is not pre-authorized here."
+        }
       }
     },
     "assets": {
@@ -82,7 +87,7 @@
       ],
       "properties": {
         "asset_id": {"type": "string", "minLength": 1},
-        "kind": {"enum": ["character", "population", "environment", "prop", "style"]},
+        "kind": {"enum": ["character", "population", "environment", "prop", "style", "storyboard"]},
         "path": {"type": "string", "minLength": 1},
         "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
         "runtime_eligible": {"type": "boolean"},
@@ -95,9 +100,43 @@
         "population_id": {"type": "string", "minLength": 1},
         "prop_id": {"type": "string", "minLength": 1},
         "state_id": {"type": "string", "minLength": 1},
-        "design_source_kind": {"enum": ["single_view", "three_view_sheet", "expression_sheet", "composite_scene", "population_archetype", "ensemble_design_master", "isolated_prop", "empty_environment", "style_anchor"]},
+        "design_source_kind": {"enum": ["single_view", "three_view_sheet", "expression_sheet", "composite_scene", "population_archetype", "ensemble_design_master", "isolated_prop", "empty_environment", "style_anchor", "semantic_storyboard"]},
         "appearance_summary": {"type": "string"},
-        "scale_class": {"type": "string"}
+        "scale_class": {"type": "string"},
+        "state_family_id": {"type": "string", "minLength": 1},
+        "state_family_master_path": {"type": "string", "minLength": 1},
+        "state_family_master_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "state_delta": {"type": "string", "minLength": 1},
+        "physical_contract": {"$ref": "#/$defs/physicalContract"}
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "kind": {"const": "prop"},
+              "runtime_eligible": {"const": true}
+            },
+            "required": ["kind", "runtime_eligible"]
+          },
+          "then": {"required": ["scale_class", "physical_contract"]}
+        }
+      ]
+    },
+    "physicalContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["scale_basis", "support_mode", "rigidity", "grip_or_contact", "forbidden_inferences"],
+      "properties": {
+        "scale_basis": {"enum": ["handheld_small", "handheld_two_hands", "body_scale", "furniture_scale", "environment_scale"]},
+        "support_mode": {"enum": ["handheld", "freestanding", "grounded", "attached", "suspended", "loose"]},
+        "rigidity": {"enum": ["rigid", "flexible", "soft", "fragile", "fluid"]},
+        "grip_or_contact": {"type": "string", "minLength": 1},
+        "forbidden_inferences": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        }
       }
     },
     "continuityGroup": {
@@ -221,7 +260,21 @@
         "visible_trigger_action": {"type": "string", "minLength": 1},
         "after_state": {"type": "string", "minLength": 1},
         "exit_evidence": {"type": "string", "minLength": 1},
-        "next_shot_asset_id": {"type": "string", "minLength": 1}
+        "next_shot_asset_id": {
+          "anyOf": [
+            {"type": "string", "minLength": 1},
+            {"type": "null"}
+          ]
+        }
+      }
+    },
+    "assemblyTrim": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["anchor"],
+      "properties": {
+        "anchor": {"enum": ["start", "center", "end", "explicit"]},
+        "start_second": {"type": "number", "minimum": 0}
       }
     },
     "shot": {
@@ -281,6 +334,9 @@
         "exit_state": {"type": "object"},
         "performance_beats": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/beat"}},
         "prop_state_transitions": {"type": "array", "items": {"$ref": "#/$defs/propTransition"}},
+        "assembly_trim": {"$ref": "#/$defs/assemblyTrim"},
+        "storyboard_reference_mode": {"enum": ["runtime", "director_only"]},
+        "storyboard_reference_reason": {"type": "string", "minLength": 1},
         "prompt": {"type": "string", "minLength": 1}
       }
     }

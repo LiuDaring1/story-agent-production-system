@@ -1,5 +1,7 @@
 # 系统总体架构
 
+> **Legacy V3 文档。** 本文描述的持久 Story Agent 已归档到 `legacy/story_agent_v3/`。当前架构见 [`codex-native-story-pipeline.md`](codex-native-story-pipeline.md)，新故事不得按本文启动。
+
 ## 目标
 
 系统把一个横屏绿幕口播原片转化为完整故事产品。它不是单一模型调用，而是“用户入口、持久状态机、阶段 worker、模型任务、确定性工具”五层协作系统。
@@ -7,7 +9,7 @@
 ```mermaid
 flowchart TB
     U["用户与人工终审"] --> C["Codex 主任务 / 指挥官"]
-    C --> A["story_agent.py / 持久执行脊柱"]
+    C --> A["legacy/story_agent_v3/story_agent.py<br/>退役持久执行脊柱"]
     A --> M["manifest v2 / 状态、预算、恢复点"]
     A --> D["DAG 调度器 / 最多并行三个阶段"]
 

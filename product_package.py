@@ -23,7 +23,7 @@ from docx.oxml import OxmlElement
 from docx.oxml.ns import qn as docx_qn
 from docx.shared import Inches, Pt, RGBColor
 from lxml import etree
-from PIL import Image, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps
+from PIL import Image, ImageChops, ImageDraw, ImageEnhance, ImageFilter, ImageFont, ImageOps, ImageStat
 from pptx import Presentation
 from pptx.dml.color import RGBColor as PptRGBColor
 from pptx.enum.text import PP_ALIGN
@@ -74,6 +74,12 @@ from product_text_projection import (
     compile_annotation_story_lines,
     compile_public_story_lines,
 )
+from static_ppt_contract import (
+    load_object as load_static_ppt_object,
+    validate_pair as validate_static_ppt_pair,
+    write_delivery_receipt as write_static_ppt_delivery_receipt,
+)
+from shot_storyboard_pipeline import validate_compile_receipt
 
 
 def production_keying_fingerprint(settings):
@@ -99,7 +105,12 @@ PPT_A_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 PPT_R_NS = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 PPT_P14_NS = "http://schemas.microsoft.com/office/powerpoint/2010/main"
 PPT_P14_EXT_URI = "{DAA4B4D4-6D71-4841-9C94-3DE7FCFB9230}"
-DELIVERY_CJK_FONT = "Arial Unicode MS"
+# Use the exact Fontconfig family reported by the delivery renderer.  Similar
+# display names such as "Arial Unicode MS" or "Hiragino Sans GB" may exist in
+# macOS metadata but remain unresolved by headless LibreOffice, causing Chinese
+# glyphs to disappear while punctuation remains visible.  Source Han Sans is
+# installed for production and embeds reliably in PDF-based QA renders.
+DELIVERY_CJK_FONT = "Source Han Sans"
 PPT_SUBTITLE_MAX_HEIGHT_RATIO = 0.09
 
 
@@ -155,7 +166,11 @@ def main() -> None:
     parser.add_argument("--bg-video-with-sub", required=True, type=Path, help="规范背景视频：含字幕")
     parser.add_argument("--bg-video-no-sub", required=True, type=Path, help="规范背景视频：无字幕")
     parser.add_argument("--person-greenscreen", required=True, type=Path, help="绿幕示范表演素材")
-    parser.add_argument("--demo-background-image", type=Path, help="示范视频背景图；第 16 步应传主账号 A 镜 16:9 无框背景图")
+    parser.add_argument(
+        "--demo-background-image",
+        type=Path,
+        help="示范与客户资料包背景图；必须是清晰、无预模糊、无暗角、无角标/Logo/文字的 16:9 无框原图",
+    )
     parser.add_argument("--story-frame-a-image", type=Path, help="主账号 A 镜故事框 PNG；用于进阶版额外生成无人物 A 镜视频")
     parser.add_argument("--demo-logo", type=Path, help="示范视频左上角品牌 Logo PNG")
     parser.add_argument("--demo-logo-width", default=150, type=int)
@@ -172,7 +187,11 @@ def main() -> None:
     parser.add_argument("--allow-draft-annotation", action="store_true", help="允许使用规则草稿生成朗读标注；默认禁止，避免产出不可用假成品")
     parser.add_argument("--keying-preset-json", type=Path, help="已确认的绿幕抠像参数 JSON")
     parser.add_argument("--allow-test-greenscreen", action="store_true", help="允许使用文件名含 test/测试 的绿幕素材")
-    parser.add_argument("--allow-full-subtitle-bg", action="store_true", help="允许含开头/结尾字幕的背景视频进入资料包")
+    parser.add_argument(
+        "--allow-full-subtitle-bg",
+        action="store_true",
+        help="已弃用的兼容参数；客户资料包始终禁止片头主持/报幕及片尾字幕",
+    )
     parser.add_argument("--output-root", default="~/Desktop", type=Path)
     parser.add_argument("--work-dir", type=Path, help="中间文件目录；默认 output/product_package_work/<slug>")
     parser.add_argument("--timings-json", type=Path, help="已有 timings.json；正式资料包必须提供，用于校准示范字幕和 PPT 翻页")
@@ -199,7 +218,12 @@ def main() -> None:
     parser.add_argument("--semantic-contract-spec", type=Path, help="已审核合同编译出的资料包内容选择规格")
     parser.add_argument("--project-dir", type=Path, help="required_v1 项目根目录，用于重新验证语义计划")
     parser.add_argument("--artifact-semantic-plan", type=Path, help="逐产物语义呈现计划")
-    parser.add_argument("--dynamic-ppt-plan", type=Path, help="story-ppt-plan-v1：每页完整静音镜头视频和字幕")
+    parser.add_argument("--director-plan", type=Path, help="Codex 原生导演计划；封存静态 PPT 模式必填")
+    parser.add_argument("--shot-storyboard-compile-receipt", type=Path, help="逐镜故事板同源编译回执")
+    parser.add_argument("--static-ppt-plan", type=Path, help="由封存故事板编译的静态 PPT 计划")
+    parser.add_argument("--static-ppt-with-subtitles", type=Path, help="已按静态 PPT 计划生成的含字幕 PPTX")
+    parser.add_argument("--static-ppt-without-subtitles", type=Path, help="已按静态 PPT 计划生成的无字幕 PPTX")
+    parser.add_argument("--dynamic-ppt-plan", type=Path, help="已弃用的兼容参数；正式资料包固定交付静态图片双版本 PPT")
     parser.add_argument("--dynamic-ppt-node", type=Path, help="load_workspace_dependencies 返回的 Node.js 绝对路径")
     parser.add_argument("--dynamic-ppt-node-modules", type=Path, help="load_workspace_dependencies 返回的 Node.js packages 绝对路径")
     parser.add_argument(
@@ -210,7 +234,7 @@ def main() -> None:
     parser.add_argument(
         "--dynamic-ppt-builder",
         type=Path,
-        default=Path(__file__).resolve().parent / "skills" / "story-full-auto" / "scripts" / "build_dynamic_story_ppt.mjs",
+        default=Path(__file__).resolve().parent / "legacy" / "story_agent_v3" / "retired_story_full_auto_ppt_scripts" / "build_dynamic_story_ppt.mjs",
     )
     args = parser.parse_args()
 
@@ -242,6 +266,26 @@ def build_product_package(args: argparse.Namespace) -> None:
         else Path("output") / "product_package_work" / (args.slug or sanitize_filename(story_name))
     )
     background_brightness = max(0.0, float(getattr(args, "demo_background_brightness", 1.0)))
+    static_ppt_values = {
+        "director_plan": getattr(args, "director_plan", None),
+        "compile_receipt": getattr(args, "shot_storyboard_compile_receipt", None),
+        "plan": getattr(args, "static_ppt_plan", None),
+        "with_subtitles": getattr(args, "static_ppt_with_subtitles", None),
+        "without_subtitles": getattr(args, "static_ppt_without_subtitles", None),
+    }
+    static_ppt_mode = any(value is not None for value in static_ppt_values.values())
+    if static_ppt_mode and not all(value is not None for value in static_ppt_values.values()):
+        missing = [name for name, value in static_ppt_values.items() if value is None]
+        raise ValueError("封存静态 PPT 模式必须同时提供五个绑定参数：" + "、".join(missing))
+    if static_ppt_mode and getattr(args, "artifact_semantic_plan", None) is not None:
+        raise ValueError(
+            "Codex 原生封存 PPT 模式不能与旧 artifact-semantic-plan PPT 分支混用"
+        )
+    static_ppt_paths = {
+        name: value.expanduser().resolve()
+        for name, value in static_ppt_values.items()
+        if value is not None
+    }
 
     for label, path in (
         ("故事正文", story_text_path),
@@ -257,7 +301,12 @@ def build_product_package(args: argparse.Namespace) -> None:
             raise FileNotFoundError(f"{label}不存在：{path}")
     if demo_logo is not None and not demo_logo.exists():
         raise FileNotFoundError(f"示范视频 Logo 不存在：{demo_logo}")
-    validate_background_videos(bg_with_sub, bg_no_sub, allow_full_subtitle_bg=args.allow_full_subtitle_bg)
+    validate_background_videos(
+        bg_with_sub,
+        bg_no_sub,
+        allow_full_subtitle_bg=args.allow_full_subtitle_bg,
+        story_title=args.story_name,
+    )
     validate_person_video_choice(person_path, allow_test=args.allow_test_greenscreen)
 
     ensure_dir(work_dir)
@@ -314,7 +363,7 @@ def build_product_package(args: argparse.Namespace) -> None:
             indices = semantic_line_indices(script_lines, semantic_spec, artifact) if semantic_spec else list(range(len(script_lines)))
         source_rows = annotation_script_lines if artifact == "reading_annotation" else public_script_lines
         lines = [source_rows[index] for index in indices]
-        selected_images = [images[index] for index in indices]
+        selected_images = [images[index] for index in indices] if artifact == "ppt" else []
         selected_timings = [
             LineTiming(position + 1, source_rows[index], timings[index].source_start, timings[index].source_end,
                        timings[index].duration, timings[index].timeline_start, timings[index].timeline_end)
@@ -322,7 +371,36 @@ def build_product_package(args: argparse.Namespace) -> None:
         ]
         return lines, selected_images, selected_timings, indices
 
-    ppt_lines, ppt_images, ppt_timings, ppt_indices = selected("ppt")
+    if static_ppt_mode:
+        static_plan = load_static_ppt_object(static_ppt_paths["plan"], "静态 PPT 计划")
+        static_slides = list(static_plan.get("slides") or [])
+        ppt_lines = [str(row.get("subtitle") or "") for row in static_slides]
+        ppt_images = [Path(str(row.get("poster_path") or "")) for row in static_slides]
+        ppt_indices = list(range(len(static_slides)))
+        ppt_timings = []
+        cursor = 0.0
+        for position, row in enumerate(static_slides, start=1):
+            duration = float(row.get("duration_seconds") or 0)
+            ppt_timings.append(
+                LineTiming(position, ppt_lines[position - 1], cursor, cursor + duration, duration, cursor, cursor + duration)
+            )
+            cursor += duration
+        validate_static_ppt_pair(
+            static_ppt_paths["director_plan"],
+            static_ppt_paths["plan"],
+            static_ppt_paths["with_subtitles"],
+            static_ppt_paths["without_subtitles"],
+        )
+        compile_receipt = validate_compile_receipt(
+            static_ppt_paths["compile_receipt"],
+            require_current_r2v_jobs=False,
+        )
+        if compile_receipt.get("director_plan_sha256") != file_sha256(static_ppt_paths["director_plan"]):
+            raise ValueError("逐镜故事板编译回执未绑定当前导演计划")
+        if compile_receipt.get("ppt_plan_sha256") != file_sha256(static_ppt_paths["plan"]):
+            raise ValueError("逐镜故事板编译回执未绑定当前静态 PPT 计划")
+    else:
+        ppt_lines, ppt_images, ppt_timings, ppt_indices = selected("ppt")
     manuscript_lines, _mi, _mt, manuscript_indices = selected("customer_manuscript")
     annotation_lines, _ai, _at, annotation_indices = selected("reading_annotation")
     demo_lines, _di, demo_timings, demo_indices = selected("demo")
@@ -408,6 +486,8 @@ def build_product_package(args: argparse.Namespace) -> None:
     demo_background = args.demo_background_image.expanduser() if args.demo_background_image else None
     if demo_background is not None and not demo_background.exists():
         raise FileNotFoundError(f"示范视频背景图不存在：{demo_background}")
+    if demo_background is not None:
+        validate_customer_background_image(demo_background)
     story_frame_a = args.story_frame_a_image.expanduser() if args.story_frame_a_image else None
     if story_frame_a is not None and not story_frame_a.exists():
         raise FileNotFoundError(f"A 镜故事框不存在：{story_frame_a}")
@@ -599,49 +679,40 @@ def build_product_package(args: argparse.Namespace) -> None:
             f"请按 story-performance-script.skill 精修后传入 --annotation-json 或 --annotation-docx：{request_path}"
         )
     narration_duration = probe_duration(narration_path)
-    build_story_ppt(
-        story_name,
-        ppt_images,
-        ppt_lines,
-        ppt_timings,
-        music_path,
-        ppt_with_sub,
-        with_subtitles=True,
-        total_duration=narration_duration,
-        semantic_card_positions=ppt_semantic_cards,
-    )
-    dynamic_ppt_outputs: dict[str, Path] = {}
-    if args.dynamic_ppt_plan:
-        if args.dynamic_ppt_node is None or args.dynamic_ppt_node_modules is None:
-            raise ValueError(
-                "动态 PPT 必须提供 --dynamic-ppt-node 和 --dynamic-ppt-node-modules，"
-                "两者必须直接使用 load_workspace_dependencies 返回的绝对路径"
-            )
-        from dynamic_story_ppt import build_dynamic_story_ppts
-
-        dynamic_ppt_outputs = build_dynamic_story_ppts(
-            source_plan_path=args.dynamic_ppt_plan.expanduser(),
-            music_path=music_path,
-            output_dir=assets_dir,
-            work_dir=work_dir / "dynamic_ppt_work",
-            node=args.dynamic_ppt_node.expanduser(),
-            node_modules=args.dynamic_ppt_node_modules.expanduser(),
-            builder_source=args.dynamic_ppt_builder.expanduser(),
-            subtitle_layout=ppt_subtitle_layout,
-            embed_media=getattr(args, "dynamic_ppt_embed_media", False),
+    if static_ppt_mode:
+        shutil.copy2(static_ppt_paths["with_subtitles"], ppt_with_sub)
+    else:
+        build_story_ppt(
+            story_name,
+            ppt_images,
+            ppt_lines,
+            ppt_timings,
+            music_path,
+            ppt_with_sub,
+            with_subtitles=True,
+            total_duration=narration_duration,
+            semantic_card_positions=ppt_semantic_cards,
         )
-    build_story_ppt(
-        story_name,
-        ppt_images,
-        ppt_lines,
-        ppt_timings,
-        music_path,
-        ppt_no_sub,
-        with_subtitles=False,
-        total_duration=narration_duration,
-        semantic_card_positions=ppt_semantic_cards,
-    )
-    if semantic_plan is not None:
+    if args.dynamic_ppt_plan:
+        print(
+            "提示：--dynamic-ppt-plan 已弃用并被忽略；正式资料包固定交付含/无字幕两份静态图片 PPT。",
+            file=sys.stderr,
+        )
+    if static_ppt_mode:
+        shutil.copy2(static_ppt_paths["without_subtitles"], ppt_no_sub)
+    else:
+        build_story_ppt(
+            story_name,
+            ppt_images,
+            ppt_lines,
+            ppt_timings,
+            music_path,
+            ppt_no_sub,
+            with_subtitles=False,
+            total_duration=narration_duration,
+            semantic_card_positions=ppt_semantic_cards,
+        )
+    if semantic_plan is not None and not static_ppt_mode:
         ppt_evidence_dir = work_dir / "ppt_evidence"
         rows_with_sub = build_ppt_manifest_rows(
             ppt_images, ppt_lines, ppt_timings, ppt_indices, narration_duration,
@@ -737,27 +808,22 @@ def build_product_package(args: argparse.Namespace) -> None:
         ppt_with_sub=ppt_with_sub,
         ppt_no_sub=ppt_no_sub,
         a_only_video=a_only_video if a_only_video.exists() else None,
-        include_legacy_ppts=not bool(dynamic_ppt_outputs),
-        additional_advanced_items=(
-            [
-                (path, path.name)
-                for key, path in dynamic_ppt_outputs.items()
-                if key not in {"plan", "qa_report", "media_dir"}
-            ]
-            + (
-                [
-                    (path, str(Path("PPT动态素材") / path.name))
-                    for path in sorted(dynamic_ppt_outputs["media_dir"].iterdir())
-                    if path.is_file()
-                ]
-                if dynamic_ppt_outputs and not getattr(args, "dynamic_ppt_embed_media", False)
-                else []
-            )
-        ),
+        include_legacy_ppts=True,
         backup_root=(work_dir / "package_backups") if semantic_plan is not None else None,
     )
+    base_dir, advanced_dir, source_map = package_result
+    if static_ppt_mode:
+        static_receipt_path = work_dir / "static_ppt_delivery_receipt.json"
+        write_static_ppt_delivery_receipt(
+            director_path=static_ppt_paths["director_plan"],
+            compile_receipt_path=static_ppt_paths["compile_receipt"],
+            plan_path=static_ppt_paths["plan"],
+            with_subtitles=advanced_dir / f"故事PPT：{story_name}（含字幕）.pptx",
+            without_subtitles=advanced_dir / f"故事PPT：{story_name}（无字幕）.pptx",
+            output_path=static_receipt_path,
+        )
+        print(f"已生成静态 PPT 交付回执：{static_receipt_path}")
     if semantic_plan is not None:
-        base_dir, advanced_dir, source_map = package_result
         dependencies = {
             "product_content_manifest": product_content_manifest_path,
             "customer_manuscript_receipt": work_dir / "customer_manuscript_receipt.json",
@@ -771,9 +837,6 @@ def build_product_package(args: argparse.Namespace) -> None:
             "background_without_subtitles": bg_no_sub,
             "timings_source": formal_timings_path,
         }
-        if dynamic_ppt_outputs:
-            dependencies["story_ppt_plan"] = dynamic_ppt_outputs["plan"]
-            dependencies["qa_dynamic_ppt_report"] = dynamic_ppt_outputs["qa_report"]
         write_product_package_manifest(
             work_dir / "product_package_manifest.json",
             product_root=output_root,
@@ -793,18 +856,65 @@ def load_product_semantic_spec(path: Path) -> dict:
     return payload
 
 
-def validate_background_videos(with_sub: Path, no_sub: Path, allow_full_subtitle_bg: bool = False) -> None:
+def validate_background_videos(
+    with_sub: Path,
+    no_sub: Path,
+    allow_full_subtitle_bg: bool = False,
+    story_title: str = "",
+) -> None:
     if with_sub.resolve() == no_sub.resolve():
         raise ValueError("含字幕和无字幕背景视频不能是同一个文件")
     for label, path in (("含字幕背景视频", with_sub), ("无字幕背景视频", no_sub)):
         duration = probe_duration(path)
         if duration <= 0:
             raise ValueError(f"{label}时长异常：{path}")
-    if not allow_full_subtitle_bg:
-        reject_full_subtitle_background(with_sub)
+    # Keep the legacy argument in the public function/CLI, but never let it
+    # weaken the customer-delivery contract.  A bypass here previously made
+    # host introductions leak into the reusable background-video product.
+    reject_full_subtitle_background(with_sub, story_title=story_title)
 
 
-def reject_full_subtitle_background(path: Path) -> None:
+def validate_customer_background_image(path: Path) -> None:
+    """Reject a pre-styled demo backdrop before it becomes a customer asset.
+
+    The delivered background is a reusable source image.  Demo rendering may
+    blur its own private derivative, but the source itself must stay sharp and
+    unbranded so customers can choose their own treatment.
+    """
+
+    try:
+        with Image.open(path) as source:
+            width, height = source.size
+            if width < 1280 or height < 720 or abs(width / height - 16 / 9) > 0.03:
+                raise ValueError(f"客户背景图必须是至少 1280x720 的 16:9 图片：{path}（当前 {width}x{height}）")
+            sample = ImageOps.fit(source.convert("RGB"), (320, 180), method=Image.Resampling.LANCZOS)
+            edges = sample.convert("L").filter(ImageFilter.FIND_EDGES).crop((3, 3, 317, 177))
+            edge_mean = float(sum(ImageStat.Stat(edges).mean))
+            micro = ImageChops.difference(
+                sample,
+                sample.filter(ImageFilter.GaussianBlur(1.2)),
+            ).convert("L").crop((3, 3, 317, 177))
+            micro_mean = float(ImageStat.Stat(micro).mean[0])
+            histogram = micro.histogram()
+            micro_occupancy = sum(histogram[24:]) / max(1, sum(histogram))
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"客户背景图无法读取：{path}（{exc}）") from exc
+    if edge_mean < 3.0:
+        raise ValueError(
+            f"客户背景图细节过低，疑似已经整体预模糊：{path}（edge_mean={edge_mean:.2f}）。"
+            "请交付清晰、无暗角、无角标/Logo/文字的原始背景；Demo 如需虚化应在合成时生成私有派生图。"
+        )
+    if edge_mean > 42.0 or micro_mean > 12.5 or micro_occupancy > 0.14:
+        raise ValueError(
+            f"客户背景图高频细节过密，容易在视频压缩和人物合成后形成噪点：{path}"
+            f"（edge_mean={edge_mean:.2f}, micro_mean={micro_mean:.2f}, micro_occupancy={micro_occupancy:.3f}）。"
+            "请降低草叶、碎花、颗粒和密集纹理，但保持场景清晰，不要用整体高斯模糊代替降噪。"
+        )
+
+
+def reject_full_subtitle_background(path: Path, story_title: str = "") -> None:
     lower_name = path.name.lower()
     likely_full = lower_name in {"story_subs_bgm.mp4", "story_subtitled_silent.mp4"} or "full_sub" in lower_name
     if likely_full:
@@ -812,7 +922,7 @@ def reject_full_subtitle_background(path: Path) -> None:
         hint = f"；检测到可能可用的正文字幕版：{sibling}" if sibling.exists() else ""
         raise ValueError(
             f"含字幕背景视频看起来是包含开头/结尾字幕的完整字幕版：{path}{hint}。"
-            "资料包应传入只保留故事正文字幕的背景视频；确认无问题时可加 --allow-full-subtitle-bg 覆盖。"
+            "资料包应传入只保留故事正文字幕的背景视频。"
         )
 
     srt_candidates = [path.with_suffix(".srt"), path.with_name(path.stem.replace("subs_bgm", "subtitles") + ".srt")]
@@ -820,9 +930,19 @@ def reject_full_subtitle_background(path: Path) -> None:
         srt_candidates.append(path.with_name("story_sales_subtitles.srt"))
     elif path.stem == "story_subs_bgm":
         srt_candidates.append(path.with_name("story_subtitles.srt"))
+    existing_candidates = {candidate.resolve() for candidate in srt_candidates if candidate.exists()}
+    sibling_srts = sorted(path.parent.glob("*.srt"))
+    if not existing_candidates and len(sibling_srts) == 1:
+        # Chinese/customer-friendly video names often do not share a stem with
+        # the authoritative SRT.  A single sibling is unambiguous and must not
+        # be silently skipped.
+        srt_candidates.append(sibling_srts[0])
+    checked: set[Path] = set()
     for srt in srt_candidates:
-        if not srt.exists():
+        resolved = srt.resolve()
+        if not srt.exists() or resolved in checked:
             continue
+        checked.add(resolved)
         subtitle_lines = _read_srt_cue_texts(srt)
         if not subtitle_lines:
             continue
@@ -845,6 +965,17 @@ def reject_full_subtitle_background(path: Path) -> None:
         } | (set(SemanticKind) - allowed_kinds)
         for line in semantics.lines:
             kind = semantics.kind_at(line.line_number)
+            # Some ordinary body openings (for example “很久很久以前”) are
+            # conservatively classified as title-like without wider context.
+            # The package command knows the reviewed story title, so only an
+            # exact normalized title match is blocked as TITLE here.
+            if (
+                kind == SemanticKind.TITLE
+                and story_title.strip()
+                and _normalize_subtitle_gate_text(line.text)
+                != _normalize_subtitle_gate_text(story_title)
+            ):
+                continue
             redacted_host_intro = bool(
                 re.match(r"^(?:大家好\s*[，,、]?\s*)?我是_{2,}\s*[。！？!?]?$", line.text.strip())
             )
@@ -854,8 +985,12 @@ def reject_full_subtitle_background(path: Path) -> None:
             raise ValueError(
                 f"含字幕背景视频对应字幕文件含开头/结尾通用性风险文本：{srt}。"
                 f"检测到语义区间 {semantic_label}（第 {line.line_number} 行：{line.text}）。"
-                "请改用正文字幕版背景视频，或确认后加 --allow-full-subtitle-bg。"
+                "请改用只从故事正文第一句开始显示字幕的背景视频。"
             )
+
+
+def _normalize_subtitle_gate_text(value: str) -> str:
+    return re.sub(r"[^0-9A-Za-z\u4e00-\u9fff]+", "", value).lower()
 
 
 def _read_srt_cue_texts(path: Path) -> list[str]:
@@ -2381,6 +2516,13 @@ def create_package_dirs(
     backup_root: Path | None = None,
     product_package_port: ProductPackagePort | None = None,
 ) -> tuple[Path, Path, dict[str, Path]]:
+    dynamic_markers = ("PPT动态素材", "自动播放", "人工控场")
+    for _source, destination_name in additional_advanced_items:
+        if any(marker in destination_name for marker in dynamic_markers):
+            raise ValueError(
+                f"正式客户资料包禁止动态 PPT、视频代理或播放壳：{destination_name}。"
+                "请只交付静态图片含/无字幕双版本。"
+            )
     base_dir = output_root / f"绵羊故事锦囊：{story_name}（基础版）"
     advanced_dir = output_root / f"绵羊故事锦囊：{story_name}（进阶版）"
     base_items = [
@@ -2394,11 +2536,12 @@ def create_package_dirs(
         (bg_with_sub, f"背景视频：{story_name}（含字幕）.mp4"),
         (bg_no_sub, f"背景视频：{story_name}（无字幕）.mp4"),
     ]
-    if include_legacy_ppts:
-        advanced_items.extend([
-            (ppt_with_sub, f"故事PPT：{story_name}（含字幕）.pptx"),
-            (ppt_no_sub, f"故事PPT：{story_name}（无字幕）.pptx"),
-        ])
+    # `include_legacy_ppts` is retained for old callers, but the static pair is
+    # the current customer product and can no longer be switched off.
+    advanced_items.extend([
+        (ppt_with_sub, f"故事PPT：{story_name}（含字幕）.pptx"),
+        (ppt_no_sub, f"故事PPT：{story_name}（无字幕）.pptx"),
+    ])
     if a_only_video is not None:
         advanced_items.append((a_only_video, f"A镜无人物背景视频：{story_name}.mp4"))
     advanced_items.extend(additional_advanced_items)
@@ -3006,6 +3149,37 @@ def set_ppt_advance(slide, seconds: float) -> None:
     transition.set("advTm", str(int(seconds * 1000)))
     if transition.find(pptx_qn("p:fade")) is None:
         etree.SubElement(transition, pptx_qn("p:fade"))
+
+
+def patch_pptx_slide_advances(pptx_path: Path, durations: Sequence[float]) -> None:
+    """Bind automatic advance times on an already-authored editable deck."""
+
+    with zipfile.ZipFile(pptx_path, "r") as archive:
+        files = {item.filename: archive.read(item.filename) for item in archive.infolist()}
+    slide_names = sorted(
+        (name for name in files if re.fullmatch(r"ppt/slides/slide\d+\.xml", name)),
+        key=lambda name: int(re.search(r"(\d+)", Path(name).stem).group(1)),
+    )
+    if len(slide_names) != len(durations):
+        raise ValueError(f"PPT 自动翻页数量不一致：slides={len(slide_names)}, durations={len(durations)}")
+    for name, seconds in zip(slide_names, durations):
+        root = etree.fromstring(files[name])
+        for old in root.findall(f"{{{PPT_P_NS}}}transition"):
+            root.remove(old)
+        transition = etree.Element(f"{{{PPT_P_NS}}}transition")
+        transition.set("advClick", "1")
+        transition.set("advTm", str(max(500, int(round(float(seconds) * 1000)))))
+        etree.SubElement(transition, f"{{{PPT_P_NS}}}fade")
+        insert_at = 1
+        while insert_at < len(root) and etree.QName(root[insert_at]).localname in {"clrMapOvr"}:
+            insert_at += 1
+        root.insert(insert_at, transition)
+        files[name] = etree.tostring(root, xml_declaration=True, encoding="UTF-8", standalone=True)
+    tmp_path = str(pptx_path) + ".timing.tmp"
+    with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as archive:
+        for name, data in files.items():
+            archive.writestr(name, data)
+    os.replace(tmp_path, str(pptx_path))
 
 
 def add_ppt_subtitle(slide, text: str, prs: Presentation) -> None:

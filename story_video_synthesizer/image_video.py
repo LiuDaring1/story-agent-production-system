@@ -382,6 +382,86 @@ def validate_image_video_jobs(jobs_csv: Path) -> list[str]:
             fieldnames = set(reader.fieldnames or [])
     except (OSError, csv.Error) as exc:
         return [f"任务 CSV 不可读：{exc}"]
+    errors: list[str] = []
+    from r2v_retry_policy import retry_row_issues
+
+    errors.extend(retry_row_issues(rows))
+    for row in rows:
+        mode = str(row.get("generation_mode") or "").strip()
+        raw_references = str(row.get("reference_image_paths_json") or "").strip()
+        if mode != "reference_to_video" and not raw_references:
+            continue
+        scene = str(row.get("scene") or "").strip() or "?"
+        if mode != "reference_to_video":
+            errors.append(f"第 {scene} 镜含多参考图但 generation_mode 不是 reference_to_video")
+        try:
+            references = json.loads(raw_references)
+        except (json.JSONDecodeError, TypeError):
+            errors.append(f"第 {scene} 镜 reference_image_paths_json 不可读")
+            continue
+        if not isinstance(references, list) or not 1 <= len(references) <= 7:
+            errors.append(f"第 {scene} 镜 R2V 参考图必须为 1–7 张")
+            continue
+        normalized = [str(Path(str(value)).expanduser().resolve()) for value in references]
+        if len(set(normalized)) != len(normalized):
+            errors.append(f"第 {scene} 镜 R2V 参考图重复")
+        missing = [value for value in normalized if not Path(value).is_file()]
+        if missing:
+            errors.append(f"第 {scene} 镜 R2V 参考图缺失")
+        storyboard = str(row.get("storyboard_image_path") or "").strip()
+        storyboard_reference_mode = str(
+            row.get("storyboard_reference_mode") or "runtime"
+        ).strip()
+        if not storyboard:
+            errors.append(f"第 {scene} 镜缺少语义故事板路径")
+        elif storyboard_reference_mode == "runtime":
+            if normalized[-1] != str(Path(storyboard).expanduser().resolve()):
+                errors.append(f"第 {scene} 镜 runtime 语义故事板不是最后一张参考图")
+        elif storyboard_reference_mode == "director_only":
+            if str(Path(storyboard).expanduser().resolve()) in normalized:
+                errors.append(f"第 {scene} 镜 director_only 语义故事板不得进入运行时参考图")
+        else:
+            errors.append(f"第 {scene} 镜 storyboard_reference_mode 无效")
+        raw_hashes = str(row.get("reference_image_sha256_json") or "").strip()
+        try:
+            hashes = json.loads(raw_hashes)
+        except (json.JSONDecodeError, TypeError):
+            errors.append(f"第 {scene} 镜 reference_image_sha256_json 不可读")
+            hashes = []
+        if not isinstance(hashes, list) or len(hashes) != len(normalized):
+            errors.append(f"第 {scene} 镜 R2V 参考图哈希数量不匹配")
+        elif not missing:
+            for path, expected in zip(normalized, hashes):
+                if file_sha256(Path(path)) != str(expected):
+                    errors.append(f"第 {scene} 镜 R2V 参考图哈希已变化")
+                    break
+        manifest_path = Path(str(row.get("storyboard_manifest_path") or ""))
+        manifest_sha = str(row.get("storyboard_manifest_sha256") or "")
+        if not manifest_path.is_file() or file_sha256(manifest_path) != manifest_sha:
+            errors.append(f"第 {scene} 镜故事板清单缺失或哈希已变化")
+        review_path = Path(str(row.get("storyboard_review_path") or ""))
+        review_sha = str(row.get("storyboard_review_sha256") or "")
+        if not review_path.is_file() or file_sha256(review_path) != review_sha:
+            errors.append(f"第 {scene} 镜故事板审核缺失或哈希已变化")
+        else:
+            try:
+                review = json.loads(review_path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                review = {}
+            score = review.get("score") if isinstance(review, dict) else None
+            critical = review.get("critical_errors") if isinstance(review, dict) else None
+            if (
+                not isinstance(review, dict)
+                or review.get("approved") is not True
+                or not isinstance(score, (int, float))
+                or isinstance(score, bool)
+                or score < 85
+                or not isinstance(critical, list)
+                or critical
+                or review.get("artifact_sha256") != str(row.get("storyboard_bundle_sha256") or "")
+            ):
+                errors.append(f"第 {scene} 镜故事板审核未通过或未绑定当前 bundle")
+
     continuity_fields = {"continuity_state", "visual_continuity_state", "continuity_required", "continuity_forbidden"}
     if not fieldnames.intersection(continuity_fields):
         # A legacy CSV is still valid when its project has no contract.  If a
@@ -399,8 +479,7 @@ def validate_image_video_jobs(jobs_csv: Path) -> list[str]:
                 f"合同：{discovered_contract}",
                 f"机器分镜：{discovered_plan or '缺失'}",
             ]
-        return []
-    errors: list[str] = []
+        return errors
     scenes: set[int] = set()
     contract_path = ""
     plan_path = ""
@@ -1164,6 +1243,17 @@ _PRESERVED_JOB_FIELDS = (
     "api_response",
     "query_response",
     "provider_attempt",
+    "retry_policy_version",
+    "quality_retry_count",
+    "quality_version",
+    "retry_defect_code",
+    "retry_evidence",
+    "retry_root_cause",
+    "retry_strategy",
+    "retry_defect_severity",
+    "v3_escalation_approved",
+    "batch_retry_calibration_status",
+    "batch_retry_calibration_notes",
     "duration",
     "frames",
     "target_duration",

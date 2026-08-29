@@ -1,4 +1,4 @@
 interface:
   display_name: "Codex 原生故事生产"
-  short_description: "从确认文本和调色绿幕视频轻量并行生产视频、资料包与动态 PPT"
+  short_description: "从确认文本和调色绿幕视频轻量并行生产视频、资料包与静态故事 PPT"
   default_prompt: "Use $story-full-auto with my confirmed story text and color-restored green-screen video, then run the Codex-native workflow to verified delivery."

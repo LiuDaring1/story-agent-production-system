@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import json
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from story_workflow import build_product_text_sources_from_story_source
+import story_workflow
+from story_workflow import (
+    build_product_text_sources_from_story_source,
+    confirmed_text_from_story_run,
+    sealed_storyboard_images_dir,
+)
 
 try:
     from product_package import reject_full_subtitle_background
@@ -27,6 +34,47 @@ def write_srt(path: Path, texts: list[str]) -> None:
 
 
 class ProductTextSourceAlignmentTests(unittest.TestCase):
+    def test_sealed_storyboard_directory_requires_every_image_hash(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status = root / "99_项目状态"
+            storyboards = status / "storyboards"
+            images = storyboards / "requests"
+            images.mkdir(parents=True)
+            image = images / "S01.png"
+            image.write_bytes(b"image")
+            import hashlib
+
+            digest = hashlib.sha256(image.read_bytes()).hexdigest()
+            (storyboards / "storyboard_manifest_sealed.json").write_text(
+                json.dumps({
+                    "status": "sealed",
+                    "entries": [{"image_path": str(image), "image_sha256": digest}],
+                }),
+                encoding="utf-8",
+            )
+            self.assertEqual(sealed_storyboard_images_dir(status), images.resolve())
+            image.write_bytes(b"tampered")
+            self.assertIsNone(sealed_storyboard_images_dir(status))
+
+    def test_native_ledger_confirmed_text_is_hash_bound(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status = root / "99_项目状态"
+            status.mkdir()
+            confirmed = root / "字幕：故事.txt"
+            confirmed.write_text("标题\n正文\n", encoding="utf-8")
+            import hashlib
+
+            digest = hashlib.sha256(confirmed.read_bytes()).hexdigest()
+            (status / "story_run.json").write_text(
+                json.dumps({"inputs": {"confirmed_text": {"path": str(confirmed), "sha256": digest}}}),
+                encoding="utf-8",
+            )
+            self.assertEqual(confirmed_text_from_story_run(status), confirmed)
+            confirmed.write_text("被篡改", encoding="utf-8")
+            self.assertIsNone(confirmed_text_from_story_run(status))
+
     def run_alignment(self, story_lines: list[str], subtitle_lines: list[str]):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -63,6 +111,15 @@ class ProductTextSourceAlignmentTests(unittest.TestCase):
         self.assertEqual([item["source_cue_start"] for item in timings], [3, 4])
         self.assertEqual([item["source_cue_end"] for item in timings], [3, 4])
 
+    def test_confirmed_text_title_can_be_absent_from_body_subtitles(self) -> None:
+        body = ["很久很久以前", "天地还没有分开"]
+        script, timings = self.run_alignment(
+            ["盘古开天辟地", *body],
+            body,
+        )
+        self.assertEqual(script, "\n".join(body) + "\n")
+        self.assertEqual([item["line"] for item in timings], body)
+
     def test_skips_semantic_story_announcement_prefix(self) -> None:
         story_lines = ["一天，小壁虎爬呀爬，爬到小河边。"]
         script, timings = self.run_alignment(
@@ -95,6 +152,46 @@ class ProductTextSourceAlignmentTests(unittest.TestCase):
                     subtitles_srt=subtitles_path,
                     output_dir=root / "work",
                 )
+
+
+class ProductPackageWorkflowForwardingTests(unittest.TestCase):
+    def run_alignment(self, story_lines: list[str], subtitle_lines: list[str]):
+        return ProductTextSourceAlignmentTests.run_alignment(self, story_lines, subtitle_lines)
+
+    def test_forwards_complete_sealed_static_ppt_contract(self) -> None:
+        argv = [
+            "story_workflow.py",
+            "product-package",
+            "--story-name", "通用故事",
+            "--story-text", "story.txt",
+            "--script-lines", "lines.txt",
+            "--narration", "narration.wav",
+            "--music", "music.mp3",
+            "--images-dir", "images",
+            "--bg-video-with-sub", "with.mp4",
+            "--bg-video-no-sub", "without.mp4",
+            "--person-greenscreen", "person.mp4",
+            "--annotation-skill-path", "skill.md",
+            "--director-plan", "director.json",
+            "--shot-storyboard-compile-receipt", "compile.json",
+            "--static-ppt-plan", "ppt-plan.json",
+            "--static-ppt-with-subtitles", "with.pptx",
+            "--static-ppt-without-subtitles", "without.pptx",
+        ]
+        with patch.object(sys, "argv", argv), patch.object(story_workflow, "run_script") as runner:
+            story_workflow.main()
+        command = list(runner.call_args.args)
+        self.assertEqual(command[0], "product_package.py")
+        expected = {
+            "--director-plan": "director.json",
+            "--shot-storyboard-compile-receipt": "compile.json",
+            "--static-ppt-plan": "ppt-plan.json",
+            "--static-ppt-with-subtitles": "with.pptx",
+            "--static-ppt-without-subtitles": "without.pptx",
+        }
+        for option, value in expected.items():
+            self.assertIn(option, command)
+            self.assertEqual(str(command[command.index(option) + 1]), value)
 
     def test_direct_alignment_without_prefix_remains_supported(self) -> None:
         story_lines = [
@@ -153,6 +250,14 @@ class ProductBackgroundSubtitleValidationTests(unittest.TestCase):
             )
 
             reject_full_subtitle_background(video)
+
+    def test_title_like_body_opening_is_allowed_when_not_the_reviewed_title(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            video = root / "story_sales_subs_bgm.mp4"
+            video.touch()
+            self.write_background_srt(root, ["很久很久以前", "天地还没有分开"])
+            reject_full_subtitle_background(video, story_title="盘古开天辟地")
 
     def test_host_intro_still_fails_semantic_validation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

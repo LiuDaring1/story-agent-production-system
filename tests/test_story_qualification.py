@@ -13,7 +13,7 @@ from unittest.mock import patch
 from story_agent import main as story_agent_main
 from story_agent_runtime import JobRegistry, ensure_manifest_v2, file_sha256, write_review_bundle
 from story_project import init_project, load_manifest, project_paths, save_json, write_manifest
-from story_qualification import (
+from legacy.story_agent_v3.story_qualification import (
     REQUIRED_REVIEW_FILES,
     build_promotion_report,
     evaluate_project_for_promotion,

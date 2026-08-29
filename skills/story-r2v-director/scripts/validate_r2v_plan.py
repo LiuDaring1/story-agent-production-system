@@ -12,7 +12,8 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "story-r2v-plan-v2"
+SCHEMA_VERSION = "story-r2v-plan-v3"
+LEGACY_SCHEMA_VERSIONS = {"story-r2v-plan-v2"}
 BODY_MODE = "reference_to_video"
 PROVIDER_DURATIONS = {6, 10}
 RELATIONS = {
@@ -29,6 +30,7 @@ RUNTIME_FORBIDDEN_SOURCES = {
     "composite_scene",
     "ensemble_design_master",
 }
+ABSENT_PROP_STATES = {"absent", "none", "removed"}
 SHOT_SIZES = {
     "extreme_wide",
     "wide",
@@ -71,6 +73,16 @@ DELIBERATE_CHANGES = {
 }
 EPSILON = 0.01
 SHA256_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+MAX_TIMELINE_GAP_SECONDS = 0.08
+PHYSICAL_SCALE_BASES = {
+    "handheld_small",
+    "handheld_two_hands",
+    "body_scale",
+    "furniture_scale",
+    "environment_scale",
+}
+PHYSICAL_SUPPORT_MODES = {"handheld", "freestanding", "grounded", "attached", "suspended", "loose"}
+PHYSICAL_RIGIDITY = {"rigid", "flexible", "soft", "fragile", "fluid"}
 
 
 def _number(value: Any) -> bool:
@@ -148,8 +160,35 @@ def _validate_policies(plan: dict[str, Any], errors: list[str]) -> dict[str, Any
     return policies
 
 
-def _validate_assets(assets: dict[str, dict[str, Any]], errors: list[str]) -> None:
-    valid_kinds = {"character", "population", "environment", "prop", "style"}
+def _validate_physical_contract(asset: dict[str, Any], path: str, errors: list[str]) -> None:
+    contract = asset.get("physical_contract")
+    if not isinstance(contract, dict):
+        errors.append(f"{path}.physical_contract: runtime prop assets require a physical contract")
+        return
+    if contract.get("scale_basis") not in PHYSICAL_SCALE_BASES:
+        errors.append(f"{path}.physical_contract.scale_basis: unsupported physical scale basis")
+    if contract.get("support_mode") not in PHYSICAL_SUPPORT_MODES:
+        errors.append(f"{path}.physical_contract.support_mode: unsupported support mode")
+    if contract.get("rigidity") not in PHYSICAL_RIGIDITY:
+        errors.append(f"{path}.physical_contract.rigidity: unsupported rigidity")
+    _required_text(contract, "grip_or_contact", f"{path}.physical_contract", errors)
+    forbidden = contract.get("forbidden_inferences")
+    if (
+        not isinstance(forbidden, list)
+        or not forbidden
+        or any(not isinstance(value, str) or not value.strip() for value in forbidden)
+    ):
+        errors.append(
+            f"{path}.physical_contract.forbidden_inferences: must list at least one forbidden inference"
+        )
+    elif _duplicates(forbidden):
+        errors.append(f"{path}.physical_contract.forbidden_inferences: values must be unique")
+
+
+def _validate_assets(
+    assets: dict[str, dict[str, Any]], errors: list[str], *, strict_v3: bool
+) -> None:
+    valid_kinds = {"character", "population", "environment", "prop", "style", "storyboard"}
     for asset_id, asset in assets.items():
         path = f"assets[{asset_id!r}]"
         _required_text(asset, "path", path, errors)
@@ -186,11 +225,74 @@ def _validate_assets(assets: dict[str, dict[str, Any]], errors: list[str]) -> No
                 errors.append(f"{path}.prop_id: prop assets require a prop id")
             if not isinstance(asset.get("state_id"), str) or not asset.get("state_id"):
                 errors.append(f"{path}.state_id: prop assets require a state id")
+            if strict_v3 and asset.get("runtime_eligible"):
+                _required_text(asset, "scale_class", path, errors)
+                _validate_physical_contract(asset, path, errors)
+        elif kind == "storyboard":
+            if asset.get("design_source_kind") != "semantic_storyboard":
+                errors.append(
+                    f"{path}.design_source_kind: storyboard assets must use 'semantic_storyboard'"
+                )
+            _required_text(asset, "appearance_summary", path, errors)
 
         if asset.get("runtime_eligible") and asset.get("design_source_kind") in RUNTIME_FORBIDDEN_SOURCES:
             errors.append(
                 f"{path}.design_source_kind: {asset.get('design_source_kind')!r} cannot be runtime eligible"
             )
+
+
+def _validate_prop_state_families(
+    assets: dict[str, dict[str, Any]], errors: list[str], *, strict_v3: bool
+) -> None:
+    """Keep multi-state prop variants traceable to one reviewed visual mother asset."""
+    if not strict_v3:
+        return
+    by_prop: dict[str, list[dict[str, Any]]] = {}
+    for asset in assets.values():
+        if asset.get("kind") != "prop" or not asset.get("runtime_eligible"):
+            continue
+        prop_id = asset.get("prop_id")
+        if isinstance(prop_id, str) and prop_id:
+            by_prop.setdefault(prop_id, []).append(asset)
+
+    for prop_id, family in by_prop.items():
+        if len(family) < 2:
+            continue
+        family_path = f"prop_state_family[{prop_id!r}]"
+        for asset in family:
+            asset_path = f"assets[{asset.get('asset_id')!r}]"
+            for field in ("state_family_id", "state_family_master_path", "state_delta"):
+                _required_text(asset, field, asset_path, errors)
+            _required_sha256(asset, "state_family_master_sha256", asset_path, errors)
+
+        def values(field: str) -> set[Any]:
+            return {asset.get(field) for asset in family}
+
+        if len(values("state_family_id")) != 1:
+            errors.append(f"{family_path}.state_family_id: all states must share one family id")
+        if len(values("state_family_master_path")) != 1:
+            errors.append(f"{family_path}.state_family_master_path: all states must share one mother asset")
+        if len(values("state_family_master_sha256")) != 1:
+            errors.append(f"{family_path}.state_family_master_sha256: all states must bind the same mother hash")
+        state_ids = [asset.get("state_id") for asset in family]
+        if _duplicates(state_ids):
+            errors.append(f"{family_path}.state_id: each derived state must be unique")
+        if len(values("scale_class")) != 1:
+            errors.append(f"{family_path}.scale_class: derived states must preserve one scale class")
+        scale_bases = {
+            (asset.get("physical_contract") or {}).get("scale_basis")
+            for asset in family
+            if isinstance(asset.get("physical_contract"), dict)
+        }
+        if len(scale_bases) != 1:
+            errors.append(f"{family_path}.physical_contract.scale_basis: derived states must preserve scale")
+        rigidities = {
+            (asset.get("physical_contract") or {}).get("rigidity")
+            for asset in family
+            if isinstance(asset.get("physical_contract"), dict)
+        }
+        if len(rigidities) != 1:
+            errors.append(f"{family_path}.physical_contract.rigidity: derived states must preserve material behavior")
 
 
 def _validate_groups(
@@ -350,6 +452,9 @@ def _validate_cut_contract(
     next_shot: dict[str, Any] | None,
     shot_path: str,
     groups: dict[str, dict[str, Any]],
+    current_assets: list[dict[str, Any]],
+    next_assets: list[dict[str, Any]],
+    strict_v3: bool,
     errors: list[str],
 ) -> None:
     contract = shot.get("cut_to_next")
@@ -405,6 +510,40 @@ def _validate_cut_contract(
                 errors.append(f"{path}: an intentional change must use different outgoing and incoming values")
         if _duplicates(dimensions):
             errors.append(f"{shot_path}.cut_to_next.continuity_bindings: dimensions must be unique")
+        if strict_v3 and next_shot.get("relation_to_previous") != "new_scene":
+            dimension_set = set(dimensions)
+            required_dimensions = {"axis", "spatial_relation"}
+            current_identities = {
+                asset.get("identity_id")
+                for asset in current_assets
+                if asset.get("kind") == "character" and asset.get("identity_id")
+            }
+            next_identities = {
+                asset.get("identity_id")
+                for asset in next_assets
+                if asset.get("kind") == "character" and asset.get("identity_id")
+            }
+            current_props = {
+                asset.get("prop_id")
+                for asset in current_assets
+                if asset.get("kind") == "prop" and asset.get("prop_id")
+            }
+            next_props = {
+                asset.get("prop_id")
+                for asset in next_assets
+                if asset.get("kind") == "prop" and asset.get("prop_id")
+            }
+            if current_identities & next_identities:
+                required_dimensions.add("character_state")
+            if current_props & next_props:
+                required_dimensions.add("prop_state")
+            if cut_type == "match_action":
+                required_dimensions.add("action_phase")
+            missing = required_dimensions - dimension_set
+            if missing:
+                errors.append(
+                    f"{shot_path}.cut_to_next.continuity_bindings: missing required dimensions {sorted(missing)}"
+                )
 
     changes = contract.get("deliberate_changes")
     if not isinstance(changes, list) or not changes:
@@ -465,14 +604,24 @@ def _validate_prop_transitions(
             for asset in selected_assets
             if asset.get("kind") == "prop" and asset.get("prop_id") == prop_id
         ]
-        if len(matching_entry) != 1:
+        if before_state in ABSENT_PROP_STATES:
+            if matching_entry:
+                errors.append(
+                    f"{path}: an absent entry state must not select a prop image for {prop_id!r}"
+                )
+        elif len(matching_entry) != 1:
             errors.append(f"{path}: current shot must select exactly one entry asset for prop {prop_id!r}")
         elif matching_entry[0].get("state_id") != before_state:
             errors.append(f"{path}.before_state: does not match the selected entry prop asset")
 
         next_asset_id = transition.get("next_shot_asset_id")
-        next_asset = assets.get(next_asset_id)
-        if next_asset is None:
+        next_asset = assets.get(next_asset_id) if isinstance(next_asset_id, str) else None
+        if after_state in ABSENT_PROP_STATES:
+            if next_asset_id is not None:
+                errors.append(
+                    f"{path}.next_shot_asset_id: an absent exit state must use null instead of a placeholder image"
+                )
+        elif next_asset is None:
             errors.append(f"{path}.next_shot_asset_id: unknown asset {next_asset_id!r}")
         elif next_asset.get("kind") != "prop" or next_asset.get("prop_id") != prop_id:
             errors.append(f"{path}.next_shot_asset_id: must reference the same prop")
@@ -490,8 +639,12 @@ def validate_plan(plan: Any) -> list[str]:
     errors: list[str] = []
     if not isinstance(plan, dict):
         return ["plan: must be a JSON object"]
-    if plan.get("schema_version") != SCHEMA_VERSION:
-        errors.append(f"schema_version: must equal {SCHEMA_VERSION!r}")
+    schema_version = plan.get("schema_version")
+    if schema_version != SCHEMA_VERSION and schema_version not in LEGACY_SCHEMA_VERSIONS:
+        errors.append(
+            f"schema_version: must equal {SCHEMA_VERSION!r} or a supported legacy version"
+        )
+    strict_v3 = schema_version == SCHEMA_VERSION
     _required_text(plan, "story_id", "plan", errors)
 
     source_audio = plan.get("source_audio")
@@ -509,7 +662,8 @@ def validate_plan(plan: Any) -> list[str]:
     assets = _index_by_id(plan.get("assets"), "asset_id", "assets", errors)
     groups = _index_by_id(plan.get("continuity_groups"), "group_id", "continuity_groups", errors)
     shots = _index_by_id(plan.get("shots"), "shot_id", "shots", errors)
-    _validate_assets(assets, errors)
+    _validate_assets(assets, errors, strict_v3=strict_v3)
+    _validate_prop_state_families(assets, errors, strict_v3=strict_v3)
     _validate_groups(groups, assets, errors)
 
     previous_shot: dict[str, Any] | None = None
@@ -534,6 +688,11 @@ def validate_plan(plan: Any) -> list[str]:
             if previous_shot is not None and _number(previous_shot.get("source_end")):
                 if start < previous_shot["source_end"] - EPSILON:
                     errors.append(f"{path}.source_start: overlaps the previous shot")
+                elif strict_v3 and start - previous_shot["source_end"] > MAX_TIMELINE_GAP_SECONDS:
+                    errors.append(
+                        f"{path}.source_start: leaves an unassigned timeline gap of "
+                        f"{start - previous_shot['source_end']:.3f}s; absorb pauses into an adjacent shot"
+                    )
             min_ratio = policies.get("min_retime_ratio")
             max_ratio = policies.get("max_retime_ratio")
             if provider_seconds in PROVIDER_DURATIONS and _number(min_ratio) and _number(max_ratio):
@@ -550,6 +709,12 @@ def validate_plan(plan: Any) -> list[str]:
             errors.append(f"{path}.relation_to_previous: the first shot must use 'first'")
         elif index > 0 and relation == "first":
             errors.append(f"{path}.relation_to_previous: only the first shot may use 'first'")
+
+        storyboard_mode = str(shot.get("storyboard_reference_mode") or "runtime").strip()
+        if storyboard_mode not in {"runtime", "director_only"}:
+            errors.append(f"{path}.storyboard_reference_mode: unsupported mode {storyboard_mode!r}")
+        if storyboard_mode == "director_only":
+            _required_text(shot, "storyboard_reference_reason", path, errors)
 
         group_id = shot.get("continuity_group")
         group = groups.get(group_id)
@@ -600,6 +765,18 @@ def validate_plan(plan: Any) -> list[str]:
         prop_ids = [asset.get("prop_id") for asset in selected_assets if asset.get("kind") == "prop"]
         if _duplicates(prop_ids):
             errors.append(f"{path}.reference_asset_ids: select only one entry state per prop")
+        storyboard_assets = [asset for asset in selected_assets if asset.get("kind") == "storyboard"]
+        if len(storyboard_assets) > 1:
+            errors.append(f"{path}.reference_asset_ids: select at most one semantic storyboard")
+        elif storyboard_assets:
+            storyboard = storyboard_assets[0]
+            if reference_ids[-1] != storyboard.get("asset_id"):
+                errors.append(f"{path}.reference_asset_ids: semantic storyboard must be the final reference")
+            unknown_storyboard_identities = set(storyboard.get("contains_characters") or []) - selected_identities
+            if unknown_storyboard_identities:
+                errors.append(
+                    f"{path}.reference_asset_ids: storyboard identities need independent character assets; missing {sorted(unknown_storyboard_identities)}"
+                )
 
         initial = shot.get("initial_visible_characters")
         entering = shot.get("entering_characters")
@@ -635,13 +812,55 @@ def validate_plan(plan: Any) -> list[str]:
         _validate_frame_envelope(shot.get("opening_frame"), f"{path}.opening_frame", errors)
         _validate_frame_envelope(shot.get("closing_frame"), f"{path}.closing_frame", errors)
         next_shot = shot_items[index + 1][1] if index + 1 < len(shot_items) else None
-        _validate_cut_contract(shot, next_shot, path, groups, errors)
+        next_assets: list[dict[str, Any]] = []
+        if isinstance(next_shot, dict):
+            for asset_id in next_shot.get("reference_asset_ids") or []:
+                asset = assets.get(asset_id)
+                if asset is not None:
+                    next_assets.append(asset)
+        _validate_cut_contract(
+            shot,
+            next_shot,
+            path,
+            groups,
+            selected_assets,
+            next_assets,
+            strict_v3,
+            errors,
+        )
+
+        assembly_trim = shot.get("assembly_trim")
+        if assembly_trim is not None:
+            if not isinstance(assembly_trim, dict):
+                errors.append(f"{path}.assembly_trim: must be an object")
+            else:
+                anchor = assembly_trim.get("anchor")
+                if anchor not in {"start", "center", "end", "explicit"}:
+                    errors.append(f"{path}.assembly_trim.anchor: unsupported trim anchor")
+                start_second = assembly_trim.get("start_second")
+                if anchor == "explicit":
+                    if not _number(start_second) or start_second < 0:
+                        errors.append(
+                            f"{path}.assembly_trim.start_second: explicit trim requires a non-negative number"
+                        )
+                elif start_second is not None:
+                    errors.append(
+                        f"{path}.assembly_trim.start_second: only explicit trim may set start_second"
+                    )
 
         _validate_beats(shot, path, selected_identities, errors)
         _validate_prop_transitions(shot, path, selected_assets, assets, errors)
         if not isinstance(shot.get("prompt"), str) or not shot.get("prompt").strip():
             errors.append(f"{path}.prompt: must be a non-empty director prompt")
         previous_shot = shot
+
+    if strict_v3 and shot_items and _number(audio_duration):
+        final_end = shot_items[-1][1].get("source_end")
+        if _number(final_end) and abs(audio_duration - final_end) > MAX_TIMELINE_GAP_SECONDS:
+            errors.append(
+                f"shots: final source_end must reach the authoritative audio duration within "
+                f"{MAX_TIMELINE_GAP_SECONDS:.2f}s"
+            )
 
     return errors
 

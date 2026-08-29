@@ -15,7 +15,7 @@ from typing import Any, Mapping
 
 from PIL import Image
 
-from story_agent_runtime import file_sha256, review_bundle_is_current, review_passes
+from story_evidence import file_sha256, review_bundle_is_current, review_passes
 from story_contract_consumers import load_consumer_context, projection_sha256, write_json_atomic
 from story_contract_runtime import contract_consumer_context_is_current
 from story_contracts import canonical_json_bytes

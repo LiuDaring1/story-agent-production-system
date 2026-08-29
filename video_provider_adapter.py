@@ -21,13 +21,13 @@ def resolve_row_generation_seconds(
     """Resolve a per-row provider-supported duration.
 
     The row's ``generation_duration`` wins over ``duration`` and the CLI/config
-    fallback. Grok Video 1.5 accepts a bounded whole-second range, while Grok
-    Video 1.0 accepts the discrete values 6 or 10 seconds. Older providers keep
-    their historical global ``--seconds`` behavior.
+    fallback. The supported ToAPIs production model, Grok Video 1.0, accepts
+    the discrete values 6 or 10 seconds. Other providers keep their historical
+    global ``--seconds`` behavior.
     """
 
     normalized_model = str(model).strip().lower()
-    if normalized_model not in {"grok-video-1.0", "grok-video-1.5"}:
+    if normalized_model != "grok-video-1.0":
         return str(fallback_seconds)
     raw = _first_nonempty_row_value(row, "generation_duration", "duration")
     value = fallback_seconds if raw is None else raw
@@ -37,19 +37,12 @@ def resolve_row_generation_seconds(
         raise ValueError(f"{model} 每镜 seconds 不是数字：{value!r}") from exc
     if not math.isfinite(numeric):
         raise ValueError(f"{model} 每镜 seconds 不是有限数字：{value!r}")
-    if normalized_model == "grok-video-1.0":
-        # The provider guide advertises two exact choices, not every integer in
-        # the 6–10 interval. Pick the closest native duration, preferring the
-        # longer clip on an exact tie so the compositor retains more temporal
-        # detail. Assembly then applies one uniform speed change to fit the
-        # narration window exactly; it never loops the generated motion.
-        return str(min((6, 10), key=lambda seconds: (abs(seconds - numeric), -seconds)))
-    minimum = max(1, math.ceil(float(1 if min_seconds is None else min_seconds)))
-    maximum = math.floor(float(15 if max_seconds is None else max_seconds))
-    if maximum < minimum:
-        raise ValueError(f"Grok Video 1.5 seconds 范围无效：{minimum}–{maximum}")
-    seconds = max(minimum, min(maximum, math.ceil(numeric)))
-    return str(seconds)
+    # The provider guide advertises two exact choices, not every integer in
+    # the 6–10 interval. Pick the closest native duration, preferring the
+    # longer clip on an exact tie so the compositor retains more temporal
+    # detail. Assembly then applies one uniform speed change to fit the
+    # narration window exactly; it never loops the generated motion.
+    return str(min((6, 10), key=lambda seconds: (abs(seconds - numeric), -seconds)))
 
 
 def _first_nonempty_row_value(row: dict[str, Any], *keys: str) -> Any:

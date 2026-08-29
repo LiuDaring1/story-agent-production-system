@@ -43,11 +43,17 @@ from release_video import (
     render_main_preview_frame,
     render_main_wide,
     render_top_panel,
+    validate_config,
     validate_person_grade,
 )
 from story_workflow import compile_release_subtitle_srt, contract_release_brand_paths
 from story_agent import StoryAgent
-from story_project import build_main_package_spec, load_main_package_reference, save_json
+from story_project import (
+    build_main_package_spec,
+    load_main_package_reference,
+    main_package_generation_receipt_issues,
+    save_json,
+)
 
 
 def _config(root: Path, *, person_region_ready: bool = True) -> ReleaseConfig:
@@ -84,8 +90,15 @@ def _config(root: Path, *, person_region_ready: bool = True) -> ReleaseConfig:
         "age_range": "3-6岁",
         "use_cases": "朗诵比赛、故事表演、少儿口才、技能比拼",
     }
+    frame_reference = root / "frame_reference.png"
+    Image.new("RGB", (1408, 768), (230, 190, 150)).save(frame_reference)
     spec_payload = build_main_package_spec(
         reference=load_main_package_reference(),
+        frame_reference={
+            "asset_path": str(frame_reference),
+            "sha256": hashlib.sha256(frame_reference.read_bytes()).hexdigest(),
+        },
+        frame_story_box=(100, 200, 900, 500),
         story_type=expected_text["story_type"],
         story_title=expected_text["story_title"],
         duration=expected_text["duration"],
@@ -98,11 +111,26 @@ def _config(root: Path, *, person_region_ready: bool = True) -> ReleaseConfig:
     spec_payload["theme_request_sha256"] = hashlib.sha256(theme_request.read_bytes()).hexdigest()
     save_json(package_spec, spec_payload)
     save_json(package_receipt, {
-        "schema_version": "story-main-package-generation/v2",
+        "schema_version": "story-main-package-generation/v5",
         "attempt_count": 1,
         "imagegen_reference_attached": True,
+        "svg_used": False,
+        "generation_methods": {
+            "top_plate": "imagegen_reference_edit",
+            "bottom_plate": "imagegen_reference_edit",
+            "main_background": "imagegen_raster",
+            "story_frame_source": "imagegen_raster",
+            "story_frame_a": "raster_alpha_postprocess",
+        },
         "reference_asset": spec_payload["reference_asset"],
         "reference_sha256": spec_payload["reference_sha256"],
+        "frame_reference_asset": spec_payload["frame_reference_asset"],
+        "frame_reference_sha256": spec_payload["frame_reference_sha256"],
+        "frame_reference_role": spec_payload["frame_reference_role"],
+        "frame_story_box": spec_payload["frame_story_box"],
+        "frame_source_background": spec_payload["frame_source_background"],
+        "frame_source_mode": spec_payload["frame_source_mode"],
+        "frame_design_policy": spec_payload["frame_design_policy"],
         "fixed_prompt_template_sha256": spec_payload["fixed_prompt_template_sha256"],
         "theme_request_path": spec_payload["theme_request_path"],
         "theme_request_sha256": spec_payload["theme_request_sha256"],
@@ -113,6 +141,23 @@ def _config(root: Path, *, person_region_ready: bool = True) -> ReleaseConfig:
             "main_not_library_product_packaging": True,
             "simple_information_hierarchy": True,
             "evidence": "single calm hierarchy follows the bound main-account reference",
+        },
+        "background_clean_review": {
+            "passed": True,
+            "not_preblurred": True,
+            "no_vignette": True,
+            "no_logo_badge_or_corner_emblem": True,
+            "no_text_or_watermark": True,
+            "evidence": "full-resolution background is crisp and contains no overlays",
+        },
+        "frame_design_review": {
+            "passed": True,
+            "frame_reference_attached": True,
+            "geometry_preserved": True,
+            "current_story_redesign": True,
+            "no_reference_theme_leak": True,
+            "solid_magenta_source": True,
+            "evidence": "geometry is bound while theme ornaments are redesigned on a solid magenta source",
         },
         "ocr_validation": {"passed": True, "expected": expected_text, "observed": expected_text},
         "reference_content_leak_check": {"passed": True, "leaked_items": []},
@@ -210,8 +255,15 @@ class ReleaseGeometryTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             with self.assertRaisesRegex(ValueError, "age_range_user_input_required"):
+                frame_reference = root / "frame_reference.png"
+                Image.new("RGB", (1408, 768), (230, 190, 150)).save(frame_reference)
                 build_main_package_spec(
                     reference=load_main_package_reference(),
+                    frame_reference={
+                        "asset_path": str(frame_reference),
+                        "sha256": hashlib.sha256(frame_reference.read_bytes()).hexdigest(),
+                    },
+                    frame_story_box=(210, 270, 910, 512),
                     story_type="童话故事",
                     story_title="测试故事",
                     duration="2分钟",
@@ -221,17 +273,14 @@ class ReleaseGeometryTests(unittest.TestCase):
                     bottom_panel=root / "bottom.png",
                 )
 
-    def test_contract_release_generates_deterministic_library_watermark_when_logo_missing(self) -> None:
+    def test_library_release_requires_reviewed_bitmap_watermark(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = _config(root)
-            generated = root / "generated-watermark.png"
-            with patch("release_video.render_watermark_png", return_value=generated) as render:
-                self.assertEqual(resolve_library_watermark(config, root, {"required_v1": True}), generated)
-                render.assert_called_once_with(root / "library_watermark.png", config.library_watermark_text)
-                render.reset_mock()
-                self.assertEqual(resolve_library_watermark(config, root, None), generated)
-                render.assert_called_once_with(root / "library_watermark.png", config.library_watermark_text)
+            with self.assertRaisesRegex(ValueError, "禁止回退为自创文字水印"):
+                resolve_library_watermark(config, root, {"required_v1": True})
+            with self.assertRaisesRegex(ValueError, "禁止回退为自创文字水印"):
+                resolve_library_watermark(config, root, None)
 
             official = root / "official-antipiracy.png"
             official.write_bytes(b"official")
@@ -257,6 +306,24 @@ class ReleaseGeometryTests(unittest.TestCase):
                 "[0:v]scale=1102:620:force_original_aspect_ratio=increase,crop=1080:608",
                 command[command.index("-filter_complex") + 1],
             )
+
+    def test_library_watermarks_remain_visible_through_tail_notice(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            official = root / "official-antipiracy.png"
+            tail = root / "tail.png"
+            output = root / "library.mp4"
+            official.write_bytes(b"official")
+            tail.write_bytes(b"tail")
+            with patch("release_video.probe_duration", return_value=10.0), \
+                 patch("release_video.run_command") as run:
+                render_library_window_video(config.bg_video, official, tail, output, config)
+            graph = run.call_args.args[0][run.call_args.args[0].index("-filter_complex") + 1]
+            self.assertIn("[tail][wm1]overlay=", graph)
+            self.assertIn("[w1][wm2]overlay=", graph)
+            self.assertNotIn("enable='lt(", graph)
+            self.assertIn("[w2][notice]overlay=", graph)
 
     def test_release_accepts_natural_person_grade_from_keying_preset(self) -> None:
         self.assertEqual(validate_person_grade("natural"), "natural")
@@ -292,6 +359,67 @@ class ReleaseGeometryTests(unittest.TestCase):
             ):
                 with self.assertRaisesRegex(ValueError, "account_role_review"):
                     compile_release_geometry(config, _spec())
+
+    def test_required_package_rejects_svg_story_frame_lineage(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            assert config.main_package_receipt is not None
+            receipt = json.loads(config.main_package_receipt.read_text(encoding="utf-8"))
+            receipt["svg_used"] = True
+            receipt["generation_methods"]["story_frame_source"] = "svg_vector"
+            config.main_package_receipt.write_text(json.dumps(receipt), encoding="utf-8")
+            plan = {"schema_version": "story-artifact-semantic-plan/v1", "story_contract_dependency_sha256": "f" * 64}
+            with patch("release_video.load_current_artifact_semantic_plan", return_value=plan), patch(
+                "release_video.keying_preset_lock_issues", return_value=[]
+            ):
+                with self.assertRaisesRegex(ValueError, "svg|generation_method"):
+                    compile_release_geometry(config, _spec())
+
+    def test_library_panels_require_current_output_lineage_and_ocr(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            assert config.main_package_spec is not None
+            assert config.main_package_receipt is not None
+            library_top = root / "library_release_plate_top.png"
+            library_bottom = root / "library_release_plate_bottom.png"
+            Image.new("RGBA", (2304, 888), (245, 210, 180, 255)).save(library_top)
+            Image.new("RGBA", (2304, 888), (240, 205, 175, 255)).save(library_bottom)
+            spec = json.loads(config.main_package_spec.read_text(encoding="utf-8"))
+            receipt = json.loads(config.main_package_receipt.read_text(encoding="utf-8"))
+            expected_outputs = {
+                "top_plate": config.main_top_panel,
+                "bottom_plate": config.main_bottom_panel,
+                "library_top_plate": library_top,
+                "library_bottom_plate": library_bottom,
+            }
+
+            issues = main_package_generation_receipt_issues(spec, receipt, expected_outputs)
+            self.assertIn("main_package_generation_method_invalid:library_top_plate", issues)
+            self.assertIn("library_package_ocr_not_passed", issues)
+
+            receipt["generation_methods"].update({
+                "library_top_plate": "imagegen_raster",
+                "library_bottom_plate": "imagegen_raster",
+            })
+            for key, path in (("library_top_plate", library_top), ("library_bottom_plate", library_bottom)):
+                receipt["outputs"][key] = {
+                    "path": str(path),
+                    "sha256": hashlib.sha256(path.read_bytes()).hexdigest(),
+                }
+            library_text = {
+                "story_title": spec["story_title"],
+                "duration": spec["duration"],
+                "age_range": spec["age_range"],
+                "package_items": ["背景视频", "PPT", "配乐", "文稿", "示范视频", "朗读标注"],
+            }
+            receipt["library_ocr_validation"] = {
+                "passed": True,
+                "expected": library_text,
+                "observed": library_text,
+            }
+            self.assertEqual(main_package_generation_receipt_issues(spec, receipt, expected_outputs), [])
 
     def test_contract_release_omits_unregistered_and_legacy_logo_overlays(self) -> None:
         story = Path("story-logo.png")

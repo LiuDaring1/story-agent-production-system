@@ -9,7 +9,7 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-from story_agent_runtime import file_sha256, now, record_derived_input
+from story_evidence import file_sha256, now, record_derived_input
 from story_project import load_manifest, project_paths, write_manifest
 
 

@@ -213,6 +213,7 @@ def _synthesize_story_core(config: SynthesisConfig) -> SynthesisResult:
         if subtitle_script_lines != script_lines
         else timings
     )
+    preserve_subtitle_lines = config.subtitle_script_path is not None
 
     semantic_plan = None
     semantic_plan_manifest = None
@@ -233,7 +234,11 @@ def _synthesize_story_core(config: SynthesisConfig) -> SynthesisResult:
     # Preserve the complete, audited semantic cue stream for deterministic
     # downstream selectors.  The customer-facing background SRT may exclude
     # title/moral cues because those are rendered as visual cards.
-    write_srt(subtitle_timings, semantic_timeline_srt)
+    write_srt(
+        subtitle_timings,
+        semantic_timeline_srt,
+        preserve_input_lines=preserve_subtitle_lines,
+    )
     background_timings = (
         select_timings_for_artifact(subtitle_timings, semantic_plan, "background_subtitles")
         if semantic_plan is not None else subtitle_timings
@@ -242,14 +247,28 @@ def _synthesize_story_core(config: SynthesisConfig) -> SynthesisResult:
         select_timings_for_artifact(subtitle_timings, semantic_plan, "demo_subtitles")
         if semantic_plan is not None else subtitle_timings
     )
-    write_srt(background_timings, subtitles_srt)
-    subtitle_cues = build_subtitle_cues(background_timings)
+    write_srt(
+        background_timings,
+        subtitles_srt,
+        preserve_input_lines=preserve_subtitle_lines,
+    )
+    subtitle_cues = build_subtitle_cues(
+        background_timings,
+        preserve_input_lines=preserve_subtitle_lines,
+    )
     sales_timings = (
         select_timings_for_artifact(subtitle_timings, semantic_plan, "sales_subtitles")
         if semantic_plan is not None else _sales_subtitle_timings(subtitle_timings, config)
     )
-    write_srt(sales_timings, sales_subtitles_srt)
-    sales_subtitle_cues = build_subtitle_cues(sales_timings)
+    write_srt(
+        sales_timings,
+        sales_subtitles_srt,
+        preserve_input_lines=preserve_subtitle_lines,
+    )
+    sales_subtitle_cues = build_subtitle_cues(
+        sales_timings,
+        preserve_input_lines=preserve_subtitle_lines,
+    )
 
     narration_duration = probe_duration(config.narration_path)
     music_duration = probe_duration(config.music_path)
@@ -343,7 +362,10 @@ def _synthesize_story_core(config: SynthesisConfig) -> SynthesisResult:
     demo_subtitled_video = work_dir / "story_demo_subtitled_silent.mp4"
     _burn_subtitles_only(
         video_path=presentation_base,
-        cues=build_subtitle_cues(demo_timings),
+        cues=build_subtitle_cues(
+            demo_timings,
+            preserve_input_lines=preserve_subtitle_lines,
+        ),
         work_dir=work_dir / "demo_subtitles",
         output_path=demo_subtitled_video,
         total_duration=total_duration,
@@ -947,7 +969,14 @@ def _render_subtitle_images(
     for cue in cues:
         image = Image.new("RGBA", (config.width, config.height), (0, 0, 0, 0))
         draw = ImageDraw.Draw(image)
-        lines = _wrap_subtitle_text(draw, cue.text, font, int(config.width * 0.86))
+        line = str(cue.text).replace("\r", "").replace("\n", "").strip()
+        safe_width = int(config.width * 0.86)
+        if _text_width(draw, line, font) > safe_width:
+            raise ValueError(
+                "subtitle_single_line_overflow: 字幕 TXT 单行超出安全宽度；"
+                "请修改用户字幕 TXT 的换行，渲染器不自动折成两行"
+            )
+        lines = [line]
         line_height = int(font_size * 1.35)
         text_height = line_height * len(lines)
         padding_x = max(24, config.width // 45)
@@ -990,10 +1019,23 @@ def _render_subtitle_images(
             y += line_height
 
         output_path = subtitle_dir / f"subtitle_{cue.index:03}.png"
+        if _subtitle_palette_has_magenta_or_purple(image):
+            raise ValueError("字幕图层出现紫色/洋红色像素，拒绝进入成片")
         image.save(output_path)
         outputs.append(output_path)
 
     return outputs
+
+
+def _subtitle_palette_has_magenta_or_purple(image) -> bool:
+    """Reject the former magenta-key subtitle fringe from customer videos."""
+
+    rgba = image.convert("RGBA")
+    pixels = rgba.get_flattened_data() if hasattr(rgba, "get_flattened_data") else rgba.getdata()
+    for red, green, blue, alpha in pixels:
+        if alpha > 16 and red >= 105 and blue >= 105 and green * 1.35 < min(red, blue):
+            return True
+    return False
 
 
 def _subtitle_overlay_chain(cues: list[SubtitleCue], first_image_input: int) -> str:
@@ -1021,24 +1063,6 @@ def _load_subtitle_font(image_font_module, font_size: int):
         if path.exists():
             return image_font_module.truetype(str(path), font_size)
     return image_font_module.load_default()
-
-
-def _wrap_subtitle_text(draw, text: str, font, max_width: int) -> list[str]:
-    if _text_width(draw, text, font) <= max_width:
-        return [text]
-
-    lines: list[str] = []
-    current = ""
-    for char in text:
-        candidate = current + char
-        if current and _text_width(draw, candidate, font) > max_width:
-            lines.append(current)
-            current = char
-        else:
-            current = candidate
-    if current:
-        lines.append(current)
-    return lines
 
 
 def _text_width(draw, text: str, font) -> int:

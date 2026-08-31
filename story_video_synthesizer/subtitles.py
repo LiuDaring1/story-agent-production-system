@@ -20,10 +20,19 @@ class SubtitleCue:
     end: float
 
 
-def build_subtitle_cues(timings: list[LineTiming], max_chars: int = 18) -> list[SubtitleCue]:
+def build_subtitle_cues(
+    timings: list[LineTiming],
+    max_chars: int = 18,
+    *,
+    preserve_input_lines: bool = False,
+) -> list[SubtitleCue]:
     cues: list[SubtitleCue] = []
     for timing in timings:
-        parts = _split_line(sanitize_script_line(timing.line), max_chars=max_chars)
+        if preserve_input_lines:
+            text = str(timing.line).replace("\r", "").replace("\n", "").strip()
+            parts = [text] if text else []
+        else:
+            parts = split_subtitle_text(sanitize_script_line(timing.line), max_chars=max_chars)
         if not parts:
             continue
         weights = [max(1, len(part)) for part in parts]
@@ -46,8 +55,18 @@ def build_subtitle_cues(timings: list[LineTiming], max_chars: int = 18) -> list[
     return cues
 
 
-def write_srt(timings: list[LineTiming], path: Path, max_chars: int = 18) -> None:
-    cues = build_subtitle_cues(timings, max_chars=max_chars)
+def write_srt(
+    timings: list[LineTiming],
+    path: Path,
+    max_chars: int = 18,
+    *,
+    preserve_input_lines: bool = False,
+) -> None:
+    cues = build_subtitle_cues(
+        timings,
+        max_chars=max_chars,
+        preserve_input_lines=preserve_input_lines,
+    )
     blocks: list[str] = []
     for cue in cues:
         blocks.append(
@@ -66,7 +85,18 @@ def clean_subtitle_text(text: str) -> str:
     return SUBTITLE_PUNCTUATION_RE.sub("", text)
 
 
-def _split_line(text: str, max_chars: int) -> list[str]:
+def split_subtitle_text(text: str, max_chars: int = 12) -> list[str]:
+    """Project spoken text into balanced, punctuation-free single-line cues.
+
+    Punctuation remains useful as a semantic break before it is removed. Long
+    clauses are divided into evenly sized chunks instead of leaving an ugly
+    one- or two-character tail, and short neighbouring phrases are merged when
+    they still fit the requested one-line limit.
+    """
+
+    if max_chars < 2:
+        raise ValueError("max_chars must be at least 2")
+
     # A comma inside a number is a grouping mark, not a subtitle break.  The
     # old generic punctuation split turned ``18,000年`` into an isolated
     # follow-up cue ``000年``, which is especially misleading for children.
@@ -83,16 +113,25 @@ def _split_line(text: str, max_chars: int) -> list[str]:
     if not raw_parts:
         raw_parts = [text]
 
-    result: list[str] = []
+    chunks: list[str] = []
     for raw_part in raw_parts:
         cleaned = clean_subtitle_text(raw_part)
         if not cleaned:
             continue
-        while len(cleaned) > max_chars:
-            result.append(cleaned[:max_chars])
-            cleaned = cleaned[max_chars:]
-        if cleaned:
-            result.append(cleaned)
+        chunk_count = max(1, (len(cleaned) + max_chars - 1) // max_chars)
+        base_size, extra = divmod(len(cleaned), chunk_count)
+        cursor = 0
+        for index in range(chunk_count):
+            size = base_size + (1 if index < extra else 0)
+            chunks.append(cleaned[cursor : cursor + size])
+            cursor += size
+
+    result: list[str] = []
+    for chunk in chunks:
+        if result and len(result[-1]) + len(chunk) <= max_chars:
+            result[-1] += chunk
+        else:
+            result.append(chunk)
     return result
 
 

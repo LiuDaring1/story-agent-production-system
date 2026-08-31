@@ -54,9 +54,12 @@ async function main() {
     });
 
     if (withSubtitles && row.shot_id !== "TITLE" && row.shot_id !== "MORAL" && String(row.subtitle || "").trim()) {
-      const text = String(row.subtitle).trim();
-      const longText = text.length > 46;
-      const barHeight = longText ? 100 : 76;
+      // TXT line boundaries are authoritative. A slide consumes exactly one
+      // cue and displays it on one line; it must never rewrap into the old
+      // oversized two-line block.
+      const text = String(row.subtitle).replace(/[\r\n]+/g, "").trim();
+      const barHeight = 78;
+      const fontSize = Math.max(24, Math.min(38, Math.floor(1180 / Math.max(1, text.length))));
       const backdrop = slide.shapes.add({
         geometry: "rect",
         name: `subtitle-backdrop-${String(index + 1).padStart(3, "0")}`,
@@ -74,13 +77,14 @@ async function main() {
       });
       subtitle.text = text;
       subtitle.text.style = {
-        fontSize: longText ? 25 : 28,
+        fontSize,
         bold: true,
         color: "#FFFFFF",
         alignment: "center",
         verticalAlignment: "middle",
         typeface: "Source Han Sans",
         autoFit: "shrinkText",
+        wrap: "none",
         insets: { top: 2, right: 6, bottom: 2, left: 6 },
       };
     }

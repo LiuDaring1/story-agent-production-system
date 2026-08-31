@@ -12,27 +12,43 @@ def keychain_service(secret_name: str) -> str:
     return f"story-agent.{secret_name}"
 
 
+def keychain_service_candidates(secret_name: str) -> tuple[str, ...]:
+    """Return current and historical service names without duplicating them."""
+
+    return tuple(dict.fromkeys((keychain_service(secret_name), secret_name)))
+
+
 def read_secret(secret_name: str) -> str:
-    """Read a provider secret from the environment, then the macOS Keychain."""
+    """Read a provider secret from the environment, then known Keychain names.
+
+    Older production runs stored the service as the bare environment name;
+    current runs use the scoped ``story-agent.`` prefix.  Reading both keeps a
+    previously supplied credential usable and avoids asking the user to enter
+    the same secret again after a naming migration.
+    """
     value = os.getenv(secret_name, "").strip()
     if value:
         return value
     if sys.platform != "darwin":
         return ""
-    process = subprocess.run(
-        [
-            "security",
-            "find-generic-password",
-            "-a",
-            os.getenv("USER", "story-agent"),
-            "-s",
-            keychain_service(secret_name),
-            "-w",
-        ],
-        text=True,
-        capture_output=True,
-    )
-    return process.stdout.strip() if process.returncode == 0 else ""
+    account = os.getenv("USER", "story-agent")
+    for service in keychain_service_candidates(secret_name):
+        process = subprocess.run(
+            [
+                "security",
+                "find-generic-password",
+                "-a",
+                account,
+                "-s",
+                service,
+                "-w",
+            ],
+            text=True,
+            capture_output=True,
+        )
+        if process.returncode == 0 and process.stdout.strip():
+            return process.stdout.strip()
+    return ""
 
 
 def write_secret(secret_name: str, value: str) -> None:

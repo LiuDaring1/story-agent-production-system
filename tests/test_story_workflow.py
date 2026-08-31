@@ -10,8 +10,11 @@ from unittest.mock import patch
 import story_workflow
 from story_workflow import (
     build_product_text_sources_from_story_source,
+    confirmed_subtitle_from_story_run,
     confirmed_text_from_story_run,
+    ensure_confirmed_spoken_timeline_srt,
     sealed_storyboard_images_dir,
+    validate_static_ppt_full_timeline,
 )
 
 try:
@@ -34,6 +37,58 @@ def write_srt(path: Path, texts: list[str]) -> None:
 
 
 class ProductTextSourceAlignmentTests(unittest.TestCase):
+    def test_confirmed_audio_anchors_generate_full_spoken_srt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status = root / "99_项目状态"
+            assembly = root / "03_背景成片"
+            timing_dir = status / "preflight_alignment"
+            timing_dir.mkdir(parents=True)
+            assembly.mkdir(parents=True)
+            (timing_dir / "confirmed_line_timings.json").write_text(
+                json.dumps(
+                    [
+                        {"line": "大家好", "source_start": 0, "source_end": 1},
+                        {"line": "正文", "source_start": 1, "source_end": 2},
+                        {"line": "道理", "source_start": 2, "source_end": 3},
+                    ],
+                    ensure_ascii=False,
+                ),
+                encoding="utf-8",
+            )
+
+            result = ensure_confirmed_spoken_timeline_srt(status, assembly)
+
+            self.assertIsNotNone(result)
+            content = result.read_text(encoding="utf-8")
+            self.assertIn("大家好", content)
+            self.assertIn("正文", content)
+            self.assertIn("道理", content)
+
+    def test_static_ppt_timeline_preserves_opening_and_moral_audio_slots(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            srt = root / "body.srt"
+            srt.write_text(
+                "1\n00:00:09,000 --> 00:02:59,000\n正文\n",
+                encoding="utf-8",
+            )
+            plan = root / "plan.json"
+            valid = {
+                "slides": [
+                    {"shot_id": "TITLE", "duration_seconds": 9.0},
+                    {"shot_id": "S01", "duration_seconds": 170.0},
+                    {"shot_id": "MORAL", "duration_seconds": 21.0},
+                ]
+            }
+            plan.write_text(json.dumps(valid), encoding="utf-8")
+            validate_static_ppt_full_timeline(plan, srt, 200.0)
+            valid["slides"][0]["duration_seconds"] = 0.0
+            valid["slides"][1]["duration_seconds"] = 179.0
+            plan.write_text(json.dumps(valid), encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "TITLE 时长"):
+                validate_static_ppt_full_timeline(plan, srt, 200.0)
+
     def test_sealed_storyboard_directory_requires_every_image_hash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -75,6 +130,25 @@ class ProductTextSourceAlignmentTests(unittest.TestCase):
             confirmed.write_text("被篡改", encoding="utf-8")
             self.assertIsNone(confirmed_text_from_story_run(status))
 
+    def test_native_ledger_subtitle_txt_is_exact_and_fails_on_hash_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            status = root / "99_项目状态"
+            status.mkdir()
+            subtitle = root / "确认字幕.txt"
+            subtitle.write_text("妈妈，这是太阳吗？\n不是，这是气球。\n", encoding="utf-8")
+            import hashlib
+
+            digest = hashlib.sha256(subtitle.read_bytes()).hexdigest()
+            (status / "story_run.json").write_text(
+                json.dumps({"inputs": {"subtitle_txt": {"path": str(subtitle), "sha256": digest}}}),
+                encoding="utf-8",
+            )
+            self.assertEqual(confirmed_subtitle_from_story_run(status), subtitle)
+            subtitle.write_text("被改过的字幕\n", encoding="utf-8")
+            with self.assertRaisesRegex(ValueError, "哈希漂移"):
+                confirmed_subtitle_from_story_run(status)
+
     def run_alignment(self, story_lines: list[str], subtitle_lines: list[str]):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -115,6 +189,29 @@ class ProductTextSourceAlignmentTests(unittest.TestCase):
         body = ["很久很久以前", "天地还没有分开"]
         script, timings = self.run_alignment(
             ["盘古开天辟地", *body],
+            body,
+        )
+        self.assertEqual(script, "\n".join(body) + "\n")
+        self.assertEqual([item["line"] for item in timings], body)
+
+    def test_presenter_intro_absent_from_sales_subtitles_is_trimmed_before_alignment(self) -> None:
+        body = ["一只狼饿了好几天", "这时走来一只小鸭子"]
+        script, timings = self.run_alignment(
+            ["大家好我是绵羊姐姐", *body],
+            body,
+        )
+        self.assertEqual(script, "\n".join(body) + "\n")
+        self.assertEqual([item["line"] for item in timings], body)
+
+    def test_independent_moral_card_suffix_is_trimmed_after_exact_body_subtitles(self) -> None:
+        body = ["狼气疯了", "没了声"]
+        script, timings = self.run_alignment(
+            [
+                *body,
+                "小朋友们",
+                "这个故事告诉我们",
+                "遇到危险不要慌",
+            ],
             body,
         )
         self.assertEqual(script, "\n".join(body) + "\n")

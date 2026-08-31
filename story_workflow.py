@@ -36,6 +36,8 @@ from story_contract_consumers import (
 )
 from artifact_semantic_plan import load_current_artifact_semantic_plan, semantic_plan_path, selected_line_indices
 from r2v_retry_policy import evaluate_quality_redos
+from presenter_layout import PRESENTER_LAYOUT_POLICY, compile_fixed_anchor, scan_rvm_body_overflow
+from story_delivery_policy import release_semantic_subtitle_artifact
 
 from story_project import (
     auto_keying,
@@ -868,9 +870,16 @@ def main() -> None:
     elif args.command == "assemble":
         subtitle_script = args.subtitle_script
         if subtitle_script is None:
-            inferred_subtitle_script = Path(args.output_dir).expanduser().parent / "00_输入素材" / "story_source.txt"
-            if inferred_subtitle_script.exists():
-                subtitle_script = inferred_subtitle_script
+            project_root = Path(args.output_dir).expanduser().parent
+            subtitle_script = confirmed_subtitle_from_story_run(project_root / "99_项目状态")
+            if subtitle_script is None:
+                # Compatibility is intentionally limited to projects that do
+                # not yet have the native ledger. Once story_run.json exists,
+                # an absent or stale subtitle TXT is a hard error rather than
+                # permission to reuse story_source.txt or invent new wrapping.
+                inferred = project_root / "00_输入素材" / "story_source.txt"
+                if inferred.exists():
+                    subtitle_script = inferred
         command = [
             "--video-dir",
             args.video_dir,
@@ -1188,7 +1197,13 @@ def annotation_skill_path_from_config() -> Path | None:
 
 
 def build_abc_scene_windows(duration: float, subtitle_srt: Path | None = None) -> tuple[str, str]:
-    """Return B and C windows snapped to speech gaps; A is the default and always ends the video."""
+    """Return B/C windows snapped to speech gaps.
+
+    A remains the default story layout.  When the audited subtitle stream ends
+    several seconds before the program, the subtitle-free host moral/outro is
+    assigned to C so a drifting presenter cannot be stranded at the edge of
+    the A composition.
+    """
     cue_ends: list[float] = []
     if subtitle_srt is not None and subtitle_srt.exists():
         from release_video import parse_srt
@@ -1202,12 +1217,16 @@ def build_abc_scene_windows(duration: float, subtitle_srt: Path | None = None) -
         if not boundaries or chosen - boundaries[-1] >= 8.0:
             boundaries.append(chosen)
         target = chosen + 18.0
+    tail_c_start = max(cue_ends) if cue_ends and duration - max(cue_ends) >= 4.0 else None
+    if tail_c_start is not None and all(abs(tail_c_start - value) >= 0.05 for value in boundaries):
+        boundaries.append(tail_c_start)
+        boundaries.sort()
     points = [0.0, *boundaries, duration]
     segments = [(points[index], points[index + 1]) for index in range(len(points) - 1) if points[index + 1] - points[index] >= 1.0]
     modes = ["c", "b", "a"]
     assigned = [modes[index % len(modes)] for index in range(len(segments))]
     if assigned:
-        assigned[-1] = "a"
+        assigned[-1] = "c" if tail_c_start is not None else "a"
     b_windows: list[str] = []
     c_windows: list[str] = []
     for (start, end), mode in zip(segments, assigned):
@@ -1255,6 +1274,105 @@ def preview_times_with_keying_coverage(value: str, preset_path: Path | None) -> 
     return ",".join(f"{item:.3f}" for item in times)
 
 
+def preview_times_with_library_tail_coverage(value: str, duration: float, tail_seconds: float) -> str:
+    """Always include a frame inside the blurred library sales tail."""
+
+    from release_video import resolved_tail_seconds
+
+    times = [max(0.0, float(part.strip())) for part in value.replace("，", ",").split(",") if part.strip()]
+    tail_duration = resolved_tail_seconds(duration, tail_seconds)
+    tail_sample = max(0.0, duration - min(2.0, max(0.2, tail_duration / 2)))
+    if int(round(tail_sample)) not in {int(round(item)) for item in times}:
+        times.append(tail_sample)
+    return ",".join(f"{item:.3f}" for item in times)
+
+
+def require_preferred_keyer(preset_path: Path, preferred_keyer: str) -> None:
+    """Refuse a production/preview fallback from the configured keyer."""
+
+    preferred = str(preferred_keyer or "").strip()
+    if not preferred:
+        return
+    payload = json.loads(preset_path.read_text(encoding="utf-8"))
+    actual = str(payload.get("keyer") or "").strip()
+    if actual != preferred:
+        raise RuntimeError(
+            "当前抠像 preset 与配置的 preferred_keyer 不一致，拒绝静默降级进入预览或正式交付："
+            f"preferred={preferred} actual={actual}。"
+            f"请重新运行 auto-keying --backend {preferred}。"
+        )
+
+
+def load_release_person_layout(
+    path: Path,
+    keying_preset: Path | None,
+    *,
+    story_box: str = "210,270,910,512",
+) -> dict[str, int]:
+    """Load and hard-check the source-native, center-aligned A-shot anchor."""
+
+    if not path.is_file():
+        return {}
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if payload.get("schema_version") != "story-release-person-layout/v1":
+        raise ValueError("release_layout.json schema_version 无效")
+    if payload.get("dynamic_repositioning") is not False:
+        raise ValueError("release_layout.json 必须禁止动态跟随移位")
+    if payload.get("person_crop") not in (None, "", []):
+        raise ValueError("release_layout.json 不得通过裁切解决大手势布局")
+    keying_payload: dict[str, object] = {}
+    if keying_preset is not None:
+        expected = str(payload.get("keying_preset_sha256") or "")
+        actual = hashlib.sha256(keying_preset.read_bytes()).hexdigest()
+        if expected != actual:
+            raise ValueError("release_layout.json 未绑定当前 keying_preset.json")
+        keying_payload = json.loads(keying_preset.read_text(encoding="utf-8"))
+    result: dict[str, int] = {}
+    for field in ("person_height", "person_x", "person_y"):
+        raw = payload.get(field)
+        if isinstance(raw, bool):
+            raise ValueError(f"release_layout.json {field} 必须为整数")
+        value = int(raw)
+        if field == "person_height" and value <= 0:
+            raise ValueError("release_layout.json person_height 必须大于 0")
+        result[field] = value
+    if keying_payload:
+        policy = str(keying_payload.get("person_layout_policy") or "")
+        if policy != PRESENTER_LAYOUT_POLICY:
+            raise ValueError("keying_preset.json 缺少 source-native 固定中轴布局策略")
+        source_height = int(keying_payload.get("rvm_input_height") or 1080)
+        if result["person_height"] != source_height:
+            raise ValueError("release_layout.json 禁止缩放人物：person_height 必须等于 RVM 原始高度")
+        if result["person_y"] != 0:
+            raise ValueError("release_layout.json 禁止改变人物原始纵向位置：person_y 必须为 0")
+        initial_bbox = keying_payload.get("presenter_initial_subject_bbox")
+        if not isinstance(initial_bbox, list) or len(initial_bbox) != 4:
+            raise ValueError("keying_preset.json 缺少开场中性帧人物框，无法计算固定中轴")
+        try:
+            story_x, _story_y, story_width, _story_height = (
+                int(float(part.strip())) for part in str(story_box).replace("，", ",").split(",")
+            )
+        except (TypeError, ValueError) as exc:
+            raise ValueError("story_box 必须为 x,y,width,height") from exc
+        story_right = story_x + story_width
+        if not 0 < story_right < 1920:
+            raise ValueError("story_box 未形成有效的右侧空白矩形")
+        anchor = compile_fixed_anchor(
+            [],
+            active_windows=[],
+            initial_subject_bbox=[int(value) for value in initial_bbox],
+            right_blank_rect=[story_right, 0, 1920 - story_right, source_height],
+            canvas_width=1920,
+        )
+        expected_x = int(anchor["anchor_x"])
+        if result["person_x"] != expected_x:
+            raise ValueError(
+                "release_layout.json 人物中轴未对齐右侧空白矩形中轴："
+                f"person_x={result['person_x']} expected={expected_x}"
+            )
+    return result
+
+
 def release_encode_guard_action(
     previous: dict[str, Any],
     *,
@@ -1271,7 +1389,7 @@ def release_encode_guard_action(
     if (
         same_binding
         and output_is_current
-        and previous.get("status") in {"completed", "completed_local_repair", "adopted_existing"}
+        and previous.get("status") in {"completed", "adopted_existing"}
     ):
         return "reuse"
     repairs = int(previous.get("technical_repair_count") or 0)
@@ -1376,7 +1494,14 @@ def run_package_release_project(
     bg_image = first_existing(outputs.get("main_background_image"), theme_dir / "main_background_16x9.png")
     frame_a = first_existing(outputs.get("story_frame_a"), theme_dir / "story_frame_a.png")
     frame_b = frame_a
+    confirmed_spoken_srt = ensure_confirmed_spoken_timeline_srt(paths.status, paths.assembly)
     subtitle_srt = first_existing(
+        # A reviewed short-cue full program SRT is the strongest release
+        # source.  Body-only sales subtitles belong to customer background
+        # deliverables, not the public release videos.
+        paths.assembly / "story_full_subtitles.srt",
+        paths.assembly / "story_semantic_timeline.srt",
+        confirmed_spoken_srt,
         outputs.get("subtitles_srt"),
         paths.assembly / "story_subtitles.srt",
         outputs.get("sales_subtitles_srt"),
@@ -1426,6 +1551,18 @@ def run_package_release_project(
             keying_preset = auto_keying(paths.root, backend=configured_keying_backend())
         except Exception as exc:
             print(f"[warning] 自动抠像参数暂不可用：{exc}")
+    if keying_preset is not None:
+        require_preferred_keyer(keying_preset, str(release_defaults.get("preferred_keyer") or ""))
+    layout_story_box = release_contract_args.get("story_box") or release_defaults.get(
+        "story_box", "210,270,910,512"
+    )
+    if isinstance(layout_story_box, (list, tuple)):
+        layout_story_box = ",".join(str(value) for value in layout_story_box)
+    release_person_layout = load_release_person_layout(
+        paths.release / "release_layout.json",
+        keying_preset,
+        story_box=str(layout_story_box),
+    )
 
     requested_variant = variant
     if requested_variant == "auto":
@@ -1473,11 +1610,52 @@ def run_package_release_project(
         )
     qa_theme_assets(paths, strict=story_contract_context is None)
 
+    severe_presenter_windows: list[tuple[float, float]] = []
+    if requested_variant in {"both", "main"} and keying_preset is not None and release_person_layout:
+        keying_payload = json.loads(keying_preset.read_text(encoding="utf-8"))
+        if str(keying_payload.get("keyer") or "") == "rvm":
+            foreground = Path(str(keying_payload.get("rvm_foreground_video") or "")).expanduser()
+            overflow = scan_rvm_body_overflow(
+                foreground,
+                fixed_anchor_x=int(release_person_layout["person_x"]),
+                canvas_width=1920,
+                source_width=int(keying_payload.get("rvm_input_width") or 1920),
+                report_path=paths.status / "release_preview_frames" / "presenter_body_overflow_report.json",
+            )
+            severe_presenter_windows = [
+                (float(window[0]), float(window[1]))
+                for window in overflow.get("severe_windows", [])
+                if isinstance(window, list) and len(window) == 2
+            ]
+
+    def merge_scene_windows(base: str, additions: list[tuple[float, float]]) -> str:
+        windows: list[tuple[float, float]] = []
+        for raw in base.replace("，", ",").split(","):
+            part = raw.strip()
+            if not part:
+                continue
+            raw_start, raw_end = part.split("-", 1)
+            windows.append((float(raw_start), float(raw_end)))
+        windows.extend(additions)
+        if not windows:
+            return ""
+        merged: list[list[float]] = []
+        for start, end in sorted(windows):
+            if merged and start <= merged[-1][1] + 0.05:
+                merged[-1][1] = max(merged[-1][1], end)
+            else:
+                merged.append([start, end])
+        return ",".join(f"{start:.3f}-{end:.3f}" for start, end in merged)
+
     def resolve_scene_windows(bg_video: Path) -> tuple[str, str]:
         configured_b = str(release_defaults.get("b_windows", "") or "").strip()
         configured_c = str(release_defaults.get("c_windows", "") or "").strip()
         auto_b, auto_c = build_abc_scene_windows(probe_duration(bg_video), subtitle_srt)
         b_windows = configured_b if configured_b and configured_b.lower() != "auto" else auto_b
+        # Severe torso overflow is resolved only by substituting the existing
+        # B scene. The approved A presenter transform remains untouched. Hand
+        # and forearm overflow was removed by the body-core scanner upstream.
+        b_windows = merge_scene_windows(b_windows, severe_presenter_windows)
         c_windows = configured_c if configured_c and configured_c.lower() != "auto" else auto_c
         return b_windows, c_windows
 
@@ -1485,6 +1663,35 @@ def run_package_release_project(
         effective = dict(release_defaults)
         if selected_variant == "main":
             effective.update({key: value for key, value in release_contract_args.items() if key != "safe_regions"})
+            effective.update(release_person_layout)
+        release_subtitle_srt = subtitle_srt
+        if release_semantic_plan is not None and subtitle_srt is not None:
+            # Both account variants are public release videos.  Their subtitle
+            # layer covers the complete spoken program: presenter opening,
+            # narrative body and closing moral.  The body-only
+            # background_subtitles policy belongs exclusively to the customer
+            # background-video asset in 06_资料包.
+            artifact = release_semantic_subtitle_artifact(selected_variant)
+            release_subtitle_srt = compile_release_subtitle_srt(
+                subtitle_srt,
+                release_semantic_plan,
+                artifact,
+                paths.status / "release_semantics" / f"{selected_variant}_{artifact}.srt",
+                semantic_source=(
+                    paths.root
+                    / str(release_semantic_plan["semantic_source"]["project_relative_path"])
+                ),
+            )
+        effective_tail_seconds = float(release_defaults.get("tail_seconds", 0.0))
+        if selected_variant == "library" and release_subtitle_srt is not None:
+            cues = parse_simple_srt(release_subtitle_srt)
+            if cues:
+                post_speech_silence = max(0.04, probe_duration(bg_video) - float(cues[-1][1]))
+                effective_tail_seconds = (
+                    post_speech_silence
+                    if effective_tail_seconds <= 0
+                    else min(effective_tail_seconds, post_speech_silence)
+                )
         command: list[object] = [
             "--story-name",
             story.get("name", ""),
@@ -1537,7 +1744,7 @@ def run_package_release_project(
             "--watermark-speed",
             str(release_defaults.get("watermark_speed", 0.45)),
             "--tail-seconds",
-            str(release_defaults.get("tail_seconds", 3.0)),
+            str(effective_tail_seconds),
             "--tail-notice-text",
             str(release_defaults.get("tail_notice_text", "有需要联系客服，好作品有偿分享！")),
             "--story-logo-width-a",
@@ -1568,19 +1775,6 @@ def run_package_release_project(
                     "--approved-preview-geometry",
                     paths.status / "release_preview_frames" / f"release_geometry_manifest_{selected_variant}.json",
                 ])
-        release_subtitle_srt = subtitle_srt
-        if release_semantic_plan is not None and subtitle_srt is not None:
-            artifact = "demo_subtitles" if selected_variant == "main" else "background_subtitles"
-            release_subtitle_srt = compile_release_subtitle_srt(
-                subtitle_srt,
-                release_semantic_plan,
-                artifact,
-                paths.status / "release_semantics" / f"{selected_variant}_{artifact}.srt",
-                semantic_source=(
-                    paths.root
-                    / str(release_semantic_plan["semantic_source"]["project_relative_path"])
-                ),
-            )
         optional: list[tuple[str, object | None]] = [
             ("--plate-image", plate_image),
             ("--main-top-panel", main_top_panel),
@@ -1589,9 +1783,6 @@ def run_package_release_project(
             ("--library-bottom-panel", library_bottom_panel),
             ("--main-package-spec", main_package_spec),
             ("--main-package-receipt", main_package_receipt),
-            ("--watermark-logo", watermark_logo),
-            ("--antipiracy-logo", antipiracy_logo),
-            ("--story-logo", story_logo),
             ("--keying-preset-json", keying_preset),
         ]
         person_crop = str(release_defaults.get("person_crop", "") or "").strip()
@@ -1600,6 +1791,8 @@ def run_package_release_project(
         if selected_variant == "main":
             optional.extend(
                 [
+                    ("--watermark-logo", watermark_logo),
+                    ("--story-logo", story_logo),
                     ("--bg-image", bg_image),
                     ("--person-greenscreen", greenscreen),
                     ("--audio-mix", audio_mix),
@@ -1609,13 +1802,17 @@ def run_package_release_project(
                 ]
             )
             b_windows, c_windows = resolve_scene_windows(bg_video)
-            if frame_b is not None and b_windows:
+            if b_windows:
                 command.extend(["--b-windows", b_windows])
             if c_windows:
                 command.extend(["--c-windows", c_windows])
         if selected_variant == "library":
             optional.extend(
                 [
+                    # Library uses two counter-moving copies of the approved
+                    # anti-piracy bitmap, rendered by release_video.  Do not
+                    # additionally pass the fixed main-account story_logo.
+                    ("--antipiracy-logo", antipiracy_logo),
                     ("--audio-mix", audio_mix),
                     ("--subtitle-srt", release_subtitle_srt),
                 ]
@@ -1625,6 +1822,12 @@ def run_package_release_project(
             if selected_variant == "main":
                 b_windows, _c_windows = resolve_scene_windows(bg_video)
                 effective_preview_times = preview_times_with_b_coverage(effective_preview_times, b_windows)
+            else:
+                effective_preview_times = preview_times_with_library_tail_coverage(
+                    effective_preview_times,
+                    probe_duration(bg_video),
+                    effective_tail_seconds,
+                )
             command.extend(["--preview-dir", preview_dir, "--preview-times", effective_preview_times])
             if selected_variant == "main" and preview_person_layouts:
                 command.extend(["--preview-person-layouts", preview_person_layouts])
@@ -1708,26 +1911,41 @@ def run_package_release_project(
         technical_repair_count = int(previous.get("technical_repair_count") or 0) + int(technical_repair)
         repair_authorization: dict[str, Any] = {}
         if authorized_binding_repair:
-            if not output_is_current:
+            previous_status = str(previous.get("status") or "")
+            incomplete_previous = previous_status in {
+                "running",
+                "running_technical_repair",
+                "running_authorized_binding_repair",
+                "failed_or_interrupted",
+            }
+            if not output_is_current and not incomplete_previous:
                 raise RuntimeError(
                     f"authorized_binding_repair_requires_current_output:{selected_variant}; "
                     "旧成片与门禁 SHA 不一致，不能建立可追溯备份。"
                 )
             backup_dir = paths.status / "release_encode_backups"
             backup_dir.mkdir(parents=True, exist_ok=True)
-            backup = backup_dir / f"{selected_variant}_{recorded_sha[:12]}.mp4"
-            if not backup.is_file():
-                shutil.copy2(output, backup)
-            backup_sha = sha256_file(backup)
-            if backup_sha != recorded_sha:
-                raise RuntimeError(f"authorized_binding_repair_backup_sha_mismatch:{selected_variant}")
+            backup = None
+            backup_sha = ""
+            backup_kind = "none"
+            if output.is_file() and output.stat().st_size > 0:
+                actual_output_sha = sha256_file(output)
+                backup_kind = "verified_previous_output" if output_is_current else "interrupted_partial_output"
+                backup = backup_dir / f"{selected_variant}_{actual_output_sha[:12]}_{backup_kind}.mp4"
+                if not backup.is_file():
+                    shutil.copy2(output, backup)
+                backup_sha = sha256_file(backup)
+                if backup_sha != actual_output_sha:
+                    raise RuntimeError(f"authorized_binding_repair_backup_sha_mismatch:{selected_variant}")
             repair_authorization = {
                 "repair_authorization": {
                     "reason": authorized_binding_repair_reason.strip(),
                     "authorized_at": datetime.now().isoformat(timespec="seconds"),
                     "previous_binding_fingerprint": str(previous.get("binding_fingerprint") or ""),
                     "previous_output_sha256": recorded_sha,
-                    "backup": str(backup),
+                    "previous_status": previous_status,
+                    "backup_kind": backup_kind,
+                    "backup": str(backup) if backup is not None else "",
                     "backup_sha256": backup_sha,
                 }
             }
@@ -1900,12 +2118,12 @@ def write_release_preview_feedback_handoff(preview_dir: Path, sheet: Path, run_i
     images = sorted(path for path in preview_dir.glob("*.png") if path.name != "preview_contact_sheet.png")
     status_dir = preview_dir.parent
     project_dir = status_dir.parent
-    preset_path = project_dir / "04_发布视频" / "keying" / "keying_preset.json"
+    preset_path = project_dir / "04_发布视频" / "release_layout.json"
     index_path = preview_dir / "preview_index.md"
     lines = [
         "# 第 13 步预览反馈给 Codex",
         "",
-        "请不要只总结图片。请直接查看本轮发布视频预览，判断主账号和宝库号是否适合进入正式生成；如果主账号人物位置、大小、抠像边缘、故事框、字幕、Logo、背景虚化或画面留白需要调整，请直接修改 keying_preset.json，然后让我回工作台重新点击第 13 步复查。",
+        "请不要只总结图片。请直接查看本轮发布视频预览，判断主账号和宝库号是否适合进入正式生成；如果主账号人物位置、大小或留白需要调整，请修改 release_layout.json并重新预览。抠像边缘问题必须回到 RVM/keying 审核链，不得用裁切或布局移位遮盖。",
         "",
         "## 本轮文件",
         f"- 项目目录：`{project_dir}`",
@@ -1938,7 +2156,8 @@ def run_release_layout_handoff(project_dir: Path, times: str, person_layouts: st
     run_package_release_project(project_dir, "both", preview_times=times, preview_person_layouts=person_layouts)
     paths = project_paths(project_dir)
     preview_dir = paths.status / "release_preview_frames"
-    preset_path = paths.release / "keying" / "keying_preset.json"
+    keying_preset_path = paths.release / "keying" / "keying_preset.json"
+    preset_path = paths.release / "release_layout.json"
     preset = {}
     if preset_path.exists():
         preset = json.loads(preset_path.read_text(encoding="utf-8"))
@@ -1952,8 +2171,9 @@ def run_release_layout_handoff(project_dir: Path, times: str, person_layouts: st
         f"- 候选预览目录：{preview_dir}",
         f"- 总览拼图：{preview_dir / 'preview_contact_sheet.png'}",
         f"- 参数写回：{preset_path}",
+        f"- 抠像绑定：{keying_preset_path}",
         "",
-        "## 当前 keying_preset.json",
+        "## 当前 release_layout.json",
         "```json",
         json.dumps(preset, ensure_ascii=False, indent=2),
         "```",
@@ -1966,7 +2186,7 @@ def run_release_layout_handoff(project_dir: Path, times: str, person_layouts: st
         "## Codex 应执行",
         "1. 先看 preview_contact_sheet.png，再逐张查看候选 A 镜、B 镜和宝库号预览。",
         "2. 以开头中性帧人物中轴对齐右侧空白矩形中心，只计算一次固定 person_x。",
-        "3. 使用 person_height_ratio=1.0、person_crop=null、person_y=0 和一个固定 person_x；整段沿用同一位置。",
+        "3. 在 release_layout.json 中使用 person_height=1080、person_crop=null、person_y=0 和一个固定 person_x；整段沿用同一位置，并绑定当前 keying_preset SHA-256。",
         "4. 再运行 preview-release-project 确认最终预览，确认后才点击工作台 ⑭ 正式编码。",
     ]
     handoff.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -2268,10 +2488,16 @@ def run_product_package_project(
     story_document_text = first_existing(outputs.get("consumer_manuscript"), story_text)
     script_lines = first_existing(confirmed_story_text, inputs.get("story_text"), paths.inputs / "story_source.txt")
     narration = first_existing(inputs.get("narration"), inputs.get("extracted_narration"))
-    music = first_existing(paths.video_jobs / "music" / f"{story.get('slug')}_background_music.mp3", inputs.get("music"))
+    music = first_existing(
+        story_run_artifact_path(paths.status, "final_background_music"),
+        paths.video_jobs / "music" / f"{story.get('slug')}_background_music.mp3",
+        inputs.get("music"),
+    )
     sealed_images_dir = sealed_storyboard_images_dir(paths.status)
     images_dir = first_existing(
         sealed_images_dir,
+        paths.root / "02_图片素材" / "shot_storyboards",
+        paths.images / "shot_storyboards",
         paths.video_jobs / "images",
         paths.images / "images",
     )
@@ -2284,9 +2510,21 @@ def run_product_package_project(
     keying_preset = first_existing(outputs.get("keying_preset"), paths.release / "keying" / "keying_preset.json")
     demo_bg = first_existing(outputs.get("main_background_image"), paths.release / "theme_assets" / "main_background_16x9.png")
     story_frame_a = first_existing(outputs.get("story_frame_a"), paths.release / "theme_assets" / "story_frame_a.png")
-    timings = first_existing(outputs.get("timings_json"), paths.assembly / "timings.json")
+    timings = first_existing(
+        outputs.get("timings_json"),
+        paths.assembly / "timings.json",
+        paths.status / "preflight" / "confirmed_line_timings.json",
+    )
+    confirmed_spoken_srt = ensure_confirmed_spoken_timeline_srt(paths.status, paths.assembly)
+    body_subtitles_srt = first_existing(
+        outputs.get("sales_subtitles_srt"),
+        paths.assembly / "story_sales_subtitles.srt",
+        paths.assembly / "story_subtitles.srt",
+    )
+    full_subtitles_srt = first_existing(paths.assembly / "story_full_subtitles.srt")
     source_subtitles = first_existing(
-        paths.assembly / "story_semantic_timeline.srt" if story_contract_context is not None else None,
+        paths.assembly / "story_semantic_timeline.srt",
+        confirmed_spoken_srt,
         paths.assembly / "story_subtitles.srt",
     )
     # The customer manuscript keeps natural reading paragraphs, while PPTs
@@ -2320,7 +2558,7 @@ def run_product_package_project(
         ("逐行台词", script_lines),
         ("旁白", narration),
         ("配乐", music),
-        ("图片目录", images_dir if images_dir.exists() else None),
+        ("图片目录", images_dir if images_dir is not None and images_dir.exists() else None),
         ("含字幕背景视频", bg_with_sub),
         ("无字幕背景视频", bg_no_sub),
         ("绿幕视频", greenscreen),
@@ -2380,21 +2618,53 @@ def run_product_package_project(
         str(release_defaults.get("story_logo_y", 44)),
     ]
     static_ppt_inputs = {
-        "--director-plan": first_existing(paths.status / "director" / "story_r2v_plan_draft.json"),
+        "--director-plan": first_existing(
+            story_run_artifact_path(paths.status, "master_director_plan"),
+            paths.root / "01_导演计划" / "master_director_plan.json",
+            paths.status / "director" / "story_r2v_plan_draft.json",
+            paths.status / "director" / "story_r2v_plan.json",
+        ),
         "--shot-storyboard-compile-receipt": first_existing(
+            story_run_artifact_path(paths.status, "shot_storyboard_compile_receipt"),
+            paths.root / "01_导演计划" / "shot_storyboard_compile_receipt.json",
             paths.status / "storyboards" / "shot_storyboard_compile_receipt.json"
         ),
-        "--static-ppt-plan": first_existing(paths.status / "product" / "static_ppt_plan.json"),
+        "--static-ppt-plan": first_existing(
+            story_run_artifact_path(paths.status, "static_ppt_plan"),
+            paths.root / "01_导演计划" / "static_ppt_plan.json",
+            paths.status / "product" / "static_ppt_plan.json",
+        ),
         "--static-ppt-with-subtitles": first_existing(
+            paths.product / "build" / f"{story.get('name')}_静态故事PPT_含字幕.pptx",
+            paths.root / "05_产品资料" / "构建中" / f"{story.get('name')}_静态故事PPT_含字幕.pptx",
             paths.product / "构建中" / f"{story.get('name')}_静态故事PPT_含字幕.pptx"
         ),
         "--static-ppt-without-subtitles": first_existing(
+            paths.product / "build" / f"{story.get('name')}_静态故事PPT_无字幕.pptx",
+            paths.root / "05_产品资料" / "构建中" / f"{story.get('name')}_静态故事PPT_无字幕.pptx",
             paths.product / "构建中" / f"{story.get('name')}_静态故事PPT_无字幕.pptx"
         ),
     }
     if all(static_ppt_inputs.values()):
+        if body_subtitles_srt is None:
+            raise FileNotFoundError("静态 PPT 完整时间轴校验缺少正文 SRT")
+        validate_static_ppt_full_timeline(
+            Path(static_ppt_inputs["--static-ppt-plan"]),
+            body_subtitles_srt,
+            probe_duration(bg_no_sub),
+        )
         for option, value in static_ppt_inputs.items():
             command.extend([option, value])
+    elif (paths.status / "story_run.json").is_file() or any(static_ppt_inputs.values()):
+        missing_static = [option for option, value in static_ppt_inputs.items() if value is None]
+        raise FileNotFoundError(
+            "静态 PPT 输入不完整，禁止回退旧目录或重拼页：" + "、".join(missing_static)
+        )
+    # Exact reviewed subtitle artifacts are authoritative for both native and
+    # contract-backed projects.  Never make the safe full/body projections
+    # conditional on an optional contract-context CLI argument.
+    if full_subtitles_srt is not None:
+        command.extend(["--demo-subtitle-srt", full_subtitles_srt])
     if story_contract_context is not None:
         # The semantic plan supersedes the older static product selector for
         # required_v1 projects. Loading revalidates lock, source and recompilation.
@@ -2462,10 +2732,62 @@ def confirmed_text_from_story_run(status_dir: Path) -> Path | None:
     return path if digest == expected else None
 
 
+def confirmed_subtitle_from_story_run(status_dir: Path) -> Path | None:
+    """Return the exact user TXT bound into the native ledger.
+
+    A native ledger makes this input mandatory. Missing, replaced, or changed
+    TXT files fail closed so downstream consumers cannot silently switch back
+    to the story manuscript and create their own punctuation or line breaks.
+    """
+
+    run_file = status_dir / "story_run.json"
+    if not run_file.is_file():
+        return None
+    try:
+        payload = json.loads(run_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("story_run.json 无法解析，不能确认字幕 TXT") from exc
+    record = payload.get("inputs", {}).get("subtitle_txt")
+    if not isinstance(record, dict):
+        raise ValueError("story_run.json 缺少 subtitle_txt；禁止系统另做字幕")
+    path = Path(str(record.get("path") or "")).expanduser()
+    expected = str(record.get("sha256") or "").lower()
+    if path.suffix.lower() != ".txt" or not path.is_file() or len(expected) != 64:
+        raise ValueError("账本中的字幕 TXT 不存在或记录无效")
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    if digest != expected:
+        raise ValueError("字幕 TXT 已发生哈希漂移；必须重新确认后登记")
+    return path
+
+
+def story_run_artifact_path(status_dir: Path, artifact_id: str) -> Path | None:
+    """Return one hash-bound artifact recorded by the native story ledger."""
+
+    run_file = status_dir / "story_run.json"
+    try:
+        payload = json.loads(run_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    record = payload.get("artifacts", {}).get(artifact_id, {})
+    if not isinstance(record, dict):
+        return None
+    path = Path(str(record.get("path") or "")).expanduser()
+    expected = str(record.get("sha256") or "").lower()
+    if not path.is_file() or len(expected) != 64:
+        return None
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return path if digest == expected else None
+
+
 def sealed_storyboard_images_dir(status_dir: Path) -> Path | None:
     """Return the common directory of the current sealed storyboard images."""
 
-    manifest_path = status_dir / "storyboards" / "storyboard_manifest_sealed.json"
+    manifest_path = first_existing(
+        story_run_artifact_path(status_dir, "storyboard_manifest_sealed"),
+        status_dir / "storyboards" / "storyboard_manifest_sealed.json",
+    )
+    if manifest_path is None:
+        return None
     try:
         payload = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -2496,6 +2818,7 @@ def build_product_text_sources_from_story_source(story_text: Path, subtitles_srt
     ]
     cues = parse_simple_srt(subtitles_srt)
     story_lines = _trim_story_source_opening_absent_from_subtitles(story_lines, cues)
+    story_lines = _trim_story_source_closing_absent_from_subtitles(story_lines, cues)
     output_dir.mkdir(parents=True, exist_ok=True)
     patched_timings: list[dict] = []
     subtitle_start = _find_story_subtitle_start(cues, story_lines)
@@ -2552,6 +2875,45 @@ def build_product_text_sources_from_story_source(story_text: Path, subtitles_srt
     return script_path, timings_path
 
 
+def validate_static_ppt_full_timeline(
+    plan_path: Path,
+    body_subtitles_srt: Path,
+    full_duration: float,
+    *,
+    tolerance: float = 0.15,
+) -> None:
+    """Block a body-only SRT from replacing TITLE/MORAL PPT timing slots."""
+
+    payload = json.loads(plan_path.read_text(encoding="utf-8"))
+    slides = payload.get("slides")
+    if not isinstance(slides, list) or len(slides) < 3:
+        raise ValueError("静态 PPT 计划缺少 TITLE/正文/MORAL 完整结构")
+    if str(slides[0].get("shot_id")) != "TITLE" or str(slides[-1].get("shot_id")) != "MORAL":
+        raise ValueError("静态 PPT 必须以 TITLE 开始并以 MORAL 结束")
+    cues = parse_simple_srt(body_subtitles_srt)
+    if not cues:
+        raise ValueError("正文 SRT 为空，无法校验 PPT 首尾独立时段")
+    title_duration = float(slides[0].get("duration_seconds") or 0)
+    moral_duration = float(slides[-1].get("duration_seconds") or 0)
+    total_duration = sum(float(slide.get("duration_seconds") or 0) for slide in slides)
+    expected_title = float(cues[0][0])
+    expected_moral = float(full_duration) - float(cues[-1][1])
+    if expected_title <= 0 or expected_moral <= 0:
+        raise ValueError("正文 SRT 未给 TITLE/MORAL 留出独立音频时段")
+    if abs(title_duration - expected_title) > tolerance:
+        raise ValueError(
+            f"PPT TITLE 时长未覆盖主持人开场：actual={title_duration:.3f} expected={expected_title:.3f}"
+        )
+    if abs(moral_duration - expected_moral) > tolerance:
+        raise ValueError(
+            f"PPT MORAL 时长未覆盖结尾寓意：actual={moral_duration:.3f} expected={expected_moral:.3f}"
+        )
+    if abs(total_duration - float(full_duration)) > tolerance:
+        raise ValueError(
+            f"PPT 总时长未覆盖完整音频：actual={total_duration:.3f} expected={full_duration:.3f}"
+        )
+
+
 def _trim_story_source_opening_absent_from_subtitles(
     story_lines: list[str],
     cues: list[tuple[float, float, str]],
@@ -2580,12 +2942,56 @@ def _trim_story_source_opening_absent_from_subtitles(
     subtitle_stream = "".join(normalize_story_text_for_alignment(cue[2]) for cue in cues)
     matching_boundaries: list[int] = []
     for boundary in range(semantic_prefix_end + 1):
-        candidate = "".join(
-            normalize_story_text_for_alignment(line) for line in story_lines[boundary:]
+        # Only the first retained line is needed to prove the opening
+        # boundary.  Requiring the *entire* remaining source to equal the SRT
+        # made a legitimate omitted host intro impossible to trim whenever a
+        # later sales-only/title/moral line differed.  The main alignment loop
+        # remains strict and will still reject any missing middle body line.
+        candidate = (
+            normalize_story_text_for_alignment(story_lines[boundary])
+            if boundary < len(story_lines)
+            else ""
         )
         if candidate and subtitle_stream.startswith(candidate):
             matching_boundaries.append(boundary)
     return story_lines[max(matching_boundaries):] if matching_boundaries else story_lines
+
+
+def _trim_story_source_closing_absent_from_subtitles(
+    story_lines: list[str],
+    cues: list[tuple[float, float, str]],
+) -> list[str]:
+    """Trim only an explicit audience-addressed moral after the body SRT.
+
+    Sales subtitles intentionally stop before the independent moral card.  A
+    missing middle body line must still fail; trimming is allowed only after
+    the subtitle stream has been consumed exactly and the remaining suffix
+    begins with the generic ``这个故事告诉我们`` moral framing (optionally
+    preceded by ``小朋友们``).
+    """
+
+    subtitle_stream = "".join(normalize_story_text_for_alignment(cue[2]) for cue in cues)
+    if not story_lines or not subtitle_stream:
+        return story_lines
+    offset = 0
+    for index, line in enumerate(story_lines):
+        key = normalize_story_text_for_alignment(line)
+        if not key or not subtitle_stream.startswith(key, offset):
+            return story_lines
+        offset += len(key)
+        if offset != len(subtitle_stream):
+            continue
+        suffix = [
+            normalize_story_text_for_alignment(item)
+            for item in story_lines[index + 1 :]
+            if normalize_story_text_for_alignment(item)
+        ]
+        if suffix and suffix[0] in {"小朋友", "小朋友们"}:
+            suffix = suffix[1:]
+        if suffix and suffix[0].startswith("这个故事告诉我们"):
+            return story_lines[: index + 1]
+        return story_lines
+    return story_lines
 
 
 def _find_story_subtitle_start(
@@ -2676,6 +3082,63 @@ def parse_simple_srt(path: Path) -> list[tuple[float, float, str]]:
         if cue_text:
             cues.append((parse_srt_timestamp(raw_start.strip()), parse_srt_timestamp(raw_end.strip()), cue_text))
     return cues
+
+
+def ensure_confirmed_spoken_timeline_srt(status_dir: Path, assembly_dir: Path) -> Path | None:
+    """Return a full spoken subtitle timeline, deriving it from audio anchors.
+
+    The body-only customer background SRT is never accepted as a substitute.
+    Native synthesis writes ``story_semantic_timeline.srt`` directly.  A
+    preflight-aligned project may instead expose ``confirmed_line_timings``;
+    this function deterministically serializes those already-reviewed anchors
+    without running ASR or changing any confirmed text.
+    """
+
+    native = assembly_dir / "story_semantic_timeline.srt"
+    if native.is_file():
+        return native
+    existing = first_existing(
+        status_dir / "preflight_alignment" / "confirmed_spoken_timeline.srt",
+        status_dir / "preflight" / "confirmed_spoken_timeline.srt",
+    )
+    if existing is not None:
+        return existing
+    timings_path = first_existing(
+        status_dir / "preflight_alignment" / "confirmed_line_timings.json",
+        status_dir / "preflight" / "confirmed_line_timings.json",
+    )
+    if timings_path is None:
+        return None
+    try:
+        rows = json.loads(timings_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("完整口播时间轴无法解析") from exc
+    if not isinstance(rows, list) or not rows:
+        raise ValueError("完整口播时间轴为空")
+
+    def stamp(seconds: float) -> str:
+        millis = max(0, round(seconds * 1000))
+        hours, millis = divmod(millis, 3_600_000)
+        minutes, millis = divmod(millis, 60_000)
+        secs, millis = divmod(millis, 1000)
+        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+
+    blocks: list[str] = []
+    previous_end = -1.0
+    for position, row in enumerate(rows, start=1):
+        if not isinstance(row, dict):
+            raise ValueError("完整口播时间轴条目格式错误")
+        text = str(row.get("line") or "").strip()
+        start = float(row.get("source_start", row.get("timeline_start", 0.0)))
+        end = float(row.get("source_end", row.get("timeline_end", start)))
+        if not text or start < 0 or end <= start or start + 1e-6 < previous_end:
+            raise ValueError("完整口播时间轴必须文本非空、时长为正且单调")
+        blocks.append(f"{position}\n{stamp(start)} --> {stamp(end)}\n{text}")
+        previous_end = end
+    target_dir = timings_path.parent
+    target = target_dir / "confirmed_spoken_timeline.srt"
+    target.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
+    return target
 
 
 def compile_release_subtitle_srt(

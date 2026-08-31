@@ -262,6 +262,28 @@ def build_storyboard_prompt(shot: dict[str, Any], refs: list[dict[str, Any]]) ->
     opening = _frame(shot, "opening_frame")
     closing = _frame(shot, "closing_frame")
     camera = _frame(shot, "camera_plan")
+    narrative = _frame(shot, "narrative_visualization")
+    narrative_mode = str(narrative.get("mode") or "literal_action")
+    if narrative_mode == "speech_visual_bubble":
+        composition_rule = (
+            "Composition: one coherent present-time tableau with exactly one clearly bounded, soft-edged, non-text visual speech bubble whose tail points to the current speaker. "
+            "The speaker and reality anchor remain visibly outside the bubble. Content inside the bubble is a framed representation, not a second real event; a repeated identity is allowed only inside that bubble. "
+            "No comics grid, multiple bubbles, captions or written words."
+        )
+        continuity_rule = (
+            "Continuity: preserve the reviewed current factual state outside the bubble. Do not transfer the bubble content's location, wetness, damage, props or action into present reality. "
+            "Any repeated identity must remain wholly inside the clearly framed bubble and must not read as a clone in the real scene."
+        )
+    else:
+        composition_rule = (
+            "Composition: one coherent cinematic tableau that communicates the entire sentence through readable cause and effect, character placement, gaze, contact and prop state. "
+            "Use a decisive representative moment. For a changing or repeated action, show the clearest mid-action contact instead of pretending that one still image contains the whole temporal sequence. "
+            "No collage, split screen, comics or multiple panels."
+        )
+        continuity_rule = (
+            "Continuity: preserve the reviewed identities, wardrobe, relative scale, environment anchors, current prop state, material behavior and intended screen direction. "
+            "Do not invent extra named characters or duplicate a character or prop."
+        )
     reference_lines: list[str] = []
     for asset in refs:
         summary = str(
@@ -280,15 +302,28 @@ def build_storyboard_prompt(shot: dict[str, Any], refs: list[dict[str, Any]]) ->
             "Primary request: Create one brand-new standalone story illustration from the reviewed assets. It will serve both the customer PPT and as the final semantic reference in an R2V request; it is not a video screenshot and not an I2V first frame.",
             f"Whole sentence: {shot.get('story_text', '')}",
             f"Director focus: {shot.get('visual_focus', '')}",
+            f"Narrative visualization mode: {narrative_mode}",
+            f"Narrative layer: {narrative.get('narrative_layer', 'current_fact')}",
+            f"Present-reality anchor: {narrative.get('reality_anchor', '')}",
+            f"Dialogue content to visualize: {narrative.get('content_to_visualize', '')}",
+            f"Visualization entry cue: {narrative.get('entry_cue', '')}",
+            f"Visualization exit cue: {narrative.get('exit_cue', '')}",
+            f"PPT no-subtitle readability strategy: {narrative.get('ppt_readability_strategy', '')}",
+            f"Duplicate identity policy: {narrative.get('duplicate_identity_policy', 'forbid')}",
             f"Opening beat: {opening.get('visual_focus', '')}; action phase={opening.get('action_phase', '')}",
             f"Closing beat: {closing.get('visual_focus', '')}; action phase={closing.get('action_phase', '')}",
             f"Required entry state: {json.dumps(shot.get('entry_state', {}), ensure_ascii=False, sort_keys=True)}",
             f"Required exit state: {json.dumps(shot.get('exit_state', {}), ensure_ascii=False, sort_keys=True)}",
             f"Camera intent: {camera.get('start_size', '')} to {camera.get('end_size', '')}; screen direction={camera.get('screen_direction', '')}; movement={camera.get('movement', '')}",
+            f"Camera angle: {camera.get('camera_angle') or opening.get('camera_angle', '')}",
+            f"Subject layout: {camera.get('subject_layout') or opening.get('subject_layout', '')}",
+            "Framing priority: obey the director focus, shot size and subject layout before trying to show every referenced character. A speaker, listener reaction, prop detail or environmental beat may be the sole dominant subject; supporting characters may be cropped in the foreground or kept offscreen when the plan allows it. Do not default to an equal-size two-character wide shot merely because two character references are attached.",
+            f"Eyeline and axis: {camera.get('axis') or opening.get('eyeline', '')}",
+            f"Decisive storyboard moment: {opening.get('decisive_storyboard_moment') or closing.get('decisive_storyboard_moment') or opening.get('action_phase', '')}",
             "Reviewed references and their roles:",
             *reference_lines,
-            "Composition: one coherent cinematic tableau that communicates the entire sentence through readable cause and effect, character placement, gaze, contact and prop state. Use a decisive representative moment. For a changing or repeated action, show the clearest mid-action contact instead of pretending that one still image contains the whole temporal sequence. No collage, split screen, comics or multiple panels.",
-            "Continuity: preserve the reviewed identities, wardrobe, relative scale, environment anchors, current prop state, material behavior and intended screen direction. Do not invent extra named characters or duplicate a character or prop.",
+            composition_rule,
+            continuity_rule,
             "Output: landscape 16:9, full bleed, polished children's story illustration, main action readable at thumbnail size.",
             "Avoid: text, subtitles, captions, logos, watermarks, borders, UI, wrong prop state, extra limbs, cloned characters, cloned props or unrelated decoration.",
         ]

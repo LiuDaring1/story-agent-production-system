@@ -17,6 +17,7 @@ from semantic_card_motion import (
     select_motion_provider_seconds,
     semantic_card_motion_prompt,
     semantic_card_motion_receipt_issues,
+    semantic_card_generation_receipt_issues,
     write_semantic_card_motion_request,
 )
 
@@ -28,6 +29,8 @@ class SemanticCardMotionTests(unittest.TestCase):
             len(prompt.encode("utf-16-le")) // 2,
             MOTION_PROVIDER_SAFE_PROMPT_CHARS,
         )
+        self.assertIn("角色可做自然生动、连续平滑的表演", prompt)
+        self.assertIn("禁止抽搐、高频往复", prompt)
 
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -112,6 +115,10 @@ class SemanticCardMotionTests(unittest.TestCase):
                     "provider_request_id": f"request-{index}",
                     "text_region_locked": True,
                     "non_text_motion_only": True,
+                    "camera_fixed": True,
+                    "global_jitter_passed": True,
+                    "smooth_motion_passed": True,
+                    "no_tremor_passed": True,
                     "ocr_first_frame_passed": True,
                     "ocr_middle_frame_passed": True,
                     "ocr_last_frame_passed": True,
@@ -149,6 +156,17 @@ class SemanticCardMotionTests(unittest.TestCase):
         )
         self.assertEqual(request["cards"][0]["presentation_window_seconds"], 7.0)
         self.assertTrue(request["production_requires_provider_video"])
+
+    def test_static_imagegen_receipt_is_hash_bound_and_native(self) -> None:
+        receipt = self.card_dir / "semantic_card_generation_receipt.json"
+        self.assertEqual(semantic_card_generation_receipt_issues(receipt), [])
+        payload = json.loads(receipt.read_text(encoding="utf-8"))
+        payload["imagegen_native"] = False
+        receipt.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        self.assertIn(
+            "semantic_card_generation_not_imagegen_native",
+            semantic_card_generation_receipt_issues(receipt),
+        )
 
     def test_provider_duration_selection_uses_nearest_choice_and_longer_tie(self) -> None:
         self.assertEqual(select_motion_provider_seconds(2.0), 6.0)

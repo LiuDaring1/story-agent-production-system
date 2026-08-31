@@ -60,7 +60,7 @@ from story_module_registry import build_compositor_registry, build_keyer_registr
 from release_geometry import compile_demo_presenter_geometry
 from story_video_synthesizer.image_video import sorted_image_files
 from story_video_synthesizer.media import ensure_dir, probe_duration, run_command
-from story_video_synthesizer.subtitles import write_srt
+from story_video_synthesizer.subtitles import build_subtitle_cues, write_srt
 from story_semantics import SemanticKind, classify_story, lines_for_output
 from product_quality import (
     compile_product_content_manifest,
@@ -80,6 +80,7 @@ from static_ppt_contract import (
     write_delivery_receipt as write_static_ppt_delivery_receipt,
 )
 from shot_storyboard_pipeline import validate_compile_receipt
+from story_delivery_policy import high_quality_background_blur
 
 
 def production_keying_fingerprint(settings):
@@ -195,6 +196,8 @@ def main() -> None:
     parser.add_argument("--output-root", default="~/Desktop", type=Path)
     parser.add_argument("--work-dir", type=Path, help="中间文件目录；默认 output/product_package_work/<slug>")
     parser.add_argument("--timings-json", type=Path, help="已有 timings.json；正式资料包必须提供，用于校准示范字幕和 PPT 翻页")
+    parser.add_argument("--demo-subtitle-srt", type=Path, help="已审核的完整口播 SRT；提供时原样用于示范视频")
+    parser.add_argument("--subtitle-txt", type=Path, help="兼容旧调用；字幕 TXT 仅是制作输入，不再加入客户资料包")
     parser.add_argument("--allow-even-timings", action="store_true", help="允许无 timings.json 时按旁白总时长平均分配；仅限内部预览")
     parser.add_argument("--whisper-model", default="base", help="保留接口；正式资料包请先用 timing 流程生成 timings.json")
     parser.add_argument("--language", default="zh")
@@ -361,7 +364,15 @@ def build_product_package(args: argparse.Namespace) -> None:
             indices = list(semantic_plan_selections[key])
         else:
             indices = semantic_line_indices(script_lines, semantic_spec, artifact) if semantic_spec else list(range(len(script_lines)))
-        source_rows = annotation_script_lines if artifact == "reading_annotation" else public_script_lines
+        if artifact == "reading_annotation":
+            source_rows = annotation_script_lines
+        elif artifact == "demo":
+            # The demonstration is a complete narrated performance.  Do not
+            # apply the customer-manuscript identity projection to its spoken
+            # subtitle stream.
+            source_rows = script_lines
+        else:
+            source_rows = public_script_lines
         lines = [source_rows[index] for index in indices]
         selected_images = [images[index] for index in indices] if artifact == "ppt" else []
         selected_timings = [
@@ -404,6 +415,19 @@ def build_product_package(args: argparse.Namespace) -> None:
     manuscript_lines, _mi, _mt, manuscript_indices = selected("customer_manuscript")
     annotation_lines, _ai, _at, annotation_indices = selected("reading_annotation")
     demo_lines, _di, demo_timings, demo_indices = selected("demo")
+    validate_demo_subtitle_full_coverage(
+        demo_lines,
+        [line.strip() for line in read_text_document(story_text_path).splitlines() if line.strip()],
+    )
+    if static_ppt_mode:
+        # The sealed static PPT and demo subtitle timeline intentionally use
+        # the body-only storyboard/SRT source.  Customer documents do not:
+        # the reading annotation must still cover the complete spoken script,
+        # including the presenter opening and the closing moral.  Rebuild only
+        # the annotation projection from the full manuscript so a body SRT can
+        # never silently truncate TITLE or MORAL content.
+        annotation_lines = complete_annotation_source_lines(story_text_path)
+        annotation_indices = list(range(len(annotation_lines)))
     ppt_semantic_cards: dict[int, str] = {}
     content_images = list(images)
     if semantic_plan is not None:
@@ -473,8 +497,17 @@ def build_product_package(args: argparse.Namespace) -> None:
         )
     public_srt_path = work_dir / "story_subtitles_public.srt"
     demo_srt_path = work_dir / "story_subtitles_demo.srt"
-    write_srt(ppt_timings, public_srt_path)
-    write_srt(demo_timings, demo_srt_path)
+    # Preschool delivery subtitles use short, punctuation-free single-line
+    # cues.  Eighteen-character desktop captions are too dense on the framed
+    # 16:9 release layout and routinely wrap into an unattractive second line.
+    write_srt(ppt_timings, public_srt_path, max_chars=12)
+    demo_subtitle_srt = args.demo_subtitle_srt.expanduser() if args.demo_subtitle_srt else None
+    if demo_subtitle_srt is not None:
+        if not demo_subtitle_srt.is_file():
+            raise FileNotFoundError(f"已审核示范字幕不存在：{demo_subtitle_srt}")
+        shutil.copy2(demo_subtitle_srt, demo_srt_path)
+    else:
+        write_srt(demo_timings, demo_srt_path, max_chars=12)
 
     story_docx = assets_dir / f"故事文稿：{story_name}.docx"
     annotation_docx = assets_dir / f"朗读标注：{story_name}.docx"
@@ -482,6 +515,11 @@ def build_product_package(args: argparse.Namespace) -> None:
     ppt_no_sub = assets_dir / f"故事PPT：{story_name}（无字幕）.pptx"
     demo_video = assets_dir / f"示范表演：{story_name}.mp4"
     a_only_video = assets_dir / f"A镜无人物背景视频：{story_name}.mp4"
+    # The reviewed TXT is a production input, not a customer deliverable.
+    # Older packages copied it into both editions even though the user never
+    # requested that file and the same words already exist in the manuscript,
+    # PPT, and videos.
+    subtitle_txt = None
 
     demo_background = args.demo_background_image.expanduser() if args.demo_background_image else None
     if demo_background is not None and not demo_background.exists():
@@ -808,6 +846,7 @@ def build_product_package(args: argparse.Namespace) -> None:
         ppt_with_sub=ppt_with_sub,
         ppt_no_sub=ppt_no_sub,
         a_only_video=a_only_video if a_only_video.exists() else None,
+        subtitle_txt=subtitle_txt,
         include_legacy_ppts=True,
         backup_root=(work_dir / "package_backups") if semantic_plan is not None else None,
     )
@@ -1041,6 +1080,49 @@ def read_text_document(path: Path) -> str:
 
         return read_docx_text(path).strip()
     raise ValueError(f"不支持的故事正文格式：{path.suffix}")
+
+
+def complete_annotation_source_lines(story_text_path: Path) -> list[str]:
+    """Build customer annotation rows from the complete spoken manuscript.
+
+    This source is deliberately independent of a body-only storyboard/SRT
+    timeline used by sealed static PPT delivery.
+    """
+
+    full_story_lines = [
+        line.strip()
+        for line in read_text_document(story_text_path).splitlines()
+        if line.strip()
+    ]
+    if not full_story_lines:
+        raise ValueError("故事正文为空，无法生成完整朗读标注。")
+    return compile_annotation_story_lines(full_story_lines)
+
+
+def validate_demo_subtitle_full_coverage(
+    demo_lines: Sequence[str], full_story_lines: Sequence[str]
+) -> None:
+    """Fail closed when a customer demo drops an opening or closing utterance."""
+
+    def normalized(lines: Sequence[str]) -> str:
+        return "".join(re.findall(r"[0-9A-Za-z\u3400-\u9fff]+", "".join(lines)))
+
+    expected = normalized(full_story_lines)
+    actual = normalized(demo_lines)
+    # DOCX manuscripts commonly begin with a standalone document title that
+    # is not spoken.  Accept only the exact full spoken remainder; this keeps
+    # the opening/body/moral fail-closed rule while excluding unvoiced cover
+    # copy from subtitle coverage.
+    expected_without_standalone_title = (
+        normalized(full_story_lines[1:]) if len(full_story_lines) > 1 else ""
+    )
+    if actual and actual == expected_without_standalone_title:
+        return
+    if not expected or actual != expected:
+        raise ValueError(
+            "示范视频字幕必须逐字覆盖完整口播（片头+正文+寓意），"
+            "不得复用资料包正文专用 SRT。"
+        )
 
 
 def load_or_build_timings(path: Path | None, script_lines: list[str], narration: Path, allow_even: bool = False) -> list[LineTiming]:
@@ -1787,7 +1869,20 @@ def _render_demo_video_core(
     render_subtitle_overlay(subtitles, subtitle_overlay, duration, width, height)
 
     crop_filter = demo_crop_filter(person_video, preset, crop_bottom_ratio, crop_mode)
-    key_filter = keying_filter_chain("[1:v]", preset, crop_filter)
+    person_duration = probe_duration(person_video)
+    rvm_frame_seconds = 1.0 / 25.0
+    presenter_tail_pad = max(
+        0.12,
+        max(0.0, duration - max(0.0, person_duration - rvm_frame_seconds)) + rvm_frame_seconds,
+    )
+    if preset.keyer == "rvm":
+        person_timeline_filter = (
+            f"[1:v]trim=start_frame=1,setpts=PTS-STARTPTS,"
+            f"tpad=stop_mode=clone:stop_duration={presenter_tail_pad:.6f}[person_timeline]"
+        )
+    else:
+        person_timeline_filter = "[1:v]setpts=PTS-STARTPTS[person_timeline]"
+    key_filter = keying_filter_chain("[person_timeline]", preset, crop_filter)
     if presenter_geometry is not None:
         person_filter, person_x, person_y = demo_person_layout_from_geometry(presenter_geometry)
         rvm_identity_transform = (
@@ -1817,6 +1912,7 @@ def _render_demo_video_core(
     alpha_resample = preset.keyer == "rvm" and not rvm_identity_transform
     filters = [
         f"[0:v]scale={width}:{height},setsar=1,format=rgba[bg]",
+        person_timeline_filter,
         key_filter,
         f"[person_keyed]{'premultiply=inplace=1,' if alpha_resample else ''}"
         f"{person_filter}{',unpremultiply=inplace=1' if alpha_resample else ''},"
@@ -1835,8 +1931,7 @@ def _render_demo_video_core(
         "1",
         "-i",
         str(background),
-        "-stream_loop",
-        "-1",
+        *([] if preset.keyer == "rvm" else ["-stream_loop", "-1"]),
         *(["-c:v", "libvpx-vp9"] if preset.keyer == "rvm" else []),
         "-i",
         str(person_video),
@@ -1971,7 +2066,11 @@ def render_demo_preview_frame(
         person_y = "H-h" if vertical_align == "bottom" else "(H-h)/2"
     filters = [
         f"[0:v]scale={width}:{height},setsar=1,format=rgba[bg]",
-        "[1:v]setpts=PTS-STARTPTS[person_source]",
+        (
+            "[1:v]trim=start_frame=1,setpts=PTS-STARTPTS[person_source]"
+            if preset.keyer == "rvm"
+            else "[1:v]setpts=PTS-STARTPTS[person_source]"
+        ),
         key_filter,
         f"[person_keyed]{'premultiply=inplace=1,' if preset.keyer == 'rvm' else ''}"
         f"{person_filter}{',unpremultiply=inplace=1' if preset.keyer == 'rvm' else ''},"
@@ -2435,10 +2534,7 @@ def _render_a_only_background_video_core(
     filters = [
         f"[0:v]scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},setsar=1,format=rgba[base_src]",
     ]
-    if background_blur > 0:
-        filters.append(f"[base_src]boxblur={background_blur}:1[base]")
-    else:
-        filters.append("[base_src]null[base]")
+    filters.append(high_quality_background_blur("base_src", background_blur, "base"))
     filters.extend(
         [
             f"[1:v]scale={story_width}:{story_height}:force_original_aspect_ratio=increase,crop={story_width}:{story_height},setsar=1,format=rgba[story_rect]",
@@ -2511,6 +2607,7 @@ def create_package_dirs(
     ppt_with_sub: Path,
     ppt_no_sub: Path,
     a_only_video: Path | None = None,
+    subtitle_txt: Path | None = None,
     include_legacy_ppts: bool = True,
     additional_advanced_items: Sequence[tuple[Path, str]] = (),
     backup_root: Path | None = None,

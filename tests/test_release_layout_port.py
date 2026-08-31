@@ -13,6 +13,7 @@ from release_video import (
     ReleaseConfig,
     _execute_release_layout,
     package_release_videos,
+    parse_preview_person_layouts,
     render_bottom_panel,
     render_release_previews,
 )
@@ -173,6 +174,22 @@ class ProtocolOnlyFake:
 
 
 class ReleaseLayoutPortTests(unittest.TestCase):
+    def test_source_native_preview_candidates_cannot_resize_or_shift_vertically(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = replace(
+                release_config(Path(directory)),
+                person_height=1080,
+                person_x=673,
+                person_y=0,
+                person_layout_policy="source-native-fixed-anchor/v2",
+                rvm_input_width=1920,
+                rvm_input_height=1080,
+            )
+            with self.assertRaisesRegex(Exception, "scale_forbidden"):
+                parse_preview_person_layouts("bad:980,900,50", config)
+            layouts = parse_preview_person_layouts("ok:1080,673,0", config)
+            self.assertEqual((layouts[0][1].person_height, layouts[0][1].person_x, layouts[0][1].person_y), (1080, 673, 0))
+
     def test_operation_receipt_reuses_intact_render_but_repairs_corrupt_output(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

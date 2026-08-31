@@ -19,6 +19,7 @@ from story_module_ports import (
     PublishAssetResult,
 )
 from story_module_registry import build_publish_asset_registry
+from story_delivery_policy import normalize_duration_label
 
 
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp"}
@@ -57,6 +58,7 @@ def main() -> None:
     parser.add_argument("--age-range", default="6-8岁")
     parser.add_argument("--roles", default="", help="可选：角色说明，例如 小羊、狐狸、旁白")
     args = parser.parse_args()
+    args.duration_text = normalize_duration_label(args.duration_text)
 
     story_text = read_text(args.story_text.expanduser())
     output_dir = args.output_dir.expanduser()

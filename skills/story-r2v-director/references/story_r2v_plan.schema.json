@@ -277,6 +277,44 @@
         "start_second": {"type": "number", "minimum": 0}
       }
     },
+    "narrativeVisualization": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "mode",
+        "narrative_layer",
+        "reality_anchor",
+        "content_to_visualize",
+        "entry_cue",
+        "exit_cue",
+        "ppt_readability_strategy",
+        "duplicate_identity_policy"
+      ],
+      "properties": {
+        "mode": {
+          "enum": [
+            "literal_action",
+            "speaker_performance",
+            "listener_reaction",
+            "speech_visual_bubble",
+            "imagined_cutaway",
+            "flashback",
+            "metaphoric_insert"
+          ]
+        },
+        "narrative_layer": {
+          "enum": ["current_fact", "proposed_action", "imagined_example", "memory", "explanation", "future_result"]
+        },
+        "reality_anchor": {"type": "string", "minLength": 1},
+        "content_to_visualize": {"type": "string", "minLength": 1},
+        "entry_cue": {"type": "string", "minLength": 1},
+        "exit_cue": {"type": "string", "minLength": 1},
+        "ppt_readability_strategy": {"type": "string", "minLength": 1},
+        "duplicate_identity_policy": {
+          "enum": ["forbid", "framed_representation_only", "same_identity_memory_only"]
+        }
+      }
+    },
     "shot": {
       "type": "object",
       "additionalProperties": false,
@@ -326,6 +364,7 @@
         "crowd_plan": {"$ref": "#/$defs/crowdPlan"},
         "audio_speaker": {"type": "string"},
         "visual_focus": {"type": "string"},
+        "narrative_visualization": {"$ref": "#/$defs/narrativeVisualization"},
         "camera_plan": {"$ref": "#/$defs/cameraPlan"},
         "opening_frame": {"$ref": "#/$defs/frameEnvelope"},
         "closing_frame": {"$ref": "#/$defs/frameEnvelope"},

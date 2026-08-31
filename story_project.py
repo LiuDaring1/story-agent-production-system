@@ -37,6 +37,7 @@ from cover_quality import (
     render_required_covers,
     required_cover_issues,
 )
+from story_delivery_policy import normalize_duration_label
 
 
 ROOT = Path(__file__).resolve().parent
@@ -107,7 +108,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "person_crop": "",
         "person_grade": "natural",
         "person_beauty": "light",
-        "keyer": "colorkey",
+        "keyer": "rvm",
         "preferred_keyer": "rvm",
         "rvm_input_width": 1920,
         "rvm_input_height": 1080,
@@ -638,7 +639,9 @@ def update_story_info(
         ("duration_text", duration_text),
     ):
         if value is not None and str(value).strip():
-            manifest["story"][key] = value
+            manifest["story"][key] = (
+                normalize_duration_label(str(value)) if key == "duration_text" else value
+            )
             manual[key] = True
             if key == "slug":
                 manifest["story"]["short_slug"] = short_slug(str(value))
@@ -1647,7 +1650,7 @@ def main_package_generation_receipt_issues(
     role_review = receipt.get("account_role_review") if isinstance(receipt.get("account_role_review"), Mapping) else {}
     for field in (
         "passed", "reference_hierarchy_preserved", "main_not_library_product_packaging",
-        "simple_information_hierarchy",
+        "simple_information_hierarchy", "flat_simple_reference_adherence",
     ):
         if role_review.get(field) is not True:
             issues.append(f"main_package_account_role_review_failed:{field}")
@@ -1714,6 +1717,40 @@ def main_package_generation_receipt_issues(
         if library_ocr.get("expected") != expected_library_text or library_ocr.get("observed") != expected_library_text:
             issues.append("library_package_ocr_text_mismatch")
     return sorted(set(issues))
+
+
+def write_main_package_reference_comparison(paths: ProjectPaths) -> Path:
+    """Place the immutable reference beside the generated top/bottom panels.
+
+    This is evidence for the existing visual review, not another review stage.
+    It makes excess depth, scenery and decoration immediately visible before
+    the reviewer either accepts the pair or requests one bounded regeneration.
+    """
+
+    theme_dir = paths.release / "theme_assets"
+    reference = Path(load_main_package_reference()["asset_path"])
+    sources = [
+        ("REFERENCE", reference),
+        ("GENERATED TOP", theme_dir / "main_release_plate_top.png"),
+        ("GENERATED BOTTOM", theme_dir / "main_release_plate_bottom.png"),
+    ]
+    missing = [str(path) for _label, path in sources if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("主账号包装参考对照缺少文件：" + "、".join(missing))
+    cell_width, cell_height, header = 720, 520, 54
+    sheet = Image.new("RGB", (cell_width * len(sources), cell_height + header), "#F2F2F2")
+    draw = ImageDraw.Draw(sheet)
+    for index, (label, path) in enumerate(sources):
+        with Image.open(path) as opened:
+            image = ImageOps.contain(opened.convert("RGB"), (cell_width - 24, cell_height - 24))
+        x = index * cell_width + (cell_width - image.width) // 2
+        y = header + (cell_height - image.height) // 2
+        sheet.paste(image, (x, y))
+        draw.text((index * cell_width + 18, 18), label, fill="#111111")
+    output = paths.status / "theme_assets" / "main_package_reference_comparison.png"
+    output.parent.mkdir(parents=True, exist_ok=True)
+    sheet.save(output)
+    return output
 
 
 def archive_invalid_theme_assets(paths: ProjectPaths, issues: list[str]) -> Path | None:
@@ -1785,7 +1822,13 @@ def qa_theme_assets(paths: ProjectPaths, assets: list[Path] | None = None, *, st
     expected_windows = {
         "story_frame_a.png": story_box,
     }
-    rows = []
+    comparison = write_main_package_reference_comparison(paths)
+    rows = [{
+        "index": "0",
+        "file": str(comparison),
+        "status": "review",
+        "notes": "现有视觉审核必须对照参考判断：平面、简洁、大留白、低装饰；过度3D场景化则定向重生",
+    }]
     issues = [f"- 主账号包装链路：{issue}" for issue in main_package_receipt_issues(paths)]
     for index, path in enumerate(assets, start=1):
         notes = []

@@ -13,6 +13,7 @@ from product_package import (
     KeyingPreset,
     add_ppt_subtitle,
     clean_public_story_text,
+    complete_annotation_source_lines,
     compute_source_native_layout,
     demo_crop_filter,
     fit_ppt_subtitle_text,
@@ -25,6 +26,7 @@ from product_package import (
     reject_full_subtitle_background,
     validate_annotation_blocks,
     validate_annotation_coverage,
+    validate_demo_subtitle_full_coverage,
     validate_customer_background_image,
 )
 from pptx import Presentation
@@ -65,6 +67,40 @@ def make_package_fixture(project: Path) -> tuple[Path, Path]:
 
 
 class ProductQaTests(unittest.TestCase):
+    def test_demo_subtitles_require_opening_body_and_moral(self) -> None:
+        full = ["大家好，今天讲故事。", "正文。", "这个故事告诉我们：要动脑筋。"]
+        validate_demo_subtitle_full_coverage(
+            ["大家好", "今天讲故事", "正文", "这个故事告诉我们", "要动脑筋"],
+            full,
+        )
+        with self.assertRaisesRegex(ValueError, r"片头\+正文\+寓意"):
+            validate_demo_subtitle_full_coverage(["正文"], full)
+
+    def test_demo_subtitles_ignore_only_an_unspoken_standalone_document_title(self) -> None:
+        validate_demo_subtitle_full_coverage(
+            ["大家好，今天讲故事。", "正文。", "这个故事告诉我们：要动脑筋。"],
+            ["故事标题", "大家好，今天讲故事。", "正文。", "这个故事告诉我们：要动脑筋。"],
+        )
+
+    def test_complete_annotation_source_keeps_opening_and_moral_outside_body_srt(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            story = Path(directory) / "story.txt"
+            story.write_text(
+                "大家好，我是绵羊姐姐。今天讲《测试》。\n"
+                "正文只有这一句。\n"
+                "小朋友们，这个故事告诉我们：要动脑筋。\n",
+                encoding="utf-8",
+            )
+
+            self.assertEqual(
+                complete_annotation_source_lines(story),
+                [
+                    "大家好，我是________。今天讲《测试》。",
+                    "正文只有这一句。",
+                    "小朋友们，这个故事告诉我们：要动脑筋。",
+                ],
+            )
+
     def test_customer_background_rejects_preblurred_and_overdense_sources_but_accepts_clear_source(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -140,6 +140,7 @@ def _config(root: Path, *, person_region_ready: bool = True) -> ReleaseConfig:
             "reference_hierarchy_preserved": True,
             "main_not_library_product_packaging": True,
             "simple_information_hierarchy": True,
+            "flat_simple_reference_adherence": True,
             "evidence": "single calm hierarchy follows the bound main-account reference",
         },
         "background_clean_review": {

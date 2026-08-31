@@ -7,16 +7,20 @@ from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 
-MOTION_REQUEST_SCHEMA = "story-semantic-card-motion-request/v1"
-MOTION_RECEIPT_SCHEMA = "story-semantic-card-motion/v1"
-MOTION_PROMPT_VERSION = "story-semantic-card-motion-prompt/v1"
+MOTION_REQUEST_SCHEMA = "story-semantic-card-motion-request/v2"
+MOTION_RECEIPT_SCHEMA = "story-semantic-card-motion/v2"
+MOTION_PROMPT_VERSION = "story-semantic-card-motion-prompt/v2"
 MOTION_PROVIDER_SECONDS = (6.0, 10.0)
 MOTION_PROVIDER_SAFE_PROMPT_CHARS = 120
 MOTION_PROVIDER_RESOLUTION = "720p"
 
 
 def file_sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def stable_json_sha256(value: Any) -> str:
@@ -26,12 +30,12 @@ def stable_json_sha256(value: Any) -> str:
 
 
 def semantic_card_motion_prompt() -> str:
-    """A stable image-to-video instruction that treats all text as locked pixels."""
+    """Lock text/camera while allowing smooth, lively character performance."""
 
     return (
-        "以首帧为唯一依据，镜头固定。所有中文文字和文字背板完全静止，不得改字、增删、"
-        "变形、闪烁、位移、缩放或重绘。仅让光影、羽毛、麦穗、树叶、云雾等非文字元素"
-        "轻微运动。不得新增人物、文字、Logo、水印或字幕，首尾衔接自然。"
+        "以首帧为依据，镜头固定，禁止推拉、缩放、漂移或抖动。所有中文文字和文字背板锁死，"
+        "禁止改字、变形、闪烁或位移。角色可做自然生动、连续平滑的表演，水面和树叶可轻动；"
+        "禁止抽搐、高频往复或全画面同步颤动。禁止新增人物、文字、Logo、水印或字幕。"
     )
 
 
@@ -66,6 +70,65 @@ def _load_static_card_receipt(card_dir: Path) -> tuple[dict[str, Any], dict[str,
         if isinstance(item, dict) and str(item.get("card_kind") or "")
     }
     return receipt, by_kind
+
+
+def semantic_card_generation_receipt_issues(receipt_path: Path) -> list[str]:
+    """Validate the native ImageGen title/moral-card receipt and its files."""
+
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return ["semantic_card_generation_receipt_missing_or_invalid"]
+    issues: list[str] = []
+    if receipt.get("schema_version") != "story-semantic-card-generation/v1":
+        issues.append("semantic_card_generation_receipt_schema_invalid")
+    if receipt.get("imagegen_native") is not True:
+        issues.append("semantic_card_generation_not_imagegen_native")
+    if receipt.get("post_render_text_overlay") is not False:
+        issues.append("semantic_card_generation_post_text_overlay_forbidden")
+    plan_sha = str(receipt.get("artifact_semantic_plan_sha256") or "").lower()
+    if len(plan_sha) != 64 or any(character not in "0123456789abcdef" for character in plan_sha):
+        issues.append("semantic_card_generation_plan_binding_missing")
+    try:
+        attempt_count = int(receipt.get("attempt_count") or 0)
+    except (TypeError, ValueError):
+        attempt_count = 0
+    if not 1 <= attempt_count <= 3:
+        issues.append("semantic_card_generation_attempt_count_invalid")
+
+    cards = receipt.get("cards") if isinstance(receipt.get("cards"), list) else []
+    kinds: list[str] = []
+    root = receipt_path.parent.resolve()
+    for item in cards:
+        if not isinstance(item, dict):
+            issues.append("semantic_card_generation_card_invalid")
+            continue
+        kind = str(item.get("card_kind") or "")
+        kinds.append(kind)
+        if kind not in {"title_card", "moral_card"}:
+            issues.append(f"semantic_card_generation_kind_invalid:{kind or 'missing'}")
+        if not str(item.get("text") or "").strip():
+            issues.append(f"semantic_card_generation_text_missing:{kind or 'missing'}")
+        if item.get("ocr_passed") is not True:
+            issues.append(f"semantic_card_generation_ocr_failed:{kind or 'missing'}")
+        source = Path(str(item.get("path") or "")).expanduser().resolve()
+        try:
+            source.relative_to(root)
+        except ValueError:
+            issues.append(f"semantic_card_generation_path_outside_project:{kind or 'missing'}")
+            continue
+        if (
+            not source.is_file()
+            or str(item.get("sha256") or "") != (file_sha256(source) if source.is_file() else "")
+        ):
+            issues.append(f"semantic_card_generation_file_binding_mismatch:{kind or 'missing'}")
+    if not cards:
+        issues.append("semantic_card_generation_cards_missing")
+    if "title_card" not in kinds:
+        issues.append("semantic_card_generation_title_missing")
+    if len(kinds) != len(set(kinds)):
+        issues.append("semantic_card_generation_duplicate_kind")
+    return sorted(set(issues))
 
 
 def write_semantic_card_motion_request(
@@ -129,6 +192,10 @@ def write_semantic_card_motion_request(
                 "prompt_sha256": prompt_sha256,
                 "text_region_locked": True,
                 "non_text_motion_only": True,
+                "camera_fixed": True,
+                "global_jitter_forbidden": True,
+                "character_motion_allowed": True,
+                "smooth_motion_required": True,
                 "max_attempt_count": 3,
             }
         )
@@ -241,6 +308,10 @@ def semantic_card_motion_receipt_issues(request_path: Path, receipt_path: Path) 
         for field in (
             "text_region_locked",
             "non_text_motion_only",
+            "camera_fixed",
+            "global_jitter_passed",
+            "smooth_motion_passed",
+            "no_tremor_passed",
             "ocr_first_frame_passed",
             "ocr_middle_frame_passed",
             "ocr_last_frame_passed",

@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import subprocess
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -21,8 +22,11 @@ from production_keying import (
 )
 from presenter_layout import (
     PRESENTER_LAYOUT_POLICY,
+    compile_fixed_anchor,
+    source_native_fixed_anchor_issues,
     source_native_layout_issues,
 )
+from story_delivery_policy import high_quality_background_blur, normalize_duration_label
 from story_module_ports import (
     ModuleFailure,
     ModuleFailureCode,
@@ -277,14 +281,9 @@ def main() -> None:
     person_height = args.person_height
     person_x = args.person_x
     person_y = args.person_y
-    if keying.get("person_height_ratio") is not None:
-        person_height = round(WIDE_HEIGHT * float(keying["person_height_ratio"]))
-        bottom_margin = round(float(keying.get("bottom_margin", 0)))
-        person_y = WIDE_HEIGHT - person_height - bottom_margin
-    if keying.get("person_x") is not None:
-        person_x = round(float(keying["person_x"]))
-    if keying.get("person_y") is not None:
-        person_y = round(float(keying["person_y"]))
+    # Keying owns matte quality and the full source canvas; release layout owns
+    # placement.  Importing person_x/y/height from keying silently overwrote the
+    # reviewed fixed anchor supplied by story_workflow.py.
     person_layout_policy = str(keying.get("person_layout_policy") or "")
     if keying.get("person_x_keyframes") not in (None, "", []):
         raise ValueError("旧版 person_x_keyframes 已退出生产；请使用开场固定 person_x")
@@ -298,7 +297,7 @@ def main() -> None:
         person_video_path = Path(str(keying["rvm_foreground_video"]))
     config = ReleaseConfig(
         story_name=args.story_name,
-        duration_text=args.duration_text,
+        duration_text=normalize_duration_label(args.duration_text),
         bg_video=args.bg_video.expanduser(),
         output_dir=args.output_dir.expanduser(),
         variant=args.variant,
@@ -731,7 +730,7 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict, *, preview: bool
         "contract_layout_rules_sha256": canonical_sha256(spec.get("layout_rules", [])),
         "semantic_selection": {
             "main": "demo_subtitles",
-            "library": "background_subtitles",
+            "library": "demo_subtitles",
         },
         "official_logo": logo_binding,
         "main_package_spec": package_assets,
@@ -1062,6 +1061,20 @@ def parse_preview_person_layouts(value: str, config: ReleaseConfig) -> list[tupl
             candidates.append((label, height, x, y))
     layouts: list[tuple[str, ReleaseConfig]] = []
     for label, height, x, y in candidates:
+        if config.person_layout_policy == PRESENTER_LAYOUT_POLICY:
+            issues = source_native_layout_issues(
+                source_width=config.rvm_input_width,
+                source_height=config.rvm_input_height,
+                rendered_height=height,
+                person_crop=config.person_crop,
+                policy=config.person_layout_policy,
+            )
+            if y != 0:
+                issues.append("presenter_source_native_vertical_shift_forbidden")
+            if issues:
+                raise argparse.ArgumentTypeError(
+                    "--preview-person-layouts 违反 source-native 固定布局门禁：" + "; ".join(issues)
+                )
         layouts.append((label, replace(config, person_height=max(1, height), person_x=x, person_y=y)))
     return layouts or [("current", config)]
 
@@ -1226,6 +1239,9 @@ def _release_layout_binding(
     **operation_binding,
 ) -> dict:
     return {
+        # Bump when render semantics change so intact-looking receipts from an
+        # older implementation cannot silently reuse visually obsolete media.
+        "renderer_policy_version": "2026-08-library-tail-and-dual-antipiracy-v4",
         "variant": config.variant,
         "video_box": list(config.video_box),
         "story_box": list(config.story_box),
@@ -1872,13 +1888,28 @@ def render_library_preview_frame(
     else:
         x, y, width, height = config.video_box
     story = scale_crop_image(Image.open(frame_path).convert("RGBA"), width, height)
+    source_duration = probe_duration(config.bg_video)
+    tail_start = max(0.0, source_duration - resolved_tail_seconds(source_duration, config.tail_seconds))
+    tail_active = timestamp >= tail_start
+    if tail_active:
+        # The still-preview fallback must show the same terminal treatment as
+        # the formal video renderer.  Previously it omitted both blur and the
+        # contact notice, allowing a visually wrong preview to pass review.
+        story = story.filter(ImageFilter.GaussianBlur(radius=18))
     if watermark_png is not None:
         watermark = Image.open(watermark_png).convert("RGBA")
         wm_width = max(48, min(config.watermark_width, int(width * 0.28)))
         watermark = watermark.resize((wm_width, max(1, round(watermark.height * wm_width / max(1, watermark.width)))), Image.Resampling.LANCZOS)
         watermark.putalpha(watermark.getchannel("A").point(lambda value: round(value * config.watermark_opacity)))
-        story.alpha_composite(watermark, (32, 40))
-        story.alpha_composite(watermark, (max(0, width - watermark.width - 32), max(0, height - watermark.height - 40)))
+        margin = 20
+        span_x = max(1, width - watermark.width - 2 * margin)
+        span_y = max(1, height - watermark.height - 2 * margin)
+        speed_x = 70.0 * config.watermark_speed
+        speed_y = 42.0 * config.watermark_speed
+        x_walk = round(span_x * (0.5 - 0.5 * math.cos(math.pi * timestamp * speed_x / span_x)))
+        y_walk = round(span_y * (0.5 - 0.5 * math.cos(math.pi * timestamp * speed_y / span_y)))
+        story.alpha_composite(watermark, (margin + x_walk, margin + y_walk))
+        story.alpha_composite(watermark, (width - watermark.width - margin - x_walk, height - watermark.height - margin - y_walk))
     draw_preview_subtitle(
         story,
         config,
@@ -1887,6 +1918,14 @@ def render_library_preview_frame(
         font_size=max(22, round(config.subtitle_font_size * width / WIDE_WIDTH)),
         margin_v=max(22, round(config.subtitle_margin_v * height / WIDE_HEIGHT)),
     )
+    if tail_active:
+        notice = Image.open(tail_notice_png).convert("RGBA")
+        notice_width = max(240, min(width - 120, int(width * 0.78)))
+        notice = notice.resize(
+            (notice_width, max(1, round(notice.height * notice_width / max(1, notice.width)))),
+            Image.Resampling.LANCZOS,
+        )
+        story.alpha_composite(notice, ((width - notice.width) // 2, (height - notice.height) // 2))
     canvas = Image.new("RGBA", (FINAL_WIDTH, FINAL_HEIGHT), (0, 0, 0, 255))
     canvas.alpha_composite(story, (x, y))
     if config.plate_image is not None:
@@ -2152,10 +2191,15 @@ def draw_preview_subtitle(
     font = load_cjk_font(font_size or config.subtitle_font_size)
     subtitle_margin = config.subtitle_margin_v if margin_v is None else margin_v
     stroke_width = 4
-    bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
-    x = (width - (bbox[2] - bbox[0])) // 2
-    y = height - subtitle_margin - (bbox[3] - bbox[1])
-    draw.text((x, y), text, font=font, fill=(255, 255, 255, 255), stroke_width=stroke_width, stroke_fill=(0, 0, 0, 230))
+    draw_single_line_subtitle(
+        draw,
+        text,
+        font=font,
+        canvas_width=width,
+        canvas_height=height,
+        margin_v=subtitle_margin,
+        stroke_width=stroke_width,
+    )
 
 
 def validate_config(config: ReleaseConfig) -> None:
@@ -2202,12 +2246,29 @@ def validate_config(config: ReleaseConfig) -> None:
     if config.person_layout_policy and config.variant in {"both", "main"}:
         assert config.person_greenscreen is not None
         source_width, source_height = probe_video_size(config.person_greenscreen)
-        layout_issues = source_native_layout_issues(
+        expected_x = None
+        if config.keying_preset_path is not None and config.keying_preset_path.is_file():
+            preset = json.loads(config.keying_preset_path.read_text(encoding="utf-8"))
+            initial_bbox = preset.get("presenter_initial_subject_bbox")
+            if isinstance(initial_bbox, list) and len(initial_bbox) == 4:
+                story_right = int(config.story_box[0]) + int(config.story_box[2])
+                anchor = compile_fixed_anchor(
+                    [],
+                    active_windows=[],
+                    initial_subject_bbox=[int(value) for value in initial_bbox],
+                    right_blank_rect=[story_right, 0, WIDE_WIDTH - story_right, source_height],
+                    canvas_width=WIDE_WIDTH,
+                )
+                expected_x = int(anchor["anchor_x"])
+        layout_issues = source_native_fixed_anchor_issues(
             source_width=source_width,
             source_height=source_height,
             rendered_height=config.person_height,
+            person_x=config.person_x,
+            person_y=config.person_y,
             person_crop=config.person_crop,
             policy=config.person_layout_policy,
+            expected_x=expected_x,
         )
         if layout_issues:
             raise ValueError("source-native 人像布局门禁失败：" + "; ".join(layout_issues))
@@ -2873,7 +2934,14 @@ def render_main_wide(
     # presenter, including when no tail padding is needed, otherwise the first
     # output frame can contain only the background/frame before the presenter
     # timeline begins.
-    filters_prefix = ["[2:v]setpts=PTS-STARTPTS[person_timeline]"]
+    # VP9-alpha RVM streams contain one decoder priming frame whose alpha is
+    # empty. Drop that frame before rebasing so frame zero of the finished
+    # release contains the presenter. The existing tail clone compensates for
+    # the removed frame and prevents the final background-only frame.
+    if config.keyer == "rvm":
+        filters_prefix = ["[2:v]trim=start_frame=1,setpts=PTS-STARTPTS[person_timeline]"]
+    else:
+        filters_prefix = ["[2:v]setpts=PTS-STARTPTS[person_timeline]"]
     person_source = "[person_timeline]"
     if config.person_crop is not None:
         crop_x, crop_y, crop_width, crop_height = config.person_crop
@@ -2902,10 +2970,7 @@ def render_main_wide(
         f"[0:v]scale={wide_width}:{wide_height}:force_original_aspect_ratio=increase,"
         f"crop={wide_width}:{wide_height},setsar=1,format=rgba[base_src]",
     ]
-    if config.background_blur > 0:
-        filters.append(f"[base_src]boxblur={config.background_blur}:1[base0]")
-    else:
-        filters.append("[base_src]null[base0]")
+    filters.append(high_quality_background_blur("base_src", config.background_blur, "base0"))
     if direct_b_sample:
         base_labels = ["base_b"]
     elif direct_c_sample:
@@ -3170,12 +3235,15 @@ def render_subtitle_overlay_video(
         image = Image.new("RGBA", (width, height), (0, 0, 0, 0))
         if text:
             draw = ImageDraw.Draw(image)
-            bbox = draw.textbbox((0, 0), text, font=font, stroke_width=stroke_width)
-            text_width = bbox[2] - bbox[0]
-            text_height = bbox[3] - bbox[1]
-            x = (width - text_width) // 2
-            y = height - margin_v - text_height
-            draw.text((x, y), text, font=font, fill=(255, 255, 255, 255), stroke_width=stroke_width, stroke_fill=(0, 0, 0, 230))
+            draw_single_line_subtitle(
+                draw,
+                text,
+                font=font,
+                canvas_width=width,
+                canvas_height=height,
+                margin_v=margin_v,
+                stroke_width=stroke_width,
+            )
         image.save(frames_dir / f"subtitle_{frame_no:05d}.png")
 
     run_command(
@@ -3196,6 +3264,42 @@ def render_subtitle_overlay_video(
         ]
     )
     return output_path
+
+
+def draw_single_line_subtitle(
+    draw: ImageDraw.ImageDraw,
+    text: str,
+    *,
+    font: ImageFont.ImageFont,
+    canvas_width: int,
+    canvas_height: int,
+    margin_v: int,
+    stroke_width: int,
+) -> str:
+    """Draw one caller-supplied subtitle line; never invent a second line."""
+
+    horizontal_margin = max(36, round(canvas_width * 0.055))
+    line = str(text).replace("\r", "").replace("\n", "").strip()
+    box = draw.textbbox((0, 0), line, font=font, stroke_width=stroke_width)
+    line_width = box[2] - box[0]
+    line_height = box[3] - box[1]
+    safe_width = max(1, canvas_width - 2 * horizontal_margin)
+    if line_width > safe_width:
+        raise ValueError(
+            "subtitle_single_line_overflow: 字幕 TXT 单行超出安全宽度，"
+            "请回到用户提供的 TXT 调整分行；渲染器不自动换行或改字"
+        )
+    draw_x = (canvas_width - line_width) // 2 - box[0]
+    draw_y = max(0, canvas_height - margin_v - line_height) - box[1]
+    draw.text(
+        (draw_x, draw_y),
+        line,
+        font=font,
+        fill=(255, 255, 255, 255),
+        stroke_width=stroke_width,
+        stroke_fill=(0, 0, 0, 230),
+    )
+    return line
 
 
 def parse_srt(path: Path) -> list[tuple[float, float, str]]:
@@ -3390,7 +3494,7 @@ def render_library_window_video(
         f"[0:v]scale={overscan_width}:{overscan_height}:force_original_aspect_ratio=increase,"
         f"crop={video_width}:{video_height},setsar=1,format=rgba[base]",
         "[base]split=2[clean][blur_src]",
-        "[blur_src]boxblur=18:1[blurred]",
+        high_quality_background_blur("blur_src", 18, "blurred"),
         f"[clean][blurred]overlay=0:0:enable='gte({timeline_t},{tail_start:.3f})'[tail]",
     ]
     current = "tail"
@@ -3409,7 +3513,8 @@ def render_library_window_video(
                 # Anti-piracy identity remains visible through the closing
                 # notice.  Hiding it at tail_start made the last seconds an
                 # unwatermarked copyable segment and disagreed with preview
-                # samples taken before the tail window.
+                # samples taken before the tail window.  The approved library
+                # anti-piracy policy uses two counter-moving copies.
                 f"[tail][wm1]overlay=x='{wm1_x}':y='{wm1_y}'[w1]",
                 f"[w1][wm2]overlay=x='{wm2_x}':y='{wm2_y}'[w2]",
             ]

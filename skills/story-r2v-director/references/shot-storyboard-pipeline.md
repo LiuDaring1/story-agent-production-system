@@ -52,7 +52,7 @@ python3 shot_storyboard_pipeline.py seal \
   --output-manifest /absolute/path/shot_storyboards_sealed.json
 ```
 
-封存阶段要求每个 `shot_id` 的图片存在、至少 1280×700、比例为 16:9，并记录当前 SHA-256。新的独立上下文随后整组审核人物身份、道具状态、场景、人物数量、空间关系和整句可读性；审核 JSON 的 `artifact_sha256` 必须等于 `storyboard_bundle_sha256`。
+封存阶段要求每个 `shot_id` 的图片存在、至少 1280×700、比例为 16:9，并记录当前 SHA-256。新的独立上下文随后整组审核人物身份、道具状态、场景、人物数量、空间关系和整句可读性；同时必须核对当前事实与角色设想的时态、头/嘴/躯干/四肢的身体连接关系，并对内容插入镜执行去字幕可读性检查。任一设想被误画为当前事实、肢体来源无法追溯或插入镜无法对应具体台词职责，都是关键错误。审核 JSON 的 `artifact_sha256` 必须等于 `storyboard_bundle_sha256`。
 
 ## 4. 一次编译两个消费者
 

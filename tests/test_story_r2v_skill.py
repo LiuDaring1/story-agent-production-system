@@ -275,6 +275,58 @@ class StoryR2VPlanValidatorTests(unittest.TestCase):
     def test_accepts_valid_native_r2v_plan(self):
         self.assertEqual(VALIDATOR.validate_plan(valid_plan()), [])
 
+    def test_long_dialogue_without_visualization_is_advisory_not_schema_failure(self):
+        plan = valid_plan()
+        plan["shots"][0]["audio_speaker"] = "character-a"
+        self.assertEqual(VALIDATOR.validate_plan(plan), [])
+        advisories = VALIDATOR.creative_advisories(plan)
+        self.assertTrue(any("较长角色台词" in item for item in advisories))
+        self.assertTrue(any("不阻断" in item for item in advisories))
+
+    def test_repeated_composition_requests_rationale_without_count_gate(self):
+        plan = valid_two_shot_plan()
+        first = plan["shots"][0]["opening_frame"]
+        second = plan["shots"][1]["opening_frame"]
+        for field in ("shot_size", "camera_angle", "subject_layout"):
+            second[field] = first[field]
+        advisories = VALIDATOR.creative_advisories(plan)
+        self.assertTrue(any("相似本身不是错误" in item for item in advisories))
+
+    def test_modality_cue_requests_fact_check_without_forcing_a_bubble(self):
+        plan = valid_plan()
+        plan["shots"][0]["story_text"] = "如果你把我放进水里，会发生什么？"
+        self.assertEqual(VALIDATOR.validate_plan(plan), [])
+        advisories = VALIDATOR.creative_advisories(plan)
+        self.assertTrue(any("当前物理事实" in item for item in advisories))
+
+    def test_accepts_explicit_non_text_dialogue_visual_bubble(self):
+        plan = valid_plan()
+        plan["shots"][0]["narrative_visualization"] = {
+            "mode": "speech_visual_bubble",
+            "narrative_layer": "proposed_action",
+            "reality_anchor": "speaker remains dry on the bank",
+            "content_to_visualize": "speaker imagines washing in the pond",
+            "entry_cue": "one bubble tail points to the speaker",
+            "exit_cue": "return to the dry speaker and listener",
+            "ppt_readability_strategy": "soft boundary separates proposal from reality",
+            "duplicate_identity_policy": "framed_representation_only",
+        }
+        self.assertEqual(VALIDATOR.validate_plan(plan), [])
+
+    def test_dialogue_visual_bubble_rejects_unframed_identity_duplication(self):
+        plan = valid_plan()
+        plan["shots"][0]["narrative_visualization"] = {
+            "mode": "speech_visual_bubble",
+            "narrative_layer": "proposed_action",
+            "reality_anchor": "speaker remains dry on the bank",
+            "content_to_visualize": "speaker imagines washing in the pond",
+            "entry_cue": "one bubble tail points to the speaker",
+            "exit_cue": "return to the dry speaker and listener",
+            "ppt_readability_strategy": "soft boundary separates proposal from reality",
+            "duplicate_identity_policy": "forbid",
+        }
+        self.assert_has_error(plan, "requires framed_representation_only")
+
     def test_director_only_storyboard_requires_a_recorded_reason(self):
         plan = valid_plan()
         plan["shots"][0]["storyboard_reference_mode"] = "director_only"

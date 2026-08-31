@@ -26,6 +26,9 @@ class StoryRunLedgerTests(unittest.TestCase):
         video = root / "restored.mp4"
         audio = root / "narration.wav"
         run_file = project / "99_项目状态" / "story_run.json"
+        input_dir = project / "00_输入素材"
+        input_dir.mkdir(parents=True, exist_ok=True)
+        (input_dir / "确认字幕.txt").write_text("确认正文，不允许系统改写。\n", encoding="utf-8")
         text.write_text("确认正文，不允许系统改写。\n", encoding="utf-8")
         video.write_bytes(b"restored-video")
         audio.write_bytes(b"authoritative-audio")
@@ -43,6 +46,8 @@ class StoryRunLedgerTests(unittest.TestCase):
             patch("story_run.validate_compile_receipt", return_value={"shot_count": 1}),
             patch("story_run.validate_delivery_receipt", return_value={}),
             patch("story_run.validate_theme_assets_manifest", return_value={}),
+            patch("story_run.semantic_card_generation_receipt_issues", return_value=[]),
+            patch("story_run.semantic_card_motion_receipt_issues", return_value=[]),
         ):
             for artifact_id in CODEX_NATIVE_REQUIRED_ARTIFACTS:
                 if artifact_id in existing or artifact_id in (skip or set()):
@@ -70,6 +75,7 @@ class StoryRunLedgerTests(unittest.TestCase):
             self.assertEqual(set(payload["work_packages"]), set(PACKAGE_NAMES))
             self.assertTrue(all(item["status"] == "pending" for item in payload["work_packages"].values()))
             self.assertEqual(len(payload["inputs"]["confirmed_text"]["sha256"]), 64)
+            self.assertEqual(len(payload["inputs"]["subtitle_txt"]["sha256"]), 64)
             self.assertNotIn("stages", payload)
             self.assertNotIn("attempts", payload)
 
@@ -152,6 +158,8 @@ class StoryRunLedgerTests(unittest.TestCase):
                     return_value={"shot_storyboard_compile_receipt_sha256": compile_sha},
                 ),
                 patch("story_run.validate_theme_assets_manifest", return_value={}),
+                patch("story_run.semantic_card_generation_receipt_issues", return_value=[]),
+                patch("story_run.semantic_card_motion_receipt_issues", return_value=[]),
             ):
                 payload = finalize_run(run_file=run_file, required_artifacts=["delivery_manifest"])
             self.assertTrue(payload["finalized_at"])
@@ -371,6 +379,8 @@ class StoryRunLedgerTests(unittest.TestCase):
             with (
                 patch("story_run.validate_compile_receipt", return_value={"shot_count": 2}),
                 patch("story_run.validate_delivery_receipt", return_value=bound),
+                patch("story_run.semantic_card_generation_receipt_issues", return_value=[]),
+                patch("story_run.semantic_card_motion_receipt_issues", return_value=[]),
             ):
                 finalized = finalize_run(run_file=run_file, required_artifacts=[])
             self.assertTrue(finalized["finalized_at"])

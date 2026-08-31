@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
+from story_delivery_policy import normalize_duration_label
 
 
 DEFAULT_VIDEO_BOX = "0,416,1080,608"
@@ -56,6 +57,7 @@ def build_prompt(
     reference_image: Path | None,
     video_box: str,
 ) -> str:
+    duration_text = normalize_duration_label(duration_text)
     title = story_name if story_name.startswith("《") else f"《{story_name}》"
     elements_line = theme_elements or "贴合故事主题的儿童友好元素，简洁、有场景感但不杂乱"
     is_main = account_variant == "main"
@@ -139,7 +141,7 @@ Story and style direction:
 - Reference style: {reference_line}
 
 Visual style:
-- High-quality 3D cartoon / soft children's illustration style.
+- {"Flat, simple children's program packaging with generous whitespace and restrained decoration; do not turn the top or bottom panels into a 3D story scene." if is_main else "High-quality soft children's illustration style for a resource-pack poster."}
 - Warm, bright, premium {'program package' if is_main else 'resource-pack poster'} feeling.
 - Follow the reference image only for top/bottom packaging logic and overall polish.
 - But unlike the reference image, do not generate a story preview picture in the middle; leave the middle as a plain full-width matte strip.
@@ -156,7 +158,7 @@ Avoid:
 - Avoid tiny unreadable text.
 
 Important production note:
-The exact Chinese text may be corrected later by code if needed. Prioritize the stable 3:4 layout, beautiful illustrated top/bottom areas, and a completely empty full-width 16:9 middle strip.
+Chinese text must be generated correctly in the image. If it is materially wrong, regenerate the affected panel; do not plan a later programmatic text overlay. Prioritize the stable 3:4 layout and the completely empty full-width 16:9 middle strip.
 """
 
 

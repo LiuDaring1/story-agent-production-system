@@ -1440,7 +1440,7 @@ def _render_review_html(rows: list[dict[str, str]], image_dir: Path, video_dir: 
         continuity_forbidden = html.escape(row.get("continuity_forbidden") or "[]", quote=True)
         cards.append(
             f"""
-            <article class="card" data-scene="{scene}" data-image-filename="{image_name}" data-story-text="{html.escape(row['story_text'], quote=True)}" data-continuity-state="{continuity_state}" data-continuity-required="{continuity_required}" data-continuity-forbidden="{continuity_forbidden}" data-initial-status="{status}">
+            <article class="card" data-scene="{scene}" data-image-filename="{image_name}" data-story-text="{html.escape(row.get('story_text', ''), quote=True)}" data-continuity-state="{continuity_state}" data-continuity-required="{continuity_required}" data-continuity-forbidden="{continuity_forbidden}" data-initial-status="{status}">
               <header>
                 <h2>{scene}</h2>
                 <span class="status">通过</span>
@@ -1453,7 +1453,7 @@ def _render_review_html(rows: list[dict[str, str]], image_dir: Path, video_dir: 
                 <span>裁切 {trim}</span>
                 <span>慢放 {slowdown}</span>
               </div>
-              <p class="story">{html.escape(row['story_text'])}</p>
+              <p class="story">{html.escape(row.get('story_text', ''))}</p>
               <label class="prompt-label">图生视频提示词（可直接修改；导出确认 CSV 后会用于生成视频）</label>
               <textarea class="prompt-editor">{prompt_text}</textarea>
               <div class="actions" role="group" aria-label="review status">

@@ -20,6 +20,10 @@ from pathlib import Path
 from typing import Any, Iterable
 
 from shot_storyboard_pipeline import validate_compile_receipt
+from semantic_card_motion import (
+    semantic_card_generation_receipt_issues,
+    semantic_card_motion_receipt_issues,
+)
 from static_ppt_contract import validate_delivery_receipt
 
 
@@ -43,6 +47,8 @@ CODEX_NATIVE_REQUIRED_ARTIFACTS = (
     "storyboard_manifest_sealed",
     "storyboard_review",
     "shot_storyboard_compile_receipt",
+    "semantic_card_generation_receipt",
+    "semantic_card_motion_receipt",
     "r2v_provider_group_receipt",
     "r2v_group_machine_qa",
     "r2v_group_visual_review",
@@ -52,13 +58,11 @@ CODEX_NATIVE_REQUIRED_ARTIFACTS = (
     "theme_assets_manifest",
     "static_ppt_delivery_receipt",
     "qa_product_report",
-    "product_package_review",
     "qa_publish_report",
-    "publish_cover_review",
     "main_release_video",
     "library_release_video",
     "qa_release_report",
-    "release_video_review",
+    "final_delivery_review",
     "final_delivery_checklist",
 )
 
@@ -91,6 +95,37 @@ def input_record(path: Path, label: str) -> dict[str, Any]:
         "sha256": file_sha256(resolved),
         "bytes": resolved.stat().st_size,
     }
+
+
+def discover_subtitle_txt(project_dir: Path) -> Path:
+    """Find exactly one user-authored subtitle TXT without inventing a stream."""
+
+    project = project_dir.expanduser().resolve()
+    roots = [project / "00_输入素材", project]
+    candidates: list[Path] = []
+    for root in roots:
+        if root.is_dir():
+            candidates.extend(path.resolve() for path in root.glob("*.txt") if path.is_file())
+    candidates = sorted(
+        path
+        for path in set(candidates)
+        if path.stem.lower() not in {"story_source", "confirmed_text", "script_lines"}
+        and not any(token in path.stem for token in ("故事原文", "确认文本", "逐行台词"))
+    )
+    named = [
+        path
+        for path in candidates
+        if any(token in path.stem.lower() for token in ("字幕", "subtitle"))
+    ]
+    selected = named if named else candidates
+    if len(selected) != 1:
+        if not selected:
+            raise FileNotFoundError("项目缺少用户确认、已换好行的字幕 TXT；禁止系统另做一套字幕")
+        raise ValueError(
+            "项目内字幕 TXT 不唯一，请用 --subtitle-txt 明确指定："
+            + "、".join(str(path) for path in selected)
+        )
+    return selected[0]
 
 
 def _validate_hashed_raster(item: Any, label: str, *, method_key: str) -> Path:
@@ -314,6 +349,7 @@ def init_run(
     greenscreen_video: Path,
     audio: Path,
     project_dir: Path,
+    subtitle_txt: Path | None = None,
     soft_budget: float = DEFAULT_SOFT_BUDGET,
     hard_budget: float = DEFAULT_HARD_BUDGET,
 ) -> dict[str, Any]:
@@ -324,6 +360,13 @@ def init_run(
         raise ValueError("预算必须满足 0 <= soft_budget <= hard_budget")
     project = project_dir.expanduser().resolve()
     project.mkdir(parents=True, exist_ok=True)
+    authoritative_subtitle = (
+        require_file(subtitle_txt, "确认字幕 TXT")
+        if subtitle_txt is not None
+        else discover_subtitle_txt(project)
+    )
+    if authoritative_subtitle.suffix.lower() != ".txt":
+        raise ValueError("确认字幕必须是 TXT 文件")
     now = utc_now()
     payload: dict[str, Any] = {
         "schema_version": SCHEMA_VERSION,
@@ -336,6 +379,7 @@ def init_run(
             "confirmed_text": input_record(confirmed_text, "确认文本"),
             "greenscreen_video": input_record(greenscreen_video, "绿幕视频"),
             "audio": input_record(audio, "权威音频"),
+            "subtitle_txt": input_record(authoritative_subtitle, "确认字幕 TXT"),
         },
         "work_packages": {
             name: {"status": "pending", "blocker": ""} for name in PACKAGE_NAMES
@@ -405,6 +449,15 @@ def record_run(
             validate_compile_receipt(artifact)
         if artifact_id == "static_ppt_delivery_receipt":
             validate_delivery_receipt(artifact)
+        if artifact_id == "semantic_card_generation_receipt":
+            issues = semantic_card_generation_receipt_issues(artifact)
+            if issues:
+                raise ValueError("ImageGen 片头/寓意卡回执未通过：" + "；".join(issues))
+        if artifact_id == "semantic_card_motion_receipt":
+            request_path = artifact.parent / "semantic_card_motion_request.json"
+            issues = semantic_card_motion_receipt_issues(request_path, artifact)
+            if issues:
+                raise ValueError("片头/寓意卡 API 微动回执未通过：" + "；".join(issues))
         digest = file_sha256(artifact)
         existing = payload["artifacts"].get(artifact_id)
         if existing and existing.get("sha256") != digest and not replace:
@@ -508,6 +561,20 @@ def finalize_run(*, run_file: Path, required_artifacts: Iterable[str]) -> dict[s
         delivery = validate_delivery_receipt(Path(delivery_receipt["path"]))
         if delivery.get("shot_storyboard_compile_receipt_sha256") != storyboard_receipt.get("sha256"):
             raise RuntimeError("静态 PPT 交付回执没有绑定账本中的当前故事板编译回执")
+    generation_receipt = payload["artifacts"].get("semantic_card_generation_receipt")
+    if isinstance(generation_receipt, dict):
+        issues = semantic_card_generation_receipt_issues(Path(generation_receipt["path"]))
+        if issues:
+            raise RuntimeError("ImageGen 片头/寓意卡回执失效：" + "；".join(issues))
+    motion_receipt = payload["artifacts"].get("semantic_card_motion_receipt")
+    if isinstance(motion_receipt, dict):
+        motion_path = Path(motion_receipt["path"])
+        issues = semantic_card_motion_receipt_issues(
+            motion_path.parent / "semantic_card_motion_request.json",
+            motion_path,
+        )
+        if issues:
+            raise RuntimeError("片头/寓意卡 API 微动回执失效：" + "；".join(issues))
     payload["finalized_at"] = utc_now()
     payload["updated_at"] = payload["finalized_at"]
     payload["blocker"] = ""
@@ -525,6 +592,11 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--text", required=True, type=Path)
     init.add_argument("--video", required=True, type=Path)
     init.add_argument("--audio", required=True, type=Path)
+    init.add_argument(
+        "--subtitle-txt",
+        type=Path,
+        help="用户确认且已换好行的字幕 TXT；省略时仅在项目内唯一自动识别",
+    )
     init.add_argument("--soft-budget", type=float, default=DEFAULT_SOFT_BUDGET)
     init.add_argument("--hard-budget", type=float, default=DEFAULT_HARD_BUDGET)
 
@@ -558,6 +630,7 @@ def main() -> None:
             greenscreen_video=args.video,
             audio=args.audio,
             project_dir=args.project_dir,
+            subtitle_txt=args.subtitle_txt,
             soft_budget=args.soft_budget,
             hard_budget=args.hard_budget,
         )

@@ -70,10 +70,10 @@ def _contract(project: Path, manifest: dict, kinds=("title", "story_body", "mora
             }
             if artifact == "background_visual" and kind in {"title", "moral"}:
                 mapping.update(action="visual_substitute", subtitle_policy="inherit", visual_substitute=f"{kind}_card", mutual_exclusion_group=f"{kind}_presentation")
-            if artifact == "background_subtitles" and kind in {"title", "moral"}:
-                mapping.update(action="exclude", subtitle_policy="hide", mutual_exclusion_group=f"{kind}_presentation")
-            if artifact == "sales_subtitles" and kind == "title":
+            if artifact in {"background_subtitles", "sales_subtitles"} and kind != "story_body":
                 mapping.update(action="exclude", subtitle_policy="hide")
+                if kind in {"title", "moral"}:
+                    mapping["mutual_exclusion_group"] = f"{kind}_presentation"
             mappings.append(mapping)
     contract["contracts"]["semantic_artifacts"]["mappings"] = mappings
     return contract
@@ -514,7 +514,7 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
         )
         normalize = lambda values: "".join(values).replace("，", "").replace("。", "")
         self.assertEqual(normalize(subtitle_calls[0]), normalize([lines[1]]))  # background: no duplicate title/moral
-        self.assertEqual(normalize(subtitle_calls[1]), normalize([lines[1], lines[2]]))  # sales: title hidden, moral shown
+        self.assertEqual(normalize(subtitle_calls[1]), normalize([lines[1]]))  # customer background: body only
         self.assertEqual(normalize(subtitle_calls[2]), normalize(lines))  # demo obeys its own mapping
         self.assertEqual(
             [(row["card_kind"], row["start"], row["end"]) for row in card_calls[0]],

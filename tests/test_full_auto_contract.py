@@ -89,7 +89,7 @@ class FullAutoContractTests(unittest.TestCase):
                 binding_fingerprint=fingerprint,
                 output_is_current=True,
             ),
-            "reuse",
+            "block_repair_limit",
         )
         self.assertEqual(
             release_encode_guard_action(completed, binding_fingerprint=fingerprint, output_is_current=False),
@@ -104,6 +104,15 @@ class FullAutoContractTests(unittest.TestCase):
                 completed,
                 binding_fingerprint="b" * 64,
                 output_is_current=True,
+                binding_repair_authorized=True,
+            ),
+            "authorized_binding_repair",
+        )
+        self.assertEqual(
+            release_encode_guard_action(
+                {**completed, "status": "failed_or_interrupted"},
+                binding_fingerprint="b" * 64,
+                output_is_current=False,
                 binding_repair_authorized=True,
             ),
             "authorized_binding_repair",

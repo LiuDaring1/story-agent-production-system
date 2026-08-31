@@ -11,6 +11,7 @@ from PIL import Image
 from run_image_video_jobs import create_provider_task, row_reference_paths
 from shot_storyboard_pipeline import (
     StoryboardPipelineError,
+    build_storyboard_prompt,
     build_storyboard_manifest,
     compile_consumers,
     create_asset_bundle,
@@ -84,6 +85,45 @@ class ShotStoryboardPipelineTests(unittest.TestCase):
         sealed_path = self.root / "storyboards_sealed.json"
         sealed = seal_storyboard_manifest(planned, sealed_path)
         return sealed_path, sealed
+
+    def test_storyboard_prompt_carries_camera_angle_layout_and_decisive_moment(self) -> None:
+        shot = self.plan["shots"][0]
+        shot["camera_plan"].update(
+            {
+                "camera_angle": "duck-eye low angle",
+                "subject_layout": "speaker close-up with listener shoulder foreground",
+                "axis": "speaker looks camera-left",
+            }
+        )
+        shot["opening_frame"]["decisive_storyboard_moment"] = "the duck points to the pond"
+        prompt = build_storyboard_prompt(shot, [])
+        self.assertIn("Camera angle: duck-eye low angle", prompt)
+        self.assertIn(
+            "Subject layout: speaker close-up with listener shoulder foreground", prompt
+        )
+        self.assertIn("Eyeline and axis: speaker looks camera-left", prompt)
+        self.assertIn(
+            "Decisive storyboard moment: the duck points to the pond", prompt
+        )
+        self.assertIn("Do not default to an equal-size two-character wide shot", prompt)
+
+    def test_storyboard_prompt_supports_non_text_dialogue_visual_bubble(self) -> None:
+        shot = self.plan["shots"][0]
+        shot["narrative_visualization"] = {
+            "mode": "speech_visual_bubble",
+            "narrative_layer": "proposed_action",
+            "reality_anchor": "duck remains dry on the grass",
+            "content_to_visualize": "duck imagines washing in the pond",
+            "entry_cue": "bubble tail points to the speaking duck",
+            "exit_cue": "pond and dry duck remain visible outside the bubble",
+            "ppt_readability_strategy": "soft cloud edge separates proposal from reality",
+            "duplicate_identity_policy": "framed_representation_only",
+        }
+        prompt = build_storyboard_prompt(shot, [])
+        self.assertIn("Narrative visualization mode: speech_visual_bubble", prompt)
+        self.assertIn("Present-reality anchor: duck remains dry on the grass", prompt)
+        self.assertIn("exactly one clearly bounded, soft-edged, non-text visual speech bubble", prompt)
+        self.assertIn("repeated identity is allowed only inside that bubble", prompt)
 
     def test_one_manifest_compiles_matching_ppt_r2v_plan_and_provider_jobs(self) -> None:
         sealed_path, sealed = self.build_and_seal()

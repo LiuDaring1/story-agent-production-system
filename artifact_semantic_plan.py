@@ -100,6 +100,7 @@ def reconcile_semantic_mappings(
     )
     kind_set = set(kinds)
     removed: list[dict[str, Any]] = []
+    corrected: list[dict[str, Any]] = []
     retained: list[dict[str, Any]] = []
     for raw in mappings:
         provenance = raw.get("provenance") if isinstance(raw, Mapping) else None
@@ -111,6 +112,23 @@ def reconcile_semantic_mappings(
         if runtime_default and str(raw.get("semantic_kind") or "") not in kind_set:
             removed.append(dict(raw))
             continue
+        if runtime_default and isinstance(raw, dict):
+            kind = str(raw.get("semantic_kind") or "")
+            artifact = str(raw.get("artifact") or "")
+            if artifact in {"background_subtitles", "sales_subtitles"} and kind != "story_body":
+                expected_group = f"{kind}_presentation" if kind in CARD_KINDS else None
+                if (
+                    raw.get("action") != "exclude"
+                    or raw.get("subtitle_policy") != "hide"
+                    or raw.get("mutual_exclusion_group") != expected_group
+                ):
+                    raw["action"] = "exclude"
+                    raw["subtitle_policy"] = "hide"
+                    if expected_group is None:
+                        raw.pop("mutual_exclusion_group", None)
+                    else:
+                        raw["mutual_exclusion_group"] = expected_group
+                    corrected.append(dict(raw))
         retained.append(raw)
     if removed:
         mappings[:] = retained
@@ -146,23 +164,23 @@ def reconcile_semantic_mappings(
                     visual_substitute=f"{kind}_card",
                     mutual_exclusion_group=f"{kind}_presentation",
                 )
-            elif artifact == "background_subtitles" and kind in CARD_KINDS:
+            elif artifact in {"background_subtitles", "sales_subtitles"} and kind != "story_body":
                 mapping.update(
                     action="exclude",
                     subtitle_policy="hide",
-                    mutual_exclusion_group=f"{kind}_presentation",
                 )
-            elif artifact == "sales_subtitles" and kind == "title":
-                mapping.update(action="exclude", subtitle_policy="hide")
+                if kind in CARD_KINDS:
+                    mapping["mutual_exclusion_group"] = f"{kind}_presentation"
             mappings.append(mapping)
             added.append(mapping)
             existing.add((kind, artifact))
-    if added or removed:
+    if added or removed or corrected:
         write_json_atomic(target, contract)
     return {
         "semantic_kinds": list(kinds),
         "added_mappings": added,
         "removed_mappings": removed,
+        "corrected_mappings": corrected,
     }
 
 

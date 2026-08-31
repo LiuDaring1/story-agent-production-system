@@ -60,7 +60,10 @@ class KeyingSearchTests(unittest.TestCase):
                 capture_output=True,
             )
             self.assertEqual(process.returncode, 0, process.stderr)
-            preset_path = auto_keying(project, video)
+            # This test exercises the explicit legacy colour-key candidate
+            # search; production defaults to RVM and must not silently enter
+            # this branch.
+            preset_path = auto_keying(project, video, backend="colorkey")
             search = project / "04_发布视频" / "keying" / "keying_search.json"
             sheet = project / "04_发布视频" / "keying" / "keying_candidates.jpg"
             self.assertTrue(search.exists())

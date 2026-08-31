@@ -5,7 +5,13 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from secret_store import import_secret_from_clipboard, keychain_service, read_secret, write_secret
+from secret_store import (
+    import_secret_from_clipboard,
+    keychain_service,
+    keychain_service_candidates,
+    read_secret,
+    write_secret,
+)
 
 
 class SecretStoreTests(unittest.TestCase):
@@ -17,6 +23,24 @@ class SecretStoreTests(unittest.TestCase):
 
     def test_keychain_service_name_is_scoped(self) -> None:
         self.assertEqual(keychain_service("TOAPIS_API_KEY"), "story-agent.TOAPIS_API_KEY")
+        self.assertEqual(
+            keychain_service_candidates("TOAPIS_API_KEY"),
+            ("story-agent.TOAPIS_API_KEY", "TOAPIS_API_KEY"),
+        )
+
+    def test_read_secret_falls_back_to_historical_unscoped_service(self) -> None:
+        attempts = [
+            subprocess.CompletedProcess([], 44, stdout="", stderr="not found"),
+            subprocess.CompletedProcess([], 0, stdout="legacy-key", stderr=""),
+        ]
+        with patch("secret_store.sys.platform", "darwin"), patch.dict(
+            os.environ, {"USER": "tester", "TOAPIS_API_KEY": ""}, clear=False
+        ), patch("secret_store.subprocess.run", side_effect=attempts) as runner:
+            self.assertEqual(read_secret("TOAPIS_API_KEY"), "legacy-key")
+        self.assertEqual(
+            [call.args[0][5] for call in runner.call_args_list],
+            ["story-agent.TOAPIS_API_KEY", "TOAPIS_API_KEY"],
+        )
 
     def test_write_secret_passes_value_directly_to_keychain_without_printing(self) -> None:
         with patch("secret_store.sys.platform", "darwin"), patch.dict(os.environ, {"USER": "tester"}, clear=False):

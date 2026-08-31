@@ -83,6 +83,42 @@ PHYSICAL_SCALE_BASES = {
 }
 PHYSICAL_SUPPORT_MODES = {"handheld", "freestanding", "grounded", "attached", "suspended", "loose"}
 PHYSICAL_RIGIDITY = {"rigid", "flexible", "soft", "fragile", "fluid"}
+NARRATIVE_VISUALIZATION_MODES = {
+    "literal_action",
+    "speaker_performance",
+    "listener_reaction",
+    "speech_visual_bubble",
+    "imagined_cutaway",
+    "flashback",
+    "metaphoric_insert",
+}
+NARRATIVE_LAYERS = {
+    "current_fact",
+    "proposed_action",
+    "imagined_example",
+    "memory",
+    "explanation",
+    "future_result",
+}
+DUPLICATE_IDENTITY_POLICIES = {
+    "forbid",
+    "framed_representation_only",
+    "same_identity_memory_only",
+}
+NON_CHARACTER_SPEAKERS = {"", "narrator", "旁白", "none", "unknown"}
+MODALITY_CUES = (
+    "如果",
+    "假如",
+    "假设",
+    "想象",
+    "梦见",
+    "回忆",
+    "曾经",
+    "打算",
+    "计划",
+    "将来",
+    "你把我",
+)
 
 
 def _number(value: Any) -> bool:
@@ -447,6 +483,44 @@ def _validate_frame_envelope(frame: Any, path: str, errors: list[str]) -> None:
         errors.append(f"{path}.state_summary: must be an object")
 
 
+def _validate_narrative_visualization(shot: dict[str, Any], path: str, errors: list[str]) -> None:
+    visualization = shot.get("narrative_visualization")
+    if visualization is None:
+        return
+    if not isinstance(visualization, dict):
+        errors.append(f"{path}.narrative_visualization: must be an object")
+        return
+    mode = visualization.get("mode")
+    layer = visualization.get("narrative_layer")
+    duplicate_policy = visualization.get("duplicate_identity_policy")
+    if mode not in NARRATIVE_VISUALIZATION_MODES:
+        errors.append(f"{path}.narrative_visualization.mode: unsupported mode {mode!r}")
+    if layer not in NARRATIVE_LAYERS:
+        errors.append(f"{path}.narrative_visualization.narrative_layer: unsupported layer {layer!r}")
+    if duplicate_policy not in DUPLICATE_IDENTITY_POLICIES:
+        errors.append(
+            f"{path}.narrative_visualization.duplicate_identity_policy: unsupported policy {duplicate_policy!r}"
+        )
+    for field in (
+        "reality_anchor",
+        "content_to_visualize",
+        "entry_cue",
+        "exit_cue",
+        "ppt_readability_strategy",
+    ):
+        _required_text(visualization, field, f"{path}.narrative_visualization", errors)
+    if mode == "speech_visual_bubble" and duplicate_policy != "framed_representation_only":
+        errors.append(
+            f"{path}.narrative_visualization: speech_visual_bubble requires framed_representation_only"
+        )
+    if mode == "flashback" and layer != "memory":
+        errors.append(f"{path}.narrative_visualization: flashback requires narrative_layer='memory'")
+    if mode in {"literal_action", "speaker_performance", "listener_reaction"} and layer != "current_fact":
+        errors.append(
+            f"{path}.narrative_visualization: {mode} must preserve narrative_layer='current_fact'"
+        )
+
+
 def _validate_cut_contract(
     shot: dict[str, Any],
     next_shot: dict[str, Any] | None,
@@ -715,6 +789,7 @@ def validate_plan(plan: Any) -> list[str]:
             errors.append(f"{path}.storyboard_reference_mode: unsupported mode {storyboard_mode!r}")
         if storyboard_mode == "director_only":
             _required_text(shot, "storyboard_reference_reason", path, errors)
+        _validate_narrative_visualization(shot, path, errors)
 
         group_id = shot.get("continuity_group")
         group = groups.get(group_id)
@@ -865,6 +940,65 @@ def validate_plan(plan: Any) -> list[str]:
     return errors
 
 
+def creative_advisories(plan: Any) -> list[str]:
+    """Return non-blocking prompts for human directorial judgment.
+
+    These observations deliberately do not participate in ``valid``. They
+    expose places worth discussing without turning shot variety or a chosen
+    visualization device into a numerical delivery rule.
+    """
+    if not isinstance(plan, dict) or not isinstance(plan.get("shots"), list):
+        return []
+    shots = [shot for shot in plan["shots"] if isinstance(shot, dict)]
+    advisories: list[str] = []
+
+    for shot in shots:
+        shot_id = str(shot.get("shot_id") or "unknown-shot")
+        speaker = str(shot.get("audio_speaker") or "").strip()
+        start = shot.get("source_start")
+        end = shot.get("source_end")
+        duration = end - start if _number(start) and _number(end) and end > start else None
+        text = str(shot.get("story_text") or "")
+        visualization = shot.get("narrative_visualization")
+        if (
+            speaker.lower() not in NON_CHARACTER_SPEAKERS
+            and "narrator" not in speaker.lower()
+            and "旁白" not in speaker
+            and duration is not None
+            and duration >= 8.0
+            and not isinstance(visualization, dict)
+        ):
+            advisories.append(
+                f"{shot_id}: 较长角色台词未使用 narrative_visualization；"
+                "请审核现有 visual_focus/表演节拍是否已明确说明画面承担。"
+                "保持说话者持续表演可以是正确选择，此项不阻断。"
+            )
+        if any(cue in text for cue in MODALITY_CUES) and not isinstance(visualization, dict):
+            advisories.append(
+                f"{shot_id}: 文本含设想/回忆/计划线索但未显式声明叙事层；"
+                "请人工确认当前物理事实没有被台词偷偷改写。"
+            )
+
+    for previous, current in zip(shots, shots[1:]):
+        previous_frame = previous.get("opening_frame")
+        current_frame = current.get("opening_frame")
+        if not isinstance(previous_frame, dict) or not isinstance(current_frame, dict):
+            continue
+        fields = ("shot_size", "camera_angle", "subject_layout")
+        if all(
+            str(previous_frame.get(field) or "").strip()
+            and str(previous_frame.get(field) or "").strip()
+            == str(current_frame.get(field) or "").strip()
+            for field in fields
+        ):
+            advisories.append(
+                f"{previous.get('shot_id')} → {current.get('shot_id')}: 入口景别、机位和主体布局高度相似；"
+                "请审核是否有情绪、动作、信息或空间关系上的保留理由。"
+                "相似本身不是错误，不按次数或比例退回。"
+            )
+    return advisories
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("plan", type=Path, help="Path to story_r2v_plan.json")
@@ -875,9 +1009,16 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps({"valid": False, "errors": [str(exc)]}, ensure_ascii=False, indent=2))
         return 2
     errors = validate_plan(payload)
+    advisories = creative_advisories(payload)
     print(
         json.dumps(
-            {"valid": not errors, "error_count": len(errors), "errors": errors},
+            {
+                "valid": not errors,
+                "error_count": len(errors),
+                "errors": errors,
+                "advisory_count": len(advisories),
+                "creative_advisories": advisories,
+            },
             ensure_ascii=False,
             indent=2,
         )

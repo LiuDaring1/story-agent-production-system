@@ -5,10 +5,13 @@ import io
 import json
 import tempfile
 import unittest
+import zipfile
 from contextlib import redirect_stdout
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
+
+from PIL import Image
 
 from story_agent import AgentContext, StageResult, StoryAgent
 from story_agent_runtime import (
@@ -43,7 +46,15 @@ from story_contract_runtime import (
     write_contract_consumer_context,
     write_trusted_input_chain,
 )
-from story_project import init_project, load_config, project_paths, save_json, write_manifest
+from story_project import (
+    detect_project_assets,
+    ensure_story_frame_variants,
+    init_project,
+    load_config,
+    project_paths,
+    save_json,
+    write_manifest,
+)
 from tests.test_story_contracts import valid_contract
 
 
@@ -169,6 +180,50 @@ def _lock_contract(project: Path, manifest: dict, *, contract_payload: dict | No
 
 
 class StoryContractRuntimeTests(unittest.TestCase):
+    def test_theme_qa_preflight_does_not_mutate_existing_receipted_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            theme = Path(directory)
+            frame = theme / "story_frame_a.png"
+            source = theme / "story_frame_source.png"
+            Image.new("RGBA", (32, 18), (240, 90, 20, 255)).save(frame)
+            Image.new("RGB", (32, 18), (255, 0, 255)).save(source)
+            before = hashlib.sha256(frame.read_bytes()).hexdigest()
+
+            ensure_story_frame_variants(theme, (2, 2, 20, 10))
+
+            self.assertEqual(hashlib.sha256(frame.read_bytes()).hexdigest(), before)
+
+    def test_trusted_input_chain_reads_docx_story_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            story_docx = project_paths(project).inputs / "story.docx"
+            document_xml = (
+                '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main">'
+                '<w:body><w:p><w:r><w:t>第一自然段。</w:t></w:r></w:p>'
+                '<w:p><w:r><w:t>第二自然段！</w:t></w:r></w:p></w:body></w:document>'
+            )
+            with zipfile.ZipFile(story_docx, "w") as archive:
+                archive.writestr("word/document.xml", document_xml)
+            manifest["inputs"]["story_text"] = str(story_docx)
+
+            chain = build_trusted_input_chain(project, manifest, load_config())
+
+            self.assertEqual(chain["sources"][0]["text"], "第一自然段。\n第二自然段！")
+            self.assertEqual(chain["sources"][0]["project_relative_path"], "00_输入素材/story.docx")
+
+    def test_asset_detection_preserves_explicit_story_text_binding(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, manifest = _new_project(Path(directory))
+            bound = Path(manifest["inputs"]["story_text"])
+            competing_docx = project / "文稿：自动发现但未绑定.docx"
+            competing_docx.write_bytes(b"not-selected")
+            write_manifest(project_paths(project), manifest)
+
+            detected = detect_project_assets(project, extract_audio=False)
+
+            self.assertEqual(detected["inputs"]["story_text"], str(bound))
+
     def test_manifest_without_historical_evidence_requires_contract(self) -> None:
         migrated = ensure_manifest_v2({"story": {"name": "possibly-v3"}})
         self.assertEqual(migrated["agent"]["story_contract"]["policy"], CONTRACT_POLICY_REQUIRED)

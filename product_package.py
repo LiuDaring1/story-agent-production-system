@@ -73,6 +73,8 @@ from product_text_projection import (
     clean_public_story_text as _clean_public_story_text,
     compile_annotation_story_lines,
     compile_public_story_lines,
+    customer_manuscript_form_issues,
+    customer_manuscript_paragraphs,
 )
 from static_ppt_contract import (
     load_object as load_static_ppt_object,
@@ -80,7 +82,8 @@ from static_ppt_contract import (
     write_delivery_receipt as write_static_ppt_delivery_receipt,
 )
 from shot_storyboard_pipeline import validate_compile_receipt
-from story_delivery_policy import high_quality_background_blur
+from story_delivery_policy import customer_music_extension, high_quality_background_blur
+from story_customer_media import write_customer_media_receipt
 
 
 def production_keying_fingerprint(settings):
@@ -197,6 +200,8 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, help="中间文件目录；默认 output/product_package_work/<slug>")
     parser.add_argument("--timings-json", type=Path, help="已有 timings.json；正式资料包必须提供，用于校准示范字幕和 PPT 翻页")
     parser.add_argument("--demo-subtitle-srt", type=Path, help="已审核的完整口播 SRT；提供时原样用于示范视频")
+    parser.add_argument("--background-subtitle-srt", type=Path, help="客户含字幕背景视频实际使用的正文 SRT")
+    parser.add_argument("--authoritative-timeline-receipt", type=Path, help="哈希绑定的权威音频时间轴回执")
     parser.add_argument("--subtitle-txt", type=Path, help="兼容旧调用；字幕 TXT 仅是制作输入，不再加入客户资料包")
     parser.add_argument("--allow-even-timings", action="store_true", help="允许无 timings.json 时按旁白总时长平均分配；仅限内部预览")
     parser.add_argument("--whisper-model", default="base", help="保留接口；正式资料包请先用 timing 流程生成 timings.json")
@@ -357,6 +362,29 @@ def build_product_package(args: argparse.Namespace) -> None:
         artifact_semantic_product_selections(script_lines, semantic_plan)
         if semantic_plan is not None else None
     )
+    validate_formal_demo_logo(
+        demo_logo,
+        formal=static_ppt_mode or semantic_plan is not None,
+        reviewed_no_logo=(
+            semantic_plan is not None
+            and isinstance(demo_brand_spec, dict)
+            and demo_brand_spec.get("official_logo_count") == 0
+        ),
+    )
+    formal_product = static_ppt_mode or semantic_plan is not None
+    authoritative_timeline_receipt = (
+        args.authoritative_timeline_receipt.expanduser()
+        if args.authoritative_timeline_receipt else None
+    )
+    background_subtitle_srt = (
+        args.background_subtitle_srt.expanduser()
+        if args.background_subtitle_srt else None
+    )
+    if formal_product:
+        if authoritative_timeline_receipt is None or not authoritative_timeline_receipt.is_file():
+            raise ValueError("正式资料包缺少 --authoritative-timeline-receipt")
+        if background_subtitle_srt is None or not background_subtitle_srt.is_file():
+            raise ValueError("正式资料包缺少 --background-subtitle-srt")
 
     def selected(artifact: str) -> tuple[list[str], list[Path], list[LineTiming], list[int]]:
         if semantic_plan is not None:
@@ -646,12 +674,20 @@ def build_product_package(args: argparse.Namespace) -> None:
         print(f"朗读标注精修请求：{request_path}")
         return
 
-    manuscript_text = (
-        "\n".join(manuscript_lines)
-        if semantic_spec is not None or semantic_plan is not None
-        else clean_public_story_text(read_text_document(story_text_path))
-    )
-    render_story_docx(story_name, manuscript_text, story_docx)
+    # The timing script is deliberately line-oriented, but the customer Word
+    # manuscript is not.  Preserve the confirmed manuscript's punctuation and
+    # natural paragraphs, then verify that its words still exactly cover the
+    # selected public script after punctuation/whitespace normalization.
+    source_story_text = read_text_document(story_text_path)
+    manuscript_paragraphs = customer_manuscript_paragraphs(story_name, source_story_text)
+    if semantic_plan is not None:
+        manuscript_issues = customer_manuscript_form_issues(
+            manuscript_paragraphs,
+            manuscript_lines,
+        )
+        if manuscript_issues:
+            raise ValueError("客户故事文稿不是自然段落版本：" + "; ".join(manuscript_issues))
+    render_story_docx(story_name, source_story_text, story_docx)
     if semantic_plan is not None:
         write_manuscript_receipt(
             work_dir / "customer_manuscript_receipt.json",
@@ -660,6 +696,7 @@ def build_product_package(args: argparse.Namespace) -> None:
             selected_indices=manuscript_indices,
             selected_lines=manuscript_lines,
             content_manifest=product_content_manifest_path,
+            source_story=story_text_path,
         )
     if args.annotation_docx is not None:
         if semantic_plan is not None:
@@ -833,11 +870,30 @@ def build_product_package(args: argparse.Namespace) -> None:
             x264_preset=args.demo_preset,
         )
 
+    customer_media_receipt = work_dir / "customer_media_receipt.json"
+    if formal_product:
+        if not a_only_video.is_file():
+            raise RuntimeError("正式资料包缺少 A 镜无人物背景视频，无法审核客户音频角色")
+        write_customer_media_receipt(
+            output_path=customer_media_receipt,
+            music=music_path,
+            authoritative_timeline_receipt=authoritative_timeline_receipt,
+            subtitle_srt=background_subtitle_srt,
+            background_with_subtitles=bg_with_sub,
+            background_without_subtitles=bg_no_sub,
+            a_only_video=a_only_video,
+            demo_video=demo_video,
+        )
+
+    customer_music = ensure_customer_music_mp3(
+        music_path,
+        assets_dir / f"故事配乐：{story_name}{customer_music_extension()}",
+    )
     package_result = create_package_dirs(
         story_name=story_name,
         output_root=output_root,
         story_docx=story_docx,
-        music=music_path,
+        music=customer_music,
         annotation_docx=annotation_docx,
         demo_video=demo_video,
         background_image=demo_background,
@@ -871,10 +927,11 @@ def build_product_package(args: argparse.Namespace) -> None:
             "ppt_with_subtitles_render_manifest": work_dir / "ppt_with_subtitles_render_manifest.json",
             "ppt_without_subtitles_render_manifest": work_dir / "ppt_without_subtitles_render_manifest.json",
             "demo_render_manifest": work_dir / "demo_render_manifest.json",
-            "music": music_path,
+            "music": customer_music,
             "background_with_subtitles": bg_with_sub,
             "background_without_subtitles": bg_no_sub,
             "timings_source": formal_timings_path,
+            "customer_media_receipt": customer_media_receipt,
         }
         write_product_package_manifest(
             work_dir / "product_package_manifest.json",
@@ -1150,8 +1207,7 @@ def load_or_build_timings(path: Path | None, script_lines: list[str], narration:
 
 
 def render_story_docx(story_name: str, story_text: str, output_path: Path) -> None:
-    story_text = re.sub(rf"^\s*故事文稿[：:]\s*{re.escape(story_name)}\s*", "", story_text, count=1)
-    story_text = re.sub(rf"^\s*{re.escape(story_name)}\s*(?:\r?\n)+", "", story_text, count=1)
+    paragraphs = customer_manuscript_paragraphs(story_name, story_text)
     doc = Document()
     section = doc.sections[0]
     section.top_margin = Inches(0.75)
@@ -1160,9 +1216,9 @@ def render_story_docx(story_name: str, story_text: str, output_path: Path) -> No
     section.right_margin = Inches(0.8)
     title = doc.add_paragraph()
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
-    run = title.add_run(f"《{story_name}》")
+    run = title.add_run(paragraphs[0])
     set_run_font(run, DELIVERY_CJK_FONT, 22, "1A1A1A", bold=True)
-    for paragraph_text in split_story_paragraphs(story_text):
+    for paragraph_text in paragraphs[1:]:
         paragraph = doc.add_paragraph()
         paragraph.paragraph_format.first_line_indent = Pt(22)
         paragraph.paragraph_format.line_spacing = 1.25
@@ -2594,6 +2650,55 @@ def _render_a_only_background_video_core(
     )
 
 
+def validate_formal_demo_logo(
+    logo_path: Path | None,
+    *,
+    formal: bool,
+    reviewed_no_logo: bool = False,
+) -> None:
+    """Require the official Demo logo unless a reviewed contract disables it."""
+
+    if not formal or reviewed_no_logo:
+        return
+    if logo_path is None:
+        raise ValueError("正式示范视频必须传入审核过的官方 Logo")
+    if not logo_path.expanduser().is_file():
+        raise ValueError(f"正式示范视频官方 Logo 不存在：{logo_path}")
+
+
+def ensure_customer_music_mp3(source: Path, target: Path) -> Path:
+    """Create the interoperable customer MP3 without changing the music master."""
+
+    source = source.expanduser().resolve()
+    target = target.expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"故事配乐不存在：{source}")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.suffix.lower() == customer_music_extension():
+        if source != target:
+            shutil.copy2(source, target)
+    else:
+        run_command(
+            [
+                "ffmpeg",
+                "-y",
+                "-i",
+                str(source),
+                "-vn",
+                "-map_metadata",
+                "-1",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                "192k",
+                str(target),
+            ]
+        )
+    if not target.is_file() or target.stat().st_size <= 0:
+        raise RuntimeError("客户 MP3 转码失败或输出为空")
+    return target
+
+
 def create_package_dirs(
     story_name: str,
     output_root: Path,
@@ -2613,6 +2718,11 @@ def create_package_dirs(
     backup_root: Path | None = None,
     product_package_port: ProductPackagePort | None = None,
 ) -> tuple[Path, Path, dict[str, Path]]:
+    if music.suffix.lower() != customer_music_extension():
+        raise ValueError(
+            "客户资料包的故事配乐必须先转为 MP3；内部 M4A/WAV 母版可以保留，"
+            "但不能直接复制给客户"
+        )
     dynamic_markers = ("PPT动态素材", "自动播放", "人工控场")
     for _source, destination_name in additional_advanced_items:
         if any(marker in destination_name for marker in dynamic_markers):
@@ -2624,7 +2734,7 @@ def create_package_dirs(
     advanced_dir = output_root / f"绵羊故事锦囊：{story_name}（进阶版）"
     base_items = [
         (story_docx, f"故事文稿：{story_name}.docx"),
-        (music, f"故事配乐：{story_name}{music.suffix.lower()}"),
+        (music, f"故事配乐：{story_name}{customer_music_extension()}"),
         (annotation_docx, f"朗读标注：{story_name}.docx"),
         (demo_video, f"示范表演：{story_name}.mp4"),
         (background_image, f"背景图片：{story_name}{background_image.suffix.lower()}"),

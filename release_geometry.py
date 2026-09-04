@@ -5,9 +5,12 @@ import json
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from PIL import Image
+
 RELEASE_GEOMETRY_SCHEMA_VERSION = "story-release-geometry/v1"
-RELEASE_GEOMETRY_COMPILER_VERSION = "1.5.0"
+RELEASE_GEOMETRY_COMPILER_VERSION = "1.6.0"
 DEMO_PRESENTER_GEOMETRY_SCHEMA_VERSION = "story-demo-presenter-geometry/v1"
+CANONICAL_B_STORY_BOX = (356, 180, 1209, 680)
 
 
 def canonical_sha256(value: Any) -> str:
@@ -559,6 +562,11 @@ def geometry_manifest_issues(
             for field in sorted(required_compositing_fields)
             if field not in compositing
         )
+    main = payload.get("main")
+    if isinstance(main, Mapping) and "story_region_b" in main:
+        if list(main.get("story_region_b") or []) != list(CANONICAL_B_STORY_BOX):
+            issues.append("release_geometry_b_story_box_not_canonical")
+
     presenter = payload.get("presenter")
     presenter_a = presenter.get("a") if isinstance(presenter, Mapping) else None
     if isinstance(presenter_a, Mapping) and "x" in presenter_a:
@@ -573,6 +581,31 @@ def geometry_manifest_issues(
             issues.append("release_geometry_presenter_dynamic_repositioning_must_be_false")
         if presenter_a.get("gesture_overlap_policy") != "allowed":
             issues.append("release_geometry_presenter_gesture_overlap_policy_invalid")
+    approved_presenter = (
+        presenter.get("approved_demo_geometry") if isinstance(presenter, Mapping) else None
+    )
+    presenter_c = presenter.get("c") if isinstance(presenter, Mapping) else None
+    if (
+        isinstance(approved_presenter, Mapping)
+        and isinstance(presenter_c, Mapping)
+        and approved_presenter.get("applicable") is not False
+        and presenter_c.get("applicable") is not False
+    ):
+        # C is the presenter-only view of the reviewed Demo canvas.  It must
+        # preserve that centered source-native transform exactly; only A is
+        # allowed to move the presenter into the right-hand blank region.
+        for field in ("source_crop", "rendered_width", "rendered_height", "scale", "x", "y"):
+            if presenter_c.get(field) != approved_presenter.get(field):
+                issues.append(f"release_geometry_presenter_c_not_demo_identity:{field}")
+        if presenter_c.get("horizontal_anchor_basis") != "approved_demo_source_canvas_center":
+            issues.append("release_geometry_presenter_c_anchor_policy_invalid")
+        correction = presenter_c.get("position_correction")
+        if (
+            not isinstance(correction, Mapping)
+            or correction.get("x") != approved_presenter.get("x")
+            or correction.get("y") != approved_presenter.get("y")
+        ):
+            issues.append("release_geometry_presenter_c_position_correction_invalid")
     stored_hash = str(payload.get("geometry_sha256") or "")
     unsigned = dict(payload)
     unsigned.pop("geometry_sha256", None)
@@ -619,12 +652,119 @@ def release_render_manifest_issues(
     return sorted(set(issues))
 
 
+def release_package_receipt_issues(
+    payload: Mapping[str, Any],
+    *,
+    verify_outputs: bool = True,
+) -> list[str]:
+    """Validate the formal two-account, four-panel release receipt.
+
+    The release render manifest is the receipt: its embedded geometry binds the
+    ImageGen panel lineage, approved preview geometry, final outputs and every
+    current SHA-256.  This stricter view prevents a valid single render or a
+    whole-canvas cover plate from satisfying final story delivery.
+    """
+
+    geometry = payload.get("actual_geometry")
+    expected_bindings = geometry.get("bindings") if isinstance(geometry, Mapping) else None
+    issues = release_render_manifest_issues(
+        payload,
+        expected_bindings=expected_bindings if isinstance(expected_bindings, Mapping) else None,
+        verify_outputs=verify_outputs,
+    )
+    if payload.get("variant") != "both":
+        issues.append("release_package_variant_must_be_both")
+    if not isinstance(geometry, Mapping):
+        return sorted(set(issues))
+
+    package = geometry.get("main_package_spec")
+    required_roles = {
+        "main_top_panel",
+        "main_bottom_panel",
+        "library_top_panel",
+        "library_bottom_panel",
+    }
+    if not isinstance(package, Mapping):
+        issues.append("release_package_imagegen_binding_missing")
+    else:
+        if package.get("text_integration") != "imagegen_native":
+            issues.append("release_package_text_integration_not_imagegen_native")
+        if package.get("render_usage_proof") is not True:
+            issues.append("release_package_render_usage_proof_missing")
+        panels = package.get("panels")
+        if not isinstance(panels, Mapping) or set(panels) != required_roles:
+            issues.append("release_package_four_panel_set_incomplete")
+        else:
+            hashes: dict[str, str] = {}
+            for role in sorted(required_roles):
+                item = panels.get(role)
+                if not isinstance(item, Mapping):
+                    issues.append(f"release_package_panel_binding_invalid:{role}")
+                    continue
+                path = Path(str(item.get("path") or ""))
+                expected_sha = str(item.get("sha256") or "")
+                if not path.is_file():
+                    issues.append(f"release_package_panel_missing:{role}")
+                    continue
+                actual_sha = file_sha256(path)
+                hashes[role] = actual_sha
+                if expected_sha != actual_sha:
+                    issues.append(f"release_package_panel_sha256_mismatch:{role}")
+                try:
+                    with Image.open(path) as image:
+                        if image.size != (2304, 888):
+                            issues.append(f"release_package_panel_size_invalid:{role}")
+                except (OSError, ValueError):
+                    issues.append(f"release_package_panel_decode_failed:{role}")
+            main_hashes = {hashes.get("main_top_panel"), hashes.get("main_bottom_panel")} - {None}
+            library_hashes = {hashes.get("library_top_panel"), hashes.get("library_bottom_panel")} - {None}
+            if main_hashes & library_hashes:
+                issues.append("release_package_account_panel_reuse_detected")
+        for name in ("main_package_spec", "main_package_receipt"):
+            path = Path(str(package.get(f"{name}_path") or ""))
+            expected_sha = str(package.get(f"{name}_sha256") or "")
+            if not path.is_file():
+                issues.append(f"release_package_binding_missing:{name}")
+            elif expected_sha != file_sha256(path):
+                issues.append(f"release_package_binding_stale:{name}")
+
+    main = geometry.get("main")
+    if not isinstance(main, Mapping):
+        issues.append("release_package_main_geometry_missing")
+    else:
+        for strip in ("upper_strip", "lower_strip"):
+            item = main.get(strip)
+            if not isinstance(item, Mapping) or item.get("renderer") != "imagegen_native_reference":
+                issues.append(f"release_package_renderer_invalid:{strip}")
+    library = geometry.get("library")
+    if not isinstance(library, Mapping) or library.get("video_region") != [0, 416, 1080, 608]:
+        issues.append("release_package_library_viewport_invalid")
+    output_geometry = payload.get("actual_output_geometry")
+    if (
+        not isinstance(output_geometry, Mapping)
+        or output_geometry.get("center_video_region") != [0, 416, 1080, 608]
+    ):
+        issues.append("release_package_output_viewport_invalid")
+    outputs = payload.get("outputs")
+    if isinstance(outputs, list):
+        names = {
+            Path(str(item.get("path") or "")).name
+            for item in outputs
+            if isinstance(item, Mapping)
+        }
+        if names != {"主账号发布视频.mp4", "宝库号发布视频.mp4"}:
+            issues.append("release_package_two_account_outputs_incomplete")
+    return sorted(set(issues))
+
+
 __all__ = [
     "DEMO_PRESENTER_GEOMETRY_SCHEMA_VERSION",
+    "CANONICAL_B_STORY_BOX",
     "RELEASE_GEOMETRY_COMPILER_VERSION", "RELEASE_GEOMETRY_SCHEMA_VERSION",
     "approved_demo_geometry", "binding_payload", "canonical_sha256",
     "compile_demo_presenter_geometry", "demo_presenter_geometry_issues",
     "compile_text_group", "file_sha256", "regions_for_variant",
     "geometry_manifest_issues", "preview_formal_binding_sha256", "release_a_geometry", "release_render_manifest_issues",
+    "release_package_receipt_issues",
     "text_group_issues",
 ]

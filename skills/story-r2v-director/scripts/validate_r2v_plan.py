@@ -12,8 +12,8 @@ from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = "story-r2v-plan-v3"
-LEGACY_SCHEMA_VERSIONS = {"story-r2v-plan-v2"}
+SCHEMA_VERSION = "story-r2v-plan-v4"
+LEGACY_SCHEMA_VERSIONS = {"story-r2v-plan-v2", "story-r2v-plan-v3"}
 BODY_MODE = "reference_to_video"
 PROVIDER_DURATIONS = {6, 10}
 RELATIONS = {
@@ -83,6 +83,15 @@ PHYSICAL_SCALE_BASES = {
 }
 PHYSICAL_SUPPORT_MODES = {"handheld", "freestanding", "grounded", "attached", "suspended", "loose"}
 PHYSICAL_RIGIDITY = {"rigid", "flexible", "soft", "fragile", "fluid"}
+SUBJECT_TYPES = {"character", "crowd", "prop", "environment"}
+SCREEN_SIDES = {"left", "center", "right", "full_frame"}
+EYELINE_DIRECTIONS = {"camera_left", "camera_right", "toward_camera", "away", "none", "mixed"}
+CAMERA_SIDES = {"side_a", "side_b", "on_axis"}
+FRAME_PRESENCE = {"on_screen", "off_screen"}
+WORLD_PRESENCE = {"in_scene", "outside_scene"}
+PROP_PRESENCE = {"present", "absent"}
+ANCHOR_PERSISTENCE = {"fixed", "shot_local"}
+ANCHOR_OCCUPANCY_RULES = {"none", "occupied_while_subject_in_scene"}
 NARRATIVE_VISUALIZATION_MODES = {
     "literal_action",
     "speaker_performance",
@@ -349,6 +358,250 @@ def _validate_groups(
             errors.append(f"{path}.anchors: must contain at least one stable scene anchor")
 
 
+def _validate_v4_groups(
+    groups: dict[str, dict[str, Any]],
+    assets: dict[str, dict[str, Any]],
+    errors: list[str],
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Validate the structured stage geography used by current production plans."""
+
+    identity_ids = {
+        str(asset.get("identity_id"))
+        for asset in assets.values()
+        if asset.get("kind") == "character" and asset.get("identity_id")
+    }
+    prop_ids = {
+        str(asset.get("prop_id"))
+        for asset in assets.values()
+        if asset.get("kind") == "prop" and asset.get("prop_id")
+    }
+    population_ids = {
+        str(asset.get("population_id"))
+        for asset in assets.values()
+        if asset.get("kind") == "population" and asset.get("population_id")
+    }
+    structures: dict[str, dict[str, dict[str, Any]]] = {}
+    for group_id, group in groups.items():
+        path = f"continuity_groups[{group_id!r}]"
+        master_environment = assets.get(group.get("environment_asset_id"))
+        master_environment_family_id = (
+            master_environment.get("environment_family_id")
+            if isinstance(master_environment, dict)
+            else None
+        )
+        if not isinstance(master_environment_family_id, str) or not master_environment_family_id.strip():
+            errors.append(
+                f"{path}.environment_asset_id: master environment must declare environment_family_id"
+            )
+        color = group.get("color_contract")
+        if not isinstance(color, dict):
+            errors.append(f"{path}.color_contract: must be an object")
+        else:
+            for field in ("white_balance", "palette", "rationale"):
+                _required_text(color, field, f"{path}.color_contract", errors)
+            prohibited_casts = color.get("prohibited_casts")
+            if (
+                not isinstance(prohibited_casts, list)
+                or not prohibited_casts
+                or any(not isinstance(value, str) or not value.strip() for value in prohibited_casts)
+            ):
+                errors.append(
+                    f"{path}.color_contract.prohibited_casts: must list at least one unwanted global cast"
+                )
+        zones = _index_by_id(group.get("zones"), "zone_id", f"{path}.zones", errors)
+        for zone_id, zone in zones.items():
+            zone_path = f"{path}.zones[{zone_id!r}]"
+            _required_text(zone, "description", zone_path, errors)
+            for field in ("map_x", "map_y"):
+                if not _number(zone.get(field)):
+                    errors.append(f"{zone_path}.{field}: must be a finite scene-map coordinate")
+
+        anchors = _index_by_id(group.get("anchors"), "anchor_id", f"{path}.anchors", errors)
+        for anchor_id, anchor in anchors.items():
+            anchor_path = f"{path}.anchors[{anchor_id!r}]"
+            _required_text(anchor, "description", anchor_path, errors)
+            if anchor.get("zone_id") not in zones:
+                errors.append(f"{anchor_path}.zone_id: unknown zone {anchor.get('zone_id')!r}")
+            if anchor.get("persistence") not in ANCHOR_PERSISTENCE:
+                errors.append(f"{anchor_path}.persistence: unsupported anchor persistence")
+            occupancy_rule = anchor.get("occupancy_rule")
+            occupant_subject_id = anchor.get("occupant_subject_id")
+            if occupancy_rule not in ANCHOR_OCCUPANCY_RULES:
+                errors.append(f"{anchor_path}.occupancy_rule: unsupported occupancy rule")
+            elif occupancy_rule == "none" and occupant_subject_id is not None:
+                errors.append(f"{anchor_path}.occupant_subject_id: unoccupied anchors must use null")
+            elif occupancy_rule == "occupied_while_subject_in_scene":
+                if occupant_subject_id not in identity_ids:
+                    errors.append(
+                        f"{anchor_path}.occupant_subject_id: unknown character {occupant_subject_id!r}"
+                    )
+
+        axes = _index_by_id(group.get("axes"), "axis_id", f"{path}.axes", errors)
+        for axis_id, axis in axes.items():
+            axis_path = f"{path}.axes[{axis_id!r}]"
+            endpoint_a = axis.get("endpoint_a_zone_id")
+            endpoint_b = axis.get("endpoint_b_zone_id")
+            if endpoint_a not in zones:
+                errors.append(f"{axis_path}.endpoint_a_zone_id: unknown zone {endpoint_a!r}")
+            if endpoint_b not in zones:
+                errors.append(f"{axis_path}.endpoint_b_zone_id: unknown zone {endpoint_b!r}")
+            if endpoint_a == endpoint_b and endpoint_a is not None:
+                errors.append(f"{axis_path}: axis endpoints must use different zones")
+            _required_text(axis, "description", axis_path, errors)
+
+        setups = _index_by_id(
+            group.get("camera_setups"),
+            "setup_id",
+            f"{path}.camera_setups",
+            errors,
+        )
+        for setup_id, setup in setups.items():
+            setup_path = f"{path}.camera_setups[{setup_id!r}]"
+            if setup.get("axis_id") not in axes:
+                errors.append(f"{setup_path}.axis_id: unknown axis {setup.get('axis_id')!r}")
+            if setup.get("camera_side") not in CAMERA_SIDES:
+                errors.append(f"{setup_path}.camera_side: unsupported camera side")
+            if setup.get("shot_size") not in SHOT_SIZES:
+                errors.append(f"{setup_path}.shot_size: unsupported shot size")
+            _required_text(setup, "camera_angle", setup_path, errors)
+            subject_type = setup.get("primary_subject_type")
+            subject_id = setup.get("primary_subject_id")
+            if subject_type not in SUBJECT_TYPES:
+                errors.append(f"{setup_path}.primary_subject_type: unsupported subject type")
+            _required_text(setup, "primary_subject_id", setup_path, errors)
+            if subject_type == "character" and subject_id not in identity_ids:
+                errors.append(f"{setup_path}.primary_subject_id: unknown character {subject_id!r}")
+            elif subject_type == "prop" and subject_id not in prop_ids:
+                errors.append(f"{setup_path}.primary_subject_id: unknown prop {subject_id!r}")
+            elif subject_type == "crowd" and subject_id not in population_ids:
+                errors.append(f"{setup_path}.primary_subject_id: unknown crowd {subject_id!r}")
+            elif subject_type == "environment" and subject_id != group.get("environment_asset_id"):
+                errors.append(f"{setup_path}.primary_subject_id: must name this group's environment asset")
+            if setup.get("subject_zone_id") not in zones:
+                errors.append(f"{setup_path}.subject_zone_id: unknown zone {setup.get('subject_zone_id')!r}")
+            camera_origin = setup.get("camera_origin_zone_id")
+            look_target = setup.get("look_target_zone_id")
+            if camera_origin not in zones:
+                errors.append(f"{setup_path}.camera_origin_zone_id: unknown zone {camera_origin!r}")
+            if look_target not in zones:
+                errors.append(f"{setup_path}.look_target_zone_id: unknown zone {look_target!r}")
+            if (
+                setup.get("subject_zone_id") in zones
+                and look_target in zones
+                and setup.get("subject_zone_id") != look_target
+            ):
+                errors.append(
+                    f"{setup_path}.look_target_zone_id: must match subject_zone_id so the camera ray "
+                    "actually passes through the declared primary subject"
+                )
+            if camera_origin == look_target and camera_origin is not None:
+                errors.append(f"{setup_path}: camera origin and look target must use different zones")
+            origin_zone = zones.get(camera_origin)
+            target_zone = zones.get(look_target)
+            if isinstance(origin_zone, dict) and isinstance(target_zone, dict):
+                origin_x = origin_zone.get("map_x")
+                origin_y = origin_zone.get("map_y")
+                target_x = target_zone.get("map_x")
+                target_y = target_zone.get("map_y")
+                if all(_number(value) for value in (origin_x, origin_y, target_x, target_y)):
+                    if math.hypot(target_x - origin_x, target_y - origin_y) <= EPSILON:
+                        errors.append(
+                            f"{setup_path}: camera origin and look target must have different scene-map coordinates"
+                        )
+            background_zone_ids = setup.get("background_zone_ids")
+            if (
+                not isinstance(background_zone_ids, list)
+                or not background_zone_ids
+                or any(value not in zones for value in background_zone_ids)
+            ):
+                errors.append(
+                    f"{setup_path}.background_zone_ids: must list one or more known zones behind the subject"
+                )
+            elif _duplicates(background_zone_ids):
+                errors.append(f"{setup_path}.background_zone_ids: zones must be unique")
+            elif isinstance(origin_zone, dict) and isinstance(target_zone, dict):
+                origin_x = origin_zone.get("map_x")
+                origin_y = origin_zone.get("map_y")
+                target_x = target_zone.get("map_x")
+                target_y = target_zone.get("map_y")
+                if all(_number(value) for value in (origin_x, origin_y, target_x, target_y)):
+                    view_x = target_x - origin_x
+                    view_y = target_y - origin_y
+                    view_length = math.hypot(view_x, view_y)
+                    if view_length > EPSILON:
+                        for background_zone_id in background_zone_ids:
+                            background_zone = zones.get(background_zone_id)
+                            if not isinstance(background_zone, dict):
+                                continue
+                            background_x = background_zone.get("map_x")
+                            background_y = background_zone.get("map_y")
+                            if not all(_number(value) for value in (background_x, background_y)):
+                                continue
+                            beyond_target = (
+                                (background_x - target_x) * view_x
+                                + (background_y - target_y) * view_y
+                            ) / view_length
+                            if beyond_target <= EPSILON:
+                                errors.append(
+                                    f"{setup_path}.background_zone_ids: {background_zone_id!r} is not "
+                                    "geometrically behind the look target; it lies at the target or on "
+                                    "the camera-facing side of the scene map"
+                                )
+            _required_text(setup, "camera_position_description", setup_path, errors)
+            environment_view_id = setup.get("environment_view_asset_id")
+            environment_view = assets.get(environment_view_id)
+            if environment_view is None:
+                errors.append(
+                    f"{setup_path}.environment_view_asset_id: unknown asset {environment_view_id!r}"
+                )
+            elif environment_view.get("kind") != "environment":
+                errors.append(f"{setup_path}.environment_view_asset_id: must reference an environment")
+            else:
+                if environment_view.get("design_source_kind") != "empty_environment_camera_view":
+                    errors.append(
+                        f"{setup_path}.environment_view_asset_id: must use an empty_environment_camera_view"
+                    )
+                if environment_view.get("contains_characters"):
+                    errors.append(
+                        f"{setup_path}.environment_view_asset_id: camera view must contain no characters"
+                    )
+                if environment_view.get("runtime_eligible") is not True:
+                    errors.append(
+                        f"{setup_path}.environment_view_asset_id: camera view must be runtime eligible"
+                    )
+                if environment_view.get("derived_from_asset_id") != group.get("environment_asset_id"):
+                    errors.append(
+                        f"{setup_path}.environment_view_asset_id: camera view must derive from the group master environment"
+                    )
+                if environment_view.get("environment_family_id") != master_environment_family_id:
+                    errors.append(
+                        f"{setup_path}.environment_view_asset_id: camera view must remain in the group environment family"
+                    )
+                if environment_view.get("view_from_zone_id") != camera_origin:
+                    errors.append(
+                        f"{setup_path}.environment_view_asset_id: view_from_zone_id must match camera_origin_zone_id"
+                    )
+                if environment_view.get("view_target_zone_id") != look_target:
+                    errors.append(
+                        f"{setup_path}.environment_view_asset_id: view_target_zone_id must match look_target_zone_id"
+                    )
+                if environment_view.get("view_background_zone_ids") != background_zone_ids:
+                    errors.append(
+                        f"{setup_path}.environment_view_asset_id: view background zones must exactly match the camera setup"
+                    )
+            if setup.get("screen_side") not in SCREEN_SIDES:
+                errors.append(f"{setup_path}.screen_side: unsupported screen side")
+            if setup.get("eyeline_direction") not in EYELINE_DIRECTIONS:
+                errors.append(f"{setup_path}.eyeline_direction: unsupported eyeline direction")
+        structures[group_id] = {
+            "zones": zones,
+            "anchors": anchors,
+            "axes": axes,
+            "camera_setups": setups,
+        }
+    return structures
+
+
 def _validate_beats(
     shot: dict[str, Any], shot_path: str, selected_identities: set[str], errors: list[str]
 ) -> None:
@@ -385,6 +638,553 @@ def _validate_beats(
         errors.append(
             f"{shot_path}.performance_beats: must cover the full {provider_seconds:g}s provider duration"
         )
+
+
+def _validate_v4_shot_contracts(
+    shot: dict[str, Any],
+    shot_path: str,
+    selected_assets: list[dict[str, Any]],
+    assets: dict[str, dict[str, Any]],
+    structure: dict[str, dict[str, Any]],
+    errors: list[str],
+) -> None:
+    """Bind free-form direction to stage geography, focus, presence and props."""
+
+    zones = structure.get("zones", {})
+    axes = structure.get("axes", {})
+    setups = structure.get("camera_setups", {})
+    camera = shot.get("camera_plan") if isinstance(shot.get("camera_plan"), dict) else {}
+    axis_id = camera.get("axis_id")
+    setup_id = camera.get("camera_setup_id")
+    if axis_id not in axes:
+        errors.append(f"{shot_path}.camera_plan.axis_id: unknown axis {axis_id!r}")
+    setup = setups.get(setup_id)
+    if setup is None:
+        errors.append(f"{shot_path}.camera_plan.camera_setup_id: unknown camera setup {setup_id!r}")
+    else:
+        if setup.get("axis_id") != axis_id:
+            errors.append(f"{shot_path}.camera_plan: camera setup and axis_id do not match")
+        opening = shot.get("opening_frame")
+        if isinstance(opening, dict) and opening.get("shot_size") != setup.get("shot_size"):
+            errors.append(
+                f"{shot_path}.opening_frame.shot_size: must match the structured camera setup"
+            )
+    visible_anchor_ids = camera.get("visible_anchor_ids")
+    excluded_anchor_ids = camera.get("excluded_anchor_ids")
+    for field, values in (
+        ("visible_anchor_ids", visible_anchor_ids),
+        ("excluded_anchor_ids", excluded_anchor_ids),
+    ):
+        if not isinstance(values, list):
+            errors.append(f"{shot_path}.camera_plan.{field}: must be an array")
+        else:
+            if any(value not in structure.get("anchors", {}) for value in values):
+                errors.append(f"{shot_path}.camera_plan.{field}: contains an unknown anchor")
+            if _duplicates(values):
+                errors.append(f"{shot_path}.camera_plan.{field}: anchors must be unique")
+    if isinstance(visible_anchor_ids, list) and isinstance(excluded_anchor_ids, list):
+        overlap = set(visible_anchor_ids) & set(excluded_anchor_ids)
+        if overlap:
+            errors.append(
+                f"{shot_path}.camera_plan: anchors cannot be both visible and excluded {sorted(overlap)}"
+            )
+        fixed_anchor_ids = {
+            anchor_id
+            for anchor_id, anchor in structure.get("anchors", {}).items()
+            if isinstance(anchor, dict) and anchor.get("persistence") == "fixed"
+        }
+        unclassified = fixed_anchor_ids - set(visible_anchor_ids) - set(excluded_anchor_ids)
+        if unclassified:
+            errors.append(
+                f"{shot_path}.camera_plan: every fixed anchor must be classified as visible or "
+                f"excluded; missing {sorted(unclassified)}"
+            )
+
+    identity_ids = {
+        str(asset.get("identity_id"))
+        for asset in assets.values()
+        if asset.get("kind") == "character" and asset.get("identity_id")
+    }
+    selected_identity_ids = {
+        str(asset.get("identity_id"))
+        for asset in selected_assets
+        if asset.get("kind") == "character" and asset.get("identity_id")
+    }
+    selected_population_ids = {
+        str(asset.get("population_id"))
+        for asset in selected_assets
+        if asset.get("kind") == "population" and asset.get("population_id")
+    }
+    presence_items = _index_by_id(
+        shot.get("subject_presence"),
+        "subject_id",
+        f"{shot_path}.subject_presence",
+        errors,
+    )
+    initial: set[str] = set()
+    entering: set[str] = set()
+    exiting: set[str] = set()
+    fully_off_screen: set[str] = set()
+    visible_at_some_point: set[str] = set()
+    for subject_id, presence in presence_items.items():
+        path = f"{shot_path}.subject_presence[{subject_id!r}]"
+        subject_type = presence.get("subject_type")
+        if subject_type not in SUBJECT_TYPES:
+            errors.append(f"{path}.subject_type: unsupported subject type")
+        if subject_type == "character" and subject_id not in identity_ids:
+            errors.append(f"{path}.subject_id: unknown character {subject_id!r}")
+        entry = presence.get("entry_presence")
+        exit_value = presence.get("exit_presence")
+        if entry not in FRAME_PRESENCE:
+            errors.append(f"{path}.entry_presence: must be on_screen or off_screen")
+        if exit_value not in FRAME_PRESENCE:
+            errors.append(f"{path}.exit_presence: must be on_screen or off_screen")
+        for phase, value in (("entry", entry), ("exit", exit_value)):
+            zone_id = presence.get(f"{phase}_zone_id")
+            if value == "on_screen" and zone_id not in zones:
+                errors.append(f"{path}.{phase}_zone_id: unknown zone {zone_id!r}")
+            if value == "off_screen" and zone_id is not None:
+                errors.append(f"{path}.{phase}_zone_id: off-screen subjects must use null")
+            world_field = f"{phase}_world_zone_id"
+            world_presence_field = f"{phase}_world_presence"
+            world_presence = presence.get(world_presence_field)
+            if world_presence not in WORLD_PRESENCE:
+                errors.append(
+                    f"{path}.{world_presence_field}: must be in_scene or outside_scene"
+                )
+            if world_field not in presence:
+                errors.append(f"{path}.{world_field}: must be declared even when off-screen")
+                world_zone_id = None
+            else:
+                world_zone_id = presence.get(world_field)
+                if world_zone_id is not None and world_zone_id not in zones:
+                    errors.append(f"{path}.{world_field}: unknown zone {world_zone_id!r}")
+            if world_presence == "in_scene" and world_zone_id not in zones:
+                errors.append(
+                    f"{path}.{world_field}: an in-scene subject must occupy one known world zone"
+                )
+            if world_presence == "outside_scene" and world_zone_id is not None:
+                errors.append(
+                    f"{path}.{world_field}: an outside-scene subject must use null"
+                )
+            if value == "on_screen" and world_presence != "in_scene":
+                errors.append(
+                    f"{path}.{world_presence_field}: an on-screen subject must be in_scene"
+                )
+            if value == "on_screen" and world_zone_id != zone_id:
+                errors.append(
+                    f"{path}.{world_field}: on-screen frame zone and world zone must match"
+                )
+            if value == "on_screen" and setup is not None and zone_id in zones:
+                origin = zones.get(setup.get("camera_origin_zone_id"))
+                target = zones.get(setup.get("look_target_zone_id"))
+                visible_zone = zones.get(zone_id)
+                if all(isinstance(item, dict) for item in (origin, target, visible_zone)):
+                    origin_x = origin.get("map_x")
+                    origin_y = origin.get("map_y")
+                    target_x = target.get("map_x")
+                    target_y = target.get("map_y")
+                    visible_x = visible_zone.get("map_x")
+                    visible_y = visible_zone.get("map_y")
+                    if all(
+                        _number(number)
+                        for number in (
+                            origin_x,
+                            origin_y,
+                            target_x,
+                            target_y,
+                            visible_x,
+                            visible_y,
+                        )
+                    ):
+                        view_x = target_x - origin_x
+                        view_y = target_y - origin_y
+                        forward_projection = (
+                            (visible_x - origin_x) * view_x
+                            + (visible_y - origin_y) * view_y
+                        )
+                        if forward_projection < -EPSILON:
+                            errors.append(
+                                f"{path}.{phase}_zone_id: on-screen subject {subject_id!r} lies "
+                                "behind the camera on the scene map"
+                            )
+        _required_text(presence, "visibility_reason", path, errors)
+        if subject_type == "character":
+            if entry == "on_screen":
+                initial.add(subject_id)
+            if entry == "off_screen" and exit_value == "on_screen":
+                entering.add(subject_id)
+            if entry == "on_screen" and exit_value == "off_screen":
+                exiting.add(subject_id)
+            if entry == "off_screen" and exit_value == "off_screen":
+                fully_off_screen.add(subject_id)
+            else:
+                visible_at_some_point.add(subject_id)
+                if subject_id not in selected_identity_ids:
+                    errors.append(f"{path}: on-screen character needs one selected runtime asset")
+        elif subject_type == "crowd" and (
+            entry == "on_screen" or exit_value == "on_screen"
+        ) and subject_id not in selected_population_ids:
+            errors.append(f"{path}: on-screen crowd needs its selected population asset")
+
+    for subject_id in selected_identity_ids - set(presence_items):
+        errors.append(
+            f"{shot_path}.subject_presence: selected character {subject_id!r} lacks a presence contract"
+        )
+    for subject_id in selected_population_ids - set(presence_items):
+        errors.append(
+            f"{shot_path}.subject_presence: selected population {subject_id!r} lacks an on-screen crowd presence contract"
+        )
+    for subject_id in selected_population_ids & set(presence_items):
+        presence = presence_items[subject_id]
+        if (
+            presence.get("subject_type") != "crowd"
+            or (
+                presence.get("entry_presence") != "on_screen"
+                and presence.get("exit_presence") != "on_screen"
+            )
+        ):
+            errors.append(
+                f"{shot_path}.subject_presence: selected population {subject_id!r} must be an on-screen crowd"
+            )
+    declared_sets = (
+        ("initial_visible_characters", initial),
+        ("entering_characters", entering),
+        ("exiting_characters", exiting),
+    )
+    for field, derived in declared_sets:
+        declared = shot.get(field)
+        if isinstance(declared, list) and set(declared) != derived:
+            errors.append(f"{shot_path}.{field}: must match structured subject_presence")
+
+    focus = shot.get("focus_contract")
+    if not isinstance(focus, dict):
+        errors.append(f"{shot_path}.focus_contract: must be an object")
+        focus = {}
+    primary_id = focus.get("primary_subject_id")
+    primary_type = focus.get("primary_subject_type")
+    _required_text(focus, "primary_subject_id", f"{shot_path}.focus_contract", errors)
+    if primary_type not in SUBJECT_TYPES:
+        errors.append(f"{shot_path}.focus_contract.primary_subject_type: unsupported subject type")
+    for field in (
+        "secondary_subject_ids",
+        "background_subject_ids",
+        "off_screen_subject_ids",
+    ):
+        values = focus.get(field)
+        if not isinstance(values, list) or any(not isinstance(value, str) or not value for value in values):
+            errors.append(f"{shot_path}.focus_contract.{field}: must be an array of subject ids")
+        elif _duplicates(values):
+            errors.append(f"{shot_path}.focus_contract.{field}: subject ids must be unique")
+    _required_text(focus, "visual_priority", f"{shot_path}.focus_contract", errors)
+    _required_text(focus, "composition_rule", f"{shot_path}.focus_contract", errors)
+    if setup is not None and (
+        primary_id != setup.get("primary_subject_id")
+        or primary_type != setup.get("primary_subject_type")
+    ):
+        errors.append(f"{shot_path}.focus_contract: focus primary subject must match the camera setup")
+    if primary_type == "character" and primary_id not in visible_at_some_point:
+        errors.append(f"{shot_path}.focus_contract: primary character must be on-screen in this shot")
+    offscreen_declared = focus.get("off_screen_subject_ids")
+    if isinstance(offscreen_declared, list) and set(offscreen_declared) != fully_off_screen:
+        errors.append(
+            f"{shot_path}.focus_contract.off_screen_subject_ids: must match subjects off-screen for the whole shot"
+        )
+
+    if isinstance(visible_anchor_ids, list):
+        anchors = structure.get("anchors", {})
+        if setup is not None:
+            origin_zone = zones.get(setup.get("camera_origin_zone_id"))
+            target_zone = zones.get(setup.get("look_target_zone_id"))
+            if isinstance(origin_zone, dict) and isinstance(target_zone, dict):
+                origin_x = origin_zone.get("map_x")
+                origin_y = origin_zone.get("map_y")
+                target_x = target_zone.get("map_x")
+                target_y = target_zone.get("map_y")
+                if all(_number(value) for value in (origin_x, origin_y, target_x, target_y)):
+                    view_x = target_x - origin_x
+                    view_y = target_y - origin_y
+                    for anchor_id in visible_anchor_ids:
+                        anchor = anchors.get(anchor_id)
+                        anchor_zone = zones.get(anchor.get("zone_id")) if isinstance(anchor, dict) else None
+                        if not isinstance(anchor_zone, dict):
+                            continue
+                        anchor_x = anchor_zone.get("map_x")
+                        anchor_y = anchor_zone.get("map_y")
+                        if not all(_number(value) for value in (anchor_x, anchor_y)):
+                            continue
+                        forward_projection = (
+                            (anchor_x - origin_x) * view_x
+                            + (anchor_y - origin_y) * view_y
+                        )
+                        if forward_projection < -EPSILON:
+                            errors.append(
+                                f"{shot_path}.camera_plan.visible_anchor_ids: {anchor_id!r} lies "
+                                "behind the camera on the scene map and cannot be visible"
+                            )
+        for anchor_id in visible_anchor_ids:
+            anchor = anchors.get(anchor_id)
+            if not isinstance(anchor, dict):
+                continue
+            if anchor.get("occupancy_rule") != "occupied_while_subject_in_scene":
+                continue
+            occupant_id = anchor.get("occupant_subject_id")
+            occupant = presence_items.get(occupant_id)
+            if occupant is None:
+                errors.append(
+                    f"{shot_path}.camera_plan.visible_anchor_ids: occupied anchor {anchor_id!r} "
+                    f"requires a presence contract for {occupant_id!r}"
+                )
+                continue
+            anchor_zone = anchor.get("zone_id")
+            for phase in ("entry", "exit"):
+                if (
+                    occupant.get(f"{phase}_world_presence") == "in_scene"
+                    and
+                    occupant.get(f"{phase}_world_zone_id") == anchor_zone
+                    and occupant.get(f"{phase}_presence") != "on_screen"
+                ):
+                    errors.append(
+                        f"{shot_path}.camera_plan.visible_anchor_ids: {anchor_id!r} cannot appear "
+                        f"empty while {occupant_id!r} occupies it at {phase}"
+                    )
+
+    beats = shot.get("performance_beats")
+    if isinstance(beats, list):
+        for index, beat in enumerate(beats):
+            if not isinstance(beat, dict):
+                continue
+            path = f"{shot_path}.performance_beats[{index}]"
+            primary = beat.get("primary_beat")
+            if not isinstance(primary, dict):
+                errors.append(f"{path}.primary_beat must be one object")
+                primary = {}
+            _required_text(primary, "subject_id", f"{path}.primary_beat", errors)
+            _required_text(primary, "action", f"{path}.primary_beat", errors)
+            visible = set(beat.get("visible_characters") or [])
+            beat_primary_id = primary.get("subject_id")
+            if beat_primary_id in fully_off_screen:
+                errors.append(f"{path}: an off-screen primary subject cannot drive a visible beat")
+            if beat_primary_id in identity_ids and beat_primary_id not in visible:
+                errors.append(f"{path}.primary_beat: primary character must be visible in the beat")
+            forbidden_visible = visible & fully_off_screen
+            if forbidden_visible:
+                errors.append(
+                    f"{path}.visible_characters: a subject off-screen for the whole shot cannot be visible {sorted(forbidden_visible)}"
+                )
+            supporting = beat.get("supporting_actions")
+            if not isinstance(supporting, list):
+                errors.append(f"{path}.supporting_actions: must be an array")
+                continue
+            supporting_ids: list[str] = []
+            for support_index, action in enumerate(supporting):
+                action_path = f"{path}.supporting_actions[{support_index}]"
+                if not isinstance(action, dict):
+                    errors.append(f"{action_path}: must be an object")
+                    continue
+                _required_text(action, "subject_id", action_path, errors)
+                _required_text(action, "action", action_path, errors)
+                support_id = action.get("subject_id")
+                if isinstance(support_id, str):
+                    supporting_ids.append(support_id)
+                if support_id == beat_primary_id:
+                    errors.append(f"{action_path}: primary subject cannot also be a supporting action")
+                if support_id in identity_ids and support_id not in visible:
+                    errors.append(f"{action_path}: supporting character must be visible in the beat")
+            if _duplicates(supporting_ids):
+                errors.append(f"{path}.supporting_actions: each supporting subject may appear once")
+
+    selected_props = {
+        str(asset.get("prop_id")): asset
+        for asset in selected_assets
+        if asset.get("kind") == "prop" and asset.get("prop_id")
+    }
+    prop_contracts = _index_by_id(
+        shot.get("prop_contracts"),
+        "prop_id",
+        f"{shot_path}.prop_contracts",
+        errors,
+    ) if shot.get("prop_contracts") else {}
+    if not isinstance(shot.get("prop_contracts"), list):
+        errors.append(f"{shot_path}.prop_contracts: must be an array")
+    for prop_id in selected_props.keys() - prop_contracts.keys():
+        errors.append(f"{shot_path}.prop_contracts: selected prop {prop_id!r} lacks a shot contract")
+    for prop_id, contract in prop_contracts.items():
+        path = f"{shot_path}.prop_contracts[{prop_id!r}]"
+        entry_presence = contract.get("entry_presence")
+        exit_presence = contract.get("exit_presence")
+        if entry_presence not in PROP_PRESENCE:
+            errors.append(f"{path}.entry_presence: must be present or absent")
+        if exit_presence not in PROP_PRESENCE:
+            errors.append(f"{path}.exit_presence: must be present or absent")
+        for field in ("entry_state", "exit_state", "owner_id", "grip_or_contact"):
+            _required_text(contract, field, path, errors)
+        zone_id = contract.get("zone_id")
+        if (entry_presence == "present" or exit_presence == "present") and zone_id not in zones:
+            errors.append(f"{path}.zone_id: unknown zone {zone_id!r}")
+        asset_id = contract.get("asset_id")
+        selected = selected_props.get(prop_id)
+        if entry_presence == "absent":
+            if asset_id is not None or selected is not None:
+                errors.append(f"{path}: absent entry prop must not bind or select an asset")
+        else:
+            if selected is None or selected.get("asset_id") != asset_id:
+                errors.append(f"{path}.asset_id: must bind the selected entry prop asset")
+            elif selected.get("state_id") != contract.get("entry_state"):
+                errors.append(f"{path}.entry_state: must match the selected prop asset state")
+            if selected is not None:
+                physical = selected.get("physical_contract") or {}
+                matches_physics = (
+                    contract.get("scale_basis") == physical.get("scale_basis")
+                    and contract.get("support_mode") == physical.get("support_mode")
+                    and contract.get("rigidity") == physical.get("rigidity")
+                    and contract.get("grip_or_contact") == physical.get("grip_or_contact")
+                    and contract.get("forbidden_inferences") == physical.get("forbidden_inferences")
+                )
+                if not matches_physics:
+                    errors.append(
+                        f"{path}: must match the selected prop asset physical contract"
+                    )
+        entry_state = shot.get("entry_state")
+        exit_state = shot.get("exit_state")
+        if isinstance(entry_state, dict) and entry_state.get(prop_id) != contract.get("entry_state"):
+            errors.append(f"{path}.entry_state: must match shot.entry_state")
+        if isinstance(exit_state, dict) and exit_state.get(prop_id) != contract.get("exit_state"):
+            errors.append(f"{path}.exit_state: must match shot.exit_state")
+
+
+def _validate_v4_reverse_cut(
+    shot: dict[str, Any],
+    next_shot: dict[str, Any] | None,
+    shot_path: str,
+    structures: dict[str, dict[str, dict[str, Any]]],
+    errors: list[str],
+) -> None:
+    contract = shot.get("cut_to_next")
+    if not isinstance(contract, dict) or contract.get("cut_type") != "shot_reverse_shot":
+        return
+    if not isinstance(next_shot, dict):
+        return
+    current_group_id = str(shot.get("continuity_group") or "")
+    next_group_id = str(next_shot.get("continuity_group") or "")
+    if current_group_id != next_group_id:
+        errors.append(f"{shot_path}.cut_to_next: shot_reverse_shot must remain in one continuity group")
+        return
+    setups = structures.get(current_group_id, {}).get("camera_setups", {})
+    current_camera = shot.get("camera_plan") if isinstance(shot.get("camera_plan"), dict) else {}
+    next_camera = next_shot.get("camera_plan") if isinstance(next_shot.get("camera_plan"), dict) else {}
+    current_id = current_camera.get("camera_setup_id")
+    next_id = next_camera.get("camera_setup_id")
+    if current_id == next_id:
+        errors.append(
+            f"{shot_path}.cut_to_next: shot_reverse_shot requires different camera setups"
+        )
+    current_setup = setups.get(current_id)
+    next_setup = setups.get(next_id)
+    if current_setup is None or next_setup is None:
+        return
+    if current_setup.get("axis_id") != next_setup.get("axis_id"):
+        errors.append(f"{shot_path}.cut_to_next: reverse setups must share one axis")
+    if (
+        current_setup.get("camera_side") != next_setup.get("camera_side")
+        or current_setup.get("camera_side") == "on_axis"
+    ):
+        errors.append(
+            f"{shot_path}.cut_to_next: reverse setups must stay on the same non-axis camera side"
+        )
+    if current_setup.get("primary_subject_id") == next_setup.get("primary_subject_id"):
+        errors.append(f"{shot_path}.cut_to_next: reverse setups must change primary subject")
+    screen_sides = {current_setup.get("screen_side"), next_setup.get("screen_side")}
+    if screen_sides != {"left", "right"}:
+        errors.append(f"{shot_path}.cut_to_next: reverse subjects must occupy complementary screen sides")
+    eyelines = {current_setup.get("eyeline_direction"), next_setup.get("eyeline_direction")}
+    if eyelines != {"camera_left", "camera_right"}:
+        errors.append(f"{shot_path}.cut_to_next: reverse eyelines must be complementary")
+
+
+def _validate_v4_cross_shot_continuity(
+    shot: dict[str, Any],
+    next_shot: dict[str, Any] | None,
+    shot_path: str,
+    errors: list[str],
+) -> None:
+    """Reject visible same-scene subjects that change zones at the cut.
+
+    A camera change may reveal or hide a subject, but a subject that is visible
+    on both sides of a contiguous cut must occupy the same declared zone. A
+    planned walk belongs inside one of the adjacent shots, so its exit and
+    entry zones still meet at the cut boundary.
+    """
+    if not isinstance(next_shot, dict):
+        return
+    if next_shot.get("relation_to_previous") == "new_scene":
+        return
+    if shot.get("continuity_group") != next_shot.get("continuity_group"):
+        return
+
+    def character_presence(item: dict[str, Any], side: str) -> dict[str, dict[str, Any]]:
+        rows = item.get("subject_presence")
+        if not isinstance(rows, list):
+            return {}
+        presence_field = f"{side}_presence"
+        return {
+            str(row.get("subject_id")): row
+            for row in rows
+            if isinstance(row, dict)
+            and row.get("subject_type") == "character"
+            and row.get(presence_field) == "on_screen"
+            and isinstance(row.get("subject_id"), str)
+            and row.get("subject_id")
+        }
+
+    outgoing = character_presence(shot, "exit")
+    incoming = character_presence(next_shot, "entry")
+    for subject_id in sorted(outgoing.keys() & incoming.keys()):
+        outgoing_zone = outgoing[subject_id].get("exit_zone_id")
+        incoming_zone = incoming[subject_id].get("entry_zone_id")
+        if outgoing_zone != incoming_zone:
+            errors.append(
+                f"{shot_path}.cut_to_next: character {subject_id} teleports from zone "
+                f"{outgoing_zone!r} to {incoming_zone!r} across a same-scene cut"
+            )
+
+    def all_subject_presence(item: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        rows = item.get("subject_presence")
+        if not isinstance(rows, list):
+            return {}
+        return {
+            str(row.get("subject_id")): row
+            for row in rows
+            if isinstance(row, dict)
+            and isinstance(row.get("subject_id"), str)
+            and row.get("subject_id")
+        }
+
+    all_outgoing = all_subject_presence(shot)
+    all_incoming = all_subject_presence(next_shot)
+    for subject_id in sorted(all_outgoing.keys() & all_incoming.keys()):
+        outgoing_row = all_outgoing[subject_id]
+        incoming_row = all_incoming[subject_id]
+        outgoing_presence = outgoing_row.get("exit_world_presence")
+        incoming_presence = incoming_row.get("entry_world_presence")
+        subject_type = outgoing_row.get("subject_type") or "subject"
+        if outgoing_presence != incoming_presence:
+            errors.append(
+                f"{shot_path}.cut_to_next: {subject_type} {subject_id} changes world presence from "
+                f"{outgoing_presence!r} to {incoming_presence!r} across a same-scene camera cut"
+            )
+            continue
+        outgoing_zone = outgoing_row.get("exit_world_zone_id")
+        incoming_zone = incoming_row.get("entry_world_zone_id")
+        if (
+            outgoing_zone is not None
+            and incoming_zone is not None
+            and outgoing_zone != incoming_zone
+        ):
+            errors.append(
+                f"{shot_path}.cut_to_next: {subject_type} {subject_id} changes world zone from "
+                f"{outgoing_zone!r} to {incoming_zone!r} without an in-shot move"
+            )
 
 
 def _validate_crowd_plan(
@@ -547,6 +1347,7 @@ def _validate_cut_contract(
         errors.append(f"{shot_path}.cut_to_next.cut_type: unsupported cut type {cut_type!r}")
     next_relation = next_shot.get("relation_to_previous")
     expected_relations = {
+        "shot_reverse_shot": "same_scene_angle_change",
         "reaction": "reaction_cut",
         "match_action": "match_action",
         "scene_transition": "new_scene",
@@ -708,17 +1509,22 @@ def _validate_prop_transitions(
                 errors.append(f"{path}.{field}: must be a non-empty string")
 
 
-def validate_plan(plan: Any) -> list[str]:
+def validate_plan(plan: Any, *, require_current_schema: bool = False) -> list[str]:
     """Return human-readable validation errors; an empty list means valid."""
     errors: list[str] = []
     if not isinstance(plan, dict):
         return ["plan: must be a JSON object"]
     schema_version = plan.get("schema_version")
+    if require_current_schema and schema_version != SCHEMA_VERSION:
+        errors.append(
+            f"schema_version: new production must use current {SCHEMA_VERSION!r}"
+        )
     if schema_version != SCHEMA_VERSION and schema_version not in LEGACY_SCHEMA_VERSIONS:
         errors.append(
             f"schema_version: must equal {SCHEMA_VERSION!r} or a supported legacy version"
         )
-    strict_v3 = schema_version == SCHEMA_VERSION
+    strict_v4 = schema_version == SCHEMA_VERSION
+    strict_v3_or_newer = schema_version in {"story-r2v-plan-v3", SCHEMA_VERSION}
     _required_text(plan, "story_id", "plan", errors)
 
     source_audio = plan.get("source_audio")
@@ -736,9 +1542,10 @@ def validate_plan(plan: Any) -> list[str]:
     assets = _index_by_id(plan.get("assets"), "asset_id", "assets", errors)
     groups = _index_by_id(plan.get("continuity_groups"), "group_id", "continuity_groups", errors)
     shots = _index_by_id(plan.get("shots"), "shot_id", "shots", errors)
-    _validate_assets(assets, errors, strict_v3=strict_v3)
-    _validate_prop_state_families(assets, errors, strict_v3=strict_v3)
+    _validate_assets(assets, errors, strict_v3=strict_v3_or_newer)
+    _validate_prop_state_families(assets, errors, strict_v3=strict_v3_or_newer)
     _validate_groups(groups, assets, errors)
+    v4_structures = _validate_v4_groups(groups, assets, errors) if strict_v4 else {}
 
     previous_shot: dict[str, Any] | None = None
     shot_items = list(shots.items())
@@ -762,7 +1569,7 @@ def validate_plan(plan: Any) -> list[str]:
             if previous_shot is not None and _number(previous_shot.get("source_end")):
                 if start < previous_shot["source_end"] - EPSILON:
                     errors.append(f"{path}.source_start: overlaps the previous shot")
-                elif strict_v3 and start - previous_shot["source_end"] > MAX_TIMELINE_GAP_SECONDS:
+                elif strict_v3_or_newer and start - previous_shot["source_end"] > MAX_TIMELINE_GAP_SECONDS:
                     errors.append(
                         f"{path}.source_start: leaves an unassigned timeline gap of "
                         f"{start - previous_shot['source_end']:.3f}s; absorb pauses into an adjacent shot"
@@ -829,8 +1636,20 @@ def validate_plan(plan: Any) -> list[str]:
         environment_assets = [asset for asset in selected_assets if asset.get("kind") == "environment"]
         if len(environment_assets) != 1:
             errors.append(f"{path}.reference_asset_ids: select exactly one empty environment")
-        elif group is not None and environment_assets[0].get("asset_id") != group.get("environment_asset_id"):
-            errors.append(f"{path}.reference_asset_ids: selected environment does not match continuity group")
+        elif group is not None:
+            if strict_v4:
+                structure = v4_structures.get(str(group_id), {})
+                setup_id = (shot.get("camera_plan") or {}).get("camera_setup_id")
+                setup = structure.get("camera_setups", {}).get(setup_id)
+                expected_view_id = (
+                    setup.get("environment_view_asset_id") if isinstance(setup, dict) else None
+                )
+                if environment_assets[0].get("asset_id") != expected_view_id:
+                    errors.append(
+                        f"{path}.reference_asset_ids: selected environment must match the camera setup view asset"
+                    )
+            elif environment_assets[0].get("asset_id") != group.get("environment_asset_id"):
+                errors.append(f"{path}.reference_asset_ids: selected environment does not match continuity group")
 
         character_assets = [asset for asset in selected_assets if asset.get("kind") == "character"]
         selected_identities = {asset.get("identity_id") for asset in character_assets if asset.get("identity_id")}
@@ -876,7 +1695,11 @@ def validate_plan(plan: Any) -> list[str]:
         if not isinstance(camera_plan, dict):
             errors.append(f"{path}.camera_plan: must be an object")
         else:
-            for field in ("start_size", "end_size", "movement", "axis", "screen_direction"):
+            camera_fields = ["start_size", "end_size", "movement", "screen_direction"]
+            camera_fields.append("axis_id" if strict_v4 else "axis")
+            if strict_v4:
+                camera_fields.append("camera_setup_id")
+            for field in camera_fields:
                 _required_text(camera_plan, field, f"{path}.camera_plan", errors)
             if camera_plan.get("internal_cut") is not False:
                 errors.append(f"{path}.camera_plan.internal_cut: one R2V task must be one continuous take")
@@ -900,9 +1723,21 @@ def validate_plan(plan: Any) -> list[str]:
             groups,
             selected_assets,
             next_assets,
-            strict_v3,
+            strict_v3_or_newer,
             errors,
         )
+        if strict_v4:
+            structure = v4_structures.get(str(group_id), {})
+            _validate_v4_shot_contracts(
+                shot,
+                path,
+                selected_assets,
+                assets,
+                structure,
+                errors,
+            )
+            _validate_v4_reverse_cut(shot, next_shot, path, v4_structures, errors)
+            _validate_v4_cross_shot_continuity(shot, next_shot, path, errors)
 
         assembly_trim = shot.get("assembly_trim")
         if assembly_trim is not None:
@@ -929,7 +1764,7 @@ def validate_plan(plan: Any) -> list[str]:
             errors.append(f"{path}.prompt: must be a non-empty director prompt")
         previous_shot = shot
 
-    if strict_v3 and shot_items and _number(audio_duration):
+    if strict_v3_or_newer and shot_items and _number(audio_duration):
         final_end = shot_items[-1][1].get("source_end")
         if _number(final_end) and abs(audio_duration - final_end) > MAX_TIMELINE_GAP_SECONDS:
             errors.append(
@@ -1002,13 +1837,18 @@ def creative_advisories(plan: Any) -> list[str]:
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("plan", type=Path, help="Path to story_r2v_plan.json")
+    parser.add_argument(
+        "--require-current-schema",
+        action="store_true",
+        help="Reject legacy v2/v3 plans at a new-production or paid-submission gate",
+    )
     args = parser.parse_args(argv)
     try:
         payload = json.loads(args.plan.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, json.JSONDecodeError) as exc:
         print(json.dumps({"valid": False, "errors": [str(exc)]}, ensure_ascii=False, indent=2))
         return 2
-    errors = validate_plan(payload)
+    errors = validate_plan(payload, require_current_schema=args.require_current_schema)
     advisories = creative_advisories(payload)
     print(
         json.dumps(

@@ -37,6 +37,7 @@ from story_module_ports import (
 )
 from story_module_registry import build_keyer_registry, build_release_layout_registry
 from release_geometry import (
+    CANONICAL_B_STORY_BOX,
     RELEASE_GEOMETRY_COMPILER_VERSION,
     RELEASE_GEOMETRY_SCHEMA_VERSION,
     approved_demo_geometry,
@@ -82,6 +83,7 @@ LIBRARY_EDGE_OVERSCAN_RATIO = 1.02
 STORY_CONTENT_OVERSCAN_RATIO = 1.02
 RELEASE_PREVIEW_SAMPLE_SECONDS = 0.4
 DEFAULT_VIDEO_BOX = (0, 416, 1080, 608)
+DEFAULT_B_STORY_BOX_TEXT = ",".join(str(value) for value in CANONICAL_B_STORY_BOX)
 
 WIDE_WIDTH = 1920
 WIDE_HEIGHT = 1080
@@ -220,7 +222,7 @@ def main() -> None:
     parser.add_argument("--story-bleed", default=0, type=int, help="故事视频开口遮罩扩展像素；默认由框内开口遮罩控制，不直接铺矩形")
     parser.add_argument("--background-blur", default=14, type=int, help="主账号 16:9 背景虚化半径")
     parser.add_argument("--frame-image-b", type=Path, help="可选 B 画面透明 PNG 大框模板")
-    parser.add_argument("--b-story-box", default="150,88,1620,911", help="B 画面故事视频窗口：x,y,w,h，基于 1920x1080")
+    parser.add_argument("--b-story-box", default=DEFAULT_B_STORY_BOX_TEXT, help="B 画面故事视频窗口：x,y,w,h，基于 1920x1080")
     parser.add_argument("--b-windows", default="", help="B 画面出现时间段，例如 8-14,38.5-55；留空则不切 B")
     parser.add_argument("--c-windows", default="", help="C 画面（仅人物+主题背景）出现时间段，例如 0-15,52-70")
     parser.add_argument("--story-logo", type=Path, help="叠在故事视频右上角的小台标 PNG")
@@ -246,7 +248,10 @@ def main() -> None:
     parser.add_argument("--person-grade", choices=PERSON_GRADES, default="natural")
     parser.add_argument("--person-beauty", choices=["none", "light"], default="light", help="本地可复现轻度磨皮；不依赖剪映")
     parser.add_argument("--library-watermark-text", default="绵羊姐姐原创故事资源")
-    parser.add_argument("--tail-seconds", default=0.0, type=float, help="宝库号结尾模糊提示时长；0 表示按总时长自动估算")
+    parser.add_argument(
+        "--tail-seconds", default=0.0, type=float,
+        help="宝库号结尾模糊提示时长；0 表示按总时长自动估算",
+    )
     parser.add_argument("--tail-notice-text", default="有需要联系客服，好作品有偿分享！")
     parser.add_argument("--crf", default=15, type=int)
     parser.add_argument("--preset", default="medium")
@@ -316,7 +321,11 @@ def main() -> None:
         story_bleed=max(0, story_bleed),
         background_blur=max(0, background_blur),
         frame_image_b=args.frame_image_b.expanduser() if args.frame_image_b else None,
-        b_story_box=parse_required_box(b_story_box_value, "--b-story-box", "150,88,1620,911"),
+        b_story_box=parse_required_box(
+            b_story_box_value,
+            "--b-story-box",
+            DEFAULT_B_STORY_BOX_TEXT,
+        ),
         b_windows=parse_b_windows(args.b_windows),
         c_windows=parse_b_windows(args.c_windows),
         story_logo=args.story_logo.expanduser() if args.story_logo else None,
@@ -512,11 +521,23 @@ def required_package_asset_binding(config: ReleaseConfig) -> dict[str, object]:
         if item.get("path") != str(path) or item.get("sha256") != sha256_path(path):
             raise ValueError(f"required_v1 主账号包装回执未绑定实际输出：{key}")
     receipt_dir = config.main_package_receipt.parent
+    frame_source_item = (
+        receipt_outputs.get("story_frame_source")
+        if isinstance(receipt_outputs.get("story_frame_source"), dict)
+        else {}
+    )
+    # B2+ repairs are versioned and must never overwrite an earlier accepted
+    # frame source.  The generation receipt is the authority for the actual
+    # source path; main_package_generation_receipt_issues below still checks
+    # both that path and its current SHA-256, so this does not weaken lineage.
+    receipt_frame_source = Path(
+        str(frame_source_item.get("path") or receipt_dir / "story_frame_source.png")
+    ).expanduser()
     receipt_expected_outputs = {
         "top_plate": config.main_top_panel,
         "bottom_plate": config.main_bottom_panel,
         "main_background": config.bg_image or receipt_dir / "main_background_16x9.png",
-        "story_frame_source": receipt_dir / "story_frame_source.png",
+        "story_frame_source": receipt_frame_source,
         "story_frame_a": config.frame_image or receipt_dir / "story_frame_a.png",
     }
     if config.variant in {"both", "library"}:
@@ -544,10 +565,20 @@ def required_package_asset_binding(config: ReleaseConfig) -> dict[str, object]:
         "reference_asset": str(reference_path),
         "reference_sha256": reference_sha,
         "reference_role": "main_vertical_package",
+        "main_package_spec_path": str(config.main_package_spec.resolve()),
         "main_package_spec_sha256": sha256_path(config.main_package_spec),
+        "main_package_receipt_path": str(config.main_package_receipt.resolve()),
         "main_package_receipt_sha256": sha256_path(config.main_package_receipt),
         "panel_sha256": {
             name: sha256_path(path)
+            for name, path in required
+            if path is not None
+        },
+        "panels": {
+            name: {
+                "path": str(path.resolve()),
+                "sha256": sha256_path(path),
+            }
             for name, path in required
             if path is not None
         },
@@ -655,25 +686,9 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict, *, preview: bool
         "approved_demo_geometry_sha256": approved_demo_geometry_sha,
     })
     official_assets = [item for item in spec.get("official_assets", []) if isinstance(item, dict)]
-    logo_binding: dict[str, object] = {"count": 0, "asset_sha256": None, "asset_id": None}
     if config.variant in {"both", "main"} and config.watermark_logo is not None:
         raise ValueError("required_v1 主账号只允许一个审核通过的官方 Logo，禁止叠加额外 watermark_logo")
-    logo_region: list[int] | None = None
-    if config.story_logo is not None:
-        logo_sha = sha256_path(config.story_logo)
-        matches = [
-            item for item in official_assets
-            if str(item.get("sha256") or "") == logo_sha
-            and "release_video" in set(item.get("allowed_uses", []))
-        ]
-        if len(matches) != 1 or int(matches[0].get("max_per_frame", 1)) != 1:
-            raise ValueError("required_v1 发布 Logo 必须匹配唯一审核通过的官方资产且 max_per_frame=1")
-        logo_binding = {"count": 1, "asset_sha256": logo_sha, "asset_id": matches[0].get("asset_id")}
-        with Image.open(config.story_logo) as logo_image:
-            logo_height = max(1, round(logo_image.height * config.story_logo_width_a / max(1, logo_image.width)))
-        logo_region = [config.story_logo_x, config.story_logo_y, config.story_logo_width_a, logo_height]
-    elif official_assets:
-        raise ValueError("required_v1 发布渲染存在官方品牌资产但未提供 story_logo")
+    logo_binding, logo_region = contract_release_logo_binding(config, official_assets)
     upper = {"x": 0, "y": 0, "width": FINAL_WIDTH, "height": TOP_HEIGHT}
     lower = {"x": 0, "y": TOP_HEIGHT + CENTER_HEIGHT, "width": FINAL_WIDTH, "height": BOTTOM_HEIGHT}
     library_group = compile_text_group(
@@ -698,8 +713,21 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict, *, preview: bool
             "approved_demo_geometry": demo or {"applicable": False, "reason": "library_variant"},
             "a": presenter_a or {"visible": False, "applicable": False, "reason": "library_variant"},
             "b": {"visible": False, "story_region": list(config.b_story_box)},
-            "c": ({**demo, "position_correction": {"x": 0, "y": 0}, "scale_changed": False}
-                  if demo is not None else {"visible": False, "applicable": False, "reason": "library_variant"}),
+            "c": ({
+                **demo,
+                # C is the presenter-only view of the reviewed Demo canvas.
+                # Only A may shift the person right to make room for a story
+                # window; carrying that A offset into C creates an off-centre
+                # opening even though the source presenter is centred.
+                "position_correction": {
+                    "x": int(demo["x"]),
+                    "y": int(demo["y"]),
+                },
+                "scale_changed": False,
+                "horizontal_anchor_basis": "approved_demo_source_canvas_center",
+            } if demo is not None else {
+                "visible": False, "applicable": False, "reason": "library_variant",
+            }),
             "initial_anchor_frame": preset.get("presenter_initial_anchor_frame"),
             "initial_anchor_frame_seconds": preset.get("presenter_initial_anchor_frame_seconds"),
             "dynamic_repositioning": False,
@@ -765,6 +793,54 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict, *, preview: bool
     if issues:
         raise ValueError("release geometry compilation invalid: " + "; ".join(issues))
     return payload
+
+
+def contract_release_logo_binding(
+    config: ReleaseConfig,
+    official_assets: list[dict],
+) -> tuple[dict[str, object], list[int] | None]:
+    """Bind the official logo according to the current account output role."""
+
+    library_variant = config.variant == "library"
+    logo_path = config.antipiracy_logo if library_variant else config.story_logo
+    empty: dict[str, object] = {
+        "count": 0,
+        "asset_sha256": None,
+        "asset_id": None,
+    }
+    if logo_path is None:
+        if official_assets:
+            option = "antipiracy_logo" if library_variant else "story_logo"
+            raise ValueError(f"required_v1 发布渲染存在官方品牌资产但未提供 {option}")
+        return empty, None
+    logo_sha = sha256_path(logo_path)
+    matches = [
+        item for item in official_assets
+        if str(item.get("sha256") or "") == logo_sha
+        and "release_video" in set(item.get("allowed_uses", []))
+    ]
+    if len(matches) != 1 or int(matches[0].get("max_per_frame", 1)) != 1:
+        raise ValueError("required_v1 发布 Logo 必须匹配唯一审核通过的官方资产且 max_per_frame=1")
+    binding: dict[str, object] = {
+        "count": 1,
+        "asset_sha256": logo_sha,
+        "asset_id": matches[0].get("asset_id"),
+    }
+    if library_variant:
+        # The library mark follows its existing counter-moving trajectory;
+        # it has no invented fixed safe-region or presenter-avoidance rule.
+        return binding, None
+    with Image.open(logo_path) as logo_image:
+        logo_height = max(
+            1,
+            round(logo_image.height * config.story_logo_width_a / max(1, logo_image.width)),
+        )
+    return binding, [
+        config.story_logo_x,
+        config.story_logo_y,
+        config.story_logo_width_a,
+        logo_height,
+    ]
 
 
 def compiled_video_compositing_geometry(config: ReleaseConfig) -> dict[str, object]:
@@ -1241,7 +1317,7 @@ def _release_layout_binding(
     return {
         # Bump when render semantics change so intact-looking receipts from an
         # older implementation cannot silently reuse visually obsolete media.
-        "renderer_policy_version": "2026-08-library-tail-and-dual-antipiracy-v4",
+        "renderer_policy_version": "2026-09-abc-tail-terminal-v10",
         "variant": config.variant,
         "video_box": list(config.video_box),
         "story_box": list(config.story_box),
@@ -1405,20 +1481,21 @@ def package_release_videos(
     release_layout_port: ReleaseLayoutPort | None = None,
 ) -> None:
     validate_config(config)
+    if contract_spec is None:
+        raise ValueError("正式发布缺少 required_v1 发布渲染合同，拒绝进入布局渲染")
+    if config.plate_image is not None:
+        raise ValueError("正式发布禁止使用整张 3:4 cover/plate；必须使用四张独立包装面板")
     ensure_dir(config.output_dir)
     work_dir = config.output_dir / "_release_work"
     ensure_dir(work_dir)
 
-    geometry = compile_release_geometry(config, contract_spec) if contract_spec is not None else None
-    if contract_spec is not None and config.plate_image is not None:
-        raise ValueError("required_v1 发布视频禁止使用含 AI 文字/Logo 的整张 plate；必须使用确定性条带")
-    if geometry is not None:
-        geometry_path = config.output_dir / f"release_geometry_manifest_{config.variant}.json"
-        write_json_atomic(geometry_path, geometry)
-        persisted = json.loads(geometry_path.read_text(encoding="utf-8"))
-        issues = geometry_manifest_issues(persisted, geometry["bindings"])
-        if issues or persisted != geometry:
-            raise ValueError("release geometry manifest write verification failed: " + "; ".join(issues))
+    geometry = compile_release_geometry(config, contract_spec)
+    geometry_path = config.output_dir / f"release_geometry_manifest_{config.variant}.json"
+    write_json_atomic(geometry_path, geometry)
+    persisted = json.loads(geometry_path.read_text(encoding="utf-8"))
+    issues = geometry_manifest_issues(persisted, geometry["bindings"])
+    if issues or persisted != geometry:
+        raise ValueError("release geometry manifest write verification failed: " + "; ".join(issues))
     assets = render_static_assets(config, work_dir, geometry)
     port = release_layout_port or build_release_layout_registry().release_layout()
     generated: list[Path] = []
@@ -1554,16 +1631,15 @@ def package_release_videos(
             )
         print(f"已生成宝库号发布视频：{library_output}")
         generated.append(library_output)
-    if contract_spec is not None:
-        manifest_path = config.output_dir / f"release_render_manifest_{config.variant}.json"
-        manifest = build_release_render_manifest(config, contract_spec, generated, geometry)
-        write_json_atomic(manifest_path, manifest)
-        persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
-        issues = release_render_manifest_issues(
-            persisted, expected_bindings=geometry["bindings"], verify_outputs=True,
-        )
-        if issues or persisted != manifest:
-            raise ValueError("release render manifest write verification failed: " + "; ".join(issues))
+    manifest_path = config.output_dir / f"release_render_manifest_{config.variant}.json"
+    manifest = build_release_render_manifest(config, contract_spec, generated, geometry)
+    write_json_atomic(manifest_path, manifest)
+    persisted = json.loads(manifest_path.read_text(encoding="utf-8"))
+    issues = release_render_manifest_issues(
+        persisted, expected_bindings=geometry["bindings"], verify_outputs=True,
+    )
+    if issues or persisted != manifest:
+        raise ValueError("release render manifest write verification failed: " + "; ".join(issues))
 
 
 def render_release_previews(
@@ -1713,21 +1789,25 @@ def render_main_preview_frame(
         token = f"{int(round(timestamp * 1000)):09d}_{scene}"
         wide_sample = work_dir / f"main_formal_sample_{token}.mp4"
         vertical_sample = work_dir / f"main_vertical_sample_{token}.mp4"
+        sample_start, requested_sample_duration, sample_frame_time = release_preview_sample_window(
+            probe_duration(config.audio_mix),
+            timestamp,
+        )
         render_main_wide(
             config,
             frame_image,
             wide_sample,
             presenter_geometry=geometry["presenter"]["a"],
             presenter_c_geometry=geometry["presenter"]["c"],
-            sample_start=timestamp,
-            sample_duration=RELEASE_PREVIEW_SAMPLE_SECONDS,
+            sample_start=sample_start,
+            sample_duration=requested_sample_duration,
             sample_scene=scene,
         )
         wide_probe = work_dir / f"main_formal_sample_probe_{token}.png"
         extract_video_frame(
             wide_sample,
             wide_probe,
-            min(RELEASE_PREVIEW_SAMPLE_SECONDS / 2, 0.2),
+            sample_frame_time,
         )
         aperture_issues = []
         if scene != "c":
@@ -1752,7 +1832,11 @@ def render_main_preview_frame(
             config=config,
             output_scale=config.output_scale,
         )
-        extract_video_frame(vertical_sample, output_path, min(sample_duration / 2, 0.2))
+        extract_video_frame(
+            vertical_sample,
+            output_path,
+            min(sample_frame_time, max(0.0, sample_duration - 1 / 30)),
+        )
         return
     if geometry is not None:
         background_frame_path = work_dir / f"background_{int(round(timestamp)):03d}.png"
@@ -1858,14 +1942,18 @@ def render_library_preview_frame(
         token = f"{int(round(timestamp * 1000)):09d}"
         window_sample = work_dir / f"library_formal_sample_{token}.mp4"
         vertical_sample = work_dir / f"library_vertical_sample_{token}.mp4"
+        sample_start, requested_sample_duration, sample_frame_time = release_preview_sample_window(
+            probe_duration(config.bg_video),
+            timestamp,
+        )
         render_library_window_video(
             source_video=config.bg_video,
             watermark_png=watermark_png,
             tail_notice_png=tail_notice_png,
             output_path=window_sample,
             config=config,
-            sample_start=timestamp,
-            sample_duration=RELEASE_PREVIEW_SAMPLE_SECONDS,
+            sample_start=sample_start,
+            sample_duration=requested_sample_duration,
         )
         sample_duration = probe_duration(window_sample)
         render_vertical_package(
@@ -1877,7 +1965,11 @@ def render_library_preview_frame(
             config=config,
             output_scale=1,
         )
-        extract_video_frame(vertical_sample, output_path, min(sample_duration / 2, 0.2))
+        extract_video_frame(
+            vertical_sample,
+            output_path,
+            min(sample_frame_time, max(0.0, sample_duration - 1 / 30)),
+        )
         return
     frame_path = work_dir / f"library_story_{int(round(timestamp)):03d}.png"
     extract_video_frame(config.bg_video, frame_path, timestamp)
@@ -1909,7 +2001,13 @@ def render_library_preview_frame(
         x_walk = round(span_x * (0.5 - 0.5 * math.cos(math.pi * timestamp * speed_x / span_x)))
         y_walk = round(span_y * (0.5 - 0.5 * math.cos(math.pi * timestamp * speed_y / span_y)))
         story.alpha_composite(watermark, (margin + x_walk, margin + y_walk))
-        story.alpha_composite(watermark, (width - watermark.width - margin - x_walk, height - watermark.height - margin - y_walk))
+        story.alpha_composite(
+            watermark,
+            (
+                width - watermark.width - margin - x_walk,
+                height - watermark.height - margin - y_walk,
+            ),
+        )
     draw_preview_subtitle(
         story,
         config,
@@ -1974,6 +2072,32 @@ def plate_overlay_image(plate_image: Path, video_box: tuple[int, int, int, int],
 def extract_video_frame(video: Path, output_path: Path, timestamp: float) -> Path:
     run_command(["ffmpeg", "-y", "-ss", f"{timestamp:.3f}", "-i", str(video), "-frames:v", "1", "-update", "1", str(output_path)])
     return output_path
+
+
+def release_preview_sample_window(
+    source_duration: float,
+    target_timestamp: float,
+    sample_duration: float = RELEASE_PREVIEW_SAMPLE_SECONDS,
+    frame_duration: float = 1 / 30,
+) -> tuple[float, float, float]:
+    """Return a complete preview window and an in-window target frame time.
+
+    Near EOF, starting a fixed sample at the requested timestamp leaves only a
+    few frames. Shift that window backwards instead of fabricating extra
+    program time, while keeping the extracted frame at (or one frame before)
+    the requested terminal instant.
+    """
+
+    duration = max(frame_duration, float(source_duration))
+    window_duration = min(max(frame_duration, float(sample_duration)), duration)
+    target = min(max(0.0, float(target_timestamp)), max(0.0, duration - frame_duration))
+    if target + window_duration <= duration:
+        start = target
+        frame_time = min(window_duration / 2, 0.2)
+    else:
+        start = max(0.0, duration - window_duration)
+        frame_time = min(max(0.0, target - start), max(0.0, window_duration - frame_duration))
+    return start, window_duration, frame_time
 
 
 def extract_person_frame(config: ReleaseConfig, video: Path, output_path: Path, timestamp: float) -> Path:
@@ -2055,10 +2179,11 @@ def probe_video_size(path: Path) -> tuple[int, int]:
 def probe_video_stream_duration(path: Path) -> float | None:
     """Read the duration of the first video stream, excluding any audio tail.
 
-    ``format=duration`` is intentionally not used here: a muxed greenscreen
-    file can carry an audio stream that outlives the actual image stream.  A
-    missing/invalid duration is returned as ``None`` so callers can retain the
-    normal ffmpeg EOF boundary instead of guessing.
+    Prefer ``stream=duration``.  A muxed greenscreen can carry audio that
+    outlives its picture, so ``format=duration`` is accepted only when every
+    stream is video (not for A/V inputs).  A missing/invalid duration is
+    returned as ``None`` so callers can retain the normal ffmpeg EOF boundary
+    instead of guessing.
     """
     process = subprocess.run(
         [
@@ -2081,8 +2206,43 @@ def probe_video_stream_duration(path: Path) -> float | None:
     try:
         value = float(process.stdout.strip())
     except (TypeError, ValueError):
+        value = 0.0
+    if value > 0:
+        return value
+
+    # WebM/VP9 alpha files commonly omit stream.duration even though the
+    # container has an exact duration.  The RVM foreground is video-only, so
+    # using its format duration cannot accidentally inherit a longer audio
+    # tail.  Keep rejecting the format fallback for muxed A/V inputs.
+    fallback = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=codec_type:format=duration",
+            "-of",
+            "json",
+            str(path),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if fallback.returncode != 0:
         return None
-    return value if value > 0 else None
+    try:
+        payload = json.loads(fallback.stdout)
+        stream_types = [
+            str(item.get("codec_type") or "")
+            for item in payload.get("streams", [])
+            if isinstance(item, dict)
+        ]
+        format_duration = float(payload.get("format", {}).get("duration"))
+    except (AttributeError, TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if stream_types and all(item == "video" for item in stream_types) and format_duration > 0:
+        return format_duration
+    return None
 
 
 def probe_video_frame_duration(path: Path) -> float:
@@ -2136,9 +2296,14 @@ def person_tail_pad_seconds(
     is already long enough receives no pad.  The function is pure and is kept
     separate from ffprobe so it can be tested without media files.
     """
-    if person_duration is None or target_duration <= 0:
+    if target_duration <= 0:
         return 0.0
     safety_frame = max(0.0, float(frame_duration))
+    if person_duration is None:
+        # Even when metadata is incomplete, add one cloned terminal frame.
+        # This is enough to cover the common one-frame PTS/EOF discrepancy
+        # without guessing a long missing duration.
+        return safety_frame
     # ``ffprobe`` duration may land exactly on the target while the final
     # decoded presentation timestamp is one frame earlier.  With
     # overlay=repeatlast=0 that boundary can expose one frame containing the
@@ -2246,8 +2411,22 @@ def validate_config(config: ReleaseConfig) -> None:
     if config.person_layout_policy and config.variant in {"both", "main"}:
         assert config.person_greenscreen is not None
         source_width, source_height = probe_video_size(config.person_greenscreen)
+        # A required_v1 render with a Demo manifest gets its one immutable
+        # display transform from the independently reviewed Demo geometry.
+        # The CLI height/x fields are legacy fallbacks and are not consumed by
+        # that render path, so comparing them with the 4K alpha-master size or
+        # its compiled anchor here creates a false scale/anchor rejection.
+        # Keep the raw-master invariants in this early gate (policy, full crop,
+        # dimensions, and no vertical shift); compile_release_geometry later
+        # validates the manifest bindings and owns the reviewed scale/anchor.
+        reviewed_demo_transform = config.demo_render_manifest is not None
         expected_x = None
-        if config.keying_preset_path is not None and config.keying_preset_path.is_file():
+        rendered_height = source_height if reviewed_demo_transform else config.person_height
+        if (
+            not reviewed_demo_transform
+            and config.keying_preset_path is not None
+            and config.keying_preset_path.is_file()
+        ):
             preset = json.loads(config.keying_preset_path.read_text(encoding="utf-8"))
             initial_bbox = preset.get("presenter_initial_subject_bbox")
             if isinstance(initial_bbox, list) and len(initial_bbox) == 4:
@@ -2263,7 +2442,7 @@ def validate_config(config: ReleaseConfig) -> None:
         layout_issues = source_native_fixed_anchor_issues(
             source_width=source_width,
             source_height=source_height,
-            rendered_height=config.person_height,
+            rendered_height=rendered_height,
             person_x=config.person_x,
             person_y=config.person_y,
             person_crop=config.person_crop,
@@ -2824,6 +3003,12 @@ def render_main_wide(
     )
     if sample_scene not in {None, "a", "b", "c"}:
         raise ValueError(f"invalid Release preview sample scene: {sample_scene}")
+    has_b = sample_scene == "b" if sample_scene is not None else bool(config.b_windows)
+    has_c = sample_scene == "c" if sample_scene is not None else bool(config.c_windows)
+    direct_b_sample = sample_scene == "b"
+    direct_c_sample = sample_scene == "c"
+    needs_a = not (direct_b_sample or direct_c_sample)
+    needs_person = needs_a or has_c
     # A greenscreen source can be a few frames shorter than the narration.  A
     # raw EOF frame is not safe to composite: ffmpeg may materialize it as an
     # opaque black rectangle before chroma-keying.  Pad the source with a clone
@@ -2863,7 +3048,55 @@ def render_main_wide(
     # reusing it as the full-canvas background made the A scene look like a
     # duplicated/zoomed story frame and also imported encoded black side rims.
     background_input = ["-loop", "1", "-i", str(config.bg_image)]
+    needs_story = needs_a or has_b
+    story_input_path = config.bg_video
+    story_seek_args = seek_args
+    if sample_duration is not None and needs_story:
+        story_input_path = work_dir / f"story_sample_{int(round(sample_start * 1000)):09d}_ffv1.mkv"
+        run_command([
+            "ffmpeg", "-y", "-loglevel", "error",
+            *seek_args,
+            "-i", str(config.bg_video),
+            "-t", f"{duration + 0.08:.6f}",
+            "-an", "-c:v", "ffv1", "-pix_fmt", "yuv420p",
+            str(story_input_path),
+        ])
+        story_seek_args = []
     person_decoder_args = ["-c:v", "libvpx-vp9"] if config.keyer == "rvm" else []
+    person_seek_args = seek_args
+    person_input_path = config.person_greenscreen
+    if sample_duration is not None and config.keyer == "rvm" and needs_person:
+        # Seeking a long VP9-alpha stream inside the full multi-input
+        # framesync graph can sleep indefinitely at otherwise healthy random
+        # access points. Decode only the reviewed sample interval to a
+        # lossless ARGB intermediate first; the formal graph below still owns
+        # the exact keying, geometry, overlays, subtitles, and encoding.
+        person_input_path = work_dir / f"person_sample_{int(round(sample_start * 1000)):09d}_argb.mov"
+        predecode_duration = duration + max(0.08, person_frame_duration * 2.0)
+        run_command([
+            "ffmpeg", "-y", "-loglevel", "error",
+            *seek_args,
+            "-c:v", "libvpx-vp9",
+            "-i", str(config.person_greenscreen),
+            "-t", f"{predecode_duration:.6f}",
+            "-an", "-c:v", "qtrle", "-pix_fmt", "argb",
+            str(person_input_path),
+        ])
+        person_seek_args = []
+        person_decoder_args = []
+    audio_input_path = config.audio_mix
+    audio_seek_args = seek_args
+    if sample_duration is not None:
+        audio_input_path = work_dir / f"audio_sample_{int(round(sample_start * 1000)):09d}.wav"
+        run_command([
+            "ffmpeg", "-y", "-loglevel", "error",
+            *seek_args,
+            "-i", str(config.audio_mix),
+            "-t", f"{duration + 0.08:.6f}",
+            "-vn", "-c:a", "pcm_s24le",
+            str(audio_input_path),
+        ])
+        audio_seek_args = []
     args = [
         "ffmpeg",
         "-y",
@@ -2872,37 +3105,45 @@ def render_main_wide(
         # scheduler is deterministic for both samples and the formal render.
         "-filter_complex_threads",
         # The legacy colour-key graph is deterministic with one scheduler
-        # thread.  libvpx's separate colour/alpha decode planes can deadlock at
-        # EOF when that same single thread also owns every framesync filter;
-        # two threads let the alpha decoder drain and close normally.
-        "2" if config.keyer == "rvm" else "1",
+        # thread. libvpx's separate colour/alpha decode planes plus the
+        # scale/premultiply/overlay chain can still deadlock with two workers
+        # at non-zero seeks (reproduced on the 60 s C-scene sample). Four
+        # bounded workers let both decoder planes and both framesync branches
+        # drain without returning to the unbounded high-core scheduler.
+        "4" if needs_person and config.keyer == "rvm" else "1",
         *background_input,
-        "-stream_loop",
-        "-1",
-        *seek_args,
-        "-i",
-        str(config.bg_video),
-        *seek_args,
-        *person_decoder_args,
-        "-i",
-        str(config.person_greenscreen),
-        "-loop",
-        "1",
-        "-i",
-        str(frame_a_path),
-        "-loop",
-        "1",
-        "-i",
-        str(mask_a_path),
     ]
-    frame_index = 3
-    mask_index = 4
+    story_input_index = None
+    if needs_story:
+        story_input_index = len(args_input_paths(args))
+        args.extend([
+            "-stream_loop", "-1",
+            *story_seek_args,
+            "-i", str(story_input_path),
+        ])
+    person_input_index = None
+    if needs_person:
+        person_input_index = len(args_input_paths(args))
+        args.extend([
+            *person_seek_args,
+            *person_decoder_args,
+            "-i",
+            str(person_input_path),
+        ])
+    frame_index = None
+    mask_index = None
+    if needs_a:
+        frame_index = len(args_input_paths(args))
+        args.extend(["-loop", "1", "-i", str(frame_a_path)])
+        mask_index = len(args_input_paths(args))
+        args.extend(["-loop", "1", "-i", str(mask_a_path)])
     frame_b_index = None
     mask_b_index = None
     if frame_b_path is not None and mask_b_path is not None:
-        frame_b_index = 5
-        mask_b_index = 6
-        args.extend(["-loop", "1", "-i", str(frame_b_path), "-loop", "1", "-i", str(mask_b_path)])
+        frame_b_index = len(args_input_paths(args))
+        args.extend(["-loop", "1", "-i", str(frame_b_path)])
+        mask_b_index = len(args_input_paths(args))
+        args.extend(["-loop", "1", "-i", str(mask_b_path)])
     watermark_index = None
     if config.watermark_logo is not None:
         watermark_index = len(args_input_paths(args))
@@ -2928,7 +3169,7 @@ def render_main_wide(
         )
         args.extend(["-i", str(subtitle_overlay)])
     audio_index = len(args_input_paths(args))
-    args.extend([*seek_args, "-i", str(config.audio_mix)])
+    args.extend([*audio_seek_args, "-i", str(audio_input_path)])
 
     # Input seeking preserves the source timestamps.  Always rebase the
     # presenter, including when no tail padding is needed, otherwise the first
@@ -2938,12 +3179,17 @@ def render_main_wide(
     # empty. Drop that frame before rebasing so frame zero of the finished
     # release contains the presenter. The existing tail clone compensates for
     # the removed frame and prevents the final background-only frame.
-    if config.keyer == "rvm":
-        filters_prefix = ["[2:v]trim=start_frame=1,setpts=PTS-STARTPTS[person_timeline]"]
-    else:
-        filters_prefix = ["[2:v]setpts=PTS-STARTPTS[person_timeline]"]
+    filters_prefix: list[str] = []
+    if needs_person and config.keyer == "rvm":
+        assert person_input_index is not None
+        filters_prefix.append(
+            f"[{person_input_index}:v]trim=start_frame=1,setpts=PTS-STARTPTS[person_timeline]"
+        )
+    elif needs_person:
+        assert person_input_index is not None
+        filters_prefix.append(f"[{person_input_index}:v]setpts=PTS-STARTPTS[person_timeline]")
     person_source = "[person_timeline]"
-    if config.person_crop is not None:
+    if needs_person and config.person_crop is not None:
         crop_x, crop_y, crop_width, crop_height = config.person_crop
         if person_tail_pad > 0:
             filters_prefix.append(
@@ -2954,18 +3200,13 @@ def render_main_wide(
             f"{person_source}crop={crop_width}:{crop_height}:{crop_x}:{crop_y},setsar=1[person_in]"
         )
         person_source = "[person_in]"
-    else:
+    elif needs_person:
         if person_tail_pad > 0:
             filters_prefix.append(
                 f"{person_source}tpad=stop_mode=clone:stop_duration={person_tail_pad:.6f}[person_padded]"
             )
             person_source = "[person_padded]"
 
-    has_b = sample_scene == "b" if sample_scene is not None else bool(config.b_windows)
-    has_c = sample_scene == "c" if sample_scene is not None else bool(config.c_windows)
-    direct_b_sample = sample_scene == "b"
-    direct_c_sample = sample_scene == "c"
-    needs_a = not (direct_b_sample or direct_c_sample)
     filters = filters_prefix + [
         f"[0:v]scale={wide_width}:{wide_height}:force_original_aspect_ratio=increase,"
         f"crop={wide_width}:{wide_height},setsar=1,format=rgba[base_src]",
@@ -2982,11 +3223,13 @@ def render_main_wide(
     else:
         filters.append(f"[base0]null[{base_labels[0]}]")
     if needs_a and has_b:
-        filters.append("[1:v]split=2[story_src_a][story_src_b]")
+        assert story_input_index is not None
+        filters.append(f"[{story_input_index}:v]split=2[story_src_a][story_src_b]")
         story_a_source = "[story_src_a]"
     else:
-        story_a_source = "[1:v]"
+        story_a_source = f"[{story_input_index}:v]" if story_input_index is not None else ""
     if needs_a:
+        assert frame_index is not None and mask_index is not None
         story_a_overscan = bleed_box(
             story_a_bbox, max(APERTURE_OVERSCAN_PIXELS, config.story_bleed), (WIDE_WIDTH, WIDE_HEIGHT),
         )
@@ -3066,7 +3309,7 @@ def render_main_wide(
         assert mask_b_index is not None
         filters.extend(
             [
-                f"{'[1:v]' if direct_b_sample else '[story_src_b]'}scale={b_source_width}:{b_source_height}:force_original_aspect_ratio=increase,"
+                f"{f'[{story_input_index}:v]' if direct_b_sample else '[story_src_b]'}scale={b_source_width}:{b_source_height}:force_original_aspect_ratio=increase,"
                 f"crop={b_width}:{b_height},setsar=1,format=rgba[story_b_rect]",
                 f"color=c=0x000000@0.0:s={wide_width}x{wide_height}:d={duration:.3f},format=rgba[story_b_canvas]",
                 f"[story_b_canvas][story_b_rect]overlay={b_x}:{b_y}[story_b_layer]",
@@ -3504,17 +3747,16 @@ def render_library_window_video(
         speed_x = 70.0 * config.watermark_speed
         speed_y = 42.0 * config.watermark_speed
         wm1_x, wm1_y, wm2_x, wm2_y = safe_watermark_motion_expressions(
-            speed_x, speed_y, time_offset=sample_start,
+            speed_x,
+            speed_y,
+            time_offset=sample_start,
         )
         filters.extend(
             [
                 f"[{watermark_index}:v]scale={watermark_width}:-1,format=rgba,colorchannelmixer=aa={opacity:.3f}[wm]",
                 "[wm]split=2[wm1][wm2]",
-                # Anti-piracy identity remains visible through the closing
-                # notice.  Hiding it at tail_start made the last seconds an
-                # unwatermarked copyable segment and disagreed with preview
-                # samples taken before the tail window.  The approved library
-                # anti-piracy policy uses two counter-moving copies.
+                # Keep both counter-moving anti-piracy marks on their full
+                # reviewed paths, including through the closing notice.
                 f"[tail][wm1]overlay=x='{wm1_x}':y='{wm1_y}'[w1]",
                 f"[w1][wm2]overlay=x='{wm2_x}':y='{wm2_y}'[w2]",
             ]
@@ -3825,6 +4067,8 @@ def render_tail_notice_png(output_path: Path, text: str) -> Path:
 
 
 def resolved_tail_seconds(duration: float, configured_tail_seconds: float) -> float:
+    if configured_tail_seconds < 0:
+        raise ValueError("--tail-seconds 不能为负数；0 表示按总时长自动估算")
     if configured_tail_seconds > 0:
         return min(duration, configured_tail_seconds)
     if duration <= 1:

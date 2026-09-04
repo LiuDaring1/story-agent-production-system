@@ -34,6 +34,7 @@ STORYBOARD_PROMPT_CLAUSE = (
     f"{STORYBOARD_PROMPT_MARKER} 最后一张参考图只用于理解本镜头完整句意、人物关系、"
     "动作阶段和大致空间方向；它不是视频首帧，不锁定像素、静止姿势、构图或镜位。"
 )
+OFFSCREEN_REVEAL_GUARD_MARKER = "[OFFSCREEN_REVEAL_GUARD_V1]"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
 IMAGEGEN_REFERENCE_LIMIT = 5
 
@@ -58,6 +59,18 @@ def digest_value(value: Any) -> str:
 
 def digest_text(value: str) -> str:
     return hashlib.sha256(str(value).encode("utf-8")).hexdigest()
+
+
+def single_line_ppt_subtitle(value: str) -> str:
+    """Normalize one director-shot caption to the required PPT display line.
+
+    A director shot may cover several source TXT cues.  The static PPT keeps
+    one page per director shot, so its display caption concatenates those
+    already-approved cue lines without inventing punctuation or retaining
+    paragraph breaks.
+    """
+
+    return "".join(str(value).splitlines()).strip()
 
 
 def file_sha256(path: Path) -> str:
@@ -258,11 +271,61 @@ def _frame(shot: dict[str, Any], key: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
-def build_storyboard_prompt(shot: dict[str, Any], refs: list[dict[str, Any]]) -> str:
+def build_storyboard_prompt(
+    shot: dict[str, Any],
+    refs: list[dict[str, Any]],
+    continuity_group: dict[str, Any] | None = None,
+) -> str:
     opening = _frame(shot, "opening_frame")
     closing = _frame(shot, "closing_frame")
     camera = _frame(shot, "camera_plan")
     narrative = _frame(shot, "narrative_visualization")
+    focus = _frame(shot, "focus_contract")
+    group = continuity_group if isinstance(continuity_group, dict) else {}
+    setup_id = str(camera.get("camera_setup_id") or "")
+    setup = next(
+        (
+            row
+            for row in group.get("camera_setups") or []
+            if isinstance(row, dict) and row.get("setup_id") == setup_id
+        ),
+        {},
+    )
+    axis_id = str(camera.get("axis_id") or "")
+    axis = next(
+        (
+            row
+            for row in group.get("axes") or []
+            if isinstance(row, dict) and row.get("axis_id") == axis_id
+        ),
+        {},
+    )
+    scene_zones = [
+        row for row in group.get("zones") or [] if isinstance(row, dict)
+    ]
+    scene_anchors = [
+        row for row in group.get("anchors") or [] if isinstance(row, dict)
+    ]
+    color_contract = group.get("color_contract") if isinstance(group.get("color_contract"), dict) else {}
+    environment_view_asset_id = str(setup.get("environment_view_asset_id") or "")
+    environment_view = next(
+        (
+            asset
+            for asset in refs
+            if isinstance(asset, dict) and asset.get("asset_id") == environment_view_asset_id
+        ),
+        {},
+    )
+    primary_beats = [
+        {
+            "start_second": beat.get("start_second"),
+            "end_second": beat.get("end_second"),
+            "primary_beat": beat.get("primary_beat"),
+            "supporting_actions": beat.get("supporting_actions", []),
+        }
+        for beat in shot.get("performance_beats") or []
+        if isinstance(beat, dict) and isinstance(beat.get("primary_beat"), dict)
+    ]
     narrative_mode = str(narrative.get("mode") or "literal_action")
     if narrative_mode == "speech_visual_bubble":
         composition_rule = (
@@ -315,10 +378,26 @@ def build_storyboard_prompt(shot: dict[str, Any], refs: list[dict[str, Any]]) ->
             f"Required entry state: {json.dumps(shot.get('entry_state', {}), ensure_ascii=False, sort_keys=True)}",
             f"Required exit state: {json.dumps(shot.get('exit_state', {}), ensure_ascii=False, sort_keys=True)}",
             f"Camera intent: {camera.get('start_size', '')} to {camera.get('end_size', '')}; screen direction={camera.get('screen_direction', '')}; movement={camera.get('movement', '')}",
-            f"Camera angle: {camera.get('camera_angle') or opening.get('camera_angle', '')}",
+            f"Structured camera setup: {json.dumps(setup, ensure_ascii=False, sort_keys=True)}",
+            f"Authoritative camera-view plate: {environment_view_asset_id}; {environment_view.get('appearance_summary', '')}",
+            "The camera-view plate is authoritative for this shot's viewpoint and crop. Preserve its forward direction and furniture orientation; do not reconstruct the scene from a different master angle. Empty means character-free, not infrastructure-free: keep every venue anchor that the plate and visible_anchor_ids require.",
+            f"Structured axis: {json.dumps(axis, ensure_ascii=False, sort_keys=True)}",
+            f"Authoritative scene-map zones: {json.dumps(scene_zones, ensure_ascii=False, sort_keys=True)}",
+            f"Fixed scene anchors and occupancy: {json.dumps(scene_anchors, ensure_ascii=False, sort_keys=True)}",
+            f"Group color contract: {json.dumps(color_contract, ensure_ascii=False, sort_keys=True)}",
+            f"Camera angle: {setup.get('camera_angle') or camera.get('camera_angle') or opening.get('camera_angle', '')}",
             f"Subject layout: {camera.get('subject_layout') or opening.get('subject_layout', '')}",
+            f"Visible anchors: {json.dumps(camera.get('visible_anchor_ids', []), ensure_ascii=False)}",
+            f"Excluded anchors: {json.dumps(camera.get('excluded_anchor_ids', []), ensure_ascii=False)}",
+            "View-direction geometry is authoritative: place the camera in camera_origin_zone_id and look through look_target_zone_id. Only the declared background_zone_ids, which lie geometrically beyond the target on the scene map, may appear behind the primary subject. Never move an origin-side zone or anchor behind the subject just to make the composition fuller.",
+            f"Focus contract: {json.dumps(focus, ensure_ascii=False, sort_keys=True)}",
+            f"Subject presence contract: {json.dumps(shot.get('subject_presence', []), ensure_ascii=False, sort_keys=True)}",
+            "World position and frame visibility are separate: an off-screen subject remains at its declared entry_world_zone_id/exit_world_zone_id. Off-screen never means absent from the scene. No on-screen character, crowd or anchor may come from a zone behind the camera. If a visible anchor is occupied by that subject, show the occupant; otherwise exclude the entire occupied anchor from frame.",
+            f"Prop contracts: {json.dumps(shot.get('prop_contracts', []), ensure_ascii=False, sort_keys=True)}",
+            f"One primary action per performance beat: {json.dumps(primary_beats, ensure_ascii=False, sort_keys=True)}",
+            "Child-audience wardrobe default: adult characters wear complete, securely closed everyday clothing with the torso covered. Use an open-front or revealing design only when an explicitly reviewed story requirement says so.",
             "Framing priority: obey the director focus, shot size and subject layout before trying to show every referenced character. A speaker, listener reaction, prop detail or environmental beat may be the sole dominant subject; supporting characters may be cropped in the foreground or kept offscreen when the plan allows it. Do not default to an equal-size two-character wide shot merely because two character references are attached.",
-            f"Eyeline and axis: {camera.get('axis') or opening.get('eyeline', '')}",
+            f"Eyeline and axis: {axis.get('description') or camera.get('axis') or opening.get('eyeline', '')}",
             f"Decisive storyboard moment: {opening.get('decisive_storyboard_moment') or closing.get('decisive_storyboard_moment') or opening.get('action_phase', '')}",
             "Reviewed references and their roles:",
             *reference_lines,
@@ -354,6 +433,11 @@ def build_storyboard_manifest(
     validate_review(review, str(current_bundle["asset_bundle_sha256"]), "资产独立审核")
 
     assets = _asset_map(director)
+    continuity_groups = {
+        str(group.get("group_id") or ""): group
+        for group in director.get("continuity_groups") or []
+        if isinstance(group, dict)
+    }
     shots = director.get("shots")
     if not isinstance(shots, list) or not shots:
         raise StoryboardPipelineError("导演计划缺少 shots")
@@ -370,7 +454,11 @@ def build_storyboard_manifest(
             raise StoryboardPipelineError(f"导演 shot_id 缺失或重复：{shot_id}")
         shot_ids.append(shot_id)
         refs = _storyboard_references(shot, assets)
-        prompt = build_storyboard_prompt(shot, refs)
+        prompt = build_storyboard_prompt(
+            shot,
+            refs,
+            continuity_groups.get(str(shot.get("continuity_group") or "")),
+        )
         target = target_dir / f"{shot_id}.png"
         ref_records = [
             {
@@ -532,6 +620,80 @@ def _prompt_with_storyboard(prompt: str) -> str:
     return f"{base}\n{STORYBOARD_PROMPT_CLAUSE}"
 
 
+def _prompt_with_offscreen_reveal_guard(shot: dict[str, Any]) -> str:
+    """Keep actor eyelines from turning into an unplanned camera reveal."""
+
+    prompt = str(shot.get("prompt") or "")
+    base = prompt.split(OFFSCREEN_REVEAL_GUARD_MARKER, 1)[0].rstrip()
+    offscreen_ids = sorted(
+        {
+            str(row.get("subject_id") or "")
+            for row in shot.get("subject_presence") or []
+            if isinstance(row, dict)
+            and (
+                row.get("entry_presence") == "off_screen"
+                or row.get("exit_presence") == "off_screen"
+            )
+            and str(row.get("subject_id") or "")
+        }
+    )
+    if not offscreen_ids:
+        return base
+    camera = _frame(shot, "camera_plan")
+    excluded = [str(value) for value in camera.get("excluded_anchor_ids") or []]
+    return (
+        f"{base}\n{OFFSCREEN_REVEAL_GUARD_MARKER} "
+        "Looking, speaking, apologizing, pointing or gesturing toward an off-screen subject "
+        "is an actor-only performance cue. The camera must not follow that eyeline, widen, "
+        "rotate, pull back or reveal the off-screen zone. Preserve the planned camera movement "
+        "inside the current camera-view plate and keep every excluded anchor out of frame. "
+        f"Off-screen subjects={json.dumps(offscreen_ids, ensure_ascii=False)}; "
+        f"excluded anchors={json.dumps(excluded, ensure_ascii=False)}."
+    )
+
+
+def _runtime_reference_assets(
+    shot: dict[str, Any], ref_assets: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Avoid double-conditioning an exact recurring cohort at provider time.
+
+    The population archetype remains a reviewed director/storyboard asset. Once a
+    runtime semantic storyboard has fixed an exact recurring cohort and count,
+    sending both images encourages providers to expand the cohort. Anonymous
+    background crowds keep their population reference.
+    """
+
+    crowd = shot.get("crowd_plan") if isinstance(shot.get("crowd_plan"), dict) else {}
+    mode = str(crowd.get("mode") or "")
+    storyboard_mode = str(shot.get("storyboard_reference_mode") or "runtime")
+    population_ids = {str(value) for value in crowd.get("population_asset_ids") or []}
+    has_runtime_storyboard = (
+        storyboard_mode == "runtime"
+        and bool(ref_assets)
+        and ref_assets[-1].get("kind") == "storyboard"
+    )
+    omitted: list[str] = []
+    filtered = ref_assets
+    if mode == "recurring_cohort" and has_runtime_storyboard and population_ids:
+        filtered = []
+        for asset in ref_assets:
+            asset_id = str(asset.get("asset_id") or "")
+            if asset.get("kind") == "population" and asset_id in population_ids:
+                omitted.append(asset_id)
+                continue
+            filtered.append(asset)
+    return filtered, {
+        "policy_version": "story-r2v-runtime-reference-policy/v1",
+        "crowd_mode": mode,
+        "omitted_population_asset_ids": omitted,
+        "reason": (
+            "exact recurring cohort count and identities are bound by the reviewed runtime storyboard"
+            if omitted
+            else "no recurring-cohort population omission required"
+        ),
+    }
+
+
 def compile_r2v_plan(
     director: dict[str, Any], manifest: dict[str, Any]
 ) -> dict[str, Any]:
@@ -623,8 +785,6 @@ def build_r2v_jobs(
         storyboard_asset = assets.get(f"storyboard__{shot_id}")
         if storyboard_asset is None:
             raise StoryboardPipelineError(f"{shot_id} 缺少已封存语义故事板资产")
-        reference_paths = [str(Path(str(asset["path"])).expanduser().resolve()) for asset in ref_assets]
-        reference_hashes = [str(asset.get("sha256") or "") for asset in ref_assets]
         storyboard_reference_mode = str(
             shot.get("storyboard_reference_mode") or "runtime"
         ).strip()
@@ -633,6 +793,10 @@ def build_r2v_jobs(
                 raise StoryboardPipelineError(f"{shot_id} runtime 语义故事板不是最后一张参考图")
         elif any(asset.get("kind") == "storyboard" for asset in ref_assets):
             raise StoryboardPipelineError(f"{shot_id} director_only 语义故事板不得进入运行时参考图")
+        ref_assets, runtime_reference_policy = _runtime_reference_assets(shot, ref_assets)
+        reference_paths = [str(Path(str(asset["path"])).expanduser().resolve()) for asset in ref_assets]
+        reference_hashes = [str(asset.get("sha256") or "") for asset in ref_assets]
+        runtime_reference_ids = [str(asset.get("asset_id") or "") for asset in ref_assets]
         camera = _frame(shot, "camera_plan")
         source_start = float(shot.get("source_start") or 0)
         source_end = float(shot.get("source_end") or 0)
@@ -650,14 +814,31 @@ def build_r2v_jobs(
                 ),
                 "story_text": str(shot.get("story_text") or ""),
                 "visual_description": str(shot.get("visual_focus") or ""),
-                "prompt": str(shot.get("prompt") or ""),
+                "prompt": _prompt_with_offscreen_reveal_guard(shot),
                 "subject_action": _performance_summary(shot),
                 "camera_motion": str(camera.get("movement") or ""),
+                "camera_setup_id": str(camera.get("camera_setup_id") or ""),
+                "axis_id": str(camera.get("axis_id") or camera.get("axis") or ""),
+                "focus_contract_json": json.dumps(
+                    shot.get("focus_contract") or {}, ensure_ascii=False, sort_keys=True
+                ),
+                "subject_presence_json": json.dumps(
+                    shot.get("subject_presence") or [], ensure_ascii=False, sort_keys=True
+                ),
+                "prop_contracts_json": json.dumps(
+                    shot.get("prop_contracts") or [], ensure_ascii=False, sort_keys=True
+                ),
+                "performance_beats_json": json.dumps(
+                    shot.get("performance_beats") or [], ensure_ascii=False, sort_keys=True
+                ),
                 "environment_motion": "环境保持连续，仅保留自然的风、光和背景运动。",
                 "reference_image_paths_json": json.dumps(reference_paths, ensure_ascii=False),
                 "reference_image_sha256_json": json.dumps(reference_hashes, ensure_ascii=False),
                 "reference_asset_ids_json": json.dumps(
-                    list(shot.get("reference_asset_ids") or []), ensure_ascii=False
+                    runtime_reference_ids, ensure_ascii=False
+                ),
+                "runtime_reference_policy_json": json.dumps(
+                    runtime_reference_policy, ensure_ascii=False, sort_keys=True
                 ),
                 "storyboard_manifest_path": str(manifest_path.expanduser().resolve()),
                 "storyboard_manifest_sha256": manifest_hash,
@@ -714,10 +895,18 @@ def build_ppt_plan(
     slides = [{**title, "slide_index": 1, "poster_origin": "approved_title_art"}]
     for index, entry in enumerate(manifest.get("entries") or [], start=2):
         shot_id = str(entry.get("shot_id") or "")
-        if shot_id not in old_map or shot_id not in director_map:
+        if shot_id not in director_map:
             raise StoryboardPipelineError(f"PPT 时长计划缺少导演镜头：{shot_id}")
-        old = old_map[shot_id]
         shot = director_map[shot_id]
+        previous_slide = old_map.get(shot_id)
+        source_duration = float(shot.get("source_end") or 0) - float(
+            shot.get("source_start") or 0
+        )
+        duration_seconds = (
+            float(previous_slide.get("duration_seconds") or source_duration)
+            if previous_slide is not None
+            else source_duration
+        )
         slides.append(
             {
                 "slide_index": index,
@@ -725,11 +914,10 @@ def build_ppt_plan(
                 "poster_path": str(entry.get("image_path") or ""),
                 "poster_sha256": str(entry.get("image_sha256") or ""),
                 "poster_origin": "imagegen_shot_illustration",
-                "duration_seconds": float(
-                    old.get("duration_seconds")
-                    or (float(shot.get("source_end") or 0) - float(shot.get("source_start") or 0))
+                "duration_seconds": duration_seconds,
+                "subtitle": single_line_ppt_subtitle(
+                    str(shot.get("story_text") or "")
                 ),
-                "subtitle": str(shot.get("story_text") or ""),
                 "semantic_card": False,
                 "story_text_sha256": str(entry.get("story_text_sha256") or ""),
                 "director_shot_sha256": str(entry.get("director_shot_sha256") or ""),

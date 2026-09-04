@@ -28,6 +28,7 @@ from product_package import (
     validate_annotation_coverage,
     validate_demo_subtitle_full_coverage,
     validate_customer_background_image,
+    validate_formal_demo_logo,
 )
 from pptx import Presentation
 from PIL import Image, ImageDraw, ImageStat
@@ -67,6 +68,15 @@ def make_package_fixture(project: Path) -> tuple[Path, Path]:
 
 
 class ProductQaTests(unittest.TestCase):
+    def test_formal_demo_requires_official_logo_unless_reviewed_contract_disables_it(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            logo = Path(directory) / "official.png"
+            logo.write_bytes(b"official-logo")
+            validate_formal_demo_logo(logo, formal=True)
+            validate_formal_demo_logo(None, formal=True, reviewed_no_logo=True)
+            with self.assertRaisesRegex(ValueError, "官方 Logo"):
+                validate_formal_demo_logo(None, formal=True)
+
     def test_demo_subtitles_require_opening_body_and_moral(self) -> None:
         full = ["大家好，今天讲故事。", "正文。", "这个故事告诉我们：要动脑筋。"]
         validate_demo_subtitle_full_coverage(
@@ -322,6 +332,23 @@ class ProductQaTests(unittest.TestCase):
             payload = json.loads(report.read_text(encoding="utf-8"))
             self.assertFalse(payload["passed"])
             self.assertTrue(any("背景视频+无字幕" in issue for issue in payload["issues"]))
+
+    def test_product_qa_is_ledger_eligible_and_rejects_extra_customer_files(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：资料包QA"
+            base, _advanced = make_package_fixture(project)
+            qa_product(project)
+            report = project_paths(project).status / "qa_product_report.json"
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(payload["schema_version"], "story-product-machine-qa/v2")
+            self.assertEqual(payload["critical_errors"], [])
+
+            (base / "多余说明.txt").write_text("不应进入客户包", encoding="utf-8")
+            qa_product(project)
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            self.assertFalse(payload["passed"])
+            self.assertTrue(payload["critical_errors"])
+            self.assertTrue(any("文件数应为 5" in issue for issue in payload["issues"]))
 
     def test_rejects_internal_reports_inside_customer_packages(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

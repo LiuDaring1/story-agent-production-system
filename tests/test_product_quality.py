@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+from docx import Document
 from PIL import Image
 
 from product_package import (
@@ -143,6 +144,7 @@ class ProductQualityTests(unittest.TestCase):
             "music",
             "background_with_subtitles",
             "background_without_subtitles",
+            "customer_media_receipt",
         )
         for name in names:
             path = self.root / f"dependency-{name}.json"
@@ -386,7 +388,10 @@ class ProductQualityTests(unittest.TestCase):
         )
         self.assertEqual(manuscript_receipt_issues(receipt), [])
         bad = self.root / "bad.docx"
-        render_story_docx("故事", "我是绵羊姐姐。", bad)
+        bad_doc = Document()
+        bad_doc.add_paragraph("《故事》")
+        bad_doc.add_paragraph("我是绵羊姐姐。")
+        bad_doc.save(bad)
         write_manuscript_receipt(
             receipt,
             manuscript=bad,
@@ -396,6 +401,29 @@ class ProductQualityTests(unittest.TestCase):
             content_manifest=content,
         )
         self.assertTrue(any("forbidden_token" in issue for issue in manuscript_receipt_issues(receipt)))
+
+    def test_customer_manuscript_v2_preserves_natural_paragraphs_not_script_rows(self) -> None:
+        content = self.make_content_manifest()
+        source = self.root / "confirmed-story.docx"
+        source_doc = Document()
+        source_doc.add_paragraph("故事")
+        source_doc.add_paragraph("第一句。第二句。")
+        source_doc.save(source)
+        output = self.root / "customer-story.docx"
+        render_story_docx("故事", "故事\n第一句。第二句。", output)
+        receipt = self.root / "manuscript-v2.json"
+        write_manuscript_receipt(
+            receipt,
+            manuscript=output,
+            story_name="故事",
+            selected_indices=[0, 1],
+            selected_lines=self.lines,
+            content_manifest=content,
+            source_story=source,
+        )
+        paragraphs = [p.text for p in Document(output).paragraphs if p.text.strip()]
+        self.assertEqual(paragraphs, ["《故事》", "第一句。第二句。"])
+        self.assertEqual(manuscript_receipt_issues(receipt), [])
 
     def test_customer_manuscript_rejects_missing_repeated_and_placeholder_text(self) -> None:
         content = self.make_content_manifest()

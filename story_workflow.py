@@ -34,10 +34,15 @@ from story_contract_consumers import (
     compile_release_render_spec,
     release_argument_overrides,
 )
+from story_contract_runtime import read_trusted_story_text
 from artifact_semantic_plan import load_current_artifact_semantic_plan, semantic_plan_path, selected_line_indices
 from r2v_retry_policy import evaluate_quality_redos
 from presenter_layout import PRESENTER_LAYOUT_POLICY, compile_fixed_anchor, scan_rvm_body_overflow
 from story_delivery_policy import release_semantic_subtitle_artifact
+from story_timeline import ensure_authoritative_timeline_srt
+from release_geometry import CANONICAL_B_STORY_BOX
+from demo_quality import demo_render_manifest_issues
+from static_ppt_contract import validate_delivery_receipt as validate_static_ppt_delivery_receipt
 
 from story_project import (
     auto_keying,
@@ -71,6 +76,134 @@ from story_project import (
 
 
 ROOT = Path(__file__).resolve().parent
+DEFAULT_B_STORY_BOX_TEXT = ",".join(str(value) for value in CANONICAL_B_STORY_BOX)
+
+
+def customer_manuscript_source(
+    confirmed_story_text: Path | None,
+    generated_consumer_manuscript: Path | str | None,
+    generic_story_text: Path | str | None,
+) -> Path | None:
+    """Choose a customer document source without feeding old output back in.
+
+    The hash-bound confirmed manuscript is authoritative.  A prior generated
+    customer document is only a migration fallback, ahead of the subtitle-like
+    generic text source.
+    """
+
+    return first_existing(
+        confirmed_story_text,
+        generated_consumer_manuscript,
+        generic_story_text,
+    )
+
+
+def product_demo_audio_source(
+    confirmed_program_audio: Path | None,
+    manifest_narration: Path | str | None,
+    extracted_narration: Path | str | None,
+) -> Path | None:
+    """Choose the full spoken program before any body-only narration."""
+
+    return first_existing(
+        confirmed_program_audio,
+        manifest_narration,
+        extracted_narration,
+    )
+
+
+def static_ppt_inputs_from_delivery_receipt(status_dir: Path) -> dict[str, Path]:
+    """Return the exact sealed PPT inputs recorded by the native ledger."""
+
+    receipt_path = story_run_artifact_path(status_dir, "static_ppt_delivery_receipt")
+    if receipt_path is None:
+        return {}
+    receipt = validate_static_ppt_delivery_receipt(receipt_path)
+    return {
+        "--director-plan": Path(str(receipt["director_plan_path"])),
+        "--shot-storyboard-compile-receipt": Path(
+            str(receipt["shot_storyboard_compile_receipt_path"])
+        ),
+        "--static-ppt-plan": Path(str(receipt["ppt_plan_path"])),
+        "--static-ppt-with-subtitles": Path(str(receipt["with_subtitles_pptx_path"])),
+        "--static-ppt-without-subtitles": Path(str(receipt["without_subtitles_pptx_path"])),
+    }
+
+
+def product_body_subtitles_from_customer_media_receipt(status_dir: Path) -> Path | None:
+    """Resolve the exact body-only SRT already audited with customer media."""
+
+    receipt_path = story_run_artifact_path(status_dir, "customer_media_receipt")
+    if receipt_path is None:
+        return None
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ValueError("客户媒体回执无法读取") from exc
+    if receipt.get("passed") is not True or receipt.get("critical_errors"):
+        raise ValueError("客户媒体回执未通过，不能复用正文 SRT")
+    subtitle = receipt.get("subtitle_srt")
+    if not isinstance(subtitle, dict):
+        raise ValueError("客户媒体回执缺少正文 SRT 绑定")
+    path = Path(str(subtitle.get("path") or "")).expanduser()
+    expected = str(subtitle.get("sha256") or "").lower()
+    if not path.is_file() or len(expected) != 64:
+        raise ValueError("客户媒体回执的正文 SRT 不存在")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+        raise ValueError("客户媒体回执的正文 SRT 哈希失效")
+    return path
+
+
+def current_demo_preview_manifest(project_root: Path, manifest: dict) -> Path:
+    """Resolve the newest *valid* preview geometry receipt, never a dead path.
+
+    Older repair runs stored this receipt under a run-specific status folder,
+    while the workflow later hard-coded one product-work path.  Search the
+    bounded status tree only as a migration fallback and validate every
+    candidate's hashes before allowing Release to inherit its geometry.
+    """
+
+    paths = project_paths(project_root)
+    outputs = manifest.get("outputs") if isinstance(manifest.get("outputs"), dict) else {}
+    candidates: list[Path] = []
+    explicit = Path(str(outputs.get("demo_preview_manifest") or ""))
+    if explicit.is_file():
+        candidates.append(explicit)
+    candidates.extend(
+        path
+        for path in (
+            paths.status / "product_package_work" / "demo_preview_manifest.json",
+            paths.product / "product_package_work" / "demo_preview_manifest.json",
+            paths.status / "product_assets" / "demo_preview_manifest.json",
+        )
+        if path.is_file()
+    )
+    discovered = sorted(
+        paths.status.rglob("*demo*manifest*.json"),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+    candidates.extend(discovered)
+    seen: set[Path] = set()
+    rejected: list[str] = []
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved in seen:
+            continue
+        seen.add(resolved)
+        try:
+            payload = json.loads(candidate.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            rejected.append(f"{candidate}:{exc}")
+            continue
+        if payload.get("mode") != "preview":
+            continue
+        issues = demo_render_manifest_issues(candidate, paths.root, require_final=False)
+        if not issues:
+            return candidate
+        rejected.append(f"{candidate}:{','.join(issues)}")
+    detail = "；".join(rejected[:4]) or "未找到 preview 模式回执"
+    raise FileNotFoundError(f"缺少当前有效的 Demo 预览几何回执：{detail}")
 
 
 def main() -> None:
@@ -365,6 +498,9 @@ def main() -> None:
     release = subparsers.add_parser("package-release", help="背景成片 -> 主账号/宝库号小红书发布视频")
     release.add_argument("--story-name", required=True)
     release.add_argument("--duration-text", required=True)
+    release.add_argument("--age-text", required=True)
+    release.add_argument("--usage-text", default="适用于朗诵比赛、故事表演、少儿口才、技能比拼")
+    release.add_argument("--story-type", default="儿童故事")
     release.add_argument("--bg-video", required=True, type=Path)
     release.add_argument("--output-dir", required=True, type=Path)
     release.add_argument("--variant", choices=["both", "main", "library"], default="both")
@@ -373,7 +509,15 @@ def main() -> None:
     release.add_argument("--audio-mix", type=Path)
     release.add_argument("--watermark-logo", type=Path)
     release.add_argument("--antipiracy-logo", type=Path)
-    release.add_argument("--plate-image", type=Path)
+    release.add_argument("--contract-render-spec", required=True, type=Path)
+    release.add_argument("--artifact-semantic-plan", required=True, type=Path)
+    release.add_argument("--main-top-panel", type=Path)
+    release.add_argument("--main-bottom-panel", type=Path)
+    release.add_argument("--library-top-panel", type=Path)
+    release.add_argument("--library-bottom-panel", type=Path)
+    release.add_argument("--main-package-spec", type=Path)
+    release.add_argument("--main-package-receipt", type=Path)
+    release.add_argument("--approved-preview-geometry", type=Path)
     release.add_argument("--video-box", default="0,416,1080,608")
     release.add_argument("--watermark-width", default=96, type=int)
     release.add_argument("--watermark-opacity", default=0.78, type=float)
@@ -381,8 +525,9 @@ def main() -> None:
     release.add_argument("--frame-image", type=Path)
     release.add_argument("--frame-image-b", type=Path)
     release.add_argument("--story-box", default="170,250,990,557")
-    release.add_argument("--b-story-box", default="150,88,1620,911")
+    release.add_argument("--b-story-box", default=DEFAULT_B_STORY_BOX_TEXT)
     release.add_argument("--b-windows", default="")
+    release.add_argument("--c-windows", default="")
     release.add_argument("--story-logo", type=Path)
     release.add_argument("--story-logo-width-a", default=180, type=int)
     release.add_argument("--story-logo-width-b", default=210, type=int)
@@ -400,11 +545,11 @@ def main() -> None:
     release.add_argument("--chroma-color", default="0x00FF00")
     release.add_argument("--chroma-similarity", default=0.16, type=float)
     release.add_argument("--chroma-blend", default=0.08, type=float)
-    release.add_argument("--keyer", choices=["chromakey", "colorkey"], default="chromakey")
+    release.add_argument("--keyer", choices=["chromakey", "colorkey", "rvm"], default="chromakey")
     release.add_argument("--keying-preset-json", type=Path)
     release.add_argument("--demo-render-manifest", type=Path)
     release.add_argument("--person-crop", default="")
-    release.add_argument("--person-grade", choices=["none", "log-soft", "log-strong"], default="none")
+    release.add_argument("--person-grade", choices=["none", "natural", "log-soft", "log-strong"], default="none")
     release.add_argument("--library-watermark-text", default="绵羊姐姐原创故事资源")
     release.add_argument("--tail-seconds", default=0.0, type=float)
     release.add_argument("--tail-notice-text", default="有需要联系客服，好作品有偿分享！")
@@ -914,6 +1059,12 @@ def main() -> None:
             args.story_name,
             "--duration-text",
             args.duration_text,
+            "--age-text",
+            args.age_text,
+            "--usage-text",
+            args.usage_text,
+            "--story-type",
+            args.story_type,
             "--bg-video",
             args.bg_video,
             "--output-dir",
@@ -956,6 +1107,10 @@ def main() -> None:
             str(args.person_x),
             "--person-y",
             str(args.person_y),
+            "--contract-render-spec",
+            args.contract_render_spec,
+            "--artifact-semantic-plan",
+            args.artifact_semantic_plan,
         ]
         for flag, value in (
             ("--bg-image", args.bg_image),
@@ -963,13 +1118,19 @@ def main() -> None:
             ("--audio-mix", args.audio_mix),
             ("--watermark-logo", args.watermark_logo),
             ("--antipiracy-logo", args.antipiracy_logo),
-            ("--plate-image", args.plate_image),
             ("--frame-image", args.frame_image),
             ("--frame-image-b", args.frame_image_b),
             ("--story-logo", args.story_logo),
             ("--subtitle-srt", args.subtitle_srt),
             ("--keying-preset-json", args.keying_preset_json),
             ("--demo-render-manifest", args.demo_render_manifest),
+            ("--main-top-panel", args.main_top_panel),
+            ("--main-bottom-panel", args.main_bottom_panel),
+            ("--library-top-panel", args.library_top_panel),
+            ("--library-bottom-panel", args.library_bottom_panel),
+            ("--main-package-spec", args.main_package_spec),
+            ("--main-package-receipt", args.main_package_receipt),
+            ("--approved-preview-geometry", args.approved_preview_geometry),
         ):
             if value is not None:
                 command.extend([flag, value])
@@ -983,6 +1144,8 @@ def main() -> None:
                 args.b_story_box,
                 "--b-windows",
                 args.b_windows,
+                "--c-windows",
+                args.c_windows,
                 "--story-logo-width-a",
                 str(args.story_logo_width_a),
                 "--story-logo-width-b",
@@ -1275,15 +1438,21 @@ def preview_times_with_keying_coverage(value: str, preset_path: Path | None) -> 
 
 
 def preview_times_with_library_tail_coverage(value: str, duration: float, tail_seconds: float) -> str:
-    """Always include a frame inside the blurred library sales tail."""
+    """Include samples immediately before and inside the expected sales tail."""
 
     from release_video import resolved_tail_seconds
 
     times = [max(0.0, float(part.strip())) for part in value.replace("，", ",").split(",") if part.strip()]
     tail_duration = resolved_tail_seconds(duration, tail_seconds)
-    tail_sample = max(0.0, duration - min(2.0, max(0.2, tail_duration / 2)))
-    if int(round(tail_sample)) not in {int(round(item)) for item in times}:
-        times.append(tail_sample)
+    tail_start = max(0.0, duration - tail_duration)
+    candidates = (
+        max(0.0, tail_start - 0.5),
+        min(max(0.0, duration - 0.04), tail_start + min(1.0, max(0.2, tail_duration / 4))),
+        max(0.0, duration - 0.2),
+    )
+    for candidate in candidates:
+        if int(round(candidate)) not in {int(round(item)) for item in times}:
+            times.append(candidate)
     return ",".join(f"{item:.3f}" for item in times)
 
 
@@ -1475,7 +1644,16 @@ def run_package_release_project(
         )
     if main_bg_video is None and library_bg_video is None:
         raise FileNotFoundError("缺少背景成片：请先完成 ⑪ 合成背景成片。")
-    audio_mix = first_existing(outputs.get("demo_voice_bgm"), paths.assembly / "story_demo_voice_bgm.mp4", inputs.get("narration"))
+    # Release is a full spoken program (opening + body + closing).  The
+    # manifest narration field may intentionally contain only the story body;
+    # using it as the render clock truncated this project's 179.86 s program
+    # to 155.32 s and made terminal-frame QA impossible.
+    audio_mix = first_existing(
+        confirmed_audio_from_story_run(paths.status),
+        outputs.get("demo_voice_bgm"),
+        paths.assembly / "story_demo_voice_bgm.mp4",
+        inputs.get("narration"),
+    )
     greenscreen = first_existing(inputs.get("greenscreen_video"))
     theme_dir = paths.release / "theme_assets"
     # 第 12 步只生成一个统一故事框；非严格 QA 只负责从源图导出 A 框。
@@ -1495,6 +1673,10 @@ def run_package_release_project(
     frame_a = first_existing(outputs.get("story_frame_a"), theme_dir / "story_frame_a.png")
     frame_b = frame_a
     confirmed_spoken_srt = ensure_confirmed_spoken_timeline_srt(paths.status, paths.assembly)
+    authoritative_timeline_receipt = story_run_artifact_path(
+        paths.status,
+        "authoritative_timeline_receipt",
+    )
     subtitle_srt = first_existing(
         # A reviewed short-cue full program SRT is the strongest release
         # source.  Body-only sales subtitles belong to customer background
@@ -1682,16 +1864,11 @@ def run_package_release_project(
                     / str(release_semantic_plan["semantic_source"]["project_relative_path"])
                 ),
             )
+        # tail_seconds=0 means the library renderer's automatic sales-protect
+        # window (normally about the final 30–50 seconds).  It must not be
+        # replaced by the often one-second post-speech silence; doing so makes
+        # a technically present but commercially ineffective tail.
         effective_tail_seconds = float(release_defaults.get("tail_seconds", 0.0))
-        if selected_variant == "library" and release_subtitle_srt is not None:
-            cues = parse_simple_srt(release_subtitle_srt)
-            if cues:
-                post_speech_silence = max(0.04, probe_duration(bg_video) - float(cues[-1][1]))
-                effective_tail_seconds = (
-                    post_speech_silence
-                    if effective_tail_seconds <= 0
-                    else min(effective_tail_seconds, post_speech_silence)
-                )
         command: list[object] = [
             "--story-name",
             story.get("name", ""),
@@ -1714,7 +1891,7 @@ def run_package_release_project(
             "--background-blur",
             str(release_defaults.get("background_blur", 14)),
             "--b-story-box",
-            release_defaults.get("b_story_box", "356,180,1209,680"),
+            release_defaults.get("b_story_box", DEFAULT_B_STORY_BOX_TEXT),
             "--crf",
             str(release_defaults.get("crf", 17)),
             "--preset",
@@ -1764,11 +1941,11 @@ def run_package_release_project(
             # Both short preview and formal Release inherit the same reviewed
             # real-material Demo geometry. The full customer Demo remains an
             # independent downstream artifact and no longer gates Release.
-            demo_manifest_name = "demo_preview_manifest.json"
+            demo_preview_manifest = current_demo_preview_manifest(paths.root, manifest)
             command.extend([
                 "--contract-render-spec", release_contract_spec,
                 "--artifact-semantic-plan", semantic_plan_path(paths.root),
-                "--demo-render-manifest", paths.status / "product_package_work" / demo_manifest_name,
+                "--demo-render-manifest", demo_preview_manifest,
             ])
             if not is_preview:
                 command.extend([
@@ -2017,11 +2194,16 @@ def run_package_release_project(
         sheet = render_release_preview_contact_sheet(preview_dir, run_id)
         handoff = write_release_preview_index(preview_dir, sheet, run_id)
         feedback_handoff = write_release_preview_feedback_handoff(preview_dir, sheet, run_id)
+        review_bundle = write_release_preview_review_bundle(
+            preview_dir,
+            paths.status / "reviews" / "release_preview_bundle.json",
+        )
         print("", flush=True)
         print(f"本轮预览目录：{preview_dir}", flush=True)
         print(f"总览拼图：{sheet}", flush=True)
         print(f"预览索引：{handoff}", flush=True)
         print(f"反馈给 Codex：{feedback_handoff}", flush=True)
+        print(f"独立审核哈希包：{review_bundle}", flush=True)
         for path in important_preview_images(preview_dir):
             print(f"重点预览：{path}", flush=True)
         return
@@ -2034,6 +2216,25 @@ def reset_release_preview_dir(preview_dir: Path) -> None:
     if preview_dir.exists():
         shutil.rmtree(preview_dir)
     preview_dir.mkdir(parents=True, exist_ok=True)
+
+
+def write_release_preview_review_bundle(preview_dir: Path, output: Path) -> Path:
+    """Bind every current preview artifact before independent review.
+
+    Formal Release already fails closed when this bundle or its review is
+    absent or stale. Creating the bundle during preview generation closes the
+    former handoff gap where operators had to assemble it manually.
+    """
+
+    from story_evidence import review_bundle_is_current, write_review_bundle
+
+    artifacts = sorted(path for path in preview_dir.rglob("*") if path.is_file())
+    if not artifacts:
+        raise RuntimeError("发布预览为空，无法生成独立审核哈希包")
+    write_review_bundle(output, artifacts)
+    if not review_bundle_is_current(output):
+        raise RuntimeError("发布预览独立审核哈希包生成后未通过当前性校验")
+    return output
 
 
 def important_preview_images(preview_dir: Path) -> list[Path]:
@@ -2485,9 +2686,21 @@ def run_product_package_project(
     outputs = manifest["outputs"]
     story_text = first_existing(inputs.get("story_text"))
     confirmed_story_text = confirmed_text_from_story_run(paths.status)
-    story_document_text = first_existing(outputs.get("consumer_manuscript"), story_text)
+    # The project manifest's generic story_text may be the punctuation-free
+    # subtitle TXT.  Prefer the hash-bound confirmed manuscript for the
+    # customer Word document so neither timing rows nor an old generated
+    # consumer manuscript can become the source of a corrected package.
+    story_document_text = customer_manuscript_source(
+        confirmed_story_text,
+        outputs.get("consumer_manuscript"),
+        story_text,
+    )
     script_lines = first_existing(confirmed_story_text, inputs.get("story_text"), paths.inputs / "story_source.txt")
-    narration = first_existing(inputs.get("narration"), inputs.get("extracted_narration"))
+    narration = product_demo_audio_source(
+        confirmed_audio_from_story_run(paths.status),
+        inputs.get("narration"),
+        inputs.get("extracted_narration"),
+    )
     music = first_existing(
         story_run_artifact_path(paths.status, "final_background_music"),
         paths.video_jobs / "music" / f"{story.get('slug')}_background_music.mp3",
@@ -2517,15 +2730,24 @@ def run_product_package_project(
     )
     confirmed_spoken_srt = ensure_confirmed_spoken_timeline_srt(paths.status, paths.assembly)
     body_subtitles_srt = first_existing(
+        product_body_subtitles_from_customer_media_receipt(paths.status),
         outputs.get("sales_subtitles_srt"),
         paths.assembly / "story_sales_subtitles.srt",
         paths.assembly / "story_subtitles.srt",
     )
-    full_subtitles_srt = first_existing(paths.assembly / "story_full_subtitles.srt")
+    full_subtitles_srt = first_existing(
+        paths.status / "release_semantics" / "main_demo_subtitles.srt",
+        paths.assembly / "story_full_subtitles.srt",
+        paths.assembly / "subtitles" / "全片字幕_62行.srt",
+    )
     source_subtitles = first_existing(
         paths.assembly / "story_semantic_timeline.srt",
         confirmed_spoken_srt,
         paths.assembly / "story_subtitles.srt",
+    )
+    authoritative_timeline_receipt = story_run_artifact_path(
+        paths.status,
+        "authoritative_timeline_receipt",
     )
     # The customer manuscript keeps natural reading paragraphs, while PPTs
     # must stay one-to-one with the generated storyboard images.  Prepared
@@ -2566,6 +2788,7 @@ def run_product_package_project(
         ("主账号 A 镜背景图", demo_bg),
         ("主账号 A 镜故事框", story_frame_a),
         ("timings.json", timings),
+        ("权威时间轴回执", authoritative_timeline_receipt),
     ):
         if value is None:
             missing.append(label)
@@ -2604,6 +2827,8 @@ def run_product_package_project(
         paths.product,
         "--work-dir",
         paths.status / "product_package_work",
+        "--authoritative-timeline-receipt",
+        authoritative_timeline_receipt,
         "--demo-person-crop-bottom-ratio",
         str(demo_person_crop_bottom_ratio),
         "--demo-person-crop-mode",
@@ -2617,29 +2842,35 @@ def run_product_package_project(
         "--demo-logo-y",
         str(release_defaults.get("story_logo_y", 44)),
     ]
+    receipted_static_ppt_inputs = static_ppt_inputs_from_delivery_receipt(paths.status)
     static_ppt_inputs = {
         "--director-plan": first_existing(
+            receipted_static_ppt_inputs.get("--director-plan"),
             story_run_artifact_path(paths.status, "master_director_plan"),
             paths.root / "01_导演计划" / "master_director_plan.json",
             paths.status / "director" / "story_r2v_plan_draft.json",
             paths.status / "director" / "story_r2v_plan.json",
         ),
         "--shot-storyboard-compile-receipt": first_existing(
+            receipted_static_ppt_inputs.get("--shot-storyboard-compile-receipt"),
             story_run_artifact_path(paths.status, "shot_storyboard_compile_receipt"),
             paths.root / "01_导演计划" / "shot_storyboard_compile_receipt.json",
             paths.status / "storyboards" / "shot_storyboard_compile_receipt.json"
         ),
         "--static-ppt-plan": first_existing(
+            receipted_static_ppt_inputs.get("--static-ppt-plan"),
             story_run_artifact_path(paths.status, "static_ppt_plan"),
             paths.root / "01_导演计划" / "static_ppt_plan.json",
             paths.status / "product" / "static_ppt_plan.json",
         ),
         "--static-ppt-with-subtitles": first_existing(
+            receipted_static_ppt_inputs.get("--static-ppt-with-subtitles"),
             paths.product / "build" / f"{story.get('name')}_静态故事PPT_含字幕.pptx",
             paths.root / "05_产品资料" / "构建中" / f"{story.get('name')}_静态故事PPT_含字幕.pptx",
             paths.product / "构建中" / f"{story.get('name')}_静态故事PPT_含字幕.pptx"
         ),
         "--static-ppt-without-subtitles": first_existing(
+            receipted_static_ppt_inputs.get("--static-ppt-without-subtitles"),
             paths.product / "build" / f"{story.get('name')}_静态故事PPT_无字幕.pptx",
             paths.root / "05_产品资料" / "构建中" / f"{story.get('name')}_静态故事PPT_无字幕.pptx",
             paths.product / "构建中" / f"{story.get('name')}_静态故事PPT_无字幕.pptx"
@@ -2655,6 +2886,7 @@ def run_product_package_project(
         )
         for option, value in static_ppt_inputs.items():
             command.extend([option, value])
+        command.extend(["--background-subtitle-srt", body_subtitles_srt])
     elif (paths.status / "story_run.json").is_file() or any(static_ppt_inputs.values()):
         missing_static = [option for option, value in static_ppt_inputs.items() if value is None]
         raise FileNotFoundError(
@@ -2666,13 +2898,16 @@ def run_product_package_project(
     if full_subtitles_srt is not None:
         command.extend(["--demo-subtitle-srt", full_subtitles_srt])
     if story_contract_context is not None:
-        # The semantic plan supersedes the older static product selector for
-        # required_v1 projects. Loading revalidates lock, source and recompilation.
-        load_current_artifact_semantic_plan(paths.root)
-        command.extend([
-            "--project-dir", paths.root,
-            "--artifact-semantic-plan", semantic_plan_path(paths.root),
-        ])
+        command.extend(["--project-dir", paths.root])
+        # A current static-PPT delivery receipt is the authoritative native
+        # branch and product_package intentionally rejects mixing it with the
+        # older artifact-semantic-plan PPT selector.  Only projects without a
+        # complete sealed PPT set use that legacy selector.
+        if not all(static_ppt_inputs.values()):
+            load_current_artifact_semantic_plan(paths.root)
+            command.extend([
+                "--artifact-semantic-plan", semantic_plan_path(paths.root),
+            ])
         release_context = paths.status / "contracts" / "consumers" / "release_video.json"
         demo_brand_spec_path = compile_demo_render_spec(
             release_context,
@@ -2707,10 +2942,32 @@ def run_product_package_project(
     if allow_draft_annotation:
         command.append("--allow-draft-annotation")
     run_script("product_package.py", *command)
-    manifest = refresh_project_outputs(paths.root)
-    write_manifest(paths, manifest)
+    manifest = bind_generated_product_outputs(paths.root, str(story.get("name") or ""))
     if not preview_only:
         qa_product(paths.root)
+
+
+def bind_generated_product_outputs(project_dir: Path, story_name: str) -> dict[str, Any]:
+    """Bind QA to the package directories produced by the current command.
+
+    Generic discovery deliberately preserves existing in-project paths.  That
+    is useful during passive scans, but it previously meant a successful
+    formal package rebuild could still leave QA pointing at an older package
+    tree.  The producer knows its exact output locations, so it must bind them
+    explicitly before QA runs.
+    """
+
+    paths = project_paths(project_dir)
+    base = paths.product / f"绵羊故事锦囊：{story_name}（基础版）"
+    advanced = paths.product / f"绵羊故事锦囊：{story_name}（进阶版）"
+    missing = [str(path) for path in (base, advanced) if not path.is_dir()]
+    if missing:
+        raise FileNotFoundError("正式资料包生成后缺少目标目录：" + "、".join(missing))
+    manifest = refresh_project_outputs(paths.root)
+    manifest["outputs"]["product_base"] = str(base)
+    manifest["outputs"]["product_advanced"] = str(advanced)
+    write_manifest(paths, manifest)
+    return manifest
 
 
 def confirmed_text_from_story_run(status_dir: Path) -> Path | None:
@@ -2726,7 +2983,28 @@ def confirmed_text_from_story_run(status_dir: Path) -> Path | None:
         return None
     path = Path(str(record.get("path") or "")).expanduser()
     expected = str(record.get("sha256") or "").lower()
-    if path.suffix.lower() not in {".txt", ".md"} or not path.is_file() or len(expected) != 64:
+    if path.suffix.lower() not in {".txt", ".md", ".docx"} or not path.is_file() or len(expected) != 64:
+        return None
+    digest = hashlib.sha256(path.read_bytes()).hexdigest()
+    return path if digest == expected else None
+
+
+def confirmed_audio_from_story_run(status_dir: Path) -> Path | None:
+    """Return the hash-bound full-program audio from the native story ledger."""
+
+    run_file = status_dir / "story_run.json"
+    try:
+        payload = json.loads(run_file.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    record = payload.get("inputs", {}).get("audio", {})
+    if not isinstance(record, dict):
+        return None
+    path = Path(str(record.get("path") or "")).expanduser()
+    expected = str(record.get("sha256") or "").lower()
+    if path.suffix.lower() not in {".mp3", ".wav", ".m4a", ".aac", ".flac", ".ogg"}:
+        return None
+    if not path.is_file() or len(expected) != 64:
         return None
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
     return path if digest == expected else None
@@ -2813,7 +3091,7 @@ def sealed_storyboard_images_dir(status_dir: Path) -> Path | None:
 def build_product_text_sources_from_story_source(story_text: Path, subtitles_srt: Path, output_dir: Path) -> tuple[Path, Path]:
     story_lines = [
         line.strip()
-        for line in story_text.read_text(encoding="utf-8-sig", errors="ignore").splitlines()
+        for line in read_trusted_story_text(story_text).splitlines()
         if line.strip()
     ]
     cues = parse_simple_srt(subtitles_srt)
@@ -3094,51 +3372,7 @@ def ensure_confirmed_spoken_timeline_srt(status_dir: Path, assembly_dir: Path) -
     without running ASR or changing any confirmed text.
     """
 
-    native = assembly_dir / "story_semantic_timeline.srt"
-    if native.is_file():
-        return native
-    existing = first_existing(
-        status_dir / "preflight_alignment" / "confirmed_spoken_timeline.srt",
-        status_dir / "preflight" / "confirmed_spoken_timeline.srt",
-    )
-    if existing is not None:
-        return existing
-    timings_path = first_existing(
-        status_dir / "preflight_alignment" / "confirmed_line_timings.json",
-        status_dir / "preflight" / "confirmed_line_timings.json",
-    )
-    if timings_path is None:
-        return None
-    try:
-        rows = json.loads(timings_path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise ValueError("完整口播时间轴无法解析") from exc
-    if not isinstance(rows, list) or not rows:
-        raise ValueError("完整口播时间轴为空")
-
-    def stamp(seconds: float) -> str:
-        millis = max(0, round(seconds * 1000))
-        hours, millis = divmod(millis, 3_600_000)
-        minutes, millis = divmod(millis, 60_000)
-        secs, millis = divmod(millis, 1000)
-        return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
-
-    blocks: list[str] = []
-    previous_end = -1.0
-    for position, row in enumerate(rows, start=1):
-        if not isinstance(row, dict):
-            raise ValueError("完整口播时间轴条目格式错误")
-        text = str(row.get("line") or "").strip()
-        start = float(row.get("source_start", row.get("timeline_start", 0.0)))
-        end = float(row.get("source_end", row.get("timeline_end", start)))
-        if not text or start < 0 or end <= start or start + 1e-6 < previous_end:
-            raise ValueError("完整口播时间轴必须文本非空、时长为正且单调")
-        blocks.append(f"{position}\n{stamp(start)} --> {stamp(end)}\n{text}")
-        previous_end = end
-    target_dir = timings_path.parent
-    target = target_dir / "confirmed_spoken_timeline.srt"
-    target.write_text("\n\n".join(blocks) + "\n", encoding="utf-8")
-    return target
+    return ensure_authoritative_timeline_srt(status_dir, assembly_dir)
 
 
 def compile_release_subtitle_srt(

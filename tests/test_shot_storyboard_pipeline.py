@@ -11,6 +11,8 @@ from PIL import Image
 from run_image_video_jobs import create_provider_task, row_reference_paths
 from shot_storyboard_pipeline import (
     StoryboardPipelineError,
+    _prompt_with_offscreen_reveal_guard,
+    _runtime_reference_assets,
     build_storyboard_prompt,
     build_storyboard_manifest,
     compile_consumers,
@@ -20,7 +22,7 @@ from shot_storyboard_pipeline import (
 )
 from story_video_synthesizer.image_video import validate_image_video_jobs
 from story_video_synthesizer.toapis_video import ToAPIsVideoClient
-from tests.test_story_r2v_skill import valid_plan
+from tests.test_story_r2v_skill import valid_plan, valid_v4_plan
 
 
 STATIC_VALIDATOR_PATH = (
@@ -125,6 +127,76 @@ class ShotStoryboardPipelineTests(unittest.TestCase):
         self.assertIn("exactly one clearly bounded, soft-edged, non-text visual speech bubble", prompt)
         self.assertIn("repeated identity is allowed only inside that bubble", prompt)
 
+    def test_v4_storyboard_prompt_carries_structured_focus_presence_props_and_primary_beats(self) -> None:
+        plan = valid_v4_plan()
+        shot = plan["shots"][0]
+        group = plan["continuity_groups"][0]
+        prompt = build_storyboard_prompt(shot, [], group)
+        self.assertIn('"setup_id": "setup-character-a"', prompt)
+        self.assertIn('"axis_id": "garden-axis"', prompt)
+        self.assertIn("Authoritative scene-map zones:", prompt)
+        self.assertIn('"map_x": 20', prompt)
+        self.assertIn("Fixed scene anchors and occupancy:", prompt)
+        self.assertIn("Group color contract:", prompt)
+        self.assertIn("Only the declared background_zone_ids", prompt)
+        self.assertIn("Authoritative camera-view plate: environment-view-a", prompt)
+        self.assertIn("Empty means character-free, not infrastructure-free", prompt)
+        self.assertIn("No on-screen character, crowd or anchor may come from a zone behind the camera", prompt)
+        self.assertIn("Visible anchors:", prompt)
+        self.assertIn("Excluded anchors:", prompt)
+        self.assertIn("Off-screen never means absent from the scene", prompt)
+        self.assertIn("complete, securely closed everyday clothing", prompt)
+        self.assertIn("Focus contract:", prompt)
+        self.assertIn("Subject presence contract:", prompt)
+        self.assertIn("Prop contracts:", prompt)
+        self.assertIn("One primary action per performance beat:", prompt)
+        self.assertIn('"subject_id": "character-b"', prompt)
+
+    def test_runtime_offscreen_guard_prevents_eyeline_from_revealing_excluded_zone(self) -> None:
+        shot = valid_v4_plan()["shots"][0]
+        prompt = _prompt_with_offscreen_reveal_guard(shot)
+        self.assertIn("[OFFSCREEN_REVEAL_GUARD_V1]", prompt)
+        self.assertIn("must not follow that eyeline", prompt)
+        self.assertIn('"character-b"', prompt)
+        self.assertIn('"stone-path"', prompt)
+        self.assertEqual(
+            _prompt_with_offscreen_reveal_guard({**shot, "prompt": prompt}),
+            prompt,
+        )
+
+    def test_runtime_storyboard_is_the_only_population_image_for_exact_recurring_cohort(self) -> None:
+        shot = {
+            "storyboard_reference_mode": "runtime",
+            "crowd_plan": {
+                "mode": "recurring_cohort",
+                "target_count": 5,
+                "population_asset_ids": ["audience-population"],
+            },
+        }
+        population = {"asset_id": "audience-population", "kind": "population"}
+        environment = {"asset_id": "environment", "kind": "environment"}
+        storyboard = {"asset_id": "storyboard__shot-001", "kind": "storyboard"}
+        filtered, policy = _runtime_reference_assets(
+            shot, [population, environment, storyboard]
+        )
+        self.assertEqual(
+            [item["asset_id"] for item in filtered],
+            ["environment", "storyboard__shot-001"],
+        )
+        self.assertEqual(
+            policy["omitted_population_asset_ids"], ["audience-population"]
+        )
+
+        anonymous = {
+            **shot,
+            "crowd_plan": {**shot["crowd_plan"], "mode": "anonymous_background"},
+        }
+        retained, anonymous_policy = _runtime_reference_assets(
+            anonymous, [population, environment, storyboard]
+        )
+        self.assertEqual(len(retained), 3)
+        self.assertEqual(anonymous_policy["omitted_population_asset_ids"], [])
+
     def test_one_manifest_compiles_matching_ppt_r2v_plan_and_provider_jobs(self) -> None:
         sealed_path, sealed = self.build_and_seal()
         storyboard_review = self.root / "storyboard_review.json"
@@ -184,6 +256,8 @@ class ShotStoryboardPipelineTests(unittest.TestCase):
         with jobs.open(encoding="utf-8-sig", newline="") as handle:
             row = next(csv.DictReader(handle))
         references = json.loads(row["reference_image_paths_json"])
+        reference_asset_ids = json.loads(row["reference_asset_ids_json"])
+        self.assertEqual(len(reference_asset_ids), len(references))
         self.assertEqual(references[-1], sealed["entries"][0]["image_path"])
         self.assertEqual(row["generation_mode"], "reference_to_video")
         self.assertEqual(validate_image_video_jobs(jobs), [])
@@ -224,6 +298,62 @@ class ShotStoryboardPipelineTests(unittest.TestCase):
                 self.root / "jobs.csv",
                 self.root / "receipt.json",
             )
+
+    def test_ppt_plan_uses_new_director_timing_when_shot_ids_changed(self) -> None:
+        sealed_path, sealed = self.build_and_seal()
+        storyboard_review = self.root / "storyboard_review.json"
+        write_json(
+            storyboard_review,
+            {
+                "approved": True,
+                "score": 94,
+                "critical_errors": [],
+                "artifact_sha256": sealed["storyboard_bundle_sha256"],
+            },
+        )
+        title = self.root / "title.png"
+        Image.new("RGB", (1600, 900), (40, 60, 80)).save(title)
+        import hashlib
+
+        previous_ppt = self.root / "previous_ppt.json"
+        write_json(
+            previous_ppt,
+            {
+                "story_name": "sample-story",
+                "music_path": "/music.mp3",
+                "music_sha256": "d" * 64,
+                "slides": [
+                    {
+                        "shot_id": "TITLE",
+                        "poster_path": str(title),
+                        "poster_sha256": hashlib.sha256(title.read_bytes()).hexdigest(),
+                        "duration_seconds": 2.0,
+                    },
+                    {
+                        "shot_id": "retired-shot-id",
+                        "poster_path": "/old.png",
+                        "duration_seconds": 99.0,
+                    },
+                ],
+            },
+        )
+        output_ppt = self.root / "ppt_plan.json"
+        compile_consumers(
+            sealed_path,
+            storyboard_review,
+            self.root / "r2v.json",
+            self.root / "jobs.csv",
+            self.root / "receipt.json",
+            previous_ppt,
+            output_ppt,
+        )
+
+        ppt_plan = json.loads(output_ppt.read_text(encoding="utf-8"))
+        self.assertEqual(
+            [row["shot_id"] for row in ppt_plan["slides"]],
+            ["TITLE", "shot-001"],
+        )
+        self.assertEqual(ppt_plan["slides"][1]["duration_seconds"], 10.0)
 
     def test_result_heavy_storyboard_can_remain_director_only(self) -> None:
         self.plan["shots"][0]["storyboard_reference_mode"] = "director_only"

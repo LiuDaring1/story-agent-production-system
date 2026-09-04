@@ -9,6 +9,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
+from release_geometry import CANONICAL_B_STORY_BOX
 from release_video import (
     ReleaseConfig,
     _execute_release_layout,
@@ -134,7 +135,7 @@ def release_config(root: Path) -> ReleaseConfig:
         plate_image=None, video_box=(0, 416, 1080, 608), watermark_width=120,
         watermark_opacity=0.62, watermark_speed=0.35, frame_image=paths["frame_a.png"],
         story_box=(170, 250, 990, 557), story_bleed=0, background_blur=14,
-        frame_image_b=paths["frame_b.png"], b_story_box=(150, 88, 1620, 911),
+        frame_image_b=paths["frame_b.png"], b_story_box=CANONICAL_B_STORY_BOX,
         b_windows=((10.0, 20.0),), c_windows=((30.0, 40.0),), story_logo=paths["story_logo.png"],
         story_logo_width_a=180, story_logo_width_b=210, story_logo_x=42, story_logo_y=44,
         subtitle_srt=paths["subtitles.srt"], subtitle_font_size=52, subtitle_margin_v=72,
@@ -174,6 +175,39 @@ class ProtocolOnlyFake:
 
 
 class ReleaseLayoutPortTests(unittest.TestCase):
+    def test_formal_release_rejects_missing_contract_before_any_render(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            config = release_config(Path(directory))
+            fake = ProtocolOnlyFake()
+            with patch("release_video.validate_config"), \
+                 patch(
+                     "release_video.render_static_assets",
+                     side_effect=AssertionError("formal render reached without contract"),
+                 ):
+                with self.assertRaisesRegex(ValueError, "正式发布.*合同"):
+                    package_release_videos(config, contract_spec=None, release_layout_port=fake)
+            self.assertEqual(fake.requests, [])
+
+    def test_formal_release_rejects_whole_canvas_plate_before_geometry_compile(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            plate = root / "cover_3x4.png"
+            plate.write_bytes(b"cover is not a release panel")
+            config = replace(release_config(root), plate_image=plate)
+            fake = ProtocolOnlyFake()
+            with patch("release_video.validate_config"), \
+                 patch(
+                     "release_video.compile_release_geometry",
+                     side_effect=AssertionError("geometry compile reached after forbidden plate"),
+                 ):
+                with self.assertRaisesRegex(ValueError, "整张.*plate"):
+                    package_release_videos(
+                        config,
+                        contract_spec={"consumer": "release_video"},
+                        release_layout_port=fake,
+                    )
+            self.assertEqual(fake.requests, [])
+
     def test_source_native_preview_candidates_cannot_resize_or_shift_vertically(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             config = replace(

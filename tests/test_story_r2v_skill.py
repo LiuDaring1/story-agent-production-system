@@ -264,6 +264,366 @@ def valid_two_shot_plan():
     return plan
 
 
+def valid_v4_plan():
+    plan = valid_plan()
+    plan["schema_version"] = "story-r2v-plan-v4"
+    master_environment = next(
+        asset for asset in plan["assets"] if asset["asset_id"] == "environment-a"
+    )
+    master_environment["environment_family_id"] = "garden-environment-family"
+    plan["assets"].extend(
+        [
+            _asset(
+                "environment-view-a",
+                "environment",
+                "empty_environment_camera_view",
+                environment_family_id="garden-environment-family",
+                derived_from_asset_id="environment-a",
+                view_from_zone_id="garden-left",
+                view_target_zone_id="garden-right",
+                view_background_zone_ids=["garden-far-right"],
+            ),
+            _asset(
+                "environment-view-b",
+                "environment",
+                "empty_environment_camera_view",
+                environment_family_id="garden-environment-family",
+                derived_from_asset_id="environment-a",
+                view_from_zone_id="garden-right",
+                view_target_zone_id="garden-left",
+                view_background_zone_ids=["garden-far-left"],
+            ),
+        ]
+    )
+    group = plan["continuity_groups"][0]
+    group["zones"] = [
+        {
+            "zone_id": "garden-left",
+            "description": "the left side of the path used by character-b",
+            "map_x": 0,
+            "map_y": 0,
+        },
+        {
+            "zone_id": "garden-right",
+            "description": "the right side of the path used by character-a",
+            "map_x": 10,
+            "map_y": 0,
+        },
+        {
+            "zone_id": "garden-far-left",
+            "description": "the garden backdrop beyond character-b from the reverse camera",
+            "map_x": -10,
+            "map_y": 0,
+        },
+        {
+            "zone_id": "garden-far-right",
+            "description": "the garden backdrop beyond character-a from the first camera",
+            "map_x": 20,
+            "map_y": 0,
+        },
+    ]
+    group["anchors"] = [
+        {
+            "anchor_id": "stone-path",
+            "zone_id": "garden-left",
+            "description": "the fixed stone path",
+            "persistence": "fixed",
+            "occupancy_rule": "none",
+            "occupant_subject_id": None,
+        },
+        {
+            "anchor_id": "large-tree",
+            "zone_id": "garden-right",
+            "description": "the fixed large tree",
+            "persistence": "fixed",
+            "occupancy_rule": "none",
+            "occupant_subject_id": None,
+        },
+    ]
+    group["color_contract"] = {
+        "white_balance": "neutral daylight",
+        "palette": "fresh greens, natural browns and clean neutral highlights",
+        "prohibited_casts": ["unmotivated full-frame yellow cast"],
+        "rationale": "daytime garden scene",
+    }
+    group["axes"] = [
+        {
+            "axis_id": "garden-axis",
+            "endpoint_a_zone_id": "garden-left",
+            "endpoint_b_zone_id": "garden-right",
+            "description": "the stable 180-degree line between both path zones",
+        }
+    ]
+    group["camera_setups"] = [
+        {
+            "setup_id": "setup-character-a",
+            "axis_id": "garden-axis",
+            "camera_side": "side_a",
+            "shot_size": "wide",
+            "camera_angle": "eye level toward garden-right",
+            "primary_subject_id": "character-a",
+            "primary_subject_type": "character",
+            "subject_zone_id": "garden-right",
+            "screen_side": "right",
+            "eyeline_direction": "camera_left",
+            "camera_origin_zone_id": "garden-left",
+            "look_target_zone_id": "garden-right",
+            "background_zone_ids": ["garden-far-right"],
+            "camera_position_description": "camera stands on the garden-left side and looks right",
+            "environment_view_asset_id": "environment-view-a",
+        },
+        {
+            "setup_id": "setup-character-b",
+            "axis_id": "garden-axis",
+            "camera_side": "side_a",
+            "shot_size": "close",
+            "camera_angle": "reverse close view toward garden-left",
+            "primary_subject_id": "character-b",
+            "primary_subject_type": "character",
+            "subject_zone_id": "garden-left",
+            "screen_side": "left",
+            "eyeline_direction": "camera_right",
+            "camera_origin_zone_id": "garden-right",
+            "look_target_zone_id": "garden-left",
+            "background_zone_ids": ["garden-far-left"],
+            "camera_position_description": "camera stands on the garden-right side and looks left",
+            "environment_view_asset_id": "environment-view-b",
+        },
+    ]
+
+    shot = plan["shots"][0]
+    shot["reference_asset_ids"] = [
+        "environment-view-a" if value == "environment-a" else value
+        for value in shot["reference_asset_ids"]
+    ]
+    shot["camera_plan"].pop("axis")
+    shot["camera_plan"].update(
+        {
+            "axis_id": "garden-axis",
+            "camera_setup_id": "setup-character-a",
+            "visible_anchor_ids": ["large-tree"],
+            "excluded_anchor_ids": ["stone-path"],
+        }
+    )
+    shot["focus_contract"] = {
+        "primary_subject_id": "character-a",
+        "primary_subject_type": "character",
+        "secondary_subject_ids": ["character-b"],
+        "background_subject_ids": [],
+        "off_screen_subject_ids": [],
+        "visual_priority": "character-a and the visible prop transition",
+        "composition_rule": "character-a remains dominant while character-b supports the action",
+    }
+    shot["subject_presence"] = [
+        {
+            "subject_id": "character-a",
+            "subject_type": "character",
+            "entry_presence": "on_screen",
+            "exit_presence": "on_screen",
+            "entry_zone_id": "garden-right",
+            "exit_zone_id": "garden-right",
+            "entry_world_presence": "in_scene",
+            "exit_world_presence": "in_scene",
+            "entry_world_zone_id": "garden-right",
+            "exit_world_zone_id": "garden-right",
+            "visibility_reason": "character-a performs the primary prop action",
+        },
+        {
+            "subject_id": "character-b",
+            "subject_type": "character",
+            "entry_presence": "off_screen",
+            "exit_presence": "on_screen",
+            "entry_zone_id": None,
+            "exit_zone_id": "garden-left",
+            "entry_world_presence": "in_scene",
+            "exit_world_presence": "in_scene",
+            "entry_world_zone_id": "garden-left",
+            "exit_world_zone_id": "garden-left",
+            "visibility_reason": "character-b enters to support the interaction",
+        },
+    ]
+    shot["prop_contracts"] = [
+        {
+            "prop_id": "prop-a",
+            "asset_id": "prop-before",
+            "entry_presence": "present",
+            "exit_presence": "present",
+            "entry_state": "complete",
+            "exit_state": "one-part-removed",
+            "owner_id": "character-a",
+            "zone_id": "garden-right",
+            "scale_basis": "handheld_small",
+            "support_mode": "handheld",
+            "rigidity": "rigid",
+            "grip_or_contact": "held securely at the intended handle",
+            "forbidden_inferences": ["must not become grounded or oversized"],
+        }
+    ]
+    for index, beat in enumerate(shot["performance_beats"], start=1):
+        primary_subject = "character-b" if index == 1 else "character-a"
+        beat["primary_beat"] = {
+            "subject_id": primary_subject,
+            "action": beat["performance"],
+        }
+        beat["supporting_actions"] = [
+            {
+                "subject_id": "character-a" if primary_subject == "character-b" else "character-b",
+                "action": "supports the primary action without taking over the frame",
+            }
+        ]
+    return plan
+
+
+def valid_v4_reverse_shot_plan():
+    plan = valid_v4_plan()
+    plan["source_audio"]["duration_seconds"] = 20.0
+    first = plan["shots"][0]
+    second = copy.deepcopy(first)
+    second["shot_id"] = "shot-002"
+    second["source_start"] = 10.0
+    second["source_end"] = 20.0
+    second["relation_to_previous"] = "same_scene_angle_change"
+    second["reference_asset_ids"] = [
+        "character-a",
+        "character-b",
+        "environment-view-b",
+        "prop-after",
+    ]
+    second["initial_visible_characters"] = ["character-a", "character-b"]
+    second["entering_characters"] = []
+    second["entry_state"] = {"prop-a": "one-part-removed"}
+    second["exit_state"] = {"prop-a": "one-part-removed"}
+    second["camera_plan"].update(
+        {
+            "start_size": "close",
+            "end_size": "close",
+            "movement": "locked reverse close view",
+            "camera_setup_id": "setup-character-b",
+            "visible_anchor_ids": ["stone-path"],
+            "excluded_anchor_ids": ["large-tree"],
+        }
+    )
+    second["opening_frame"].update(
+        {
+            "shot_size": "close",
+            "camera_angle": "reverse close view toward garden-left",
+            "visual_focus": "character-b reaction",
+            "subject_layout": "character-b fills the left third",
+            "action_phase": "reaction after the state change",
+        }
+    )
+    second["closing_frame"].update(
+        {
+            "shot_size": "close",
+            "camera_angle": "reverse close view toward garden-left",
+            "visual_focus": "character-b completes the reaction",
+            "subject_layout": "character-b remains on the left third",
+            "action_phase": "reaction settles",
+        }
+    )
+    second["focus_contract"] = {
+        "primary_subject_id": "character-b",
+        "primary_subject_type": "character",
+        "secondary_subject_ids": ["character-a"],
+        "background_subject_ids": [],
+        "off_screen_subject_ids": [],
+        "visual_priority": "character-b reaction",
+        "composition_rule": "character-b dominates the reverse close view",
+    }
+    second["subject_presence"] = [
+        {
+            "subject_id": "character-a",
+            "subject_type": "character",
+            "entry_presence": "on_screen",
+            "exit_presence": "on_screen",
+            "entry_zone_id": "garden-right",
+            "exit_zone_id": "garden-right",
+            "entry_world_presence": "in_scene",
+            "exit_world_presence": "in_scene",
+            "entry_world_zone_id": "garden-right",
+            "exit_world_zone_id": "garden-right",
+            "visibility_reason": "supporting eyeline partner",
+        },
+        {
+            "subject_id": "character-b",
+            "subject_type": "character",
+            "entry_presence": "on_screen",
+            "exit_presence": "on_screen",
+            "entry_zone_id": "garden-left",
+            "exit_zone_id": "garden-left",
+            "entry_world_presence": "in_scene",
+            "exit_world_presence": "in_scene",
+            "entry_world_zone_id": "garden-left",
+            "exit_world_zone_id": "garden-left",
+            "visibility_reason": "primary reaction subject",
+        },
+    ]
+    second["prop_contracts"] = [
+        {
+            "prop_id": "prop-a",
+            "asset_id": "prop-after",
+            "entry_presence": "present",
+            "exit_presence": "present",
+            "entry_state": "one-part-removed",
+            "exit_state": "one-part-removed",
+            "owner_id": "character-a",
+            "zone_id": "garden-right",
+            "scale_basis": "handheld_small",
+            "support_mode": "handheld",
+            "rigidity": "rigid",
+            "grip_or_contact": "held securely at the intended handle",
+            "forbidden_inferences": ["must not become grounded or oversized"],
+        }
+    ]
+    second["prop_state_transitions"] = []
+    for beat in second["performance_beats"]:
+        beat["primary_beat"] = {
+            "subject_id": "character-b",
+            "action": "reacts to the completed prop change",
+        }
+        beat["supporting_actions"] = [
+            {
+                "subject_id": "character-a",
+                "action": "holds the changed prop without taking over the frame",
+            }
+        ]
+    first["cut_to_next"] = {
+        "next_shot_id": "shot-002",
+        "cut_type": "shot_reverse_shot",
+        "motivation": "reverse from character-a's action to character-b's reaction",
+        "continuity_bindings": [
+            {
+                "dimension": "axis",
+                "outgoing_value": "garden-axis",
+                "incoming_value": "garden-axis",
+                "match_required": True,
+            },
+            {
+                "dimension": "spatial_relation",
+                "outgoing_value": "character-a garden-right; character-b garden-left",
+                "incoming_value": "character-a garden-right; character-b garden-left",
+                "match_required": True,
+            },
+            {
+                "dimension": "character_state",
+                "outgoing_value": "both identities and wardrobes unchanged",
+                "incoming_value": "both identities and wardrobes unchanged",
+                "match_required": True,
+            },
+            {
+                "dimension": "prop_state",
+                "outgoing_value": "prop-a=one-part-removed",
+                "incoming_value": "prop-a=one-part-removed",
+                "match_required": True,
+            },
+        ],
+        "deliberate_changes": ["shot_size", "camera_angle", "visual_focus", "subject"],
+    }
+    first["closing_frame"]["shot_size"] = "wide"
+    plan["shots"].append(second)
+    return plan
+
+
 class StoryR2VPlanValidatorTests(unittest.TestCase):
     def assert_has_error(self, plan, fragment):
         errors = VALIDATOR.validate_plan(plan)
@@ -274,6 +634,288 @@ class StoryR2VPlanValidatorTests(unittest.TestCase):
 
     def test_accepts_valid_native_r2v_plan(self):
         self.assertEqual(VALIDATOR.validate_plan(valid_plan()), [])
+
+    def test_current_production_gate_rejects_legacy_v3(self):
+        errors = VALIDATOR.validate_plan(valid_plan(), require_current_schema=True)
+        self.assertTrue(any("new production must use current" in error for error in errors))
+
+    def test_v4_accepts_structured_zones_setups_presence_focus_props_and_primary_beats(self):
+        self.assertEqual(VALIDATOR.validate_plan(valid_v4_plan()), [])
+
+    def test_v4_requires_camera_origin_target_background_and_anchor_visibility(self):
+        for field in (
+            "camera_origin_zone_id",
+            "look_target_zone_id",
+            "background_zone_ids",
+            "camera_position_description",
+        ):
+            with self.subTest(field=field):
+                plan = valid_v4_plan()
+                plan["continuity_groups"][0]["camera_setups"][0].pop(field)
+                self.assert_has_error(plan, field)
+
+    def test_v4_requires_a_camera_specific_empty_environment_view(self):
+        plan = valid_v4_plan()
+        plan["continuity_groups"][0]["camera_setups"][0]["environment_view_asset_id"] = "environment-a"
+        self.assert_has_error(plan, "must use an empty_environment_camera_view")
+
+    def test_v4_shot_must_select_its_camera_setup_environment_view(self):
+        plan = valid_v4_plan()
+        plan["shots"][0]["reference_asset_ids"] = [
+            "environment-view-b" if value == "environment-view-a" else value
+            for value in plan["shots"][0]["reference_asset_ids"]
+        ]
+        self.assert_has_error(plan, "must match the camera setup view asset")
+
+    def test_v4_scene_map_rejects_a_background_on_the_camera_side_of_the_subject(self):
+        plan = valid_v4_plan()
+        setup = plan["continuity_groups"][0]["camera_setups"][0]
+        setup["background_zone_ids"] = ["garden-left"]
+        self.assert_has_error(plan, "is not geometrically behind the look target")
+
+    def test_v4_rejects_an_on_screen_subject_behind_the_camera(self):
+        plan = valid_v4_plan()
+        plan["continuity_groups"][0]["zones"].append(
+            {
+                "zone_id": "behind-camera",
+                "description": "physically behind the current camera position",
+                "map_x": -10,
+                "map_y": 0,
+            }
+        )
+        supporting = plan["shots"][0]["subject_presence"][1]
+        supporting["entry_presence"] = "on_screen"
+        supporting["entry_zone_id"] = "behind-camera"
+        supporting["entry_world_zone_id"] = "behind-camera"
+        supporting["exit_zone_id"] = "behind-camera"
+        supporting["exit_world_zone_id"] = "behind-camera"
+        plan["shots"][0]["initial_visible_characters"].append("character-b")
+        plan["shots"][0]["entering_characters"] = []
+        self.assert_has_error(plan, "lies behind the camera on the scene map")
+
+    def test_v4_selected_population_requires_spatial_presence_contract(self):
+        plan = valid_v4_plan()
+        plan["assets"].append(
+            _asset(
+                "audience-population",
+                "population",
+                "population_archetype",
+                population_id="audience",
+            )
+        )
+        plan["shots"][0]["reference_asset_ids"].append("audience-population")
+        plan["shots"][0]["crowd_plan"] = {
+            "mode": "recurring_cohort",
+            "target_count": 5,
+            "identity_critical_characters": [],
+            "population_asset_ids": ["audience-population"],
+            "placement": "audience seating behind the judge",
+            "behavior": "watching the stage",
+            "face_readability": "secondary",
+        }
+        self.assert_has_error(plan, "lacks an on-screen crowd presence contract")
+
+    def test_v4_rejects_visible_audience_behind_a_front_camera(self):
+        plan = valid_v4_plan()
+        plan["assets"].append(
+            _asset(
+                "audience-population",
+                "population",
+                "population_archetype",
+                population_id="audience",
+            )
+        )
+        plan["shots"][0]["reference_asset_ids"].append("audience-population")
+        plan["shots"][0]["crowd_plan"] = {
+            "mode": "recurring_cohort",
+            "target_count": 5,
+            "identity_critical_characters": [],
+            "population_asset_ids": ["audience-population"],
+            "placement": "behind the camera",
+            "behavior": "watching the stage",
+            "face_readability": "secondary",
+        }
+        plan["shots"][0]["subject_presence"].append(
+            {
+                "subject_id": "audience",
+                "subject_type": "crowd",
+                "entry_presence": "on_screen",
+                "exit_presence": "on_screen",
+                "entry_zone_id": "garden-far-left",
+                "exit_zone_id": "garden-far-left",
+                "entry_world_presence": "in_scene",
+                "exit_world_presence": "in_scene",
+                "entry_world_zone_id": "garden-far-left",
+                "exit_world_zone_id": "garden-far-left",
+                "visibility_reason": "invalidly shown behind the camera",
+            }
+        )
+        self.assert_has_error(plan, "lies behind the camera on the scene map")
+
+    def test_v4_rejects_crowd_disappearing_across_same_scene_camera_cut(self):
+        plan = valid_v4_reverse_shot_plan()
+        plan["assets"].append(
+            _asset(
+                "audience-population",
+                "population",
+                "population_archetype",
+                population_id="audience",
+            )
+        )
+        first, second = plan["shots"]
+        first["reference_asset_ids"].append("audience-population")
+        first["crowd_plan"] = {
+            "mode": "recurring_cohort",
+            "target_count": 5,
+            "identity_critical_characters": [],
+            "population_asset_ids": ["audience-population"],
+            "placement": "stable audience zone",
+            "behavior": "watching",
+            "face_readability": "secondary",
+        }
+        first["subject_presence"].append(
+            {
+                "subject_id": "audience",
+                "subject_type": "crowd",
+                "entry_presence": "on_screen",
+                "exit_presence": "on_screen",
+                "entry_zone_id": "garden-right",
+                "exit_zone_id": "garden-right",
+                "entry_world_presence": "in_scene",
+                "exit_world_presence": "in_scene",
+                "entry_world_zone_id": "garden-right",
+                "exit_world_zone_id": "garden-right",
+                "visibility_reason": "audience is visible in the first camera",
+            }
+        )
+        second["subject_presence"].append(
+            {
+                "subject_id": "audience",
+                "subject_type": "crowd",
+                "entry_presence": "off_screen",
+                "exit_presence": "off_screen",
+                "entry_zone_id": None,
+                "exit_zone_id": None,
+                "entry_world_presence": "outside_scene",
+                "exit_world_presence": "outside_scene",
+                "entry_world_zone_id": None,
+                "exit_world_zone_id": None,
+                "visibility_reason": "invalidly disappears when the camera changes",
+            }
+        )
+        self.assert_has_error(plan, "changes world presence")
+
+    def test_v4_scene_map_coordinates_are_required(self):
+        plan = valid_v4_plan()
+        plan["continuity_groups"][0]["zones"][0].pop("map_x")
+        self.assert_has_error(plan, "map_x")
+
+    def test_v4_camera_must_look_through_the_primary_subject_zone(self):
+        plan = valid_v4_plan()
+        plan["continuity_groups"][0]["camera_setups"][0]["look_target_zone_id"] = "garden-far-right"
+        self.assert_has_error(plan, "must match subject_zone_id")
+        for field in ("visible_anchor_ids", "excluded_anchor_ids"):
+            with self.subTest(field=field):
+                plan = valid_v4_plan()
+                plan["shots"][0]["camera_plan"].pop(field)
+                self.assert_has_error(plan, field)
+
+    def test_v4_rejects_visible_and_excluded_anchor_overlap(self):
+        plan = valid_v4_plan()
+        plan["shots"][0]["camera_plan"]["excluded_anchor_ids"] = ["large-tree"]
+        self.assert_has_error(plan, "cannot be both visible and excluded")
+
+    def test_v4_requires_every_fixed_anchor_to_be_classified_per_shot(self):
+        plan = valid_v4_plan()
+        plan["shots"][0]["camera_plan"]["excluded_anchor_ids"] = []
+        self.assert_has_error(plan, "every fixed anchor must be classified")
+
+    def test_v4_rejects_a_visible_fixed_anchor_behind_the_camera(self):
+        plan = valid_v4_plan()
+        plan["continuity_groups"][0]["anchors"][0]["zone_id"] = "garden-far-left"
+        plan["shots"][0]["camera_plan"]["visible_anchor_ids"] = ["large-tree", "stone-path"]
+        plan["shots"][0]["camera_plan"]["excluded_anchor_ids"] = []
+        self.assert_has_error(plan, "lies behind the camera")
+
+    def test_v4_rejects_an_empty_visible_anchor_while_its_occupant_remains_there(self):
+        plan = valid_v4_plan()
+        anchor = plan["continuity_groups"][0]["anchors"][1]
+        anchor["occupancy_rule"] = "occupied_while_subject_in_scene"
+        anchor["occupant_subject_id"] = "character-a"
+        occupant = plan["shots"][0]["subject_presence"][0]
+        occupant["exit_presence"] = "off_screen"
+        occupant["exit_zone_id"] = None
+        plan["shots"][0]["exiting_characters"] = ["character-a"]
+        self.assert_has_error(plan, "cannot appear empty")
+
+    def test_v4_requires_world_location_separate_from_frame_visibility(self):
+        plan = valid_v4_plan()
+        offscreen = plan["shots"][0]["subject_presence"][1]
+        offscreen.pop("entry_world_zone_id")
+        self.assert_has_error(plan, "entry_world_zone_id")
+
+    def test_v4_requires_world_presence_separate_from_frame_visibility(self):
+        plan = valid_v4_plan()
+        offscreen = plan["shots"][0]["subject_presence"][1]
+        offscreen.pop("entry_world_presence")
+        self.assert_has_error(plan, "entry_world_presence")
+
+    def test_v4_requires_explicit_group_color_contract(self):
+        plan = valid_v4_plan()
+        plan["continuity_groups"][0].pop("color_contract")
+        self.assert_has_error(plan, "color_contract")
+
+    def test_v4_rejects_fake_shot_reverse_shot_using_the_same_camera_setup(self):
+        plan = valid_v4_reverse_shot_plan()
+        plan["shots"][1]["camera_plan"]["camera_setup_id"] = "setup-character-a"
+        self.assert_has_error(plan, "shot_reverse_shot requires different camera setups")
+
+    def test_v4_accepts_complementary_shot_reverse_shot_on_one_axis(self):
+        self.assertEqual(VALIDATOR.validate_plan(valid_v4_reverse_shot_plan()), [])
+
+    def test_v4_rejects_on_screen_character_teleport_between_same_scene_shots(self):
+        plan = valid_v4_reverse_shot_plan()
+        plan["shots"][1]["subject_presence"][0]["entry_zone_id"] = "garden-left"
+        self.assert_has_error(plan, "character-a teleports from zone 'garden-right' to 'garden-left'")
+
+    def test_v4_requires_exactly_one_structured_primary_beat_per_performance_beat(self):
+        plan = valid_v4_plan()
+        del plan["shots"][0]["performance_beats"][0]["primary_beat"]
+        self.assert_has_error(plan, "primary_beat must be one object")
+
+        plan = valid_v4_plan()
+        plan["shots"][0]["performance_beats"][0]["primary_beat"] = [
+            {"subject_id": "character-a", "action": "first"},
+            {"subject_id": "character-b", "action": "second"},
+        ]
+        self.assert_has_error(plan, "primary_beat must be one object")
+
+    def test_v4_rejects_offscreen_subject_claimed_visible_in_a_beat(self):
+        plan = valid_v4_plan()
+        presence = plan["shots"][0]["subject_presence"][1]
+        presence["entry_presence"] = "off_screen"
+        presence["exit_presence"] = "off_screen"
+        presence["exit_zone_id"] = None
+        self.assert_has_error(plan, "off-screen for the whole shot cannot be visible")
+
+    def test_v4_focus_primary_must_be_present_and_match_camera_setup(self):
+        plan = valid_v4_plan()
+        plan["shots"][0]["focus_contract"]["primary_subject_id"] = "character-b"
+        self.assert_has_error(plan, "focus primary subject must match the camera setup")
+
+    def test_v4_prop_contract_binds_selected_asset_state_and_physics(self):
+        plan = valid_v4_plan()
+        plan["shots"][0]["prop_contracts"][0]["support_mode"] = "grounded"
+        self.assert_has_error(plan, "must match the selected prop asset physical contract")
+
+    def test_v4_rejects_unknown_structured_zone_axis_and_camera_setup(self):
+        plan = valid_v4_plan()
+        plan["shots"][0]["subject_presence"][0]["entry_zone_id"] = "unknown-zone"
+        plan["shots"][0]["camera_plan"]["axis_id"] = "unknown-axis"
+        plan["shots"][0]["camera_plan"]["camera_setup_id"] = "unknown-setup"
+        self.assert_has_error(plan, "unknown zone")
+        self.assert_has_error(plan, "unknown axis")
+        self.assert_has_error(plan, "unknown camera setup")
 
     def test_long_dialogue_without_visualization_is_advisory_not_schema_failure(self):
         plan = valid_plan()

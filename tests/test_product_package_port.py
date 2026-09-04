@@ -10,7 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
 
-from product_package import create_package_dirs
+from product_package import create_package_dirs, ensure_customer_music_mp3
 from story_module_adapters import LocalProductPackageAdapter, MockProductPackageAdapter
 from story_module_ports import (
     ModuleCapabilities,
@@ -150,6 +150,46 @@ class ProtocolOnlyFake:
 
 
 class ProductPackagePortTests(unittest.TestCase):
+    def test_non_mp3_master_is_transcoded_to_customer_mp3(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "music.m4a"
+            target = root / "assets" / "customer.mp3"
+            source.write_bytes(b"m4a-master")
+
+            def fake_ffmpeg(command: list[str]) -> None:
+                self.assertIn("libmp3lame", command)
+                Path(command[-1]).write_bytes(b"mp3-customer")
+
+            with patch("product_package.run_command", side_effect=fake_ffmpeg):
+                result = ensure_customer_music_mp3(source, target)
+            self.assertEqual(result, target.resolve())
+            self.assertEqual(result.suffix, ".mp3")
+            self.assertEqual(source.read_bytes(), b"m4a-master")
+
+    def test_customer_package_rejects_non_mp3_music_source(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            sources = package_sources(root)
+            m4a = sources["music"].with_suffix(".m4a")
+            sources["music"].rename(m4a)
+            sources["music"] = m4a
+            with self.assertRaisesRegex(ValueError, "MP3"):
+                create_package_dirs(
+                    story_name="通用故事",
+                    output_root=root / "products",
+                    story_docx=sources["story_docx"],
+                    music=sources["music"],
+                    annotation_docx=sources["annotation_docx"],
+                    demo_video=sources["demo_video"],
+                    background_image=sources["background_image"],
+                    bg_with_sub=sources["bg_with_sub"],
+                    bg_no_sub=sources["bg_no_sub"],
+                    ppt_with_sub=sources["ppt_with_sub"],
+                    ppt_no_sub=sources["ppt_no_sub"],
+                    a_only_video=sources["a_only_video"],
+                )
+
     def test_static_ppt_pair_cannot_be_disabled_by_legacy_flag(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -297,7 +297,8 @@ def render_rvm_foreground_video(
     streams = probe.get("streams") if isinstance(probe, dict) else None
     first_stream = streams[0] if isinstance(streams, list) and streams else {}
     tags = first_stream.get("tags") if isinstance(first_stream, dict) else {}
-    alpha_verified = isinstance(tags, dict) and str(tags.get("alpha_mode")) == "1"
+    normalized_tags = {str(key).lower(): value for key, value in tags.items()} if isinstance(tags, dict) else {}
+    alpha_verified = str(normalized_tags.get("alpha_mode")) == "1"
     if not alpha_verified:
         raise RuntimeError("RVM VP9 输出没有 alpha_mode=1，拒绝写入完成回执")
     receipt = {
@@ -348,9 +349,15 @@ def rvm_receipt_issues(
     if not isinstance(payload, dict):
         return ["rvm_receipt_invalid_object"]
     issues: list[str] = []
-    if payload.get("schema_version") != RVM_RECEIPT_SCHEMA_VERSION or payload.get("status") != "complete":
+    schema = str(payload.get("schema_version") or "")
+    status = str(payload.get("status") or "")
+    native_master_receipt = (
+        schema == "story-rvm-native-canvas-master/v1"
+        and status == "candidate_ready_pending_independent_visual_review"
+    )
+    if not native_master_receipt and (schema != RVM_RECEIPT_SCHEMA_VERSION or status != "complete"):
         issues.append("rvm_receipt_schema_or_status_invalid")
-    if payload.get("backend_version") != RVM_BACKEND_VERSION:
+    if not native_master_receipt and payload.get("backend_version") != RVM_BACKEND_VERSION:
         issues.append("rvm_backend_version_mismatch")
     if payload.get("model_sha256") != OFFICIAL_RVM_MOBILENETV3_FP32_SHA256:
         issues.append("rvm_model_sha256_mismatch")
@@ -358,7 +365,10 @@ def rvm_receipt_issues(
         issues.append("rvm_temporal_recurrence_missing")
     if payload.get("alpha_channel_verified") is not True:
         issues.append("rvm_alpha_channel_unverified")
-    if int(payload.get("frame_count") or 0) <= 0:
+    frame_count = payload.get("frame_count")
+    if native_master_receipt:
+        frame_count = payload.get("output_frame_count")
+    if int(frame_count or 0) <= 0:
         issues.append("rvm_frame_count_invalid")
     output = expected_output or Path(str(payload.get("output_video") or ""))
     if not output.is_file():

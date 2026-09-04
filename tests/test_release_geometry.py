@@ -13,6 +13,7 @@ from unittest.mock import patch
 from PIL import Image, ImageDraw
 
 from release_geometry import (
+    CANONICAL_B_STORY_BOX,
     RELEASE_GEOMETRY_COMPILER_VERSION,
     RELEASE_GEOMETRY_SCHEMA_VERSION,
     approved_demo_geometry,
@@ -22,6 +23,7 @@ from release_geometry import (
     geometry_manifest_issues,
     preview_formal_binding_sha256,
     release_a_geometry,
+    release_package_receipt_issues,
     release_render_manifest_issues,
     text_group_issues,
 )
@@ -34,6 +36,7 @@ from release_video import (
     ReleaseConfig,
     build_release_render_manifest,
     compile_release_geometry,
+    contract_release_logo_binding,
     content_overscan_size,
     deferred_presenter_safe_region,
     package_deterministic_preview_frame,
@@ -43,6 +46,8 @@ from release_video import (
     render_main_preview_frame,
     render_main_wide,
     render_top_panel,
+    resolved_tail_seconds,
+    required_package_asset_binding,
     validate_config,
     validate_person_grade,
 )
@@ -177,7 +182,7 @@ def _config(root: Path, *, person_region_ready: bool = True) -> ReleaseConfig:
         video_box=(0, 0, FINAL_WIDTH, CENTER_HEIGHT), watermark_width=100,
         watermark_opacity=.5, watermark_speed=1, frame_image=frame_a,
         story_box=(100, 200, 900, 500), story_bleed=0, background_blur=0,
-        frame_image_b=None, b_story_box=(220, 150, 1200, 675),
+        frame_image_b=None, b_story_box=CANONICAL_B_STORY_BOX,
         b_windows=((10.0, 20.0),), c_windows=((30.0, 40.0),), story_logo=None,
         story_logo_width_a=180, story_logo_width_b=180, story_logo_x=30, story_logo_y=30,
         subtitle_srt=None, subtitle_font_size=42, subtitle_margin_v=60,
@@ -252,6 +257,126 @@ def _valid_manifest() -> dict:
 
 
 class ReleaseGeometryTests(unittest.TestCase):
+    def test_library_contract_binds_antipiracy_logo_without_story_logo(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            logo = root / "official.png"
+            Image.new("RGBA", (200, 100), (255, 255, 255, 255)).save(logo)
+            config = replace(
+                _config(root),
+                variant="library",
+                story_logo=None,
+                antipiracy_logo=logo,
+            )
+            binding, fixed_region = contract_release_logo_binding(
+                config,
+                [{
+                    "asset_id": "official-program-logo",
+                    "sha256": hashlib.sha256(logo.read_bytes()).hexdigest(),
+                    "allowed_uses": ["release_video"],
+                    "max_per_frame": 1,
+                }],
+            )
+            self.assertEqual(binding["count"], 1)
+            self.assertIsNone(fixed_region)
+
+    def test_required_package_accepts_hash_bound_versioned_frame_source_without_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            source_v2 = root / "story_frame_source_b2_v2.png"
+            frame_v2 = root / "story_frame_a_b2_v2.png"
+            Image.open(root / "story_frame_source.png").save(source_v2)
+            Image.open(root / "story_frame_a.png").save(frame_v2)
+            receipt = json.loads(config.main_package_receipt.read_text(encoding="utf-8"))
+            receipt["outputs"]["story_frame_source"] = {
+                "path": str(source_v2),
+                "sha256": hashlib.sha256(source_v2.read_bytes()).hexdigest(),
+            }
+            receipt["outputs"]["story_frame_a"] = {
+                "path": str(frame_v2),
+                "sha256": hashlib.sha256(frame_v2.read_bytes()).hexdigest(),
+            }
+            config.main_package_receipt.write_text(json.dumps(receipt), encoding="utf-8")
+            binding = required_package_asset_binding(replace(config, frame_image=frame_v2))
+            self.assertEqual(
+                binding["main_package_receipt_sha256"],
+                hashlib.sha256(config.main_package_receipt.read_bytes()).hexdigest(),
+            )
+
+    def test_validate_config_defers_reviewed_demo_scale_and_anchor_to_geometry_compiler(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            config.bg_video.write_bytes(b"fixture-background")
+            audio_mix = root / "audio.m4a"
+            audio_mix.write_bytes(b"fixture-audio")
+            demo_manifest = root / "demo_render_manifest.json"
+            demo_manifest.write_text("{}", encoding="utf-8")
+            config = replace(
+                config,
+                audio_mix=audio_mix,
+                demo_render_manifest=demo_manifest,
+                person_layout_policy="source-native-fixed-anchor/v2",
+                person_height=1080,
+                person_x=0,
+                person_y=0,
+            )
+            with (
+                patch("release_video.probe_video_size", return_value=(3840, 2160)),
+                patch("release_video.validate_release_assets"),
+            ):
+                validate_config(config)
+
+    def test_validate_config_without_reviewed_demo_still_rejects_source_resize(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            config.bg_video.write_bytes(b"fixture-background")
+            audio_mix = root / "audio.m4a"
+            audio_mix.write_bytes(b"fixture-audio")
+            config = replace(
+                config,
+                audio_mix=audio_mix,
+                person_layout_policy="source-native-fixed-anchor/v2",
+                person_height=1080,
+                person_x=0,
+                person_y=0,
+            )
+            with (
+                patch("release_video.probe_video_size", return_value=(3840, 2160)),
+                patch("release_video.validate_release_assets"),
+            ):
+                with self.assertRaisesRegex(ValueError, "presenter_source_native_scale_forbidden"):
+                    validate_config(config)
+
+    def test_validate_config_reviewed_demo_still_rejects_crop_and_vertical_shift(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = _config(root)
+            config.bg_video.write_bytes(b"fixture-background")
+            audio_mix = root / "audio.m4a"
+            audio_mix.write_bytes(b"fixture-audio")
+            demo_manifest = root / "demo_render_manifest.json"
+            demo_manifest.write_text("{}", encoding="utf-8")
+            base = replace(
+                config,
+                audio_mix=audio_mix,
+                demo_render_manifest=demo_manifest,
+                person_layout_policy="source-native-fixed-anchor/v2",
+                person_height=1080,
+                person_x=0,
+                person_y=0,
+            )
+            with (
+                patch("release_video.probe_video_size", return_value=(3840, 2160)),
+                patch("release_video.validate_release_assets"),
+            ):
+                with self.assertRaisesRegex(ValueError, "presenter_source_native_person_crop_forbidden"):
+                    validate_config(replace(base, person_crop=(0, 0, 3840, 2160)))
+                with self.assertRaisesRegex(ValueError, "presenter_source_native_y_shift_forbidden"):
+                    validate_config(replace(base, person_y=1))
+
     def test_main_package_age_must_be_explicit(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -308,23 +433,39 @@ class ReleaseGeometryTests(unittest.TestCase):
                 command[command.index("-filter_complex") + 1],
             )
 
-    def test_library_watermarks_remain_visible_through_tail_notice(self) -> None:
+    def test_library_uses_two_countermoving_watermarks_through_tail_notice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             config = _config(root)
             official = root / "official-antipiracy.png"
             tail = root / "tail.png"
+            subtitle = root / "subtitles.srt"
             output = root / "library.mp4"
             official.write_bytes(b"official")
             tail.write_bytes(b"tail")
+            subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n字幕\n", encoding="utf-8")
+            config = replace(config, subtitle_srt=subtitle)
             with patch("release_video.probe_duration", return_value=10.0), \
+                 patch("release_video.render_subtitle_overlay_video"), \
                  patch("release_video.run_command") as run:
                 render_library_window_video(config.bg_video, official, tail, output, config)
-            graph = run.call_args.args[0][run.call_args.args[0].index("-filter_complex") + 1]
+            render_command = next(command for command in (call.args[0] for call in run.call_args_list) if "-filter_complex" in command)
+            graph = render_command[render_command.index("-filter_complex") + 1]
+            self.assertIn("[wm]split=2[wm1][wm2]", graph)
             self.assertIn("[tail][wm1]overlay=", graph)
             self.assertIn("[w1][wm2]overlay=", graph)
+            self.assertIn("max(1\\,W-w-40)", graph)
+            self.assertIn("max(1\\,H-h-40)", graph)
+            self.assertIn("y='H-h-20-", graph)
             self.assertNotIn("enable='lt(", graph)
-            self.assertIn("[w2][notice]overlay=", graph)
+            self.assertIn("[w2][subtitle_overlay]overlay=", graph)
+            self.assertIn("[with_subtitles][notice]overlay=", graph)
+
+    def test_negative_tail_seconds_cannot_disable_required_library_notice(self) -> None:
+        with self.assertRaisesRegex(ValueError, "不能为负数"):
+            resolved_tail_seconds(180.0, -1.0)
+        self.assertGreater(resolved_tail_seconds(180.0, 0.0), 0.0)
+        self.assertEqual(resolved_tail_seconds(180.0, 12.0), 12.0)
 
     def test_release_accepts_natural_person_grade_from_keying_preset(self) -> None:
         self.assertEqual(validate_person_grade("natural"), "natural")
@@ -631,6 +772,20 @@ class ReleaseGeometryTests(unittest.TestCase):
             geometry_manifest_issues(payload, {"artifact_semantic_plan_sha256": "9" * 64}),
         )
 
+    def test_library_geometry_does_not_require_non_applicable_presenter_c(self) -> None:
+        payload = _valid_manifest()
+        payload["presenter"] = {
+            "approved_demo_geometry": {"applicable": False, "reason": "library_variant"},
+            "a": {"applicable": False, "reason": "library_variant"},
+            "c": {"applicable": False, "reason": "library_variant"},
+        }
+        payload.pop("geometry_sha256", None)
+        payload["geometry_sha256"] = canonical_sha256(payload)
+
+        issues = geometry_manifest_issues(payload)
+
+        self.assertFalse(any("presenter_c" in issue for issue in issues), issues)
+
     def test_render_receipt_binds_actual_geometry_and_output_bytes(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -671,6 +826,67 @@ class ReleaseGeometryTests(unittest.TestCase):
                     ),
                 )
 
+    def test_release_package_receipt_requires_four_current_distinct_panels(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            panels = {}
+            for role, color in (
+                ("main_top_panel", (220, 80, 70, 255)),
+                ("main_bottom_panel", (230, 110, 80, 255)),
+                ("library_top_panel", (60, 130, 210, 255)),
+                ("library_bottom_panel", (80, 160, 220, 255)),
+            ):
+                path = root / f"{role}.png"
+                Image.new("RGBA", (2304, 888), color).save(path)
+                panels[role] = {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+            package_spec = root / "bound_main_package_spec.json"
+            package_receipt = root / "bound_main_package_generation_receipt.json"
+            package_spec.write_text("{}", encoding="utf-8")
+            package_receipt.write_text("{}", encoding="utf-8")
+            geometry = _valid_manifest()
+            geometry["main"] = {
+                "upper_strip": {"renderer": "imagegen_native_reference"},
+                "lower_strip": {"renderer": "imagegen_native_reference"},
+            }
+            geometry["library"] = {"video_region": [0, 416, 1080, 608]}
+            geometry["main_package_spec"] = {
+                "main_package_spec_path": str(package_spec),
+                "main_package_spec_sha256": hashlib.sha256(package_spec.read_bytes()).hexdigest(),
+                "main_package_receipt_path": str(package_receipt),
+                "main_package_receipt_sha256": hashlib.sha256(package_receipt.read_bytes()).hexdigest(),
+                "panels": panels,
+                "panel_sha256": {name: item["sha256"] for name, item in panels.items()},
+                "text_integration": "imagegen_native",
+                "render_usage_proof": True,
+            }
+            geometry["formal_render_binding_sha256"] = preview_formal_binding_sha256(geometry)
+            geometry.pop("geometry_sha256", None)
+            geometry["geometry_sha256"] = canonical_sha256(geometry)
+            main = root / "主账号发布视频.mp4"
+            library = root / "宝库号发布视频.mp4"
+            main.write_bytes(b"main-release")
+            library.write_bytes(b"library-release")
+            config = replace(_config(root), variant="both")
+            manifest = build_release_render_manifest(config, _spec(), [main, library], geometry)
+
+            self.assertEqual(release_package_receipt_issues(manifest), [])
+
+            reused = copy.deepcopy(manifest)
+            reused_geometry = reused["actual_geometry"]
+            reused_geometry["main_package_spec"]["panels"]["library_top_panel"] = copy.deepcopy(
+                reused_geometry["main_package_spec"]["panels"]["main_top_panel"]
+            )
+            reused_geometry["formal_render_binding_sha256"] = preview_formal_binding_sha256(reused_geometry)
+            reused_geometry.pop("geometry_sha256", None)
+            reused_geometry["geometry_sha256"] = canonical_sha256(reused_geometry)
+            reused["release_geometry_sha256"] = reused_geometry["geometry_sha256"]
+            reused.pop("render_manifest_sha256", None)
+            reused["render_manifest_sha256"] = canonical_sha256(reused)
+            self.assertIn(
+                "release_package_account_panel_reuse_detected",
+                release_package_receipt_issues(reused),
+            )
+
     def test_compiler_records_abc_segments_and_actual_center_region(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -697,6 +913,20 @@ class ReleaseGeometryTests(unittest.TestCase):
                 geometry = compile_release_geometry(config, _spec())
             self.assertEqual(geometry["presenter"]["approved_demo_geometry"]["scale"], 1.0)
             self.assertFalse(geometry["presenter"]["a"]["scale_changed"])
+            self.assertEqual(
+                geometry["presenter"]["c"]["x"],
+                geometry["presenter"]["approved_demo_geometry"]["x"],
+            )
+            self.assertNotEqual(geometry["presenter"]["c"]["x"], geometry["presenter"]["a"]["x"])
+            self.assertEqual(
+                geometry["presenter"]["c"]["y"],
+                geometry["presenter"]["approved_demo_geometry"]["y"],
+            )
+            self.assertEqual(geometry["presenter"]["c"]["scale"], geometry["presenter"]["a"]["scale"])
+            self.assertEqual(
+                geometry["presenter"]["c"]["horizontal_anchor_basis"],
+                "approved_demo_source_canvas_center",
+            )
             self.assertEqual(geometry["main"]["segments"]["b"]["active_time_ranges"], [[10.0, 20.0]])
             self.assertEqual(geometry["main"]["segments"]["c"]["active_time_ranges"], [[30.0, 40.0]])
             self.assertEqual(geometry["library"]["video_region"], [0, TOP_HEIGHT, FINAL_WIDTH, CENTER_HEIGHT])
@@ -956,7 +1186,7 @@ class ReleaseGeometryTests(unittest.TestCase):
                 patch("release_video.render_main_wide", side_effect=write_main) as main_renderer,
                 patch("release_video.render_library_window_video", side_effect=write_library) as library_renderer,
                 patch("release_video.render_vertical_package", side_effect=write_vertical) as vertical_renderer,
-                patch("release_video.probe_duration", return_value=0.4),
+                patch("release_video.probe_duration", return_value=180.0),
                 patch("release_video.extract_video_frame", side_effect=write_frame),
             ):
                 render_main_preview_frame(
@@ -991,6 +1221,7 @@ class ReleaseGeometryTests(unittest.TestCase):
                 frame_image=frame,
                 b_windows=(),
                 c_windows=(),
+                keyer="rvm",
             )
             presenter = {
                 "source_crop": [0, 0, 320, 360],
@@ -1008,7 +1239,10 @@ class ReleaseGeometryTests(unittest.TestCase):
                     "release_video.prepare_story_frame_assets",
                     return_value=(frame, root / "mask.png", (170, 250, 990, 557)),
                 ),
-                patch("release_video.person_key_filters", return_value=["[2:v]null[person_keyed]"]),
+                patch(
+                    "release_video.person_key_filters",
+                    side_effect=lambda _config, source: [f"{source}null[person_keyed]"],
+                ),
                 patch("release_video.run_command", side_effect=lambda command: commands.append(command)),
             ):
                 render_main_wide(
@@ -1021,14 +1255,43 @@ class ReleaseGeometryTests(unittest.TestCase):
                     presenter_geometry=presenter, presenter_c_geometry=presenter,
                     sample_start=1.0, sample_duration=0.4, sample_scene="c",
                 )
-            for command in commands:
+            self.assertEqual(len(commands), 6)
+            predecode = next(command for command in commands if "qtrle" in command)
+            self.assertIn("argb", predecode)
+            self.assertEqual(
+                predecode[predecode.index("-i") + 1],
+                str(config.person_greenscreen),
+            )
+            story_predecode = next(command for command in commands if "ffv1" in command)
+            self.assertEqual(
+                story_predecode[story_predecode.index("-i") + 1],
+                str(config.bg_video),
+            )
+            self.assertEqual(sum("pcm_s24le" in command for command in commands), 2)
+            render_commands = [command for command in commands if "-filter_complex" in command]
+            self.assertEqual(len(render_commands), 2)
+            for index, command in enumerate(render_commands):
                 self.assertIn("-filter_complex_threads", command)
+                self.assertEqual(
+                    command[command.index("-filter_complex_threads") + 1],
+                    "1" if index == 0 else "4",
+                )
                 self.assertEqual(command[command.index("-i") + 1], str(background))
                 graph = command[command.index("-filter_complex") + 1]
-                self.assertIn("[2:v]setpts=PTS-STARTPTS[person_timeline]", graph)
+                if index == 0:
+                    self.assertNotIn("person_timeline", graph)
+                    self.assertNotIn(str(config.person_greenscreen), command)
+                    self.assertNotIn("story_frame_a_prepared", " ".join(command))
+                else:
+                    self.assertIn(
+                        "[1:v]trim=start_frame=1,setpts=PTS-STARTPTS[person_timeline]",
+                        graph,
+                    )
+                    self.assertIn("person_sample_000001000_argb.mov", " ".join(command))
+                    self.assertNotIn("story_frame_a_prepared", " ".join(command))
                 self.assertNotIn("blend=", graph)
-            self.assertEqual(commands[0][commands[0].index("-map") + 1], "[b_framed]")
-            self.assertEqual(commands[1][commands[1].index("-map") + 1], "[c_person]")
+            self.assertEqual(render_commands[0][render_commands[0].index("-map") + 1], "[b_framed]")
+            self.assertEqual(render_commands[1][render_commands[1].index("-map") + 1], "[c_person]")
 
     def test_story_content_overscan_is_even_and_crops_encoded_rims(self) -> None:
         width, height = content_overscan_size(1080, 608)

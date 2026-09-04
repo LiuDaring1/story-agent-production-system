@@ -16,6 +16,8 @@ from shot_storyboard_pipeline import validate_compile_receipt
 
 
 DELIVERY_RECEIPT_SCHEMA = "story-static-ppt-delivery/v1"
+PML_NS = "http://schemas.openxmlformats.org/presentationml/2006/main"
+DML_NS = "http://schemas.openxmlformats.org/drawingml/2006/main"
 
 
 def file_sha256(path: Path) -> str:
@@ -44,6 +46,36 @@ def _canonical_hash(value: Any) -> str:
         value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+def _single_line_subtitle(value: str) -> str:
+    return "".join(str(value).splitlines()).strip()
+
+
+def _subtitle_shapes(root: ET.Element) -> list[dict[str, Any]]:
+    """Return explicitly named subtitle shapes and their paragraph evidence."""
+
+    namespaces = {"p": PML_NS, "a": DML_NS}
+    result: list[dict[str, Any]] = []
+    for shape in root.findall(".//p:sp", namespaces):
+        properties = shape.find("./p:nvSpPr/p:cNvPr", namespaces)
+        name = str(properties.get("name") or "") if properties is not None else ""
+        if name != "story-subtitle" and re.fullmatch(r"subtitle-\d+", name) is None:
+            continue
+        paragraphs = shape.findall("./p:txBody/a:p", namespaces)
+        paragraph_texts = [
+            "".join(node.text or "" for node in paragraph.findall(".//a:t", namespaces))
+            for paragraph in paragraphs
+        ]
+        result.append(
+            {
+                "name": name,
+                "paragraphs": paragraph_texts,
+                "has_explicit_break": shape.find(".//a:br", namespaces) is not None,
+                "text": "".join(paragraph_texts),
+            }
+        )
+    return result
 
 
 def validate_plan(
@@ -119,6 +151,14 @@ def validate_plan(
             continue
         shot = shot_map[shot_id]
         story_text = str(shot.get("story_text") or "")
+        subtitle = str(row.get("subtitle") or "")
+        if "\n" in subtitle or "\r" in subtitle:
+            raise ValueError(f"{shot_id} PPT 字幕必须合并为底部单行，禁止保留换行")
+        expected_subtitle = _single_line_subtitle(story_text)
+        if subtitle != expected_subtitle:
+            raise ValueError(
+                f"{shot_id} PPT 单行字幕必须逐字等于完整 story_text 去除换行后的文本"
+            )
         if row.get("poster_origin") != "imagegen_shot_illustration":
             raise ValueError(f"{shot_id} PPT 主图必须来自逐镜 ImageGen 故事板")
         if row.get("story_text_sha256") != hashlib.sha256(story_text.encode("utf-8")).hexdigest():
@@ -146,6 +186,8 @@ def validate_pptx(
     *,
     music_sha256: str,
     expected_durations: list[float],
+    expected_subtitles: list[str] | None = None,
+    subtitle_mode: str | None = None,
 ) -> None:
     path = path.expanduser().resolve()
     if not path.is_file():
@@ -175,16 +217,42 @@ def validate_pptx(
             raise ValueError("PPTX 没有内嵌计划绑定的配乐")
         if len(expected_durations) != len(slide_names):
             raise ValueError("PPTX 自动翻页时长数量与页数不一致")
-        namespace = "http://schemas.openxmlformats.org/presentationml/2006/main"
+        if expected_subtitles is not None and len(expected_subtitles) != len(slide_names):
+            raise ValueError("PPTX 字幕期望数量与页数不一致")
+        if subtitle_mode not in {None, "with", "without"}:
+            raise ValueError(f"未知 PPT 字幕模式：{subtitle_mode}")
         for index, (name, seconds) in enumerate(zip(slide_names, expected_durations), start=1):
             root = ET.fromstring(archive.read(name))
-            transition = root.find(f"{{{namespace}}}transition")
+            transition = root.find(f"{{{PML_NS}}}transition")
             expected_ms = max(500, int(round(float(seconds) * 1000)))
             actual_ms = int(transition.get("advTm") or 0) if transition is not None else 0
             if transition is None or transition.get("advClick") != "1" or abs(actual_ms - expected_ms) > 1:
                 raise ValueError(
                     f"PPTX 第 {index} 页自动翻页错误：expected={expected_ms}, actual={actual_ms}"
                 )
+            if subtitle_mode is None:
+                continue
+            shapes = _subtitle_shapes(root)
+            expected_text = (
+                str(expected_subtitles[index - 1]) if expected_subtitles is not None else ""
+            )
+            if subtitle_mode == "without":
+                if shapes:
+                    raise ValueError(f"无字幕 PPT 第 {index} 页残留字幕对象")
+                continue
+            if not expected_text:
+                if shapes:
+                    raise ValueError(f"含字幕 PPT 第 {index} 页不应出现字幕对象")
+                continue
+            if len(shapes) != 1:
+                raise ValueError(
+                    f"含字幕 PPT 第 {index} 页必须恰好有一个单行字幕对象：actual={len(shapes)}"
+                )
+            shape = shapes[0]
+            if len(shape["paragraphs"]) != 1 or shape["has_explicit_break"]:
+                raise ValueError(f"含字幕 PPT 第 {index} 页字幕不是单行")
+            if shape["text"] != expected_text:
+                raise ValueError(f"含字幕 PPT 第 {index} 页字幕文本与计划不一致")
 
 
 def validate_pair(
@@ -196,18 +264,28 @@ def validate_pair(
     slide_ids, slides = validate_plan(director_path, plan_path)
     plan = load_object(plan_path, "静态 PPT 计划")
     durations = [float(row.get("duration_seconds") or 0) for row in slides]
+    subtitles = [
+        ""
+        if str(row.get("shot_id") or "") in {"TITLE", "MORAL"}
+        else str(row.get("subtitle") or "")
+        for row in slides
+    ]
     music_sha256 = str(plan.get("music_sha256") or "")
     validate_pptx(
         with_subtitles,
         len(slide_ids),
         music_sha256=music_sha256,
         expected_durations=durations,
+        expected_subtitles=subtitles,
+        subtitle_mode="with",
     )
     validate_pptx(
         without_subtitles,
         len(slide_ids),
         music_sha256=music_sha256,
         expected_durations=durations,
+        expected_subtitles=subtitles,
+        subtitle_mode="without",
     )
     return slide_ids, slides
 

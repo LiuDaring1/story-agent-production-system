@@ -435,6 +435,33 @@ def validate_image_video_jobs(jobs_csv: Path) -> list[str]:
                 if file_sha256(Path(path)) != str(expected):
                     errors.append(f"第 {scene} 镜 R2V 参考图哈希已变化")
                     break
+        raw_asset_ids = str(row.get("reference_asset_ids_json") or "").strip()
+        if raw_asset_ids:
+            try:
+                asset_ids = json.loads(raw_asset_ids)
+            except (json.JSONDecodeError, TypeError):
+                errors.append(f"第 {scene} 镜 reference_asset_ids_json 不可读")
+                asset_ids = []
+            if (
+                not isinstance(asset_ids, list)
+                or len(asset_ids) != len(normalized)
+                or any(not str(value).strip() for value in asset_ids)
+                or len({str(value) for value in asset_ids}) != len(asset_ids)
+            ):
+                errors.append(f"第 {scene} 镜 R2V 参考资产 ID 与实际参考图不匹配")
+            raw_policy = str(row.get("runtime_reference_policy_json") or "").strip()
+            if raw_policy:
+                try:
+                    policy = json.loads(raw_policy)
+                except (json.JSONDecodeError, TypeError):
+                    errors.append(f"第 {scene} 镜 runtime_reference_policy_json 不可读")
+                    policy = {}
+                omitted = policy.get("omitted_population_asset_ids") if isinstance(policy, dict) else None
+                if not isinstance(omitted, list) or any(
+                    str(value) in {str(asset_id) for asset_id in asset_ids}
+                    for value in omitted
+                ):
+                    errors.append(f"第 {scene} 镜 recurring cohort 参考省略策略无效")
         manifest_path = Path(str(row.get("storyboard_manifest_path") or ""))
         manifest_sha = str(row.get("storyboard_manifest_sha256") or "")
         if not manifest_path.is_file() or file_sha256(manifest_path) != manifest_sha:

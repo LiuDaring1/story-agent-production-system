@@ -10,9 +10,12 @@ from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
+from release_geometry import CANONICAL_B_STORY_BOX
 from release_video import (
     build_tail_frame_probe_commands,
     person_tail_pad_seconds,
+    probe_video_stream_duration,
+    release_preview_sample_window,
     probe_video_size,
     release_plate_integrity_issues,
     render_static_assets,
@@ -45,6 +48,18 @@ def make_vertical_video(path: Path, *, with_audio: bool = True) -> None:
 
 
 class ReleaseQaTests(unittest.TestCase):
+    def test_terminal_preview_shifts_full_sample_window_before_eof(self) -> None:
+        start, duration, frame_time = release_preview_sample_window(179.883, 179.7)
+        self.assertAlmostEqual(start, 179.483, places=3)
+        self.assertAlmostEqual(duration, 0.4, places=6)
+        self.assertAlmostEqual(start + frame_time, 179.7, places=3)
+
+    def test_regular_preview_keeps_existing_forward_sample_behavior(self) -> None:
+        start, duration, frame_time = release_preview_sample_window(179.883, 52.0)
+        self.assertEqual(start, 52.0)
+        self.assertEqual(duration, 0.4)
+        self.assertEqual(frame_time, 0.2)
+
     def test_probe_video_size_uses_ffprobe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             video = Path(directory) / "probe.mp4"
@@ -75,6 +90,35 @@ class ReleaseQaTests(unittest.TestCase):
         # clone window instead of allowing ffmpeg to synthesize an EOF frame.
         self.assertAlmostEqual(person_tail_pad_seconds(11.96, 12.0), 0.08, places=6)
         self.assertAlmostEqual(person_tail_pad_seconds(11.96, 12.0, frame_duration=1 / 25), 0.08, places=6)
+        self.assertAlmostEqual(person_tail_pad_seconds(None, 12.0, frame_duration=1 / 30), 1 / 30, places=6)
+
+    def test_video_only_webm_uses_format_duration_when_stream_duration_is_missing(self) -> None:
+        responses = [
+            SimpleNamespace(returncode=0, stdout="N/A\n"),
+            SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "streams": [{"codec_type": "video"}],
+                    "format": {"duration": "179.866"},
+                }),
+            ),
+        ]
+        with patch("release_video.subprocess.run", side_effect=responses):
+            self.assertEqual(probe_video_stream_duration(Path("presenter.webm")), 179.866)
+
+    def test_muxed_file_does_not_use_format_duration_as_video_duration(self) -> None:
+        responses = [
+            SimpleNamespace(returncode=0, stdout="N/A\n"),
+            SimpleNamespace(
+                returncode=0,
+                stdout=json.dumps({
+                    "streams": [{"codec_type": "video"}, {"codec_type": "audio"}],
+                    "format": {"duration": "180.0"},
+                }),
+            ),
+        ]
+        with patch("release_video.subprocess.run", side_effect=responses):
+            self.assertIsNone(probe_video_stream_duration(Path("muxed.mp4")))
 
     def test_tail_probe_samples_the_whole_last_two_seconds_and_final_frame(self) -> None:
         commands = build_tail_frame_probe_commands(Path("release.mp4"), Path("frames"), 10.0, fps=8)
@@ -198,7 +242,7 @@ class ReleaseQaTests(unittest.TestCase):
                 frame_image=frame_path,
                 story_box=a_window,
                 frame_image_b=frame_path,
-                b_story_box=(150, 88, 1620, 911),
+                b_story_box=CANONICAL_B_STORY_BOX,
                 b_windows=((0.0, 1.0),),
             )
             # The raw A frame is not positioned around B, but preview/render
@@ -236,7 +280,7 @@ class ReleaseQaTests(unittest.TestCase):
                 frame_image=frame_path,
                 story_box=story_box,
                 frame_image_b=None,
-                b_story_box=(150, 88, 1620, 911),
+                b_story_box=CANONICAL_B_STORY_BOX,
                 b_windows=(),
             )
 
@@ -266,15 +310,18 @@ class ReleaseQaTests(unittest.TestCase):
                 assets = render_static_assets(config, root)
             self.assertIsNone(assets["frame"])
 
-    def test_new_project_exposes_fixed_ten_hour_delivery_policy(self) -> None:
+    def test_new_project_has_no_implicit_wall_clock_completion_policy(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：八小时默认策略"
             manifest = init_project(project, story_name="十小时默认策略", slug="ten-hour-default")
 
-            self.assertTrue(manifest["agent"]["runtime_deadline_enabled"])
-            self.assertEqual(manifest["agent"]["deadline_hours"], 10.0)
-            self.assertEqual(manifest["agent"]["target_delivery_seconds"], 36000)
-            self.assertEqual(manifest["agent"]["deadline_behavior"], "deliver_best_valid")
+            self.assertFalse(manifest["agent"]["runtime_deadline_enabled"])
+            self.assertEqual(manifest["agent"]["deadline_hours"], 0.0)
+            self.assertIsNone(manifest["agent"]["target_delivery_seconds"])
+            self.assertEqual(
+                manifest["agent"]["deadline_behavior"],
+                "no_implicit_wall_clock_deadline",
+            )
 
     def test_release_qa_requires_vertical_video_with_aligned_audio(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -286,6 +333,8 @@ class ReleaseQaTests(unittest.TestCase):
             qa_release(project)
             payload = json.loads((paths.status / "qa_release_report.json").read_text(encoding="utf-8"))
             self.assertTrue(payload["passed"])
+            self.assertEqual(payload["schema_version"], "story-release-machine-qa/v2")
+            self.assertEqual(payload["critical_errors"], [])
             self.assertEqual(len(payload["artifacts"]), 2)
 
     def test_release_qa_rejects_missing_audio(self) -> None:
@@ -298,6 +347,7 @@ class ReleaseQaTests(unittest.TestCase):
             qa_release(project)
             payload = json.loads((paths.status / "qa_release_report.json").read_text(encoding="utf-8"))
             self.assertFalse(payload["passed"])
+            self.assertTrue(payload["critical_errors"])
             self.assertTrue(any("缺少音轨" in issue for issue in payload["issues"]))
 
     def test_release_qa_never_uses_rejected_video_when_canonical_output_exists(self) -> None:

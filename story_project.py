@@ -174,10 +174,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "agent_defaults": {
         "soft_budget_cny": 50.0,
         "hard_budget_cny": 100.0,
-        "deadline_hours": 10.0,
-        "target_delivery_seconds": 36000,
-        "runtime_deadline_enabled": True,
-        "deadline_behavior": "deliver_best_valid",
+        "deadline_hours": 0.0,
+        "target_delivery_seconds": None,
+        "runtime_deadline_enabled": False,
+        "deadline_behavior": "no_implicit_wall_clock_deadline",
         "max_full_resolution_encodes": 1,
         "review_pass_score": 85,
         "whisper_model": "small",
@@ -296,6 +296,21 @@ def init_project(project_dir: Path, story_name: str = "", slug: str = "", episod
 
 def default_manifest(paths: ProjectPaths, config: dict[str, Any], story_name: str, slug: str, episode: int) -> dict[str, Any]:
     agent_defaults = config.get("agent_defaults", {}) if isinstance(config.get("agent_defaults"), dict) else {}
+    deadline_hours_value = agent_defaults.get("deadline_hours")
+    deadline_hours = (
+        float(deadline_hours_value)
+        if isinstance(deadline_hours_value, (int, float)) and not isinstance(deadline_hours_value, bool)
+        else 0.0
+    )
+    target_delivery_value = agent_defaults.get("target_delivery_seconds")
+    target_delivery_seconds = (
+        int(target_delivery_value)
+        if isinstance(target_delivery_value, (int, float)) and not isinstance(target_delivery_value, bool)
+        else None
+    )
+    deadline_enabled = bool(agent_defaults.get("runtime_deadline_enabled", False))
+    if target_delivery_seconds is None or target_delivery_seconds <= 0:
+        deadline_enabled = False
     return {
         "version": 2,
         "project_root": str(paths.root),
@@ -352,10 +367,13 @@ def default_manifest(paths: ProjectPaths, config: dict[str, Any], story_name: st
             "heartbeat_at": "",
             "last_checkpoint": "",
             "blocked_reason": "",
-            "deadline_hours": float(agent_defaults.get("deadline_hours", 10.0)),
-            "target_delivery_seconds": int(agent_defaults.get("target_delivery_seconds", 36000)),
-            "runtime_deadline_enabled": bool(agent_defaults.get("runtime_deadline_enabled", True)),
-            "deadline_behavior": str(agent_defaults.get("deadline_behavior") or "deliver_best_valid"),
+            "deadline_hours": deadline_hours,
+            "target_delivery_seconds": target_delivery_seconds,
+            "runtime_deadline_enabled": deadline_enabled,
+            "deadline_behavior": str(
+                agent_defaults.get("deadline_behavior") or "no_implicit_wall_clock_deadline"
+            ),
+            "runtime_deadline_source": "disabled_by_default",
             "max_full_resolution_encodes": int(agent_defaults.get("max_full_resolution_encodes", 1)),
             "min_free_disk_gb": float(agent_defaults.get("min_free_disk_gb", 10.0)),
             "started_at": "",
@@ -438,7 +456,12 @@ def detect_project_assets(project_dir: Path, *, extract_audio: bool = False) -> 
     files = [path for path in paths.root.rglob("*") if path.is_file() and STATUS_DIR_NAME not in path.parts]
     input_files = [path for path in files if is_user_input_asset(paths, path)]
     bound_story_text = Path(str(manifest.get("inputs", {}).get("story_text") or ""))
-    story_text = bound_story_text if prepared_mode and bound_story_text.is_file() else choose_first(
+    # Asset discovery must not silently replace an already-bound story source.
+    # Apart from breaking the Runtime trust hash, that used to let a natural
+    # DOCX and a line-oriented subtitle TXT take turns occupying the same
+    # manifest field on repeated scans.  A caller that wants a different input
+    # must change the binding explicitly; ordinary detection only fills blanks.
+    story_text = bound_story_text if bound_story_text.is_file() else choose_first(
         input_files, TEXT_EXTENSIONS, ("原文", "story", "source", "正文", "故事", "文稿")
     )
     audios = [path for path in input_files if path.suffix.lower() in AUDIO_EXTENSIONS]
@@ -1875,16 +1898,15 @@ def ensure_story_frame_variants(theme_dir: Path, a_window: tuple[int, int, int, 
     ]
     source = next((path for path in source_candidates if path.exists()), None)
     if frame_a.exists():
-        if _normalize_existing_story_frame(frame_a, a_window):
-            return
-        if source is None:
-            return
+        # QA is a read-only gate.  Earlier code normalized an existing PNG in
+        # place before checking its generation receipt, changing the SHA-256
+        # of the very artifact being audited and then archiving the whole
+        # package as stale.  Existing generated output must be reported as-is;
+        # only a missing canonical derivative may be created here.
+        return
     if source is None:
         return
-    if not frame_a.exists():
-        export_frame_from_source(source, frame_a, a_window)
-    else:
-        export_frame_from_source(source, frame_a, a_window)
+    export_frame_from_source(source, frame_a, a_window)
 
 
 def _normalize_existing_story_frame(frame_path: Path, window: tuple[int, int, int, int]) -> bool:
@@ -3476,8 +3498,13 @@ def qa_release(project_dir: Path) -> Path:
     save_json(
         report_json,
         {
-            "version": 1,
+            "schema_version": "story-release-machine-qa/v2",
+            "version": 2,
             "passed": not issues,
+            # Completion gates must distinguish an explicit empty critical
+            # set from a producer that simply omitted the field.
+            "critical_errors": list(issues),
+            "warnings": [],
             "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "artifacts": artifacts,
             "results": structured_results,
@@ -3588,9 +3615,9 @@ def qa_product(project_dir: Path) -> Path:
         for component, component_issues in deterministic_checks.items():
             for issue in component_issues:
                 issues.append(f"- {component}：{issue}")
-    for label, key, required in (
-        ("基础版资料包", "product_base", required_base),
-        ("进阶版资料包", "product_advanced", required_advanced),
+    for label, key, required, expected_count in (
+        ("基础版资料包", "product_base", required_base, 5),
+        ("进阶版资料包", "product_advanced", required_advanced, 10),
     ):
         value = manifest["outputs"].get(key, "")
         if not value or not Path(value).exists():
@@ -3610,6 +3637,8 @@ def qa_product(project_dir: Path) -> Path:
             notes.append("空文件：" + "、".join(empty))
         if leaked:
             notes.append("混入内部报告：" + "、".join(leaked))
+        if len(files) != expected_count:
+            notes.append(f"文件数应为 {expected_count}，当前为 {len(files)}")
         rows.append({"index": str(len(rows) + 1), "file": str(directory), "status": "warning" if notes else "ok", "notes": "；".join(notes) if notes else "文件齐全"})
         if notes:
             issues.append(f"- {label}：{'；'.join(notes)}")
@@ -3622,8 +3651,11 @@ def qa_product(project_dir: Path) -> Path:
     save_json(
         report_json,
         {
-            "version": 1,
+            "schema_version": "story-product-machine-qa/v2",
+            "version": 2,
             "passed": not issues,
+            "critical_errors": list(issues),
+            "warnings": [],
             "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "artifacts": artifacts,
             "issues": issues,

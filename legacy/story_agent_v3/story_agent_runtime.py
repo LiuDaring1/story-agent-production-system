@@ -32,12 +32,13 @@ MANIFEST_VERSION = 2
 DEFAULT_SOFT_BUDGET_CNY = 50.0
 DEFAULT_HARD_BUDGET_CNY = 100.0
 STORY_AGENT_RELEASE_VERSION = "3.6.2-canary.9"
-# V3.6 targets an overnight run.  At the deadline the scheduler freezes new
-# aesthetic retries and exposes the best hash-valid output; it does not launch
-# final_delivery/doctor or restart the full DAG.
-DEFAULT_DEADLINE_HOURS = 10.0
-DEFAULT_TARGET_DELIVERY_SECONDS = 10 * 60 * 60
-DEFAULT_DEADLINE_BEHAVIOR = "deliver_best_valid"
+# Historical manifests used a ten-hour wall clock to force a best-effort
+# delivery.  Compatibility loading must not silently recreate that policy.
+# A deadline is now opt-in; deterministic verification/finalization may run
+# past any paid-aesthetic-retry cutoff.
+DEFAULT_DEADLINE_HOURS = 0.0
+DEFAULT_TARGET_DELIVERY_SECONDS = None
+DEFAULT_DEADLINE_BEHAVIOR = "no_implicit_wall_clock_deadline"
 DEFAULT_MIN_FREE_DISK_GB = 10.0
 PASS_SCORE = 85
 _CONTROL_THREAD_LOCKS: dict[str, threading.Lock] = {}
@@ -361,20 +362,24 @@ def runtime_deadline_state(agent: dict[str, Any]) -> dict[str, Any]:
     hours = max(0.0, float(agent.get("deadline_hours") or 0.0))
     elapsed = runtime_elapsed_seconds(agent)
     configured_seconds = agent.get("target_delivery_seconds")
-    target_seconds = (
+    target_seconds: float | None = (
         max(0.0, float(configured_seconds))
         if isinstance(configured_seconds, (int, float)) and not isinstance(configured_seconds, bool)
-        else hours * 3600
+        else hours * 3600 if hours > 0 else None
     )
-    reached = enabled and target_seconds > 0 and elapsed >= target_seconds
+    reached = enabled and target_seconds is not None and target_seconds > 0 and elapsed >= target_seconds
     return {
         "enabled": enabled,
         "deadline_hours": hours,
-        "target_delivery_seconds": round(target_seconds, 3),
+        "target_delivery_seconds": round(target_seconds, 3) if target_seconds is not None else None,
         "deadline_behavior": str(agent.get("deadline_behavior") or DEFAULT_DEADLINE_BEHAVIOR),
         "elapsed_seconds": round(elapsed, 3),
-        "target_seconds": round(target_seconds, 3),
-        "remaining_seconds": max(0.0, round(target_seconds - elapsed, 3)) if enabled else None,
+        "target_seconds": round(target_seconds, 3) if target_seconds is not None else None,
+        "remaining_seconds": (
+            max(0.0, round(target_seconds - elapsed, 3))
+            if enabled and target_seconds is not None
+            else None
+        ),
         "reached": reached,
     }
 
@@ -488,7 +493,7 @@ def ensure_manifest_v2(
     job_id: str = "",
     soft_budget_cny: float = DEFAULT_SOFT_BUDGET_CNY,
     hard_budget_cny: float = DEFAULT_HARD_BUDGET_CNY,
-    deadline_hours: float = DEFAULT_DEADLINE_HOURS,
+    deadline_hours: float | None = None,
 ) -> dict[str, Any]:
     manifest["version"] = MANIFEST_VERSION
     agent = manifest.setdefault("agent", {})
@@ -500,14 +505,34 @@ def ensure_manifest_v2(
     agent.setdefault("heartbeat_at", "")
     agent.setdefault("last_checkpoint", "")
     agent.setdefault("blocked_reason", "")
-    # One project-wide deadline prevents unbounded aesthetic retry loops.
-    # The default follows the repository production contract; callers may
-    # still pass an explicit project-specific deadline.
-    configured_deadline = max(0.0, float(deadline_hours))
-    agent["runtime_deadline_enabled"] = True
-    agent["deadline_hours"] = configured_deadline
-    agent["target_delivery_seconds"] = configured_deadline * 60 * 60
-    agent["deadline_behavior"] = DEFAULT_DEADLINE_BEHAVIOR
+    # Retire the old implicit 10h/36000s migration rewrite.  Only a caller that
+    # explicitly supplies a positive deadline may re-enable the legacy cutoff.
+    # Existing fields without an explicit source are historical defaults, not
+    # user authorization, and are therefore migrated to disabled.
+    if deadline_hours is not None:
+        configured_deadline = max(0.0, float(deadline_hours))
+        agent["runtime_deadline_enabled"] = configured_deadline > 0
+        agent["deadline_hours"] = configured_deadline
+        agent["target_delivery_seconds"] = (
+            configured_deadline * 60 * 60 if configured_deadline > 0 else None
+        )
+        agent["runtime_deadline_source"] = "explicit_argument"
+        agent["deadline_behavior"] = (
+            "deliver_best_valid" if configured_deadline > 0 else DEFAULT_DEADLINE_BEHAVIOR
+        )
+    elif agent.get("runtime_deadline_source") == "explicit_argument":
+        configured_deadline = max(0.0, float(agent.get("deadline_hours") or 0.0))
+        agent["runtime_deadline_enabled"] = configured_deadline > 0
+        agent["deadline_hours"] = configured_deadline
+        agent["target_delivery_seconds"] = (
+            configured_deadline * 60 * 60 if configured_deadline > 0 else None
+        )
+    else:
+        agent["runtime_deadline_enabled"] = False
+        agent["deadline_hours"] = 0.0
+        agent["target_delivery_seconds"] = None
+        agent["runtime_deadline_source"] = "disabled_implicit_legacy_default"
+        agent["deadline_behavior"] = DEFAULT_DEADLINE_BEHAVIOR
     agent["max_full_resolution_encodes"] = 1
     agent.setdefault("min_free_disk_gb", DEFAULT_MIN_FREE_DISK_GB)
     agent.setdefault("started_at", "")
@@ -548,6 +573,7 @@ def ensure_manifest_v2(
     stages = agent.setdefault("stages", {})
     for stage in STORY_STAGE_SEQUENCE:
         record = stages.setdefault(stage, {})
+        had_cost_status = "actual_cost_status" in record
         for key, default in (
             ("status", "pending"),
             ("attempts", 0),
@@ -561,11 +587,31 @@ def ensure_manifest_v2(
             ("output_hashes", {}),
             ("provider", ""),
             ("request_id", ""),
-            ("actual_cost", 0.0),
+            ("actual_cost", None),
+            ("actual_cost_status", "not_reported"),
+            (
+                "token_usage",
+                {
+                    "input_tokens": None,
+                    "output_tokens": None,
+                    "total_tokens": None,
+                    "status": "not_reported",
+                },
+            ),
             ("retry_reason", ""),
             ("review", {}),
         ):
             record.setdefault(key, default)
+        if not had_cost_status:
+            if record.get("actual_cost") in (None, 0, 0.0):
+                record["actual_cost"] = None
+                record["actual_cost_status"] = (
+                    "not_reported"
+                    if record.get("provider") or record.get("request_id")
+                    else "not_applicable"
+                )
+            else:
+                record["actual_cost_status"] = "settled"
     agent.setdefault("events", [])
     agent.setdefault("code_identity", runtime_code_identity())
     agent.setdefault("delivery_state", "")
@@ -589,7 +635,14 @@ def stage_record(manifest: dict[str, Any], stage: str) -> dict[str, Any]:
             "output_hashes": {},
             "provider": "",
             "request_id": "",
-            "actual_cost": 0.0,
+            "actual_cost": None,
+            "actual_cost_status": "not_reported",
+            "token_usage": {
+                "input_tokens": None,
+                "output_tokens": None,
+                "total_tokens": None,
+                "status": "not_reported",
+            },
             "retry_reason": "",
             "review": {},
             "worktree_revision": "",
@@ -609,7 +662,17 @@ def stage_record(manifest: dict[str, Any], stage: str) -> dict[str, Any]:
         ("output_hashes", {}),
         ("provider", ""),
         ("request_id", ""),
-        ("actual_cost", 0.0),
+        ("actual_cost", None),
+        ("actual_cost_status", "not_reported"),
+        (
+            "token_usage",
+            {
+                "input_tokens": None,
+                "output_tokens": None,
+                "total_tokens": None,
+                "status": "not_reported",
+            },
+        ),
         ("retry_reason", ""),
         ("worktree_revision", ""),
         ("input_artifact_hashes", {}),
@@ -665,6 +728,10 @@ def mark_stage(
         record["request_id"] = request_id
     if actual_cost is not None:
         record["actual_cost"] = round(max(0.0, float(actual_cost)), 4)
+        record["actual_cost_status"] = "settled"
+    elif provider is not None or request_id is not None:
+        record["actual_cost"] = None
+        record["actual_cost_status"] = "not_reported"
     if retry_reason is not None:
         record["retry_reason"] = retry_reason
     if review is not None:
@@ -2472,9 +2539,16 @@ def render_job_report(project_dir: Path) -> Path:
         record = stages.get(name, {})
         score = record.get("review", {}).get("score", "")
         detail = record.get("retry_reason") or record.get("message", "")
+        actual_cost = record.get("actual_cost")
+        cost_status = str(record.get("actual_cost_status") or "not_reported")
+        cost_label = (
+            f"¥{float(actual_cost):.2f}"
+            if isinstance(actual_cost, (int, float)) and not isinstance(actual_cost, bool)
+            else "不适用" if cost_status == "not_applicable" else "未报告"
+        )
         lines.append(
             f"| {name} | {record.get('status', 'pending')} | {record.get('attempts', 0)} | {record.get('provider', '')} | "
-            f"¥{float(record.get('actual_cost', 0.0)):.2f} | {score} | {str(detail).replace('|', '/')} |"
+            f"{cost_label} | {score} | {str(detail).replace('|', '/')} |"
         )
     lines.extend([
         "",

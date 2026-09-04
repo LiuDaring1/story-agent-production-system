@@ -19,6 +19,8 @@ from product_text_projection import (
     PUBLIC_TEXT_TRANSFORM_VERSION,
     compile_annotation_story_lines,
     compile_public_story_lines,
+    customer_manuscript_form_issues,
+    customer_manuscript_paragraphs,
     public_line_list_sha256,
 )
 
@@ -28,6 +30,7 @@ PRODUCT_CONTENT_COMPILER_VERSION = "2.0.0"
 PRODUCT_TIMING_COMPILER_VERSION = "story-product-timing/v1"
 PPT_RENDER_MANIFEST_VERSION = "story-ppt-render/v2"
 ANNOTATION_RECEIPT_VERSION = "story-reading-annotation/v1"
+MANUSCRIPT_RECEIPT_VERSION = "story-customer-manuscript/v2"
 PRODUCT_PACKAGE_MANIFEST_VERSION = "story-product-package/v1"
 
 CONTRACT_BINDING_FIELDS = (
@@ -135,6 +138,12 @@ def _load_content_selection(content_manifest: Path, artifact: str) -> tuple[dict
 
 def extract_docx_paragraphs(path: Path) -> list[str]:
     return [paragraph.text.strip() for paragraph in Document(path).paragraphs if paragraph.text.strip()]
+
+
+def read_manuscript_source_text(path: Path) -> str:
+    if path.suffix.lower() == ".docx":
+        return "\n".join(extract_docx_paragraphs(path))
+    return path.read_text(encoding="utf-8-sig").strip()
 
 
 def compile_product_content_manifest(
@@ -348,11 +357,26 @@ def write_manuscript_receipt(
     selected_indices: list[int],
     selected_lines: list[str],
     content_manifest: Path,
+    source_story: Path | None = None,
 ) -> dict[str, Any]:
     paragraphs = extract_docx_paragraphs(manuscript)
-    expected = [f"《{story_name}》", *selected_lines]
+    if source_story is not None:
+        source_story = source_story.expanduser().resolve()
+        expected = customer_manuscript_paragraphs(
+            story_name,
+            read_manuscript_source_text(source_story),
+        )
+        form_issues = customer_manuscript_form_issues(expected, selected_lines)
+        if form_issues:
+            raise ValueError("客户故事文稿来源不是自然段落版本：" + "; ".join(form_issues))
+        schema_version = MANUSCRIPT_RECEIPT_VERSION
+    else:
+        # Legacy/internal callers retain the v1 exact-row receipt.  Formal
+        # production always supplies source_story and therefore uses v2.
+        expected = [f"《{story_name}》", *selected_lines]
+        schema_version = "story-customer-manuscript/v1"
     payload = {
-        "schema_version": "story-customer-manuscript/v1",
+        "schema_version": schema_version,
         "story_name": story_name,
         "product_content_manifest_path": str(content_manifest),
         "product_content_manifest_sha256": file_sha256(content_manifest),
@@ -364,6 +388,12 @@ def write_manuscript_receipt(
         "extracted_text_sha256": stable_sha256(paragraphs),
         "expected_paragraphs_sha256": stable_sha256(expected),
     }
+    if source_story is not None:
+        payload.update({
+            "source_story_path": str(source_story),
+            "source_story_sha256": file_sha256(source_story),
+            "paragraph_policy": "confirmed_source_natural_paragraphs_with_punctuation",
+        })
     atomic_write_json(output, payload)
     return payload
 
@@ -383,6 +413,26 @@ def manuscript_receipt_issues(receipt_path: Path) -> list[str]:
     if not manuscript.is_file() or payload.get("manuscript_sha256") != file_sha256(manuscript):
         return ["manuscript_stale"]
     paragraphs = extract_docx_paragraphs(manuscript)
+    schema_version = str(payload.get("schema_version") or "")
+    expected_from_source: list[str] | None = None
+    if schema_version == MANUSCRIPT_RECEIPT_VERSION:
+        source_story = Path(str(payload.get("source_story_path") or ""))
+        if (
+            not source_story.is_file()
+            or payload.get("source_story_sha256") != file_sha256(source_story)
+        ):
+            issues.append("manuscript_source_story_stale")
+        else:
+            expected_from_source = customer_manuscript_paragraphs(
+                str(payload.get("story_name") or ""),
+                read_manuscript_source_text(source_story),
+            )
+            if stable_sha256(expected_from_source) != payload.get("expected_paragraphs_sha256"):
+                issues.append("manuscript_expected_paragraphs_stale")
+            if paragraphs != expected_from_source:
+                issues.append("manuscript_current_source_paragraphs_mismatch")
+    elif schema_version != "story-customer-manuscript/v1":
+        issues.append("manuscript_receipt_schema_mismatch")
     if stable_sha256(paragraphs) != payload.get("extracted_text_sha256"):
         issues.append("manuscript_extracted_text_stale")
     if payload.get("extracted_text_sha256") != payload.get("expected_paragraphs_sha256"):
@@ -396,7 +446,9 @@ def manuscript_receipt_issues(receipt_path: Path) -> list[str]:
             issues.append("manuscript_source_indices_stale")
         if payload.get("selected_text_sha256") != stable_sha256(selected_lines):
             issues.append("manuscript_selected_text_stale")
-        if paragraphs != expected:
+        if schema_version == MANUSCRIPT_RECEIPT_VERSION:
+            issues.extend(customer_manuscript_form_issues(paragraphs, selected_lines))
+        elif paragraphs != expected:
             issues.append("manuscript_current_selection_mismatch")
     except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
         issues.append("manuscript_content_selection_invalid")
@@ -876,6 +928,7 @@ def product_package_manifest_issues(manifest_path: Path) -> list[str]:
         "background_with_subtitles",
         "background_without_subtitles",
         "timings_source",
+        "customer_media_receipt",
     }
     if not isinstance(dependencies, dict):
         dependencies = {}

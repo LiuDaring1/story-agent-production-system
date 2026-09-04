@@ -13,7 +13,7 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from static_ppt_contract import validate_plan, validate_pptx
+from static_ppt_contract import validate_pair, validate_plan
 
 
 def main() -> None:
@@ -23,15 +23,10 @@ def main() -> None:
     parser.add_argument("--pptx", action="append", default=[], type=Path)
     args = parser.parse_args()
     expected_ids, slides = validate_plan(args.director_plan, args.ppt_plan)
-    plan = json.loads(args.ppt_plan.read_text(encoding="utf-8"))
-    expected_durations = [float(row.get("duration_seconds") or 0) for row in slides]
-    for pptx in args.pptx:
-        validate_pptx(
-            pptx,
-            len(expected_ids),
-            music_sha256=str(plan.get("music_sha256") or ""),
-            expected_durations=expected_durations,
-        )
+    if args.pptx:
+        if len(args.pptx) != 2:
+            raise ValueError("--pptx 必须按含字幕、无字幕顺序恰好传入两次")
+        validate_pair(args.director_plan, args.ppt_plan, args.pptx[0], args.pptx[1])
     print(
         json.dumps(
             {

@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Callable
 
 
-from .align import LineTiming, align_script_to_narration, read_script_lines, save_timings
+from .align import LineTiming, align_script_to_narration, clean_text, read_script_lines, save_timings
 from .media import ensure_dir, probe_duration, run_command, sorted_video_files
 from .subtitles import SubtitleCue, build_subtitle_cues, write_srt
 from story_semantics import SemanticKind, classify_story, select_line_numbers
@@ -28,6 +28,7 @@ from semantic_card_motion import (
     load_semantic_card_motion_paths,
     write_semantic_card_motion_request,
 )
+from story_timeline import write_authoritative_timeline_receipt
 
 
 @dataclass(frozen=True)
@@ -67,6 +68,7 @@ class SynthesisResult:
     timings_json: Path
     subtitles_srt: Path
     sales_subtitles_srt: Path
+    timeline_receipt: Path | None
     semantic_plan_manifest: Path | None
     total_duration: float
 
@@ -76,6 +78,9 @@ def synthesize_story(
     compositor_port: CompositorPort | None = None,
 ) -> SynthesisResult:
     """Run the existing background assembly through the local CompositorPort seam."""
+
+    if config.project_dir is not None and config.alignment_mode != "whisper":
+        raise ValueError("正式项目禁止 even/均分 fallback；必须使用 Whisper 音频对齐")
 
     input_paths: list[tuple[str, Path]] = [
         (f"video_segment:{index}", path)
@@ -102,6 +107,13 @@ def synthesize_story(
         config.output_dir / "story_sales_subtitles.srt",
         config.output_dir / "story_semantic_timeline.srt",
     ]
+    if config.alignment_mode == "whisper":
+        output_targets.extend(
+            [
+                config.output_dir / "alignment_run_metadata.json",
+                config.output_dir / "authoritative_timeline_receipt.json",
+            ]
+        )
     if config.artifact_semantic_plan_path is not None:
         output_targets.append(config.output_dir / "artifact_semantic_plan_manifest.json")
     request = CompositorRequest(
@@ -239,6 +251,35 @@ def _synthesize_story_core(config: SynthesisConfig) -> SynthesisResult:
         semantic_timeline_srt,
         preserve_input_lines=preserve_subtitle_lines,
     )
+    timeline_receipt: Path | None = None
+    if config.alignment_mode == "whisper":
+        alignment_metadata = config.output_dir / "alignment_run_metadata.json"
+        subtitle_source = config.subtitle_script_path or config.script_path
+        _write_json_atomic(
+            alignment_metadata,
+            {
+                "alignment_mode": "whisper",
+                "model": config.whisper_model,
+                "language": config.language,
+                "audio_path": str(config.narration_path.resolve()),
+                "audio_sha256": _file_sha256(config.narration_path),
+                "subtitle_path": str(subtitle_source.resolve()),
+                "subtitle_sha256": _file_sha256(subtitle_source),
+                "subtitle_line_count": len(subtitle_timings),
+                "timed_char_count": sum(len(clean_text(item.line)) for item in subtitle_timings),
+            },
+        )
+        timeline_receipt = config.output_dir / "authoritative_timeline_receipt.json"
+        write_authoritative_timeline_receipt(
+            receipt_path=timeline_receipt,
+            source_kind="whisper_native_synthesis",
+            timings_path=subtitle_timings_json if subtitle_timings is not timings else timings_json,
+            alignment_metadata_path=alignment_metadata,
+            subtitle_txt=subtitle_source,
+            authoritative_audio=config.narration_path,
+            alignment_audio=config.narration_path,
+            output_srt=semantic_timeline_srt,
+        )
     background_timings = (
         select_timings_for_artifact(subtitle_timings, semantic_plan, "background_subtitles")
         if semantic_plan is not None else subtitle_timings
@@ -392,6 +433,7 @@ def _synthesize_story_core(config: SynthesisConfig) -> SynthesisResult:
         timings_json=timings_json,
         subtitles_srt=subtitles_srt,
         sales_subtitles_srt=sales_subtitles_srt,
+        timeline_receipt=timeline_receipt,
         semantic_plan_manifest=semantic_plan_manifest,
         total_duration=total_duration,
     )

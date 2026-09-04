@@ -80,6 +80,8 @@ def main() -> None:
     print(f"- 时间轴：{result.timings_json}")
     print(f"- 字幕：{result.subtitles_srt}")
     print(f"- 销售版字幕：{result.sales_subtitles_srt}")
+    if result.timeline_receipt is not None:
+        print(f"- 权威时间轴回执：{result.timeline_receipt}")
     print(f"- 总时长：{result.total_duration:.2f} 秒")
     print(f"- 制作耗时：{time.perf_counter() - start_time:.1f} 秒")
 

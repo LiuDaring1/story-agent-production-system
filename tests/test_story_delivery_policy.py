@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from PIL import Image
+import story_delivery_policy
 from story_video_synthesizer.pipeline import _subtitle_palette_has_magenta_or_purple
 
 from story_delivery_policy import (
@@ -29,6 +30,25 @@ class StoryDeliveryPolicyTests(unittest.TestCase):
     def test_both_public_release_variants_use_full_spoken_semantics(self) -> None:
         self.assertEqual(release_semantic_subtitle_artifact("main"), "demo_subtitles")
         self.assertEqual(release_semantic_subtitle_artifact("library"), "demo_subtitles")
+
+    def test_audio_matrix_keeps_customer_reusable_videos_music_only_not_silent(self) -> None:
+        self.assertEqual(
+            story_delivery_policy.audio_role("product_background_with_subtitles"),
+            "music_only",
+        )
+        self.assertEqual(
+            story_delivery_policy.audio_role("product_background_without_subtitles"),
+            "music_only",
+        )
+        self.assertEqual(
+            story_delivery_policy.audio_role("product_a_only_background"),
+            "music_only",
+        )
+        self.assertEqual(
+            story_delivery_policy.audio_role("product_demo"),
+            "narration_plus_music",
+        )
+        self.assertEqual(story_delivery_policy.customer_music_extension(), ".mp3")
 
     def test_duration_label_never_contains_approximation_word(self) -> None:
         self.assertEqual(normalize_duration_label("约 3分钟"), "3分钟")

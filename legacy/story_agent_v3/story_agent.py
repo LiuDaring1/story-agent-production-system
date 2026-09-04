@@ -1459,7 +1459,8 @@ class StoryAgent:
                 "status": record.get("status", "pending"),
                 "attempts": int(record.get("attempts", 0)),
                 "provider": record.get("provider", ""),
-                "actual_cost": float(record.get("actual_cost", 0.0)),
+                "actual_cost": record.get("actual_cost"),
+                "actual_cost_status": record.get("actual_cost_status", "not_reported"),
                 "retry_reason": record.get("retry_reason", ""),
             }
             for name, record in stage_records.items()
@@ -1684,7 +1685,15 @@ class StoryAgent:
                 "duration_seconds": duration_seconds,
                 "provider": str(record.get("provider") or ""),
                 "request_id": request_id,
-                "actual_cost": float(record.get("actual_cost") or 0.0),
+                "actual_cost": (
+                    float(record["actual_cost"])
+                    if isinstance(record.get("actual_cost"), (int, float))
+                    and not isinstance(record.get("actual_cost"), bool)
+                    else None
+                ),
+                "actual_cost_status": str(
+                    record.get("actual_cost_status") or "not_reported"
+                ),
                 "message": str(record.get("message") or ""),
                 "why_running": str(
                     attempt.get("why_running") or record.get("why_running") or record.get("message") or ""
@@ -1883,7 +1892,18 @@ class StoryAgent:
             for item in codex_usage_records
             if isinstance(item.get("total_tokens"), int)
         )
-        provider_cost = sum(float(row.get("actual_cost") or 0.0) for row in stage_rows)
+        provider_rows = [
+            row for row in stage_rows if row.get("provider") or row.get("request_id")
+        ]
+        provider_cost_unknown = sum(
+            1 for row in provider_rows if row.get("actual_cost") is None
+        )
+        provider_cost_settled = sum(
+            float(row["actual_cost"])
+            for row in provider_rows
+            if isinstance(row.get("actual_cost"), (int, float))
+            and not isinstance(row.get("actual_cost"), bool)
+        )
         render_stages = {
             "assemble_final", "release_preview", "package_release",
             "product_preflight", "product_package",
@@ -1898,15 +1918,23 @@ class StoryAgent:
             for row in stage_rows
             if row.get("stage") == "package_release"
         )
+        video_rows = [row for row in stage_rows if row.get("stage") == "generate_videos"]
+        video_cost_unknown = any(row.get("actual_cost") is None for row in video_rows)
         video_generation_cost = sum(
-            float(row.get("actual_cost") or 0.0)
-            for row in stage_rows
-            if row.get("stage") == "generate_videos"
+            float(row["actual_cost"])
+            for row in video_rows
+            if isinstance(row.get("actual_cost"), (int, float))
+            and not isinstance(row.get("actual_cost"), bool)
         )
+        music_rows = [
+            row for row in stage_rows if row.get("stage") in {"suno_generate", "assemble_music"}
+        ]
+        music_cost_unknown = any(row.get("actual_cost") is None for row in music_rows)
         music_cost = sum(
-            float(row.get("actual_cost") or 0.0)
-            for row in stage_rows
-            if row.get("stage") in {"suno_generate", "assemble_music"}
+            float(row["actual_cost"])
+            for row in music_rows
+            if isinstance(row.get("actual_cost"), (int, float))
+            and not isinstance(row.get("actual_cost"), bool)
         )
         budget = agent.get("budget") if isinstance(agent.get("budget"), dict) else {}
         current_record = stage_records.get(current_stage) if isinstance(stage_records.get(current_stage), dict) else {}
@@ -1983,14 +2011,28 @@ class StoryAgent:
             "retry_scope": str(current_record.get("retry_scope") or current_stage or ""),
             "delivery_state": str(agent.get("delivery_state") or ""),
             "cost_and_usage": {
-                "provider_cost_cny": round(provider_cost, 4),
+                "provider_cost_cny": (
+                    None if provider_cost_unknown else round(provider_cost_settled, 4)
+                ),
+                "provider_cost_settled_cny": round(provider_cost_settled, 4),
+                "provider_cost_unreported_requests": provider_cost_unknown,
+                "provider_cost_status": (
+                    "partial_unreported" if provider_cost_unknown else "settled"
+                ),
                 "budget_spent_cny": round(float(budget.get("spent") or 0.0), 4),
                 "codex_total_tokens_reported": known_codex_tokens,
                 "codex_calls": len(codex_usage_records),
                 "codex_calls_without_cli_usage": sum(1 for item in codex_usage_records if item.get("total_tokens") is None),
-                "video_generation_cost_cny": round(video_generation_cost, 4),
-                "music_cost_cny": round(music_cost, 4) if music_cost else None,
-                "music_cost_status": "reported" if music_cost else "not_reported_by_local_runtime",
+                "video_generation_cost_cny": (
+                    None if video_cost_unknown else round(video_generation_cost, 4)
+                ),
+                "video_generation_cost_status": (
+                    "not_reported_by_local_runtime" if video_cost_unknown else "reported"
+                ),
+                "music_cost_cny": None if music_cost_unknown else round(music_cost, 4),
+                "music_cost_status": (
+                    "not_reported_by_local_runtime" if music_cost_unknown else "reported"
+                ),
                 "imagegen_cost_cny": None,
                 "imagegen_cost_status": "not_reported_by_local_runtime",
                 "render_time_seconds": render_time_seconds,
@@ -8982,11 +9024,21 @@ class StoryAgent:
                 recovery_decision=str(payload.get("recovery_decision") or ""),
                 provider=str(stage_record.get("provider") or ""),
                 request_id=str(stage_record.get("request_id") or ""),
-                cost_cny=float(stage_record.get("actual_cost") or 0.0),
+                cost_cny=(
+                    float(stage_record["actual_cost"])
+                    if isinstance(stage_record.get("actual_cost"), (int, float))
+                    and not isinstance(stage_record.get("actual_cost"), bool)
+                    else None
+                ),
                 metadata={
-                    key: value
-                    for key, value in payload.items()
-                    if key not in {"message", "status", "stage", "attempt_id"}
+                    **{
+                        key: value
+                        for key, value in payload.items()
+                        if key not in {"message", "status", "stage", "attempt_id"}
+                    },
+                    "actual_cost_status": str(
+                        stage_record.get("actual_cost_status") or "not_reported"
+                    ),
                 },
             )
         except (OSError, ValueError) as exc:

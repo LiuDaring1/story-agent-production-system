@@ -261,6 +261,10 @@ def main() -> int:
         "paid_tasks": len(receipt_rows),
         "unique_paid_task_ids": len(set(task_ids)),
         "passed": not errors,
+        # Keep the producer contract aligned with story_run's fail-closed
+        # machine-QA registry.  A passing report must state this explicitly;
+        # absence is not equivalent to an empty critical-error list.
+        "critical_errors": [] if not errors else ["one_or_more_machine_checks_failed"],
         "errors": errors,
         "warnings": warnings,
         "clips": rows,

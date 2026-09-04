@@ -160,7 +160,7 @@ function render(snapshot) {{
     '</td><td>'+esc((dependencies[row.stage] || []).join(", ") || "—")+'</td><td>'+badge(row.effective_status)+'</td><td>'+esc(row.attempts)+' (I'+esc(row.infrastructure_attempts || 0)+'/Q'+esc(row.quality_attempts || 0)+')</td><td>'+esc(row.duration_seconds == null ? "—" : row.duration_seconds+"s")+
     ' / '+esc(row.estimate_status === "overdue" ? "原估算已过期" : (row.estimated_remaining_seconds == null ? "—" : row.estimated_remaining_seconds+"s"))+
     '</td><td>'+esc(row.provider || "—")+(row.request_id ? '<br><code>'+esc(row.request_id)+'</code>' : "")+
-    '</td><td>¥'+Number(row.actual_cost || 0).toFixed(2)+'</td><td><strong>'+esc(row.why_running || row.message || "")+'</strong>'+
+    '</td><td>'+esc(row.actual_cost == null ? (row.actual_cost_status === "not_applicable" ? "不适用" : "未报告") : "¥"+Number(row.actual_cost).toFixed(2))+'</td><td><strong>'+esc(row.why_running || row.message || "")+'</strong>'+
     (row.status_explanation ? '<br><span class="muted">'+esc(row.status_explanation)+'</span>' : '')+
     '<br><span class="muted">retry_scope: '+esc(row.retry_scope || "—")+
     (((row.retry_files || []).length) ? ' · '+esc(row.retry_files.join(", ")) : "")+'</span>'+

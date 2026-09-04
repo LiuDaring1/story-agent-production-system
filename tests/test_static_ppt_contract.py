@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import zipfile
 from pathlib import Path
+from xml.sax.saxutils import escape
 
 from PIL import Image
 
@@ -28,15 +29,34 @@ def write_json(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
 
 
-def write_minimal_static_ppt(path: Path, durations: list[float], music: bytes) -> None:
+def write_minimal_static_ppt(
+    path: Path,
+    durations: list[float],
+    music: bytes,
+    subtitles: list[str] | None = None,
+) -> None:
     namespace = "http://schemas.openxmlformats.org/presentationml/2006/main"
+    drawing = "http://schemas.openxmlformats.org/drawingml/2006/main"
+    subtitles = subtitles or [""] * len(durations)
     with zipfile.ZipFile(path, "w") as archive:
-        for index, seconds in enumerate(durations, start=1):
+        for index, (seconds, subtitle) in enumerate(zip(durations, subtitles), start=1):
             milliseconds = max(500, int(round(seconds * 1000)))
+            subtitle_xml = ""
+            if subtitle:
+                paragraphs = "".join(
+                    f'<a:p><a:r><a:t>{escape(line)}</a:t></a:r></a:p>'
+                    for line in subtitle.split("\n")
+                )
+                subtitle_xml = (
+                    f'<p:cSld><p:spTree><p:sp><p:nvSpPr><p:cNvPr id="2" '
+                    f'name="subtitle-{index:03d}"/></p:nvSpPr><p:txBody>{paragraphs}'
+                    f'</p:txBody></p:sp></p:spTree></p:cSld>'
+                )
             archive.writestr(
                 f"ppt/slides/slide{index}.xml",
                 (
-                    f'<p:sld xmlns:p="{namespace}">'
+                    f'<p:sld xmlns:p="{namespace}" xmlns:a="{drawing}">'
+                    f"{subtitle_xml}"
                     f'<p:transition advClick="1" advTm="{milliseconds}"/>'
                     "</p:sld>"
                 ),
@@ -138,14 +158,36 @@ class StaticPptContractTests(unittest.TestCase):
                 handle.write("provider-status-updated\n")
 
             durations = [2.0, 4.0, 4.0]
+            plan_payload = json.loads(plan_path.read_text(encoding="utf-8"))
+            subtitles = [
+                ""
+                if row["shot_id"] in {"TITLE", "MORAL"}
+                else str(row.get("subtitle") or "")
+                for row in plan_payload["slides"]
+            ]
             with_subtitles = root / "with-subtitles.pptx"
             without_subtitles = root / "without-subtitles.pptx"
-            write_minimal_static_ppt(with_subtitles, durations, music)
+            write_minimal_static_ppt(with_subtitles, durations, music, subtitles)
             write_minimal_static_ppt(without_subtitles, durations, music)
             slide_ids, _slides = validate_pair(
                 director_path, plan_path, with_subtitles, without_subtitles
             )
             self.assertEqual(slide_ids, ["TITLE", "shot-001", "shot-002"])
+
+            multiline_ppt = root / "multiline.pptx"
+            bad_subtitles = list(subtitles)
+            bad_subtitles[1] = "错误\n换行"
+            write_minimal_static_ppt(multiline_ppt, durations, music, bad_subtitles)
+            with self.assertRaisesRegex(ValueError, "字幕不是单行"):
+                validate_pair(director_path, plan_path, multiline_ppt, without_subtitles)
+
+            original_plan_text = plan_path.read_text(encoding="utf-8")
+            bad_plan = json.loads(original_plan_text)
+            bad_plan["slides"][1]["subtitle"] += "\n错误换行"
+            write_json(plan_path, bad_plan)
+            with self.assertRaisesRegex(ValueError, "必须合并为底部单行"):
+                validate_pair(director_path, plan_path, with_subtitles, without_subtitles)
+            plan_path.write_text(original_plan_text, encoding="utf-8")
 
             delivery_receipt_path = root / "static_ppt_delivery_receipt.json"
             receipt = write_delivery_receipt(

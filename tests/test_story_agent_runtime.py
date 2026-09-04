@@ -1882,7 +1882,7 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertFalse(story.exists())
             self.assertTrue((archive / story.name).exists())
 
-    def test_resume_preserves_cumulative_runtime_with_fixed_ten_hour_deadline(self) -> None:
+    def test_resume_preserves_runtime_but_retires_implicit_legacy_deadline(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：累计时限"
             manifest = init_project(project, story_name="累计时限", slug="cumulative-runtime")
@@ -1899,8 +1899,9 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(resumed["agent"]["started_at"], "")
             resumed["agent"]["active_elapsed_seconds"] = 2.1 * 3600
             assert_runnable(resumed)
-            self.assertTrue(resumed["agent"]["runtime_deadline_enabled"])
-            self.assertEqual(resumed["agent"]["deadline_hours"], 10.0)
+            self.assertFalse(resumed["agent"]["runtime_deadline_enabled"])
+            self.assertEqual(resumed["agent"]["deadline_hours"], 0.0)
+            self.assertIsNone(resumed["agent"]["target_delivery_seconds"])
 
     def test_reconcile_archives_unbound_story_images_and_normalizes_stale_state(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -1970,8 +1971,9 @@ class StoryAgentRuntimeTests(unittest.TestCase):
             self.assertEqual(reloaded["agent"]["stages"]["codex_story_images"]["status"], "pending")
             self.assertEqual(reloaded["agent"]["stages"]["story_images_review"]["status"], "pending")
             self.assertEqual(reloaded["agent"]["branch_blockers"], {})
-            self.assertTrue(reloaded["agent"]["runtime_deadline_enabled"])
-            self.assertEqual(reloaded["agent"]["deadline_hours"], 10.0)
+            self.assertFalse(reloaded["agent"]["runtime_deadline_enabled"])
+            self.assertEqual(reloaded["agent"]["deadline_hours"], 0.0)
+            self.assertIsNone(reloaded["agent"]["target_delivery_seconds"])
 
     def test_reconcile_marks_interrupted_but_verified_prior_stage_passed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -2660,8 +2662,16 @@ class StoryAgentRuntimeTests(unittest.TestCase):
     def test_manifest_v2_and_budget_limits(self) -> None:
         manifest = ensure_manifest_v2({}, soft_budget_cny=50, hard_budget_cny=100)
         self.assertEqual(manifest["version"], 2)
+        self.assertFalse(manifest["agent"]["runtime_deadline_enabled"])
+        self.assertEqual(manifest["agent"]["deadline_hours"], 0.0)
+        self.assertIsNone(manifest["agent"]["target_delivery_seconds"])
         self.assertEqual(manifest["agent"]["stages"]["source_edit"]["status"], "pending")
         self.assertEqual(manifest["agent"]["stages"]["doctor"]["attempts"], 0)
+        self.assertIsNone(manifest["agent"]["stages"]["source_edit"]["actual_cost"])
+        self.assertEqual(
+            manifest["agent"]["stages"]["source_edit"]["actual_cost_status"],
+            "not_applicable",
+        )
         ledger = BudgetLedger(manifest)
         reservation = ledger.authorize(40, label="first")
         ledger.settle(reservation, 35, provider="stub", request_id="r1")
@@ -2672,6 +2682,28 @@ class StoryAgentRuntimeTests(unittest.TestCase):
         ledger.release(critical, reason="test")
         with self.assertRaises(BudgetExceeded):
             ledger.authorize(70, label="over hard", critical=True)
+
+    def test_legacy_ten_hour_default_is_retired_but_explicit_deadline_is_preserved(self) -> None:
+        historical = {
+            "agent": {
+                "runtime_deadline_enabled": True,
+                "deadline_hours": 10.0,
+                "target_delivery_seconds": 36000,
+                "deadline_behavior": "deliver_best_valid",
+            }
+        }
+        migrated = ensure_manifest_v2(historical)
+        self.assertFalse(migrated["agent"]["runtime_deadline_enabled"])
+        self.assertEqual(migrated["agent"]["deadline_hours"], 0.0)
+        self.assertIsNone(migrated["agent"]["target_delivery_seconds"])
+        self.assertNotIn("accepted_with_exceptions", migrated["agent"]["delivery_state"])
+
+        explicit = ensure_manifest_v2({}, deadline_hours=2.0)
+        self.assertTrue(explicit["agent"]["runtime_deadline_enabled"])
+        self.assertEqual(explicit["agent"]["target_delivery_seconds"], 7200.0)
+        reloaded = ensure_manifest_v2(explicit)
+        self.assertTrue(reloaded["agent"]["runtime_deadline_enabled"])
+        self.assertEqual(reloaded["agent"]["target_delivery_seconds"], 7200.0)
 
     def test_review_requires_score_no_critical_and_matching_hash(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

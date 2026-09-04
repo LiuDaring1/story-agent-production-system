@@ -96,6 +96,57 @@ def clean_public_story_text(text: str) -> str:
     return "\n".join(compile_public_story_lines(lines)).strip()
 
 
+def customer_manuscript_paragraphs(story_name: str, source_text: str) -> list[str]:
+    """Return the customer-facing title plus natural source paragraphs.
+
+    Subtitle/script rows are a timing representation and must not become the
+    document's paragraph structure.  This function preserves the paragraphs
+    and punctuation of the confirmed manuscript while applying only the
+    public presenter-identity projection.
+    """
+
+    cleaned = clean_public_story_text(source_text)
+    paragraphs = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    normalized_name = re.sub(r"[^0-9A-Za-z\u3400-\u9fff]+", "", story_name)
+    if paragraphs:
+        normalized_first = re.sub(r"[^0-9A-Za-z\u3400-\u9fff]+", "", paragraphs[0])
+        if normalized_first == normalized_name:
+            paragraphs.pop(0)
+    return [f"《{story_name}》", *paragraphs]
+
+
+def customer_manuscript_form_issues(
+    paragraphs: Sequence[str],
+    selected_script_lines: Sequence[str],
+) -> list[str]:
+    """Validate semantic equality without demanding subtitle-shaped layout."""
+
+    issues: list[str] = []
+    body = [str(item).strip() for item in paragraphs[1:] if str(item).strip()]
+    selected = [str(item).strip() for item in selected_script_lines if str(item).strip()]
+
+    def content_key(items: Sequence[str]) -> str:
+        return "".join(re.findall(r"[0-9A-Za-z\u3400-\u9fff]+", "".join(items)))
+
+    if not body:
+        return ["manuscript_natural_paragraphs_missing"]
+    if content_key(body) != content_key(selected):
+        issues.append("manuscript_natural_content_mismatch")
+
+    if len(selected) >= 8:
+        compact_lengths = [len(content_key([item])) for item in body]
+        short_ratio = sum(length <= 18 for length in compact_lengths) / len(compact_lengths)
+        line_count_ratio = len(body) / max(1, len(selected))
+        punctuation_count = sum(
+            len(re.findall(r"[，。！？；：,.!?;:]", item)) for item in body
+        )
+        if line_count_ratio >= 0.6 and short_ratio >= 0.5:
+            issues.append("manuscript_subtitle_line_layout")
+        if punctuation_count < max(2, len(body) // 2):
+            issues.append("manuscript_natural_punctuation_missing")
+    return issues
+
+
 def public_line_list_sha256(lines: Sequence[str]) -> str:
     normalized = [re.sub(r"\s+", "", str(line)).strip() for line in lines]
     encoded = json.dumps(

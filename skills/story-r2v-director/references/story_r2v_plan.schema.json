@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "story-r2v-plan-v3",
-  "title": "Story R2V Director Plan",
+  "$id": "story-r2v-plan-v4",
+  "title": "Story R2V Director Plan v4",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -14,7 +14,7 @@
     "shots"
   ],
   "properties": {
-    "schema_version": {"const": "story-r2v-plan-v3"},
+    "schema_version": {"const": "story-r2v-plan-v4"},
     "story_id": {"type": "string", "minLength": 1},
     "source_audio": {
       "type": "object",
@@ -100,9 +100,19 @@
         "population_id": {"type": "string", "minLength": 1},
         "prop_id": {"type": "string", "minLength": 1},
         "state_id": {"type": "string", "minLength": 1},
-        "design_source_kind": {"enum": ["single_view", "three_view_sheet", "expression_sheet", "composite_scene", "population_archetype", "ensemble_design_master", "isolated_prop", "empty_environment", "style_anchor", "semantic_storyboard"]},
+        "design_source_kind": {"enum": ["single_view", "three_view_sheet", "expression_sheet", "composite_scene", "population_archetype", "ensemble_design_master", "isolated_prop", "empty_environment", "empty_environment_camera_view", "style_anchor", "semantic_storyboard"]},
         "appearance_summary": {"type": "string"},
         "scale_class": {"type": "string"},
+        "environment_family_id": {"type": "string", "minLength": 1},
+        "derived_from_asset_id": {"type": "string", "minLength": 1},
+        "view_from_zone_id": {"type": "string", "minLength": 1},
+        "view_target_zone_id": {"type": "string", "minLength": 1},
+        "view_background_zone_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
         "state_family_id": {"type": "string", "minLength": 1},
         "state_family_master_path": {"type": "string", "minLength": 1},
         "state_family_master_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
@@ -119,6 +129,21 @@
             "required": ["kind", "runtime_eligible"]
           },
           "then": {"required": ["scale_class", "physical_contract"]}
+        },
+        {
+          "if": {
+            "properties": {"design_source_kind": {"const": "empty_environment_camera_view"}},
+            "required": ["design_source_kind"]
+          },
+          "then": {
+            "required": [
+              "environment_family_id",
+              "derived_from_asset_id",
+              "view_from_zone_id",
+              "view_target_zone_id",
+              "view_background_zone_ids"
+            ]
+          }
         }
       ]
     },
@@ -139,6 +164,100 @@
         }
       }
     },
+    "zone": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["zone_id", "description", "map_x", "map_y"],
+      "properties": {
+        "zone_id": {"type": "string", "minLength": 1},
+        "description": {"type": "string", "minLength": 1},
+        "map_x": {"type": "number"},
+        "map_y": {"type": "number"}
+      }
+    },
+    "anchor": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["anchor_id", "zone_id", "description", "persistence", "occupancy_rule", "occupant_subject_id"],
+      "properties": {
+        "anchor_id": {"type": "string", "minLength": 1},
+        "zone_id": {"type": "string", "minLength": 1},
+        "description": {"type": "string", "minLength": 1},
+        "persistence": {"enum": ["fixed", "shot_local"]},
+        "occupancy_rule": {"enum": ["none", "occupied_while_subject_in_scene"]},
+        "occupant_subject_id": {"type": ["string", "null"], "minLength": 1}
+      }
+    },
+    "axis": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["axis_id", "endpoint_a_zone_id", "endpoint_b_zone_id", "description"],
+      "properties": {
+        "axis_id": {"type": "string", "minLength": 1},
+        "endpoint_a_zone_id": {"type": "string", "minLength": 1},
+        "endpoint_b_zone_id": {"type": "string", "minLength": 1},
+        "description": {"type": "string", "minLength": 1}
+      }
+    },
+    "cameraSetup": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "setup_id",
+        "axis_id",
+        "camera_side",
+        "shot_size",
+        "camera_angle",
+        "primary_subject_id",
+        "primary_subject_type",
+        "subject_zone_id",
+        "screen_side",
+        "eyeline_direction",
+        "camera_origin_zone_id",
+        "look_target_zone_id",
+        "background_zone_ids",
+        "camera_position_description"
+        ,"environment_view_asset_id"
+      ],
+      "properties": {
+        "setup_id": {"type": "string", "minLength": 1},
+        "axis_id": {"type": "string", "minLength": 1},
+        "camera_side": {"enum": ["side_a", "side_b", "on_axis"]},
+        "shot_size": {"enum": ["extreme_wide", "wide", "medium_wide", "medium", "medium_close", "close", "extreme_close", "insert"]},
+        "camera_angle": {"type": "string", "minLength": 1},
+        "primary_subject_id": {"type": "string", "minLength": 1},
+        "primary_subject_type": {"enum": ["character", "crowd", "prop", "environment"]},
+        "subject_zone_id": {"type": "string", "minLength": 1},
+        "screen_side": {"enum": ["left", "center", "right", "full_frame"]},
+        "eyeline_direction": {"enum": ["camera_left", "camera_right", "toward_camera", "away", "none", "mixed"]},
+        "camera_origin_zone_id": {"type": "string", "minLength": 1},
+        "look_target_zone_id": {"type": "string", "minLength": 1},
+        "background_zone_ids": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "camera_position_description": {"type": "string", "minLength": 1}
+        ,"environment_view_asset_id": {"type": "string", "minLength": 1}
+      }
+    },
+    "colorContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["white_balance", "palette", "prohibited_casts", "rationale"],
+      "properties": {
+        "white_balance": {"type": "string", "minLength": 1},
+        "palette": {"type": "string", "minLength": 1},
+        "prohibited_casts": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {"type": "string", "minLength": 1}
+        },
+        "rationale": {"type": "string", "minLength": 1}
+      }
+    },
     "continuityGroup": {
       "type": "object",
       "additionalProperties": false,
@@ -148,7 +267,11 @@
         "location",
         "time_of_day",
         "lighting",
-        "anchors"
+        "zones",
+        "anchors",
+        "axes",
+        "camera_setups",
+        "color_contract"
       ],
       "properties": {
         "group_id": {"type": "string", "minLength": 1},
@@ -156,25 +279,32 @@
         "location": {"type": "string", "minLength": 1},
         "time_of_day": {"type": "string", "minLength": 1},
         "lighting": {"type": "string", "minLength": 1},
-        "anchors": {
+        "zones": {
           "type": "array",
           "minItems": 1,
-          "items": {"type": "string", "minLength": 1}
+          "items": {"$ref": "#/$defs/zone"}
         },
+        "anchors": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/anchor"}},
+        "axes": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/axis"}},
+        "camera_setups": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/cameraSetup"}},
+        "color_contract": {"$ref": "#/$defs/colorContract"},
         "scene_change_basis": {"type": "string"}
       }
     },
     "cameraPlan": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["start_size", "end_size", "movement", "axis", "screen_direction", "internal_cut"],
+      "required": ["start_size", "end_size", "movement", "axis_id", "camera_setup_id", "screen_direction", "internal_cut", "visible_anchor_ids", "excluded_anchor_ids"],
       "properties": {
         "start_size": {"type": "string", "minLength": 1},
         "end_size": {"type": "string", "minLength": 1},
         "movement": {"type": "string", "minLength": 1},
-        "axis": {"type": "string", "minLength": 1},
+        "axis_id": {"type": "string", "minLength": 1},
+        "camera_setup_id": {"type": "string", "minLength": 1},
         "screen_direction": {"enum": ["left_to_right", "right_to_left", "toward_camera", "away_from_camera", "stationary", "mixed"]},
-        "internal_cut": {"const": false}
+        "internal_cut": {"const": false},
+        "visible_anchor_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "excluded_anchor_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
       }
     },
     "crowdPlan": {
@@ -229,10 +359,28 @@
         "deliberate_changes": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"enum": ["shot_size", "camera_angle", "visual_focus", "subject", "action_phase", "location", "time"]}}
       }
     },
+    "primaryBeat": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject_id", "action"],
+      "properties": {
+        "subject_id": {"type": "string", "minLength": 1},
+        "action": {"type": "string", "minLength": 1}
+      }
+    },
+    "supportingAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject_id", "action"],
+      "properties": {
+        "subject_id": {"type": "string", "minLength": 1},
+        "action": {"type": "string", "minLength": 1}
+      }
+    },
     "beat": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["start_second", "end_second", "source_text", "performance", "visible_characters", "camera"],
+      "required": ["start_second", "end_second", "source_text", "performance", "visible_characters", "primary_beat", "supporting_actions", "camera"],
       "properties": {
         "start_second": {"type": "number", "minimum": 0},
         "end_second": {"type": "number", "exclusiveMinimum": 0},
@@ -243,6 +391,8 @@
           "uniqueItems": true,
           "items": {"type": "string", "minLength": 1}
         },
+        "primary_beat": {"$ref": "#/$defs/primaryBeat"},
+        "supporting_actions": {"type": "array", "items": {"$ref": "#/$defs/supportingAction"}},
         "audio_speaker": {"type": "string"},
         "visual_focus": {"type": "string"},
         "listener_reaction": {"type": "string"},
@@ -315,6 +465,80 @@
         }
       }
     },
+    "focusContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "primary_subject_id",
+        "primary_subject_type",
+        "secondary_subject_ids",
+        "background_subject_ids",
+        "off_screen_subject_ids",
+        "visual_priority",
+        "composition_rule"
+      ],
+      "properties": {
+        "primary_subject_id": {"type": "string", "minLength": 1},
+        "primary_subject_type": {"enum": ["character", "crowd", "prop", "environment"]},
+        "secondary_subject_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "background_subject_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "off_screen_subject_ids": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
+        "visual_priority": {"type": "string", "minLength": 1},
+        "composition_rule": {"type": "string", "minLength": 1}
+      }
+    },
+    "subjectPresence": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["subject_id", "subject_type", "entry_presence", "exit_presence", "entry_zone_id", "exit_zone_id", "entry_world_presence", "exit_world_presence", "entry_world_zone_id", "exit_world_zone_id", "visibility_reason"],
+      "properties": {
+        "subject_id": {"type": "string", "minLength": 1},
+        "subject_type": {"enum": ["character", "crowd", "prop", "environment"]},
+        "entry_presence": {"enum": ["on_screen", "off_screen"]},
+        "exit_presence": {"enum": ["on_screen", "off_screen"]},
+        "entry_zone_id": {"type": ["string", "null"], "minLength": 1},
+        "exit_zone_id": {"type": ["string", "null"], "minLength": 1},
+        "entry_world_presence": {"enum": ["in_scene", "outside_scene"]},
+        "exit_world_presence": {"enum": ["in_scene", "outside_scene"]},
+        "entry_world_zone_id": {"type": ["string", "null"], "minLength": 1},
+        "exit_world_zone_id": {"type": ["string", "null"], "minLength": 1},
+        "visibility_reason": {"type": "string", "minLength": 1}
+      }
+    },
+    "propContract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "prop_id",
+        "asset_id",
+        "entry_presence",
+        "exit_presence",
+        "entry_state",
+        "exit_state",
+        "owner_id",
+        "zone_id",
+        "scale_basis",
+        "support_mode",
+        "rigidity",
+        "grip_or_contact",
+        "forbidden_inferences"
+      ],
+      "properties": {
+        "prop_id": {"type": "string", "minLength": 1},
+        "asset_id": {"type": ["string", "null"], "minLength": 1},
+        "entry_presence": {"enum": ["present", "absent"]},
+        "exit_presence": {"enum": ["present", "absent"]},
+        "entry_state": {"type": "string", "minLength": 1},
+        "exit_state": {"type": "string", "minLength": 1},
+        "owner_id": {"type": "string", "minLength": 1},
+        "zone_id": {"type": ["string", "null"], "minLength": 1},
+        "scale_basis": {"enum": ["handheld_small", "handheld_two_hands", "body_scale", "furniture_scale", "environment_scale"]},
+        "support_mode": {"enum": ["handheld", "freestanding", "grounded", "attached", "suspended", "loose"]},
+        "rigidity": {"enum": ["rigid", "flexible", "soft", "fragile", "fluid"]},
+        "grip_or_contact": {"type": "string", "minLength": 1},
+        "forbidden_inferences": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "string", "minLength": 1}}
+      }
+    },
     "shot": {
       "type": "object",
       "additionalProperties": false,
@@ -332,6 +556,9 @@
         "entering_characters",
         "exiting_characters",
         "crowd_plan",
+        "focus_contract",
+        "subject_presence",
+        "prop_contracts",
         "camera_plan",
         "opening_frame",
         "closing_frame",
@@ -362,6 +589,9 @@
         "entering_characters": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
         "exiting_characters": {"type": "array", "uniqueItems": true, "items": {"type": "string", "minLength": 1}},
         "crowd_plan": {"$ref": "#/$defs/crowdPlan"},
+        "focus_contract": {"$ref": "#/$defs/focusContract"},
+        "subject_presence": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/subjectPresence"}},
+        "prop_contracts": {"type": "array", "items": {"$ref": "#/$defs/propContract"}},
         "audio_speaker": {"type": "string"},
         "visual_focus": {"type": "string"},
         "narrative_visualization": {"$ref": "#/$defs/narrativeVisualization"},

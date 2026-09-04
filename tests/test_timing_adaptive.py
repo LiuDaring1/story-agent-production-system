@@ -9,14 +9,65 @@ from unittest.mock import patch
 
 import story_workflow
 import apply_narration_durations
+from assemble_r2v_story import retime_plan_to_authoritative_audio
 from apply_narration_durations import generation_duration_for_target
 from story_agent import AgentContext, StoryAgent
 from story_project import init_project, project_paths, write_manifest
 from story_video_synthesizer.align import LineTiming
-from story_video_synthesizer.pipeline import SynthesisConfig, _render_video_segments
+from story_video_synthesizer.pipeline import SynthesisConfig, _render_video_segments, synthesize_story
 
 
 class AdaptiveTimingTests(unittest.TestCase):
+    def test_r2v_assembly_projects_shot_boundaries_from_authoritative_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            audio = root / "audio.m4a"
+            timings = root / "timings.json"
+            audio.write_bytes(b"audio")
+            timings.write_text("[]", encoding="utf-8")
+            plan = {
+                "shots": [
+                    {"shot_id": "S01", "story_text": "正文一\n正文二"},
+                    {"shot_id": "S02", "story_text": "正文三"},
+                    {"shot_id": "MORAL", "story_text": "寓意"},
+                ]
+            }
+            rows = [
+                {"line": "主持开场", "source_start": 0.0, "source_end": 2.0},
+                {"line": "正文一", "source_start": 3.0, "source_end": 4.0},
+                {"line": "正文二", "source_start": 4.0, "source_end": 5.0},
+                {"line": "正文三", "source_start": 6.0, "source_end": 7.0},
+                {"line": "寓意一", "source_start": 8.0, "source_end": 9.0},
+            ]
+            result = retime_plan_to_authoritative_audio(
+                plan,
+                rows,
+                audio_path=audio,
+                audio_duration=10.0,
+                timings_path=timings,
+            )
+            self.assertEqual(result["title_window"], [0.0, 3.0])
+            self.assertEqual(
+                [(item["source_start"], item["source_end"]) for item in result["shots"]],
+                [(3.0, 6.0), (6.0, 8.0), (8.0, 10.0)],
+            )
+            self.assertEqual(result["shots"][0]["authoritative_line_start"], 2)
+
+    def test_formal_synthesis_rejects_even_alignment_fallback_before_execution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config = SynthesisConfig(
+                video_dir=root / "videos",
+                script_path=root / "script.txt",
+                narration_path=root / "voice.wav",
+                music_path=root / "music.mp3",
+                output_dir=root / "output",
+                project_dir=root,
+                alignment_mode="even",
+            )
+            with self.assertRaisesRegex(ValueError, "even|均分"):
+                synthesize_story(config)
+
     def test_adaptive_seconds_rounds_up_and_clamps_to_provider_bounds(self) -> None:
         kwargs = {
             "duration_mode": "adaptive-seconds",

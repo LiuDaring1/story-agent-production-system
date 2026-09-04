@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import hashlib
 import json
 import subprocess
@@ -45,6 +46,111 @@ def load_plan(path: Path) -> dict[str, Any]:
     if not isinstance(payload, dict) or not isinstance(payload.get("shots"), list):
         raise ValueError("R2V 计划缺少 shots")
     return payload
+
+
+def load_authoritative_timings(path: Path) -> list[dict[str, Any]]:
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(payload, list) or not payload:
+        raise ValueError("权威时间轴必须是非空列表")
+    rows: list[dict[str, Any]] = []
+    previous_end = -1.0
+    for index, item in enumerate(payload, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"权威时间轴第 {index} 行格式无效")
+        text = str(item.get("line") or "").strip()
+        start = float(item.get("source_start", -1))
+        end = float(item.get("source_end", -1))
+        if not text or start < 0 or end <= start or start + 1e-6 < previous_end:
+            raise ValueError("权威时间轴必须文本非空、时长为正且单调")
+        rows.append({"line": text, "source_start": start, "source_end": end})
+        previous_end = end
+    return rows
+
+
+def retime_plan_to_authoritative_audio(
+    plan: dict[str, Any],
+    timing_rows: list[dict[str, Any]],
+    *,
+    audio_path: Path,
+    audio_duration: float,
+    timings_path: Path,
+) -> dict[str, Any]:
+    """Project immutable shot text groups onto confirmed audio timestamps.
+
+    The next shot begins exactly when its first confirmed line begins; pauses
+    stay with the preceding visual. TITLE covers everything before the first
+    body line and MORAL covers the remaining confirmed suffix and audio tail.
+    """
+
+    updated = copy.deepcopy(plan)
+    shots = updated.get("shots")
+    if not isinstance(shots, list) or not shots:
+        raise ValueError("R2V 计划缺少 shots")
+    body_shots = [shot for shot in shots if str(shot.get("shot_id") or "").upper() != "MORAL"]
+    moral_shots = [shot for shot in shots if str(shot.get("shot_id") or "").upper() == "MORAL"]
+    if len(moral_shots) > 1:
+        raise ValueError("R2V 完整计划最多允许一个 MORAL 语义卡")
+
+    cursor = 0
+    matches: list[tuple[dict[str, Any], int, int]] = []
+    for shot in body_shots:
+        lines = [line.strip() for line in str(shot.get("story_text") or "").splitlines() if line.strip()]
+        if not lines:
+            raise ValueError(f"{shot.get('shot_id')}: story_text 为空，无法绑定权威时间轴")
+        found = None
+        for start_index in range(cursor, len(timing_rows) - len(lines) + 1):
+            if [row["line"] for row in timing_rows[start_index : start_index + len(lines)]] == lines:
+                found = start_index
+                break
+        if found is None:
+            raise ValueError(f"{shot.get('shot_id')}: story_text 无法与确认字幕连续对齐")
+        end_index = found + len(lines) - 1
+        matches.append((shot, found, end_index))
+        cursor = end_index + 1
+
+    first_body_index = matches[0][1]
+    moral_start_index = cursor
+    if moral_shots and moral_start_index >= len(timing_rows):
+        raise ValueError("MORAL 已计划但确认时间轴没有剩余寓意/收束行")
+    if not moral_shots and moral_start_index < len(timing_rows):
+        raise ValueError("确认时间轴仍有未分配行，缺少 MORAL 或正文镜头")
+    moral_start = (
+        float(timing_rows[moral_start_index]["source_start"])
+        if moral_shots else audio_duration
+    )
+
+    for index, (shot, start_index, end_index) in enumerate(matches):
+        next_start = (
+            float(timing_rows[matches[index + 1][1]]["source_start"])
+            if index + 1 < len(matches)
+            else moral_start
+        )
+        shot["source_start"] = float(timing_rows[start_index]["source_start"])
+        shot["source_end"] = next_start
+        shot["authoritative_line_start"] = start_index + 1
+        shot["authoritative_line_end"] = end_index + 1
+    if moral_shots:
+        moral = moral_shots[0]
+        moral["source_start"] = moral_start
+        moral["source_end"] = audio_duration
+        moral["authoritative_line_start"] = moral_start_index + 1
+        moral["authoritative_line_end"] = len(timing_rows)
+
+    title_end = float(timing_rows[first_body_index]["source_start"])
+    updated["title_window"] = [0.0, title_end]
+    updated["moral_window"] = [moral_start, audio_duration] if moral_shots else None
+    updated["source_audio"] = {
+        "path": str(audio_path.resolve()),
+        "sha256": sha256_path(audio_path),
+        "duration_seconds": audio_duration,
+    }
+    updated["authoritative_timings"] = {
+        "path": str(timings_path.resolve()),
+        "sha256": sha256_path(timings_path),
+        "time_basis": "source_start_source_end",
+    }
+    updated["timing_projection"] = "confirmed_audio_first_line_boundaries/v1"
+    return updated
 
 
 def encode_segment(
@@ -151,6 +257,9 @@ def main() -> int:
     parser.add_argument("--decisions", required=True, type=Path)
     parser.add_argument("--clips-dir", required=True, type=Path)
     parser.add_argument("--ppt-plan", required=True, type=Path)
+    parser.add_argument("--authoritative-timings", type=Path)
+    parser.add_argument("--retimed-plan", type=Path)
+    parser.add_argument("--moral-video", type=Path)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument(
@@ -169,10 +278,24 @@ def main() -> int:
     clips_dir = args.clips_dir.expanduser()
     ppt_plan_path = args.ppt_plan.expanduser()
     plan = load_plan(plan_path)
+    audio_duration = duration(audio_path, args.ffprobe)
+    if args.authoritative_timings is not None:
+        if args.retimed_plan is None:
+            raise ValueError("--authoritative-timings 必须同时提供 --retimed-plan，禁止覆盖旧计划")
+        authoritative_timings = args.authoritative_timings.expanduser()
+        plan = retime_plan_to_authoritative_audio(
+            plan,
+            load_authoritative_timings(authoritative_timings),
+            audio_path=audio_path,
+            audio_duration=audio_duration,
+            timings_path=authoritative_timings,
+        )
+        plan_path = args.retimed_plan.expanduser()
+        plan_path.parent.mkdir(parents=True, exist_ok=True)
+        plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     shots = plan["shots"]
     if not shots:
         raise ValueError("R2V 计划没有镜头")
-    audio_duration = duration(audio_path, args.ffprobe)
     validate_contiguous_timeline(shots, audio_duration)
     first_start = float(shots[0].get("source_start") or 0.0)
     if first_start <= 0:
@@ -215,7 +338,11 @@ def main() -> int:
             end = float(shot.get("source_end") or 0.0)
             if end <= start:
                 raise ValueError(f"{shot_id} 时间区间无效")
-            source = videos_dir / f"{shot_id}.mp4"
+            source = (
+                args.moral_video.expanduser()
+                if shot_id.upper() == "MORAL" and args.moral_video is not None
+                else videos_dir / f"{shot_id}.mp4"
+            )
             if not source.is_file() or source.stat().st_size <= 0:
                 raise FileNotFoundError(f"缺少镜头视频：{source}")
             source_duration = duration(source, args.ffprobe)

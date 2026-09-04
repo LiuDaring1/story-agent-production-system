@@ -11,13 +11,16 @@ repeating completed work.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
 import tempfile
+import threading
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Iterable, Iterator
 
 from shot_storyboard_pipeline import validate_compile_receipt
 from semantic_card_motion import (
@@ -25,6 +28,7 @@ from semantic_card_motion import (
     semantic_card_motion_receipt_issues,
 )
 from static_ppt_contract import validate_delivery_receipt
+from story_artifact_validation import validate_artifact_semantics
 
 
 SCHEMA_VERSION = "story-run-v1"
@@ -41,9 +45,21 @@ PACKAGE_NAMES = (
     "delivery",
 )
 PACKAGE_STATES = {"pending", "running", "done", "blocked"}
+REQUEST_STATES = {"submitted", "running", "completed", "failed", "cancelled"}
+COST_STATES = {
+    "settled",
+    "pending",
+    "estimated_only",
+    "provider_not_exposed",
+    "not_applicable",
+}
+TOKEN_STATES = {"reported", "not_reported", "not_applicable"}
+_RUN_THREAD_LOCKS: dict[str, threading.RLock] = {}
+_RUN_THREAD_LOCKS_GUARD = threading.Lock()
 CODEX_NATIVE_REQUIRED_ARTIFACTS = (
     "master_director_plan",
     "director_plan_review",
+    "authoritative_timeline_receipt",
     "storyboard_manifest_sealed",
     "storyboard_review",
     "shot_storyboard_compile_receipt",
@@ -57,8 +73,11 @@ CODEX_NATIVE_REQUIRED_ARTIFACTS = (
     "keying_visual_review",
     "theme_assets_manifest",
     "static_ppt_delivery_receipt",
+    "customer_media_receipt",
+    "customer_media_independent_review",
     "qa_product_report",
     "qa_publish_report",
+    "release_package_receipt",
     "main_release_video",
     "library_release_video",
     "qa_release_report",
@@ -71,12 +90,231 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+@contextmanager
+def run_file_lock(path: Path) -> Iterator[None]:
+    """Serialize every read-modify-write transaction for one run ledger."""
+
+    target = path.expanduser().resolve()
+    lock_path = target.with_name(f".{target.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    key = str(lock_path)
+    with _RUN_THREAD_LOCKS_GUARD:
+        thread_lock = _RUN_THREAD_LOCKS.setdefault(key, threading.RLock())
+    with thread_lock:
+        with lock_path.open("a+", encoding="utf-8") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
 def file_sha256(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as handle:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _optional_nonnegative_number(value: Any, label: str) -> float | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError(f"{label}必须是非负数或 null")
+    number = float(value)
+    if number < 0:
+        raise ValueError(f"{label}必须是非负数或 null")
+    return number
+
+
+def _new_package_observation(*, history_complete: bool) -> dict[str, Any]:
+    return {
+        "started_at": None,
+        "finished_at": None,
+        "active_seconds": None,
+        "wait_seconds": None,
+        "retry_count": 0 if history_complete else None,
+        "history_complete": history_complete,
+        "first_observed_at": None,
+        "last_observed_at": None,
+    }
+
+
+def ensure_observability(payload: dict[str, Any], *, new_run: bool = False) -> dict[str, Any]:
+    """Add the native request/event ledger without inventing historical values."""
+
+    existing = payload.get("observability")
+    migrated = not isinstance(existing, dict)
+    observability = payload.setdefault("observability", {})
+    observability.setdefault("schema_version", "story-run-observability/v1")
+    observability.setdefault("history_complete", bool(new_run) if migrated else False)
+    observability.setdefault("events", [])
+    observability.setdefault("requests", {})
+    package_rows = observability.setdefault("packages", {})
+    history_complete = bool(observability.get("history_complete"))
+    for package in PACKAGE_NAMES:
+        package_rows.setdefault(
+            package,
+            _new_package_observation(history_complete=history_complete),
+        )
+    payload.setdefault("manual_paid_total", float(payload.get("paid_total") or 0.0))
+    refresh_observability_summary(payload)
+    return observability
+
+
+def refresh_observability_summary(payload: dict[str, Any]) -> None:
+    observability = payload.get("observability")
+    if not isinstance(observability, dict):
+        return
+    requests = observability.get("requests")
+    if not isinstance(requests, dict):
+        requests = {}
+        observability["requests"] = requests
+
+    settled = float(payload.get("manual_paid_total") or 0.0)
+    unresolved_cost = 0
+    known_estimated = 0.0
+    for item in requests.values():
+        if not isinstance(item, dict):
+            continue
+        cost_state = str(item.get("cost_status") or "")
+        actual = item.get("actual_cost")
+        estimated = item.get("estimated_cost")
+        if cost_state == "settled" and isinstance(actual, (int, float)) and not isinstance(actual, bool):
+            settled += float(actual)
+        elif cost_state not in {"not_applicable"}:
+            unresolved_cost += 1
+        if isinstance(estimated, (int, float)) and not isinstance(estimated, bool):
+            known_estimated += float(estimated)
+
+    total_actual = None if unresolved_cost else round(settled, 4)
+    cost_status = (
+        "unsettled_requests"
+        if unresolved_cost
+        else "settled" if requests or settled else "known_zero_no_requests"
+    )
+    observability["cost_summary"] = {
+        "currency": "CNY",
+        "settled_actual_cny": round(settled, 4),
+        "known_estimated_cny": round(known_estimated, 4),
+        "unsettled_request_count": unresolved_cost,
+        "total_actual_cny": total_actual,
+        "status": cost_status,
+    }
+    payload["paid_total"] = round(settled, 4)
+    payload["paid_total_status"] = cost_status
+
+    token_applicable = 0
+    token_unknown = 0
+    known_input = 0
+    known_output = 0
+    known_total = 0
+    for item in requests.values():
+        if not isinstance(item, dict):
+            continue
+        token_state = str(item.get("token_status") or "not_reported")
+        if token_state == "not_applicable":
+            continue
+        token_applicable += 1
+        if token_state != "reported":
+            token_unknown += 1
+            continue
+        known_input += int(item.get("input_tokens") or 0)
+        known_output += int(item.get("output_tokens") or 0)
+        known_total += int(item.get("total_tokens") or 0)
+    if not token_applicable:
+        token_summary = {
+            "input_tokens": None,
+            "output_tokens": None,
+            "total_tokens": None,
+            "known_input_tokens": 0,
+            "known_output_tokens": 0,
+            "known_total_tokens": 0,
+            "unreported_request_count": 0,
+            "status": "not_applicable",
+        }
+    else:
+        token_summary = {
+            "input_tokens": None if token_unknown else known_input,
+            "output_tokens": None if token_unknown else known_output,
+            "total_tokens": None if token_unknown else known_total,
+            "known_input_tokens": known_input,
+            "known_output_tokens": known_output,
+            "known_total_tokens": known_total,
+            "unreported_request_count": token_unknown,
+            "status": "partial_unreported" if token_unknown else "reported",
+        }
+    observability["token_summary"] = token_summary
+
+    package_rows = observability.get("packages")
+    if not isinstance(package_rows, dict):
+        return
+    for package in PACKAGE_NAMES:
+        metrics = package_rows.setdefault(
+            package,
+            _new_package_observation(
+                history_complete=bool(observability.get("history_complete"))
+            ),
+        )
+        package_requests = [
+            item
+            for item in requests.values()
+            if isinstance(item, dict) and item.get("package") == package
+        ]
+        if not package_requests:
+            continue
+        starts = sorted(
+            str(item["started_at"])
+            for item in package_requests
+            if item.get("started_at")
+        )
+        ends = sorted(
+            str(item["ended_at"])
+            for item in package_requests
+            if item.get("ended_at")
+        )
+        if starts:
+            metrics["started_at"] = starts[0]
+        if ends:
+            metrics["finished_at"] = ends[-1]
+        known_active = sum(
+            float(item["duration_seconds"])
+            for item in package_requests
+            if item.get("duration_seconds") is not None
+        )
+        unknown_active = sum(
+            1 for item in package_requests if item.get("duration_seconds") is None
+        )
+        known_wait = sum(
+            float(item["wait_seconds"])
+            for item in package_requests
+            if item.get("wait_seconds") is not None
+        )
+        unknown_wait = sum(
+            1 for item in package_requests if item.get("wait_seconds") is None
+        )
+        known_retries = sum(
+            int(item["retry_index"])
+            for item in package_requests
+            if item.get("retry_index") is not None
+        )
+        unknown_retries = sum(
+            1 for item in package_requests if item.get("retry_index") is None
+        )
+        metrics.update(
+            {
+                "active_seconds": None if unknown_active else round(known_active, 3),
+                "known_active_seconds": round(known_active, 3),
+                "active_unreported_request_count": unknown_active,
+                "wait_seconds": None if unknown_wait else round(known_wait, 3),
+                "known_wait_seconds": round(known_wait, 3),
+                "wait_unreported_request_count": unknown_wait,
+                "retry_count": None if unknown_retries else known_retries,
+                "known_retry_count": known_retries,
+                "retry_unreported_request_count": unknown_retries,
+            }
+        )
 
 
 def require_file(path: Path, label: str) -> Path:
@@ -322,6 +560,7 @@ def load_run(path: Path) -> dict[str, Any]:
     payload = json.loads(resolved.read_text(encoding="utf-8"))
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise ValueError(f"不支持的运行账本版本：{payload.get('schema_version')!r}")
+    ensure_observability(payload)
     validate_run(payload)
     return payload
 
@@ -340,6 +579,25 @@ def validate_run(payload: dict[str, Any]) -> None:
     paid_total = payload.get("paid_total")
     if not isinstance(paid_total, (int, float)) or paid_total < 0:
         raise ValueError("story_run.json 的 paid_total 无效")
+    observability = payload.get("observability")
+    if not isinstance(observability, dict):
+        raise ValueError("story_run.json 缺少 observability")
+    if observability.get("schema_version") != "story-run-observability/v1":
+        raise ValueError("story_run.json 的 observability 版本无效")
+    if not isinstance(observability.get("events"), list):
+        raise ValueError("story_run.json 的 observability.events 无效")
+    requests = observability.get("requests")
+    if not isinstance(requests, dict):
+        raise ValueError("story_run.json 的 observability.requests 无效")
+    for request_key, request in requests.items():
+        if not isinstance(request, dict):
+            raise ValueError(f"请求观测记录无效：{request_key}")
+        if request.get("status") not in REQUEST_STATES:
+            raise ValueError(f"请求状态无效：{request_key}")
+        if request.get("cost_status") not in COST_STATES:
+            raise ValueError(f"请求成本状态无效：{request_key}")
+        if request.get("token_status") not in TOKEN_STATES:
+            raise ValueError(f"请求 Token 状态无效：{request_key}")
 
 
 def init_run(
@@ -354,8 +612,6 @@ def init_run(
     hard_budget: float = DEFAULT_HARD_BUDGET,
 ) -> dict[str, Any]:
     target = run_file.expanduser().resolve()
-    if target.exists():
-        raise FileExistsError(f"运行账本已存在，禁止覆盖：{target}")
     if soft_budget < 0 or hard_budget <= 0 or soft_budget > hard_budget:
         raise ValueError("预算必须满足 0 <= soft_budget <= hard_budget")
     project = project_dir.expanduser().resolve()
@@ -389,7 +645,11 @@ def init_run(
         "budget": {"soft": float(soft_budget), "hard": float(hard_budget)},
         "blocker": "",
     }
-    atomic_write_json(target, payload)
+    ensure_observability(payload, new_run=True)
+    with run_file_lock(target):
+        if target.exists():
+            raise FileExistsError(f"运行账本已存在，禁止覆盖：{target}")
+        atomic_write_json(target, payload)
     return payload
 
 
@@ -406,7 +666,7 @@ def parse_input_hashes(values: Iterable[str]) -> dict[str, str]:
     return result
 
 
-def record_run(
+def _record_run_unlocked(
     *,
     run_file: Path,
     package: str,
@@ -434,7 +694,18 @@ def record_run(
 
     target = run_file.expanduser().resolve()
     payload = load_run(target)
-    new_paid_total = round(float(payload["paid_total"]) + float(paid_amount), 4)
+    observability = ensure_observability(payload)
+    cost_summary = observability["cost_summary"]
+    if paid_amount > 0 and int(cost_summary["unsettled_request_count"]) > 0:
+        raise RuntimeError("存在未结算请求成本；未知不得当作 0，禁止新增付费工作")
+    new_manual_paid_total = round(
+        float(payload.get("manual_paid_total") or 0.0) + float(paid_amount),
+        4,
+    )
+    new_paid_total = round(
+        float(cost_summary["settled_actual_cny"]) + float(paid_amount),
+        4,
+    )
     hard = float(payload["budget"]["hard"])
     if new_paid_total > hard:
         raise RuntimeError(
@@ -446,7 +717,14 @@ def record_run(
         if artifact_id == "theme_assets_manifest":
             validate_theme_assets_manifest(artifact)
         if artifact_id == "shot_storyboard_compile_receipt":
-            validate_compile_receipt(artifact)
+            # Provider execution is allowed to append status/result metadata to
+            # the jobs CSV after compilation.  Recording the sealed compiler
+            # receipt therefore revalidates only its immutable bindings; the
+            # live job results are proven by the downstream provider receipt.
+            validate_compile_receipt(
+                artifact,
+                require_current_r2v_jobs=False,
+            )
         if artifact_id == "static_ppt_delivery_receipt":
             validate_delivery_receipt(artifact)
         if artifact_id == "semantic_card_generation_receipt":
@@ -458,6 +736,12 @@ def record_run(
             issues = semantic_card_motion_receipt_issues(request_path, artifact)
             if issues:
                 raise ValueError("片头/寓意卡 API 微动回执未通过：" + "；".join(issues))
+        validate_artifact_semantics(
+            artifact_id,
+            artifact,
+            registered_artifacts=payload["artifacts"],
+            registered_inputs=payload["inputs"],
+        )
         digest = file_sha256(artifact)
         existing = payload["artifacts"].get(artifact_id)
         if existing and existing.get("sha256") != digest and not replace:
@@ -474,11 +758,36 @@ def record_run(
             "recorded_at": utc_now(),
         }
 
+    previous_status = str(payload["work_packages"][package].get("status") or "")
+    observed_at = utc_now()
     payload["work_packages"][package] = {
         "status": status,
         "blocker": blocker.strip() if status == "blocked" else "",
     }
-    payload["paid_total"] = new_paid_total
+    payload["manual_paid_total"] = new_manual_paid_total
+    package_observation = observability["packages"][package]
+    package_observation["first_observed_at"] = (
+        package_observation.get("first_observed_at") or observed_at
+    )
+    package_observation["last_observed_at"] = observed_at
+    if status == "running" and not package_observation.get("started_at"):
+        if package_observation.get("history_complete"):
+            package_observation["started_at"] = observed_at
+    if status == "done":
+        package_observation["finished_at"] = observed_at
+    observability["events"].append(
+        {
+            "sequence": len(observability["events"]) + 1,
+            "observed_at": observed_at,
+            "event": "package_status",
+            "package": package,
+            "previous_status": previous_status,
+            "status": status,
+            "artifact_id": artifact_id.strip() or None,
+            "paid_amount_cny": float(paid_amount) if paid_amount else None,
+        }
+    )
+    refresh_observability_summary(payload)
     blocked = [
         value["blocker"]
         for value in payload["work_packages"].values()
@@ -491,26 +800,257 @@ def record_run(
     return payload
 
 
+def record_run(
+    *,
+    run_file: Path,
+    package: str,
+    status: str,
+    artifact_id: str = "",
+    artifact_path: Path | None = None,
+    input_hashes: dict[str, str] | None = None,
+    provider_task_id: str = "",
+    paid_amount: float = 0.0,
+    blocker: str = "",
+    replace: bool = False,
+) -> dict[str, Any]:
+    target = run_file.expanduser().resolve()
+    with run_file_lock(target):
+        return _record_run_unlocked(
+            run_file=target,
+            package=package,
+            status=status,
+            artifact_id=artifact_id,
+            artifact_path=artifact_path,
+            input_hashes=input_hashes,
+            provider_task_id=provider_task_id,
+            paid_amount=paid_amount,
+            blocker=blocker,
+            replace=replace,
+        )
+
+
+def _record_request_observation_unlocked(
+    *,
+    run_file: Path,
+    package: str,
+    provider: str,
+    request_id: str,
+    operation: str,
+    status: str,
+    model: str = "",
+    started_at: str = "",
+    ended_at: str = "",
+    duration_seconds: float | None = None,
+    wait_seconds: float | None = None,
+    retry_index: int | None = None,
+    token_status: str = "not_reported",
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    total_tokens: int | None = None,
+    estimated_cost: float | None = None,
+    actual_cost: float | None = None,
+    currency: str = "CNY",
+    cost_status: str = "provider_not_exposed",
+    replace: bool = False,
+) -> dict[str, Any]:
+    if package not in PACKAGE_NAMES:
+        raise ValueError(f"未知工作包：{package}")
+    provider = provider.strip()
+    request_id = request_id.strip()
+    operation = operation.strip()
+    if not provider or not request_id or not operation:
+        raise ValueError("请求观测必须提供 provider、request_id 和 operation")
+    if status not in REQUEST_STATES:
+        raise ValueError(f"请求状态无效：{status}")
+    if cost_status not in COST_STATES:
+        raise ValueError(f"成本状态无效：{cost_status}")
+    if token_status not in TOKEN_STATES:
+        raise ValueError(f"Token 状态无效：{token_status}")
+    duration_seconds = _optional_nonnegative_number(duration_seconds, "duration_seconds")
+    wait_seconds = _optional_nonnegative_number(wait_seconds, "wait_seconds")
+    estimated_cost = _optional_nonnegative_number(estimated_cost, "estimated_cost")
+    actual_cost = _optional_nonnegative_number(actual_cost, "actual_cost")
+    if retry_index is not None and (isinstance(retry_index, bool) or retry_index < 0):
+        raise ValueError("retry_index 必须是非负整数或 null")
+    token_values = (input_tokens, output_tokens, total_tokens)
+    if any(
+        value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0)
+        for value in token_values
+    ):
+        raise ValueError("Token 用量必须是非负整数或 null")
+    if token_status == "reported":
+        if total_tokens is None:
+            if input_tokens is None or output_tokens is None:
+                raise ValueError("token_status=reported 时必须提供 total_tokens 或完整输入/输出 Token")
+            total_tokens = input_tokens + output_tokens
+    elif any(value is not None for value in token_values):
+        raise ValueError("未报告/不适用 Token 不得写成 0 或其他数字")
+    if cost_status == "settled" and actual_cost is None:
+        raise ValueError("cost_status=settled 时必须提供 actual_cost")
+    if cost_status != "settled" and actual_cost is not None:
+        raise ValueError("未结算成本不得写 actual_cost")
+    if cost_status == "not_applicable" and estimated_cost is not None:
+        raise ValueError("cost_status=not_applicable 时不得写估算成本")
+    if not currency.strip():
+        raise ValueError("currency 不得为空")
+
+    target = run_file.expanduser().resolve()
+    payload = load_run(target)
+    observability = ensure_observability(payload)
+    key = f"{provider}:{request_id}"
+    requests = observability["requests"]
+    if key in requests and not replace:
+        raise RuntimeError(f"请求 {key!r} 已登记；更新状态必须显式使用 --replace")
+
+    record = {
+        "package": package,
+        "provider": provider,
+        "request_id": request_id,
+        "operation": operation,
+        "model": model.strip() or None,
+        "status": status,
+        "started_at": started_at.strip() or None,
+        "ended_at": ended_at.strip() or None,
+        "duration_seconds": duration_seconds,
+        "wait_seconds": wait_seconds,
+        "retry_index": retry_index,
+        "token_status": token_status,
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "estimated_cost": estimated_cost,
+        "actual_cost": actual_cost,
+        "currency": currency.strip().upper(),
+        "cost_status": cost_status,
+        "observed_at": utc_now(),
+    }
+    old = requests.get(key)
+    requests[key] = record
+    refresh_observability_summary(payload)
+    hard = float(payload["budget"]["hard"])
+    settled = float(observability["cost_summary"]["settled_actual_cny"])
+    if settled > hard:
+        if old is None:
+            requests.pop(key, None)
+        else:
+            requests[key] = old
+        refresh_observability_summary(payload)
+        raise RuntimeError(f"已结算成本超过硬预算：{settled:.2f} > {hard:.2f}")
+
+    package_observation = observability["packages"][package]
+    package_observation["first_observed_at"] = (
+        package_observation.get("first_observed_at") or record["observed_at"]
+    )
+    package_observation["last_observed_at"] = record["observed_at"]
+    if retry_index is not None:
+        known_retry_count = max(0, retry_index)
+        previous_retry_count = package_observation.get("retry_count")
+        package_observation["retry_count"] = max(
+            int(previous_retry_count or 0),
+            known_retry_count,
+        )
+    observability["events"].append(
+        {
+            "sequence": len(observability["events"]) + 1,
+            "observed_at": record["observed_at"],
+            "event": "request_observation",
+            "package": package,
+            "provider": provider,
+            "request_id": request_id,
+            "status": status,
+            "cost_status": cost_status,
+            "token_status": token_status,
+            "replaced_previous_observation": old is not None,
+        }
+    )
+    payload["updated_at"] = record["observed_at"]
+    payload["finalized_at"] = ""
+    atomic_write_json(target, payload)
+    return payload
+
+
+def record_request_observation(
+    *,
+    run_file: Path,
+    package: str,
+    provider: str,
+    request_id: str,
+    operation: str,
+    status: str,
+    model: str = "",
+    started_at: str = "",
+    ended_at: str = "",
+    duration_seconds: float | None = None,
+    wait_seconds: float | None = None,
+    retry_index: int | None = None,
+    token_status: str = "not_reported",
+    input_tokens: int | None = None,
+    output_tokens: int | None = None,
+    total_tokens: int | None = None,
+    estimated_cost: float | None = None,
+    actual_cost: float | None = None,
+    currency: str = "CNY",
+    cost_status: str = "provider_not_exposed",
+    replace: bool = False,
+) -> dict[str, Any]:
+    target = run_file.expanduser().resolve()
+    with run_file_lock(target):
+        return _record_request_observation_unlocked(
+            run_file=target,
+            package=package,
+            provider=provider,
+            request_id=request_id,
+            operation=operation,
+            status=status,
+            model=model,
+            started_at=started_at,
+            ended_at=ended_at,
+            duration_seconds=duration_seconds,
+            wait_seconds=wait_seconds,
+            retry_index=retry_index,
+            token_status=token_status,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            estimated_cost=estimated_cost,
+            actual_cost=actual_cost,
+            currency=currency,
+            cost_status=cost_status,
+            replace=replace,
+        )
+
+
 def status_summary(payload: dict[str, Any]) -> dict[str, Any]:
+    ensure_observability(payload)
     hard = float(payload["budget"]["hard"])
     soft = float(payload["budget"]["soft"])
-    paid = float(payload["paid_total"])
+    cost_summary = payload["observability"]["cost_summary"]
+    paid = float(cost_summary["settled_actual_cny"])
+    unresolved = int(cost_summary["unsettled_request_count"])
+    total_actual = cost_summary["total_actual_cny"]
     return {
         "schema_version": payload["schema_version"],
         "run_id": payload["run_id"],
         "project_dir": payload["project_dir"],
         "work_packages": payload["work_packages"],
         "artifact_ids": sorted(payload["artifacts"]),
-        "paid_total": paid,
+        "paid_total": total_actual,
+        "settled_paid_total": paid,
+        "cost_status": cost_summary["status"],
+        "unsettled_request_count": unresolved,
+        "token_usage": payload["observability"]["token_summary"],
+        "request_count": len(payload["observability"]["requests"]),
         "soft_budget_warning": paid >= soft,
-        "remaining_hard_budget": round(max(0.0, hard - paid), 4),
-        "can_start_paid_work": paid < hard,
+        "remaining_hard_budget": (
+            None if unresolved else round(max(0.0, hard - paid), 4)
+        ),
+        "can_start_paid_work": unresolved == 0 and paid < hard,
         "blocker": payload.get("blocker", ""),
         "finalized": bool(payload.get("finalized_at")),
     }
 
 
-def finalize_run(*, run_file: Path, required_artifacts: Iterable[str]) -> dict[str, Any]:
+def _finalize_run_unlocked(*, run_file: Path, required_artifacts: Iterable[str]) -> dict[str, Any]:
     target = run_file.expanduser().resolve()
     payload = load_run(target)
     incomplete = [
@@ -531,6 +1071,17 @@ def finalize_run(*, run_file: Path, required_artifacts: Iterable[str]) -> dict[s
             stale.append(artifact_id)
     if stale:
         raise RuntimeError(f"产物缺失或哈希漂移：{', '.join(stale)}")
+    for artifact_id in required:
+        record = payload["artifacts"][artifact_id]
+        try:
+            validate_artifact_semantics(
+                artifact_id,
+                Path(record["path"]),
+                registered_artifacts=payload["artifacts"],
+                registered_inputs=payload["inputs"],
+            )
+        except ValueError as exc:
+            raise RuntimeError(f"产物语义门禁失败：{exc}") from exc
     storyboard_receipt = payload["artifacts"].get("shot_storyboard_compile_receipt")
     theme_manifest = payload["artifacts"].get("theme_assets_manifest")
     if storyboard_receipt is not None and not isinstance(theme_manifest, dict):
@@ -582,6 +1133,15 @@ def finalize_run(*, run_file: Path, required_artifacts: Iterable[str]) -> dict[s
     return payload
 
 
+def finalize_run(*, run_file: Path, required_artifacts: Iterable[str]) -> dict[str, Any]:
+    target = run_file.expanduser().resolve()
+    with run_file_lock(target):
+        return _finalize_run_unlocked(
+            run_file=target,
+            required_artifacts=required_artifacts,
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Codex 原生故事生产的极简产物账本")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -611,6 +1171,32 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--paid-amount", type=float, default=0.0)
     record.add_argument("--blocker", default="")
     record.add_argument("--replace", action="store_true")
+
+    observe = subparsers.add_parser(
+        "observe-request",
+        help="登记一次请求的时间、重试、Token 与成本；未知值保持 null",
+    )
+    observe.add_argument("--run-file", required=True, type=Path)
+    observe.add_argument("--package", required=True, choices=PACKAGE_NAMES)
+    observe.add_argument("--provider", required=True)
+    observe.add_argument("--request-id", required=True)
+    observe.add_argument("--operation", required=True)
+    observe.add_argument("--status", required=True, choices=sorted(REQUEST_STATES))
+    observe.add_argument("--model", default="")
+    observe.add_argument("--started-at", default="")
+    observe.add_argument("--ended-at", default="")
+    observe.add_argument("--duration-seconds", type=float)
+    observe.add_argument("--wait-seconds", type=float)
+    observe.add_argument("--retry-index", type=int)
+    observe.add_argument("--token-status", choices=sorted(TOKEN_STATES), default="not_reported")
+    observe.add_argument("--input-tokens", type=int)
+    observe.add_argument("--output-tokens", type=int)
+    observe.add_argument("--total-tokens", type=int)
+    observe.add_argument("--estimated-cost", type=float)
+    observe.add_argument("--actual-cost", type=float)
+    observe.add_argument("--currency", default="CNY")
+    observe.add_argument("--cost-status", choices=sorted(COST_STATES), default="provider_not_exposed")
+    observe.add_argument("--replace", action="store_true")
 
     status = subparsers.add_parser("status", help="输出六个工作包和预算的简洁状态")
     status.add_argument("--run-file", required=True, type=Path)
@@ -645,6 +1231,30 @@ def main() -> None:
             provider_task_id=args.provider_task_id,
             paid_amount=args.paid_amount,
             blocker=args.blocker,
+            replace=args.replace,
+        )
+    elif args.command == "observe-request":
+        payload = record_request_observation(
+            run_file=args.run_file,
+            package=args.package,
+            provider=args.provider,
+            request_id=args.request_id,
+            operation=args.operation,
+            status=args.status,
+            model=args.model,
+            started_at=args.started_at,
+            ended_at=args.ended_at,
+            duration_seconds=args.duration_seconds,
+            wait_seconds=args.wait_seconds,
+            retry_index=args.retry_index,
+            token_status=args.token_status,
+            input_tokens=args.input_tokens,
+            output_tokens=args.output_tokens,
+            total_tokens=args.total_tokens,
+            estimated_cost=args.estimated_cost,
+            actual_cost=args.actual_cost,
+            currency=args.currency,
+            cost_status=args.cost_status,
             replace=args.replace,
         )
     elif args.command == "status":

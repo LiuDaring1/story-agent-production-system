@@ -433,6 +433,29 @@ class ReleaseGeometryTests(unittest.TestCase):
                 command[command.index("-filter_complex") + 1],
             )
 
+    def test_library_formal_render_mixes_spoken_program_with_background_music(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            voice = root / "voice.wav"
+            tail = root / "tail.png"
+            output = root / "library.mp4"
+            config = replace(
+                _config(root),
+                audio_mix=voice,
+                mix_bg_audio=True,
+                voice_volume=1.0,
+                bg_audio_volume=1.0,
+            )
+            with patch("release_video.probe_duration", return_value=10.0), \
+                 patch("release_video.run_command") as run:
+                render_library_window_video(config.bg_video, None, tail, output, config)
+            command = run.call_args.args[0]
+            graph = command[command.index("-filter_complex") + 1]
+            self.assertIn("[2:a]volume=1.000", graph)
+            self.assertIn("[0:a]volume=1.000", graph)
+            self.assertIn("amix=inputs=2:duration=first:dropout_transition=0:normalize=0", graph)
+            self.assertEqual(command[command.index("-map", command.index("-map") + 1) + 1], "[a]")
+
     def test_library_uses_two_countermoving_watermarks_through_tail_notice(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

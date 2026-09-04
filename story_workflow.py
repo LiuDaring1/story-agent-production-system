@@ -112,6 +112,29 @@ def product_demo_audio_source(
     )
 
 
+def formal_release_audio_arguments(
+    release_defaults: dict,
+    *,
+    strict_contract: bool,
+) -> list[str]:
+    """Return the public-release narration+music mixing contract.
+
+    The project background videos already carry the reviewed music-only bed.
+    Formal release must mix that bed with the hash-bound spoken program; an
+    audio stream containing narration alone is not a valid release soundtrack.
+    """
+
+    if not strict_contract:
+        return []
+    return [
+        "--mix-bg-audio",
+        "--voice-volume",
+        str(float(release_defaults.get("voice_volume", 1.0))),
+        "--bg-audio-volume",
+        str(float(release_defaults.get("bg_audio_volume", 1.0))),
+    ]
+
+
 def static_ppt_inputs_from_delivery_receipt(status_dir: Path) -> dict[str, Path]:
     """Return the exact sealed PPT inputs recorded by the native ledger."""
 
@@ -1756,7 +1779,7 @@ def run_package_release_project(
             ("主账号 16:9 背景图 main_background_16x9.png", bg_image),
             ("A 景透明故事框 story_frame_a.png", frame_a),
             ("无字幕背景视频 story_no_subs_bgm.mp4", main_bg_video),
-            ("人声混音 story_demo_voice_bgm.mp4", audio_mix),
+            ("完整口播音频", audio_mix),
             ("绿幕视频", greenscreen),
         ):
             if value is None:
@@ -1937,6 +1960,12 @@ def run_package_release_project(
             "--subtitle-margin-v",
             str(effective.get("subtitle_margin_v", 72)),
         ]
+        command.extend(
+            formal_release_audio_arguments(
+                release_defaults,
+                strict_contract=story_contract_context is not None,
+            )
+        )
         if release_contract_spec is not None:
             # Both short preview and formal Release inherit the same reviewed
             # real-material Demo geometry. The full customer Demo remains an

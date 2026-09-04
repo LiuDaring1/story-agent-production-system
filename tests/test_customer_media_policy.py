@@ -10,12 +10,23 @@ import numpy as np
 from story_customer_media import (
     file_sha256,
     music_only_fit,
+    narration_music_fit,
     subtitle_geometry_from_frames,
     validate_customer_media_receipt,
 )
 
 
 class CustomerMediaPolicyTests(unittest.TestCase):
+    def test_release_mix_requires_both_narration_and_music(self) -> None:
+        rng = np.random.default_rng(23)
+        narration = rng.normal(0.0, 0.15, 16_000)
+        music = rng.normal(0.0, 0.08, 16_000)
+        mixed = 0.9 * narration + 0.7 * music + rng.normal(0.0, 0.0001, 16_000)
+
+        self.assertTrue(narration_music_fit(mixed, narration, music)["passed"])
+        narration_only = narration + rng.normal(0.0, 0.0001, 16_000)
+        self.assertFalse(narration_music_fit(narration_only, narration, music)["passed"])
+
     def test_music_only_signal_passes_but_narration_mix_fails(self) -> None:
         rng = np.random.default_rng(20260902)
         music = rng.normal(0.0, 0.08, 80_000)

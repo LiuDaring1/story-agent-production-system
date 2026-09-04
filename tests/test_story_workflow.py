@@ -20,6 +20,7 @@ from story_workflow import (
     current_demo_preview_manifest,
     customer_manuscript_source,
     ensure_confirmed_spoken_timeline_srt,
+    formal_release_audio_arguments,
     preview_times_with_library_tail_coverage,
     product_demo_audio_source,
     product_body_subtitles_from_customer_media_receipt,
@@ -49,6 +50,22 @@ def write_srt(path: Path, texts: list[str]) -> None:
 
 
 class ProductTextSourceAlignmentTests(unittest.TestCase):
+    def test_formal_release_always_mixes_reviewed_background_music(self) -> None:
+        self.assertEqual(
+            formal_release_audio_arguments({}, strict_contract=True),
+            [
+                "--mix-bg-audio",
+                "--voice-volume",
+                "1.0",
+                "--bg-audio-volume",
+                "1.0",
+            ],
+        )
+        self.assertEqual(
+            formal_release_audio_arguments({}, strict_contract=False),
+            [],
+        )
+
     def test_formal_product_rebuild_rebinds_qa_away_from_existing_old_package(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project = Path(directory) / "故事剪辑：测试故事"

@@ -234,8 +234,13 @@ def main() -> None:
     parser.add_argument("--subtitle-font-size", default=52, type=int)
     parser.add_argument("--subtitle-margin-v", default=72, type=int, help="字幕距 16:9 横屏底部距离")
     parser.add_argument("--mix-bg-audio", action="store_true", help="把 --bg-video 的音频作为配乐，与 --audio-mix 混合")
-    parser.add_argument("--voice-volume", default=1.05, type=float, help="--audio-mix 人声音量倍率")
-    parser.add_argument("--bg-audio-volume", default=0.28, type=float, help="--bg-video 配乐音量倍率")
+    parser.add_argument("--voice-volume", default=1.0, type=float, help="--audio-mix 人声音量倍率")
+    parser.add_argument(
+        "--bg-audio-volume",
+        default=1.0,
+        type=float,
+        help="--bg-video 已按交付响度生成的配乐音量倍率",
+    )
     parser.add_argument("--person-height", default=PERSON_HEIGHT, type=int, help="主账号人像缩放后的高度")
     parser.add_argument("--person-x", default=PERSON_X, type=int, help="主账号人像左上角 X")
     parser.add_argument("--person-y", default=PERSON_Y, type=int, help="主账号人像左上角 Y")
@@ -1317,7 +1322,7 @@ def _release_layout_binding(
     return {
         # Bump when render semantics change so intact-looking receipts from an
         # older implementation cannot silently reuse visually obsolete media.
-        "renderer_policy_version": "2026-09-abc-tail-terminal-v10",
+        "renderer_policy_version": "2026-09-release-audio-role-v11",
         "variant": config.variant,
         "video_box": list(config.video_box),
         "story_box": list(config.story_box),
@@ -3086,6 +3091,8 @@ def render_main_wide(
         person_decoder_args = []
     audio_input_path = config.audio_mix
     audio_seek_args = seek_args
+    music_audio_input_path = config.bg_video
+    music_audio_seek_args = seek_args
     if sample_duration is not None:
         audio_input_path = work_dir / f"audio_sample_{int(round(sample_start * 1000)):09d}.wav"
         run_command([
@@ -3097,6 +3104,17 @@ def render_main_wide(
             str(audio_input_path),
         ])
         audio_seek_args = []
+        if config.mix_bg_audio:
+            music_audio_input_path = work_dir / f"music_sample_{int(round(sample_start * 1000)):09d}.wav"
+            run_command([
+                "ffmpeg", "-y", "-loglevel", "error",
+                *seek_args,
+                "-i", str(config.bg_video),
+                "-t", f"{duration + 0.08:.6f}",
+                "-vn", "-c:a", "pcm_s24le",
+                str(music_audio_input_path),
+            ])
+            music_audio_seek_args = []
     args = [
         "ffmpeg",
         "-y",
@@ -3170,6 +3188,10 @@ def render_main_wide(
         args.extend(["-i", str(subtitle_overlay)])
     audio_index = len(args_input_paths(args))
     args.extend([*audio_seek_args, "-i", str(audio_input_path)])
+    music_audio_index = None
+    if config.mix_bg_audio:
+        music_audio_index = len(args_input_paths(args))
+        args.extend([*music_audio_seek_args, "-i", str(music_audio_input_path)])
 
     # Input seeking preserves the source timestamps.  Always rebase the
     # presenter, including when no tail padding is needed, otherwise the first
@@ -3385,13 +3407,15 @@ def render_main_wide(
         filters.append(f"[{current}][subtitle_overlay]overlay=0:0[with_subtitles]")
         current = "with_subtitles"
     if config.mix_bg_audio:
+        assert music_audio_index is not None
         filters.extend(
             [
                 f"[{audio_index}:a]volume={config.voice_volume:.3f},atrim=0:{duration:.3f},"
                 f"apad=whole_dur={duration:.3f},asetpts=PTS-STARTPTS[voice]",
-                f"[1:a]volume={config.bg_audio_volume:.3f},atrim=0:{duration:.3f},"
+                f"[{music_audio_index}:a]volume={config.bg_audio_volume:.3f},atrim=0:{duration:.3f},"
                 f"apad=whole_dur={duration:.3f},asetpts=PTS-STARTPTS[music]",
-                "[voice][music]amix=inputs=2:duration=first:dropout_transition=0,alimiter=limit=0.94[a]",
+                "[voice][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+                "alimiter=limit=0.94:latency=1[a]",
             ]
         )
     else:
@@ -3770,6 +3794,21 @@ def render_library_window_video(
             ]
         )
         current = "with_subtitles"
+    audio_map = f"{audio_index}:a" if audio_index is not None else "0:a?"
+    if config.mix_bg_audio:
+        if audio_index is None:
+            raise ValueError("宝库号旁白+配乐合成缺少 --audio-mix 旁白输入")
+        filters.extend(
+            [
+                f"[{audio_index}:a]volume={config.voice_volume:.3f},atrim=0:{duration:.3f},"
+                f"apad=whole_dur={duration:.3f},asetpts=PTS-STARTPTS[voice]",
+                f"[0:a]volume={config.bg_audio_volume:.3f},atrim=0:{duration:.3f},"
+                f"apad=whole_dur={duration:.3f},asetpts=PTS-STARTPTS[music]",
+                "[voice][music]amix=inputs=2:duration=first:dropout_transition=0:normalize=0,"
+                "alimiter=limit=0.94:latency=1[a]",
+            ]
+        )
+        audio_map = "[a]"
     filters.extend(
         [
             f"[{tail_notice_index}:v]scale={notice_width}:-1,format=rgba[notice]",
@@ -3783,7 +3822,7 @@ def render_library_window_video(
             "-map",
             "[v]",
             "-map",
-            f"{audio_index}:a" if audio_index is not None else "0:a?",
+            audio_map,
             "-t",
             f"{duration:.3f}",
             "-c:v",

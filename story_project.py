@@ -37,7 +37,7 @@ from cover_quality import (
     render_required_covers,
     required_cover_issues,
 )
-from story_delivery_policy import normalize_duration_label
+from story_delivery_policy import audio_role, normalize_duration_label
 
 
 ROOT = Path(__file__).resolve().parent
@@ -3396,6 +3396,19 @@ def qa_release(project_dir: Path) -> Path:
     issues = []
     structured_results: list[dict[str, Any]] = []
     artifacts: dict[str, dict[str, str]] = {}
+    audio_contract, audio_contract_errors = release_audio_role_references(paths)
+    issues.extend(f"- {message}" for message in audio_contract_errors)
+    audio_reference_signals: tuple[Any, Any] | None = None
+    if audio_contract is not None:
+        from story_customer_media import decode_audio, narration_music_fit
+
+        try:
+            audio_reference_signals = (
+                decode_audio(Path(audio_contract["narration"]["path"])),
+                decode_audio(Path(audio_contract["music_bed"]["path"])),
+            )
+        except (OSError, ValueError, subprocess.SubprocessError) as exc:
+            issues.append(f"- 正式发布音频合同：参考音轨无法解码（{exc}）")
     for label, key in (("主账号发布视频", "main_release_video"), ("宝库号发布视频", "library_release_video")):
         value = manifest["outputs"].get(key, "")
         if not value or not Path(value).exists():
@@ -3409,6 +3422,19 @@ def qa_release(project_dir: Path) -> Path:
             notes.append("时长异常")
         alignment = probe_av_alignment(path)
         notes.extend(alignment["issues"])
+        release_audio_fit: dict[str, Any] | None = None
+        if audio_contract is not None and audio_reference_signals is not None:
+            try:
+                release_audio_fit = narration_music_fit(
+                    decode_audio(path),
+                    audio_reference_signals[0],
+                    audio_reference_signals[1],
+                )
+            except (OSError, ValueError, subprocess.SubprocessError) as exc:
+                notes.append(f"发布音轨内容角色无法审核：{exc}")
+            else:
+                if release_audio_fit.get("passed") is not True:
+                    notes.append("audio_role_not_narration_plus_music：发布音轨缺少旁白或配乐")
         width = int(alignment.get("width") or 0)
         height = int(alignment.get("height") or 0)
         if width <= 0 or height <= 0 or abs(width / height - 3 / 4) > 0.01:
@@ -3485,6 +3511,10 @@ def qa_release(project_dir: Path) -> Path:
                 "tail_probe_dir": str(tail_dir),
                 "tail_probe_frame_count": len(tail_frames),
                 "general_probe_frame_count": len(general_frames),
+                "audio_role": audio_role(
+                    "release_main" if key == "main_release_video" else "release_library"
+                ),
+                "audio_role_fit": release_audio_fit,
                 "issues": notes,
             }
         )
@@ -3492,14 +3522,21 @@ def qa_release(project_dir: Path) -> Path:
         if notes:
             issues.append(f"- {label}：{'；'.join(notes)}")
     report = paths.status / "qa_release_report.md"
-    write_qa_report(report, "发布视频机器审查", paths.release, rows, issues, expected="主账号/宝库号发布视频存在、时长正常")
+    write_qa_report(
+        report,
+        "发布视频机器审查",
+        paths.release,
+        rows,
+        issues,
+        expected="主账号/宝库号发布视频存在、时长正常，且音轨同时包含旁白与配乐",
+    )
     manifest["qa"]["release"] = str(report)
     report_json = paths.status / "qa_release_report.json"
     save_json(
         report_json,
         {
-            "schema_version": "story-release-machine-qa/v2",
-            "version": 2,
+            "schema_version": "story-release-machine-qa/v3",
+            "version": 3,
             "passed": not issues,
             # Completion gates must distinguish an explicit empty critical
             # set from a producer that simply omitted the field.
@@ -3507,6 +3544,7 @@ def qa_release(project_dir: Path) -> Path:
             "warnings": [],
             "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "artifacts": artifacts,
+            "audio_contract": audio_contract,
             "results": structured_results,
             "issues": issues,
         },
@@ -3571,6 +3609,71 @@ def probe_av_alignment(path: Path) -> dict[str, Any]:
         "audio_duration_sec": audio_duration,
         "issues": issues,
     }
+
+
+def release_audio_role_references(paths: ProjectPaths) -> tuple[dict[str, Any] | None, list[str]]:
+    """Resolve hash-bound narration and music-bed inputs for formal Release QA."""
+
+    run_path = paths.status / "story_run.json"
+    if not run_path.is_file():
+        # Lightweight/unit projects retain the structural A/V QA.  A native
+        # formal run always has story_run.json and therefore enters the strict
+        # content-role gate below.
+        return None, []
+    errors: list[str] = []
+    try:
+        run_payload = json.loads(run_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return None, ["正式发布音频合同：story_run.json 无效"]
+    narration_item = run_payload.get("inputs", {}).get("audio")
+    if not isinstance(narration_item, dict):
+        errors.append("正式发布音频合同：缺少哈希绑定的完整口播")
+        narration_path = None
+    else:
+        narration_path = Path(str(narration_item.get("path") or "")).expanduser()
+        if (
+            not narration_path.is_file()
+            or narration_item.get("sha256") != sha256_file(narration_path)
+        ):
+            errors.append("正式发布音频合同：完整口播缺失或哈希漂移")
+            narration_path = None
+
+    receipt_item = run_payload.get("artifacts", {}).get("customer_media_receipt")
+    music_bed_path: Path | None = None
+    music_bed_binding: dict[str, Any] | None = None
+    if not isinstance(receipt_item, dict):
+        errors.append("正式发布音频合同：缺少客户媒体配乐-only 回执")
+    else:
+        receipt_path = Path(str(receipt_item.get("path") or "")).expanduser()
+        if (
+            not receipt_path.is_file()
+            or receipt_item.get("sha256") != sha256_file(receipt_path)
+        ):
+            errors.append("正式发布音频合同：客户媒体回执缺失或哈希漂移")
+        else:
+            try:
+                from story_customer_media import validate_customer_media_receipt
+
+                receipt = validate_customer_media_receipt(receipt_path)
+                music_bed_binding = receipt["artifacts"]["product_background_without_subtitles"]
+                music_bed_path = Path(str(music_bed_binding["path"])).expanduser()
+            except (KeyError, TypeError, ValueError) as exc:
+                errors.append(f"正式发布音频合同：配乐-only 回执无效（{exc}）")
+
+    if errors or narration_path is None or music_bed_path is None or music_bed_binding is None:
+        return None, errors
+    return {
+        "required_audio_role": audio_role("release_main"),
+        "narration": {
+            "path": str(narration_path),
+            "sha256": sha256_file(narration_path),
+        },
+        "music_bed": {
+            "path": str(music_bed_path),
+            "sha256": str(music_bed_binding["sha256"]),
+            "source_role": "product_background_without_subtitles:music_only",
+        },
+    }, []
 
 
 def qa_product(project_dir: Path) -> Path:

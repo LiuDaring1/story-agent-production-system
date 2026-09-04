@@ -19,6 +19,9 @@ import numpy as np
 SCHEMA_VERSION = "story-customer-media-receipt/v1"
 MUSIC_ONLY_CORRELATION_MIN = 0.97
 MUSIC_ONLY_RESIDUAL_MAX = 0.08
+NARRATION_MUSIC_RESIDUAL_MAX = 0.12
+NARRATION_COMPONENT_RMS_RATIO_MIN = 0.05
+MUSIC_COMPONENT_RMS_RATIO_MIN = 0.01
 
 
 def file_sha256(path: Path) -> str:
@@ -81,6 +84,12 @@ def _decode_audio(path: Path, sample_rate: int = 8000) -> np.ndarray:
     return signal
 
 
+def decode_audio(path: Path, sample_rate: int = 8000) -> np.ndarray:
+    """Decode one media audio stream for independent content-role QA."""
+
+    return _decode_audio(path, sample_rate)
+
+
 def music_only_fit(
     rendered_audio: np.ndarray,
     source_music: np.ndarray,
@@ -130,6 +139,103 @@ def music_only_fit(
         "best_lag_samples": int(lag),
         "gain": round(gain, 6),
         "rms": round(rms, 8),
+    }
+
+
+def narration_music_fit(
+    rendered_audio: np.ndarray,
+    narration_audio: np.ndarray,
+    music_audio: np.ndarray,
+    *,
+    sample_rate: int = 8000,
+) -> dict[str, float | int | bool]:
+    """Prove that a release track contains both narration and its score bed.
+
+    An audio stream can be perfectly aligned while still containing narration
+    only.  This fits the rendered signal against both exact sources and rejects
+    a result when either positive component is missing.
+    """
+
+    length = min(rendered_audio.size, narration_audio.size, music_audio.size)
+    if length < sample_rate:
+        raise ValueError("音频过短，无法审核旁白+配乐角色")
+    rendered = rendered_audio[:length]
+    narration = narration_audio[:length]
+    music = music_audio[:length]
+    best: tuple[float, int, float, float, float, float] | None = None
+    max_lag = min(round(sample_rate * 0.2), max(0, (length - sample_rate) // 2))
+    window_length = min(sample_rate * 2, length - 2 * max_lag)
+    latest_start = min(length - window_length - max_lag, sample_rate * 30)
+    starts = range(max_lag, latest_start + 1, max(1, sample_rate))
+    anchor = max(
+        starts,
+        key=lambda start: float(np.dot(narration[start:start + window_length], narration[start:start + window_length])),
+        default=max_lag,
+    )
+    voice_window = narration[anchor:anchor + window_length]
+    voice_energy = float(np.dot(voice_window, voice_window))
+    best_alignment = (-math.inf, 0)
+    # AAC/limiter latency is often 5 ms, so a 10 ms-only search can miss an
+    # otherwise exact mixture. Search sample-accurately on one energetic short
+    # narration window, then fit only the winning offsets over the full track.
+    for lag in range(-max_lag, max_lag + 1):
+        actual_window = rendered[anchor + lag:anchor + lag + window_length]
+        energy = float(np.dot(actual_window, actual_window))
+        correlation = float(np.dot(actual_window, voice_window)) / math.sqrt(max(1e-20, energy * voice_energy))
+        if correlation > best_alignment[0]:
+            best_alignment = (correlation, lag)
+    alignment_lag = best_alignment[1]
+    candidate_lags = {0, alignment_lag}
+    candidate_lags.update(lag for lag in (alignment_lag - 1, alignment_lag + 1) if abs(lag) <= max_lag)
+    for lag in sorted(candidate_lags):
+        if lag >= 0:
+            actual = rendered[lag:length]
+            voice = narration[: length - lag]
+            score = music[: length - lag]
+        else:
+            actual = rendered[: length + lag]
+            voice = narration[-lag:length]
+            score = music[-lag:length]
+        if actual.size < sample_rate:
+            continue
+        gram = np.array([
+            [np.dot(voice, voice), np.dot(voice, score)],
+            [np.dot(voice, score), np.dot(score, score)],
+        ])
+        target = np.array([np.dot(voice, actual), np.dot(score, actual)])
+        gains, *_ = np.linalg.lstsq(gram, target, rcond=None)
+        voice_gain, music_gain = (float(value) for value in gains)
+        predicted = voice_gain * voice + music_gain * score
+        actual_energy = float(np.mean(actual**2))
+        if actual_energy <= 1e-12:
+            continue
+        residual = float(np.mean((actual - predicted) ** 2) / actual_energy)
+        output_rms = math.sqrt(actual_energy)
+        voice_ratio = abs(voice_gain) * float(np.sqrt(np.mean(voice**2))) / output_rms
+        music_ratio = abs(music_gain) * float(np.sqrt(np.mean(score**2))) / output_rms
+        candidate = (residual, lag, voice_gain, music_gain, voice_ratio, music_ratio)
+        if best is None or (candidate[0], abs(candidate[1])) < (best[0], abs(best[1])):
+            best = candidate
+    if best is None:
+        raise ValueError("音频能量不足，发布视频不能是静音")
+    residual, lag, voice_gain, music_gain, voice_ratio, music_ratio = best
+    output_rms = float(math.sqrt(np.mean(rendered**2)))
+    return {
+        "passed": (
+            output_rms > 1e-5
+            and voice_gain > 0
+            and music_gain > 0
+            and voice_ratio >= NARRATION_COMPONENT_RMS_RATIO_MIN
+            and music_ratio >= MUSIC_COMPONENT_RMS_RATIO_MIN
+            and residual <= NARRATION_MUSIC_RESIDUAL_MAX
+        ),
+        "residual_energy_ratio": round(residual, 6),
+        "best_lag_samples": int(lag),
+        "voice_gain": round(voice_gain, 6),
+        "music_gain": round(music_gain, 6),
+        "voice_component_rms_ratio": round(voice_ratio, 6),
+        "music_component_rms_ratio": round(music_ratio, 6),
+        "rms": round(output_rms, 8),
     }
 
 
@@ -421,7 +527,9 @@ def validate_customer_media_receipt(path: Path) -> dict[str, Any]:
 
 __all__ = [
     "SCHEMA_VERSION",
+    "decode_audio",
     "music_only_fit",
+    "narration_music_fit",
     "subtitle_geometry_from_frames",
     "subtitle_geometry_from_videos",
     "validate_customer_media_receipt",

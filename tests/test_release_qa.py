@@ -47,6 +47,24 @@ def make_vertical_video(path: Path, *, with_audio: bool = True) -> None:
         raise RuntimeError(process.stderr)
 
 
+def make_audio(path: Path, frequency: int) -> None:
+    process = subprocess.run(
+        [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "lavfi",
+            "-i",
+            f"sine=frequency={frequency}:duration=1.2",
+            str(path),
+        ],
+        text=True,
+        capture_output=True,
+    )
+    if process.returncode != 0:
+        raise RuntimeError(process.stderr)
+
+
 class ReleaseQaTests(unittest.TestCase):
     def test_terminal_preview_shifts_full_sample_window_before_eof(self) -> None:
         start, duration, frame_time = release_preview_sample_window(179.883, 179.7)
@@ -333,7 +351,7 @@ class ReleaseQaTests(unittest.TestCase):
             qa_release(project)
             payload = json.loads((paths.status / "qa_release_report.json").read_text(encoding="utf-8"))
             self.assertTrue(payload["passed"])
-            self.assertEqual(payload["schema_version"], "story-release-machine-qa/v2")
+            self.assertEqual(payload["schema_version"], "story-release-machine-qa/v3")
             self.assertEqual(payload["critical_errors"], [])
             self.assertEqual(len(payload["artifacts"]), 2)
 
@@ -349,6 +367,35 @@ class ReleaseQaTests(unittest.TestCase):
             self.assertFalse(payload["passed"])
             self.assertTrue(payload["critical_errors"])
             self.assertTrue(any("缺少音轨" in issue for issue in payload["issues"]))
+
+    def test_release_qa_rejects_aligned_narration_only_tracks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project = Path(directory) / "故事剪辑：只有旁白"
+            init_project(project, story_name="只有旁白", slug="voice-only")
+            paths = project_paths(project)
+            narration = project / "narration.wav"
+            music = project / "music.wav"
+            make_audio(narration, 330)
+            make_audio(music, 550)
+            make_vertical_video(paths.release / "主账号发布视频.mp4")
+            make_vertical_video(paths.release / "宝库号发布视频.mp4")
+            audio_contract = {
+                "required_audio_role": "narration_plus_music",
+                "narration": {"path": str(narration), "sha256": "a" * 64},
+                "music_bed": {"path": str(music), "sha256": "b" * 64},
+            }
+
+            with patch(
+                "story_project.release_audio_role_references",
+                return_value=(audio_contract, []),
+            ):
+                qa_release(project)
+            payload = json.loads((paths.status / "qa_release_report.json").read_text(encoding="utf-8"))
+            self.assertFalse(payload["passed"])
+            self.assertTrue(
+                any("audio_role_not_narration_plus_music" in issue for issue in payload["issues"]),
+                payload["issues"],
+            )
 
     def test_release_qa_never_uses_rejected_video_when_canonical_output_exists(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

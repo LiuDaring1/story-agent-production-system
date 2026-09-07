@@ -85,7 +85,7 @@ DEFAULT_CONFIG: dict[str, Any] = {
     "age_range_options": ["3-6岁", "4-6岁", "6-8岁", "9-11岁", "12-14岁", "15岁以上"],
     "default_age_range": "",
     "brand_assets": {
-        "assets_dir": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材",
+        "assets_dir": "assets/brand",
         "logo": "assets/brand/program_logo.png",
         "watermark_logo": "assets/brand/program_logo.png",
         "story_logo": "assets/brand/program_logo.png",
@@ -154,8 +154,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "base_url": "https://toapis.com/v1",
                 "model": "grok-video-1.0",
                 "api_key_env": "TOAPIS_API_KEY",
-                "estimated_cost_cny_per_clip": 0.06,
-                "estimated_cost_cny_per_second": 0.01,
                 "default_seconds": 6,
                 "min_seconds": 6,
                 "max_seconds": 10,
@@ -167,13 +165,10 @@ DEFAULT_CONFIG: dict[str, Any] = {
                 "runner": "mock_video_provider.py",
                 "model": "ffmpeg-still-frame",
                 "api_key_env": "",
-                "estimated_cost_cny_per_clip": 0.0,
             }
         },
     },
     "agent_defaults": {
-        "soft_budget_cny": 50.0,
-        "hard_budget_cny": 100.0,
         "deadline_hours": 0.0,
         "target_delivery_seconds": None,
         "runtime_deadline_enabled": False,
@@ -208,13 +203,19 @@ class ProjectPaths:
 def load_config() -> dict[str, Any]:
     if not CONFIG_PATH.exists():
         save_json(CONFIG_PATH, DEFAULT_CONFIG)
-        return json.loads(json.dumps(DEFAULT_CONFIG, ensure_ascii=False))
     config = json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-    return deep_merge(DEFAULT_CONFIG, config)
+    merged = deep_merge(DEFAULT_CONFIG, config)
+    local_path = CONFIG_PATH.with_name("pipeline_config.local.json")
+    if local_path.is_file():
+        merged = deep_merge(merged, json.loads(local_path.read_text(encoding="utf-8")))
+    return merged
 
 
 def save_config(config: dict[str, Any]) -> None:
-    save_json(CONFIG_PATH, config)
+    # A loaded config can contain private local paths. Keep later episode or
+    # settings updates in that same ignored file rather than leaking them back.
+    local_path = CONFIG_PATH.with_name("pipeline_config.local.json")
+    save_json(local_path if local_path.is_file() else CONFIG_PATH, config)
 
 
 def deep_merge(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
@@ -379,14 +380,6 @@ def default_manifest(paths: ProjectPaths, config: dict[str, Any], story_name: st
             "started_at": "",
             "active_elapsed_seconds": 0.0,
             "finished_at": "",
-            "budget": {
-                "currency": "CNY",
-                "soft_limit": float(agent_defaults.get("soft_budget_cny", 50.0)),
-                "hard_limit": float(agent_defaults.get("hard_budget_cny", 100.0)),
-                "spent": 0.0,
-                "reserved": 0.0,
-                "entries": [],
-            },
             "source": {},
             "stages": {},
             "events": [],
@@ -2940,57 +2933,10 @@ def render_contact_sheet(images: list[Path], output: Path, title: str) -> None:
 
 
 def write_internal_agent_reports(project_dir: Path) -> dict[str, Path]:
-    """Write internal-only cost, QA and exception reports under 99_项目状态."""
+    """Write internal-only QA and exception reports under 99_项目状态."""
     paths = project_paths(project_dir)
     manifest = load_manifest(paths) or init_project(project_dir)
     agent = manifest.get("agent", {}) if isinstance(manifest.get("agent"), dict) else {}
-    budget = agent.get("budget", {}) if isinstance(agent.get("budget"), dict) else {}
-    entries = budget.get("entries", []) if isinstance(budget.get("entries"), list) else []
-    provider_totals: dict[str, float] = {}
-    for entry in entries:
-        if not isinstance(entry, dict) or entry.get("status") != "settled":
-            continue
-        provider = str(entry.get("provider") or "未记录")
-        provider_totals[provider] = round(provider_totals.get(provider, 0.0) + float(entry.get("actual_amount", 0.0)), 4)
-    cost_json = paths.status / "成本报告.json"
-    cost_payload = {
-        "currency": budget.get("currency", "CNY"),
-        "spent": float(budget.get("spent", 0.0)),
-        "reserved": float(budget.get("reserved", 0.0)),
-        "soft_limit": float(budget.get("soft_limit", 0.0)),
-        "hard_limit": float(budget.get("hard_limit", 0.0)),
-        "provider_totals": provider_totals,
-        "entries": entries,
-        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-    }
-    save_json(cost_json, cost_payload)
-    cost_md = paths.status / "成本报告.md"
-    cost_lines = [
-        "# 成本报告（内部）",
-        "",
-        f"- 已结算：¥{cost_payload['spent']:.2f}",
-        f"- 预留中：¥{cost_payload['reserved']:.2f}",
-        f"- 软/硬上限：¥{cost_payload['soft_limit']:.2f} / ¥{cost_payload['hard_limit']:.2f}",
-        "",
-        "## 供应商汇总",
-        *(f"- {provider}：¥{amount:.2f}" for provider, amount in sorted(provider_totals.items())),
-        "",
-        "## 明细",
-        "| 时间 | 标签 | 状态 | 预留 | 实际 | 供应商 | 请求编号 |",
-        "| --- | --- | --- | ---: | ---: | --- | --- |",
-    ]
-    if not provider_totals:
-        cost_lines.insert(cost_lines.index("## 明细") - 1, "- 暂无已结算供应商费用")
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-        cost_lines.append(
-            f"| {entry.get('time', '')} | {str(entry.get('label', '')).replace('|', '/')} | {entry.get('status', '')} | "
-            f"¥{float(entry.get('amount', 0.0)):.2f} | ¥{float(entry.get('actual_amount', 0.0)):.2f} | "
-            f"{entry.get('provider', '')} | {entry.get('request_id', '')} |"
-        )
-    cost_md.write_text("\n".join(cost_lines) + "\n", encoding="utf-8")
-
     reviews: list[dict[str, Any]] = []
     review_files = sorted((paths.status / "reviews").glob("*_review.json")) if (paths.status / "reviews").exists() else []
     source_review = paths.status / "source_edit" / "source_edit_review.json"
@@ -3092,15 +3038,12 @@ def write_internal_agent_reports(project_dir: Path) -> dict[str, Path]:
 
     manifest.setdefault("outputs", {}).update(
         {
-            "internal_cost_report": str(cost_md),
             "internal_qa_summary": str(qa_md),
             "internal_exception_report": str(exception_md),
         }
     )
     write_manifest(paths, manifest)
     return {
-        "cost_md": cost_md,
-        "cost_json": cost_json,
         "qa_md": qa_md,
         "qa_json": qa_json,
         "exception_md": exception_md,
@@ -3191,7 +3134,7 @@ def final_delivery(project_dir: Path, *, update_latest_episode: bool = False) ->
         value = manifest.get("outputs", {}).get(key, "")
         required_paths.append(Path(value) if value else default_path)
     if manifest.get("agent", {}).get("job_id"):
-        required_paths.extend([internal_reports["cost_md"], internal_reports["qa_md"], internal_reports["exception_md"]])
+        required_paths.extend([internal_reports["qa_md"], internal_reports["exception_md"]])
     missing_delivery = [path for path in required_paths if not path.exists()]
     review_failures: list[str] = []
     if manifest.get("agent", {}).get("job_id"):
@@ -3400,7 +3343,9 @@ def qa_release(project_dir: Path) -> Path:
     issues.extend(f"- {message}" for message in audio_contract_errors)
     audio_reference_signals: tuple[Any, Any] | None = None
     if audio_contract is not None:
-        from story_customer_media import decode_audio, narration_music_fit
+        from story_customer_media import (
+            decode_audio, narration_music_fit, RELEASE_AUDIO_DURATION_TOLERANCE_SECONDS,
+        )
 
         try:
             audio_reference_signals = (
@@ -3424,6 +3369,9 @@ def qa_release(project_dir: Path) -> Path:
         notes.extend(alignment["issues"])
         release_audio_fit: dict[str, Any] | None = None
         if audio_contract is not None and audio_reference_signals is not None:
+            expected_duration = audio_reference_signals[0].size / 8000
+            if abs(duration - expected_duration) > RELEASE_AUDIO_DURATION_TOLERANCE_SECONDS:
+                notes.append("发布视频未覆盖完整口播时长")
             try:
                 release_audio_fit = narration_music_fit(
                     decode_audio(path),
@@ -3926,8 +3874,11 @@ def qa_publish(project_dir: Path) -> Path:
     save_json(
         report_json,
         {
-            "version": 1,
+            "schema_version": "story-publish-machine-qa/v2",
+            "version": 2,
             "passed": not issues,
+            "critical_errors": list(issues),
+            "warnings": [],
             "checked_at": time.strftime("%Y-%m-%d %H:%M:%S"),
             "artifacts": artifacts,
             "issues": issues,

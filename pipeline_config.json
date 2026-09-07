@@ -22,13 +22,13 @@
   ],
   "default_age_range": "",
   "brand_assets": {
-    "assets_dir": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材",
+    "assets_dir": "assets/brand",
     "logo": "assets/brand/program_logo.png",
     "watermark_logo": "assets/brand/program_logo.png",
     "story_logo": "assets/brand/program_logo.png",
     "antipiracy_logo": "assets/brand/program_logo.png",
-    "frame_reference": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材/矩形边框 3.png",
-    "cover_reference": "/Volumes/语苗计划/桌面整理2026-08-07/故事剪辑/（常用）剪辑所使用的素材/封面参考图/狐狸分奶酪_202603301924 (1).jpeg",
+    "frame_reference": "assets/references/frame_reference.png",
+    "cover_reference": "assets/references/cover_reference.png",
     "main_package_reference": "assets/references/main_vertical_package_reference.png"
   },
   "release_defaults": {
@@ -51,7 +51,11 @@
     "rvm_input_height": 1080,
     "rvm_output_fps": 25,
     "rvm_downsample_ratio": 0.4,
-    "rvm_alpha_choke_candidates": [0, 1, 2],
+    "rvm_alpha_choke_candidates": [
+      0,
+      1,
+      2
+    ],
     "rvm_runtime_path": ".runtime/rvm",
     "rvm_model_path": "",
     "chroma_color": "0x00FF00",
@@ -78,7 +82,7 @@
     "include_demo_logo": true
   },
   "external_tools": {
-    "suno_story_score_skill": "/Users/baiyanglin/.codex/skills/suno-story-score/SKILL.md",
+    "suno_story_score_skill": "skills/suno-story-score/SKILL.md",
     "story_performance_script_skill": "skills/story-performance-script/SKILL.md"
   },
   "video_api": {
@@ -91,26 +95,24 @@
         "base_url": "https://toapis.com/v1",
         "model": "grok-video-1.0",
         "api_key_env": "TOAPIS_API_KEY",
-        "estimated_cost_cny_per_clip": 0.06,
-        "estimated_cost_cny_per_second": 0.01,
         "default_seconds": 6,
         "min_seconds": 6,
         "max_seconds": 10,
-        "duration_choices": [6, 10],
+        "duration_choices": [
+          6,
+          10
+        ],
         "default_resolution": "720p",
         "default_ratio": "16:9"
       },
       "mock_local": {
         "runner": "mock_video_provider.py",
         "model": "ffmpeg-still-frame",
-        "api_key_env": "",
-        "estimated_cost_cny_per_clip": 0.0
+        "api_key_env": ""
       }
     }
   },
   "agent_defaults": {
-    "soft_budget_cny": 50.0,
-    "hard_budget_cny": 100.0,
     "deadline_hours": 0.0,
     "target_delivery_seconds": null,
     "runtime_deadline_enabled": false,

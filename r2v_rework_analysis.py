@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Create a reproducible root-cause analysis for one targeted R2V repair round."""
+"""Historical, story-specific forensic report generator.
+
+This script is not a generic benchmark and must never be used to claim current
+pipeline speed or quality.  Its frozen shot IDs remain solely to reproduce the
+one archived review bundle for which it was written.
+"""
 
 from __future__ import annotations
 
@@ -27,7 +32,8 @@ def load_json(path: Path) -> dict[str, Any]:
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="生成 R2V 定点返工根因分析")
+    parser = argparse.ArgumentParser(description="历史单项目 R2V 取证报告（不得作通用性能证据）")
+    parser.add_argument("--historical-case", required=True, choices=["frozen-2026-r2v-repair"])
     parser.add_argument("--initial-review", required=True, type=Path)
     parser.add_argument("--repair-manifest", required=True, type=Path)
     parser.add_argument("--selection", required=True, type=Path)
@@ -96,13 +102,9 @@ def main() -> int:
         },
         "metrics": {
             "total_story_shots": total_shots,
-            "initial_new_paid_tasks": 27,
-            "initial_cost_cny": 1.62,
             "initial_review_score": initial_score,
             "initial_critical_shots": repair_count,
             "targeted_repair_tasks": repair_count,
-            "targeted_repair_cost_cny": 0.54,
-            "total_r2v_cost_cny": 2.16,
             "repair_share_of_story_shots": round(repair_count / total_shots, 4) if total_shots else None,
             "final_review_score": final_score,
             "final_approved": bool(final.get("approved")),
@@ -143,7 +145,6 @@ def main() -> int:
         "",
         f"- 首轮整组审核：{initial_score} 分，{repair_count} 个严重镜头。",
         f"- 定点修复：{repair_count} 个镜头，各一次；其余 {total_shots - repair_count} 个镜头直接复用。",
-        f"- R2V 成本：首轮 ¥1.62，定点修复 ¥0.54，合计 ¥2.16。",
         f"- 最终整组审核：{final_score} 分，approved={str(bool(final.get('approved'))).lower()}，关键错误 {len(final_critical)} 个。",
         "- 未启动第三轮付费抽卡。",
         f"- 本地后期：{len((postfix or {}).get('decisions', []))} 个镜头，全部只用已有动态视频剪接或裁切。",
@@ -162,7 +163,7 @@ def main() -> int:
             "",
         ])
     lines.extend([
-        "## 后续成本纪律",
+        "## 后续质量版本纪律",
         "",
         "每个严重失败镜头最多一次定点重做。达到上限后不再抽卡；普通审美瑕疵和可规避问题使用最佳已有版本、剪辑、变速、裁切或本地确定性后期解决。所有失败版本、回执、提示词修改和 SHA-256 继续保留。",
         "",

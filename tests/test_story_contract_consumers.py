@@ -13,8 +13,7 @@ from PIL import Image
 
 import prepare_suno_music_request
 from release_video import ReleaseConfig, apply_release_contract_spec, build_release_render_manifest
-from story_agent import StageResult
-from story_agent_runtime import file_sha256
+from story_evidence import file_sha256
 from story_contract_consumers import (
     BINDING_FIELDS,
     compile_cover_spec,
@@ -107,108 +106,7 @@ class StoryContractConsumerTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "official asset"):
                 compile_demo_render_spec(context, root / "bad.json", official_logo_path=other)
 
-    def test_storyboard_plan_carries_five_sections_while_batch_request_stays_projection_bound(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project, manifest = _new_project(Path(directory))
-            agent, _paths = _lock_contract(project, manifest, contract_payload=semantic_contract_fixture(project, manifest, ("title", "story_body")))
-            semantic_source = Path(manifest["inputs"]["story_text"])
-            semantic_path = write_artifact_semantic_plan(project, semantic_source)
-            semantic_binding = plan_binding(semantic_path, load_current_artifact_semantic_plan(project, semantic_source))
-            context_path = write_contract_consumer_context(project, "storyboard_images")
-            expected = json.loads(context_path.read_text(encoding="utf-8"))
-            projection = expected["contract_projection"]
-            self.assertEqual(
-                set(projection),
-                {"semantic_artifacts", "visual_style", "characters", "world_scale", "story_state"},
-            )
-            staging = Path(directory) / "staging"
-            (staging / "images").mkdir(parents=True)
-            storyboard = staging / "generic-contract_storyboard_lines.txt"
-            storyboard.write_text("主角出发。\n", encoding="utf-8")
-            prompt = agent._story_images_batch_prompt(
-                handoff=staging / "handoff.md", staging_images=staging / "images",
-                staging_storyboard=storyboard, story_lines=["主角出发。"], indices=[1],
-            )
-            batch_request = json.loads(
-                (staging / "generic-contract_story_images_batch_01_01.json").read_text(encoding="utf-8")
-            )
-            for section in projection:
-                self.assertNotIn(f'"{section}"', prompt)
-                self.assertNotIn(section, batch_request)
-            self.assertEqual(batch_request["shots"], [{"scene": 1, "story_text": "主角出发。"}])
-            self.assertEqual(batch_request["generation_policy"]["do_not_replan_story"], True)
-            shot = {
-                "scene": 1, "story_text": "主角出发。", "narrative_function": "setup",
-                "shot_size": "wide", "focal_character": "主角", "visible_characters": ["主角"],
-                "excluded_characters": [], "continuity_group": "opening", "appearance_ids": [],
-                "visual_description": "主角出发",
-                "speaker": "none", "listener": "none", "narrative_focus": "主角出发",
-                "emotion": "期待", "shot_intent": "建立行动方向", "transition_reason": "开场建立镜头",
-                "scale_basis": {"applicable": False, "relationship_ids": [], "reason": "合同没有尺度关系"},
-                "current_story_state": {}, "visual_state_evidence": {},
-                "location_state": {"location_id": "road", "time_of_day": "day", "change_from_previous": False, "change_cue": ""},
-                "character_knowledge": {"主角": {"aware_of": ["出发"], "unaware_of": [], "gaze_target": "前方"}},
-                "required_visible_actions": [], "state_transition_evidence": {},
-                "subject_action": "主角自然出发",
-                "environment_motion": "环境轻微自然变化",
-                "camera_motion": "稳定跟随",
-                "entry_state": {"story_state": "opening"},
-                "exit_state": {"story_state": "opening"},
-                "screen_direction": "left_to_right",
-                "adjacent_handoff": {"from_previous": "", "to_next": "", "allows_direction_change": False, "allows_state_transition": False},
-                "expected_motion": {
-                    "primary": "subject", "subject_level": "moderate",
-                    "environment_level": "low", "camera_level": "low",
-                    "rationale": "主角正在出发",
-                },
-            }
-            plan = staging / "generic-contract_storyboard_plan.json"
-            sample_binding = {
-                "visual_sample_plan_sha256": "c" * 64,
-                "visual_sample_schema_version": "1.0",
-                "visual_sample_dependency_sha256": "d" * 64,
-                "visual_sample_review_bundle_sha256": "e" * 64,
-            }
-            plan.write_text(json.dumps({**{field: expected[field] for field in BINDING_FIELDS}, **semantic_binding, **sample_binding, "contract_projection": projection, "shots": [shot]}, ensure_ascii=False), encoding="utf-8")
-            with patch("story_agent.visual_sample_lock_is_current", return_value=True), patch(
-                "story_agent.visual_sample_binding", return_value=sample_binding
-            ):
-                self.assertTrue(agent._storyboard_plan_valid(plan, storyboard))
-            changed = json.loads(context_path.read_text(encoding="utf-8"))
-            changed["contract_projection"]["visual_style"]["rules"] = [{"value": "changed"}]
-            context_path.write_text(json.dumps(changed, ensure_ascii=False), encoding="utf-8")
-            with patch("story_agent.visual_sample_lock_is_current", return_value=True), patch(
-                "story_agent.visual_sample_binding", return_value=sample_binding
-            ):
-                self.assertFalse(agent._storyboard_plan_valid(plan, storyboard))
 
-    def test_storyagent_music_chain_passes_projection_and_requires_current_plan_binding(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project, manifest = _new_project(Path(directory))
-            agent, _paths = _lock_contract(project, manifest)
-
-            def workflow(command, _label):
-                self.assertIn("--story-contract-context", command)
-                argv = ["prepare_suno_music_request.py", *command[1:]]
-                with patch.object(sys, "argv", argv), patch.object(prepare_suno_music_request, "probe_duration", return_value=12.0):
-                    prepare_suno_music_request.main()
-                return StageResult("done", "ok")
-
-            with patch.object(agent, "_workflow", side_effect=workflow):
-                self.assertEqual(agent._stage_music_request(manifest).status, "done")
-            request = (agent._music_dir() / "generic-contract_suno_music_request.md").read_text(encoding="utf-8")
-            self.assertIn("semantic_artifacts", request)
-            self.assertIn("story_state", request)
-            expected = json.loads(contract_consumer_path(project, "music").read_text(encoding="utf-8"))
-            plan = agent._music_plan()
-            with plan.open("w", encoding="utf-8", newline="") as file:
-                writer = csv.DictWriter(file, fieldnames=["segment", *BINDING_FIELDS])
-                writer.writeheader()
-                writer.writerow({"segment": "opening", **{field: expected[field] for field in BINDING_FIELDS}})
-            self.assertTrue(agent._music_plan_contract_bound(manifest))
-            expected["story_contract_dependency_sha256"] = "c" * 64
-            contract_consumer_path(project, "music").write_text(json.dumps(expected), encoding="utf-8")
-            self.assertFalse(agent._music_plan_contract_bound(manifest))
 
     def test_cover_compiled_spec_drives_official_logo_and_layout_manifest(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

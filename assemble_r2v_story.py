@@ -48,6 +48,92 @@ def load_plan(path: Path) -> dict[str, Any]:
     return payload
 
 
+def validate_formal_r2v_bindings(
+    *,
+    plan_path: Path,
+    plan: dict[str, Any],
+    videos_dir: Path,
+    moral_video: Path | None,
+    machine_qa_path: Path,
+    provider_receipt_record: dict[str, Any],
+) -> None:
+    """Bind the exact formal inputs to the QA/review evidence set."""
+
+    qa = json.loads(machine_qa_path.read_text(encoding="utf-8"))
+    resolved_plan = plan_path.expanduser().resolve()
+    if (
+        Path(str(qa.get("plan_path") or "")).expanduser().resolve() != resolved_plan
+        or qa.get("plan_sha256") != sha256_path(resolved_plan)
+    ):
+        raise ValueError("正式 R2V 组装的 --plan 不是整组机器 QA 审过的当前计划")
+    resolved_videos = videos_dir.expanduser().resolve()
+    if Path(str(qa.get("videos_dir") or "")).expanduser().resolve() != resolved_videos:
+        raise ValueError("正式 R2V 组装的 --videos-dir 不是整组机器 QA 检查的目录")
+    qa_receipt = Path(str(qa.get("receipt_path") or "")).expanduser().resolve()
+    ledger_receipt = Path(str(provider_receipt_record.get("path") or "")).expanduser().resolve()
+    if (
+        qa_receipt != ledger_receipt
+        or qa.get("receipt_sha256") != provider_receipt_record.get("sha256")
+    ):
+        raise ValueError("正式 R2V 组装的机器 QA 与账本当前供应商组回执不是同一版")
+    clips = qa.get("clips")
+    if not isinstance(clips, list):
+        raise ValueError("正式 R2V 组装的机器 QA 缺少逐镜绑定")
+    qa_by_shot = {
+        str(item.get("shot_id") or ""): item
+        for item in clips
+        if isinstance(item, dict)
+    }
+    for shot in plan["shots"]:
+        shot_id = str(shot.get("shot_id") or "").strip()
+        item = qa_by_shot.get(shot_id)
+        if not shot_id or not isinstance(item, dict):
+            raise ValueError(f"正式 R2V 组装镜头 {shot_id or '<missing>'} 缺少当前机器 QA")
+        source = (
+            moral_video.expanduser().resolve()
+            if shot_id.upper() == "MORAL" and moral_video is not None
+            else resolved_videos / f"{shot_id}.mp4"
+        )
+        output = item.get("output") or item.get("video")
+        if not isinstance(output, dict):
+            output = {"path": item.get("path"), "sha256": item.get("sha256")}
+        reviewed_path = Path(str(output.get("path") or "")).expanduser().resolve()
+        if reviewed_path != source or output.get("sha256") != sha256_path(source):
+            raise ValueError(f"正式 R2V 组装镜头 {shot_id} 不是整组机器 QA 审过的当前视频")
+
+
+def validate_semantic_card_video_bindings(
+    *, title_video: Path, moral_video: Path | None,
+    motion_receipt_path: Path, require_moral: bool,
+) -> None:
+    """Require the CLI card videos to be the exact reviewed provider outputs."""
+
+    receipt = json.loads(motion_receipt_path.read_text(encoding="utf-8"))
+    cards = {
+        str(item.get("card_kind") or ""): item
+        for item in receipt.get("cards", [])
+        if isinstance(item, dict)
+    }
+    requested = {"title_card": title_video.expanduser().resolve()}
+    if require_moral:
+        if moral_video is None:
+            raise ValueError("正式计划包含 MORAL，但未提供回执绑定的 --moral-video")
+        requested["moral_card"] = moral_video.expanduser().resolve()
+    for kind, actual_path in requested.items():
+        binding = cards.get(kind)
+        if not isinstance(binding, dict):
+            raise ValueError(f"语义卡微动回执缺少 {kind}")
+        expected_path = Path(str(binding.get("output_video_path") or "")).expanduser().resolve()
+        expected_sha = str(binding.get("output_video_sha256") or "").lower()
+        if (
+            actual_path != expected_path
+            or not actual_path.is_file()
+            or sha256_path(actual_path) != expected_sha
+        ):
+            option = "--title-video" if kind == "title_card" else "--moral-video"
+            raise ValueError(f"正式组装的 {option} 不是语义卡微动回执审过的当前视频")
+
+
 def load_authoritative_timings(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list) or not payload:
@@ -260,6 +346,12 @@ def main() -> int:
     parser.add_argument("--authoritative-timings", type=Path)
     parser.add_argument("--retimed-plan", type=Path)
     parser.add_argument("--moral-video", type=Path)
+    parser.add_argument("--run-file", type=Path, help="正式组装必需的当前 story_run.json")
+    parser.add_argument(
+        "--diagnostic-preview",
+        action="store_true",
+        help="生成不可交付的诊断连续预览，不代替整组审核",
+    )
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--ffprobe", default="ffprobe")
     parser.add_argument(
@@ -278,6 +370,78 @@ def main() -> int:
     clips_dir = args.clips_dir.expanduser()
     ppt_plan_path = args.ppt_plan.expanduser()
     plan = load_plan(plan_path)
+    if not args.diagnostic_preview:
+        if args.authoritative_timings is not None or args.retimed_plan is not None:
+            raise ValueError(
+                "正式 R2V 组装禁止现场 retime；请先生成新计划，对新计划和时间轴重做机器 QA/整组审核后再组装"
+            )
+        if args.run_file is None:
+            raise ValueError("正式 R2V 组装必须提供 --run-file；诊断连续预览请显式使用 --diagnostic-preview")
+        from semantic_card_motion import (
+            semantic_card_generation_receipt_issues,
+            semantic_card_motion_receipt_issues,
+        )
+        from story_artifact_validation import validate_artifact_semantics
+        from story_run import file_sha256 as ledger_sha256, load_run
+
+        ledger = load_run(args.run_file.expanduser())
+        current_audio = ledger.get("inputs", {}).get("audio", {})
+        resolved_audio = audio_path.resolve()
+        if (
+            Path(str(current_audio.get("path") or "")).expanduser().resolve() != resolved_audio
+            or current_audio.get("sha256") != ledger_sha256(resolved_audio)
+        ):
+            raise ValueError("正式组装的音频未绑定账本当前权威输入")
+        required_evidence = (
+            "authoritative_timeline_receipt",
+            "semantic_card_generation_receipt",
+            "semantic_card_motion_receipt",
+            "r2v_provider_group_receipt",
+            "r2v_group_machine_qa",
+            "r2v_group_visual_review",
+        )
+        missing = [name for name in required_evidence if name not in ledger.get("artifacts", {})]
+        if missing:
+            raise ValueError("正式 R2V 组装缺少当前证据：" + ", ".join(missing))
+        for name in required_evidence:
+            record = ledger["artifacts"][name]
+            evidence_path = Path(record["path"])
+            if ledger_sha256(evidence_path) != record["sha256"]:
+                raise ValueError(f"正式 R2V 组装证据哈希漂移：{name}")
+            validate_artifact_semantics(
+                name,
+                evidence_path,
+                registered_artifacts=ledger["artifacts"],
+                registered_inputs=ledger["inputs"],
+            )
+        validate_formal_r2v_bindings(
+            plan_path=plan_path,
+            plan=plan,
+            videos_dir=videos_dir,
+            moral_video=args.moral_video,
+            machine_qa_path=Path(ledger["artifacts"]["r2v_group_machine_qa"]["path"]),
+            provider_receipt_record=ledger["artifacts"]["r2v_provider_group_receipt"],
+        )
+        generation_path = Path(ledger["artifacts"]["semantic_card_generation_receipt"]["path"])
+        generation_issues = semantic_card_generation_receipt_issues(generation_path)
+        if generation_issues:
+            raise ValueError("正式 R2V 组装的语义卡生成回执失效：" + "；".join(generation_issues))
+        motion_path = Path(ledger["artifacts"]["semantic_card_motion_receipt"]["path"])
+        motion_issues = semantic_card_motion_receipt_issues(
+            motion_path.parent / "semantic_card_motion_request.json",
+            motion_path,
+        )
+        if motion_issues:
+            raise ValueError("正式 R2V 组装的语义卡微动回执失效：" + "；".join(motion_issues))
+        validate_semantic_card_video_bindings(
+            title_video=title_video,
+            moral_video=args.moral_video,
+            motion_receipt_path=motion_path,
+            require_moral=any(
+                str(shot.get("shot_id") or "").upper() == "MORAL"
+                for shot in plan["shots"]
+            ),
+        )
     audio_duration = duration(audio_path, args.ffprobe)
     if args.authoritative_timings is not None:
         if args.retimed_plan is None:
@@ -401,6 +565,7 @@ def main() -> int:
         )
     payload = {
         "schema_version": "story-r2v-assembly-decisions-v2",
+        "qualification": "diagnostic_preview_not_deliverable" if args.diagnostic_preview else "formal_reviewed_master",
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "plan_path": str(plan_path),
         "plan_sha256": sha256_path(plan_path),

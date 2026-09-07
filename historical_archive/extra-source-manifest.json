@@ -1,0 +1,17 @@
+[
+  {
+    "path": "app.py",
+    "sha256": "f692a1ed8e20df64d7a04c1f97ca4b2cef4e3177355841d462d494111eaf7695",
+    "bytes": 5052
+  },
+  {
+    "path": "儿童故事视频合成器.spec",
+    "sha256": "94a89e0476a04014d7843274adfc499b724e9a2f40c15a60addfe3725389acfd",
+    "bytes": 1327
+  },
+  {
+    "path": "STORY_AGENT_SPEC.md",
+    "sha256": "b16f7cd3befc3d9a805085073801e9a705e164c288e9f4adc8edcfa501bba5da",
+    "bytes": 11383
+  }
+]

@@ -8,7 +8,6 @@ from pathlib import Path
 
 from PIL import Image
 
-from story_agent import AgentContext, StoryAgent
 from story_project import init_project, project_paths
 from story_workflow import reset_redo_scenes
 from story_video_synthesizer.image_video import (
@@ -235,38 +234,6 @@ class ImageVideoContinuityTests(unittest.TestCase):
             with self.assertRaises(VisualContinuityContractError):
                 build_jobs(image_dir, storyboard, root / "jobs", "demo", "demo", contract, plan)
 
-    def test_staging_sync_copies_flow_prompt_control_files(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            project = root / "project"
-            init_project(project, story_name="同步测试", slug="sync-test")
-            context = AgentContext(
-                project_dir=project,
-                inbox=None,
-                story_name="同步测试",
-                slug="sync-test",
-                execute=False,
-                update_latest_episode=False,
-                codex_mode="handoff",
-                codex_model="",
-                codex_sandbox="workspace-write",
-                codex_approval="never",
-                codex_path="codex",
-                codex_timeout=30,
-            )
-            agent = StoryAgent(context, read_only=True)
-            staging = root / "staging"
-            staging_images = staging / "images"
-            staging_images.mkdir(parents=True)
-            staging_storyboard = staging / "sync-test_storyboard_lines.txt"
-            staging_storyboard.write_text("一行\n", encoding="utf-8")
-            (staging / "sync-test_visual_bible.md").write_text("视觉圣经", encoding="utf-8")
-            (staging / "sync-test_storyboard_plan.json").write_text(json.dumps({"shots": []}), encoding="utf-8")
-            for name in ("sync-test_flow_video_prompts.csv", "sync-test_flow_video_prompts.md", "sync-test_flow_clip_names.csv"):
-                (staging_images / name).write_text("control", encoding="utf-8")
-            agent._sync_story_images_from_staging(staging, staging_storyboard, staging_images)
-            for name in ("sync-test_flow_video_prompts.csv", "sync-test_flow_video_prompts.md", "sync-test_flow_clip_names.csv"):
-                self.assertTrue((project_paths(project).images / name).is_file())
 
     def test_redo_reset_keeps_continuity_clause_at_end_of_prompt(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

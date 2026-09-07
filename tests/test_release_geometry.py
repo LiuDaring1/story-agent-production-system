@@ -52,7 +52,6 @@ from release_video import (
     validate_person_grade,
 )
 from story_workflow import compile_release_subtitle_srt, contract_release_brand_paths
-from story_agent import StoryAgent
 from story_project import (
     build_main_package_spec,
     load_main_package_reference,
@@ -625,28 +624,6 @@ class ReleaseGeometryTests(unittest.TestCase):
             production_keying_filter_fingerprint="1" * 64,
         )
 
-    def test_independent_review_receives_explicit_abc_and_library_previews(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            status = Path(directory)
-            preview_dir = status / "release_preview_frames"
-            preview_dir.mkdir()
-            names = (
-                "preview_contact_sheet.png",
-                "main_001s_a.png",
-                "main_090s_a_gesture.png",
-                "main_020s_b.png",
-                "main_040s_c.png",
-                "library_001s.png",
-            )
-            for name in names:
-                (preview_dir / name).write_bytes(b"offline-preview")
-            agent = StoryAgent.__new__(StoryAgent)
-            agent.context = SimpleNamespace(paths=SimpleNamespace(status=status))
-            selected = {path.name for path in agent._release_preview_images()}
-            self.assertTrue({
-                "main_001s_a.png", "main_090s_a_gesture.png",
-                "main_020s_b.png", "main_040s_c.png", "library_001s.png",
-            }.issubset(selected))
 
     def test_demo_scale_is_inherited_and_large_gesture_bbox_does_not_shrink(self) -> None:
         demo = approved_demo_geometry(1920, 1080, 1920, 1080, (100, 50, 1700, 1000))

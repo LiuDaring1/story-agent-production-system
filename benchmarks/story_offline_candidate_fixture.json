@@ -1,0 +1,14 @@
+{
+  "schema_version": "story-offline-directing-candidate/v1",
+  "candidate_id": "deterministic-structure-fixture",
+  "source_kind": "fixture_not_model_output",
+  "cases": [
+    {"case_id": "dialogue-reaction", "evidence": {"ordered_beats": "信息先说出，再出现接收者反应", "reaction_after_information": "反应节拍晚于信息节拍"}, "critical_errors": []},
+    {"case_id": "three-character-reverse", "evidence": {"zones": "三人区域固定", "axis": "反打保持同一轴线", "camera_setup": "机位位于轴线同侧", "reference_roles": "参考角色与画面角色一一对应"}, "critical_errors": []},
+    {"case_id": "future-imagination", "evidence": {"narrative_layer": "提议而非已发生事件", "present_reality_anchor": "当前仍锚定屋内"}, "critical_errors": []},
+    {"case_id": "decreasing-prop", "evidence": {"entry_state": "完整道具", "visible_trigger": "取下一部分的动作可见", "exit_state": "剩余部分可见", "stable_tail": "尾帧保持结果态"}, "critical_errors": []},
+    {"case_id": "offscreen-character", "evidence": {"world_presence": "画外人物存在于空间地图", "offscreen_guard": "镜头不跟随揭示画外区域"}, "critical_errors": []},
+    {"case_id": "long-dialogue-visual-duty", "evidence": {"audience_meaning": "儿童能从画面理解因果", "visual_focus": "画面聚焦可见变化", "ordered_beats": "动作顺序可表演"}, "critical_errors": []},
+    {"case_id": "review-preference-vs-defect", "evidence": {"nonblocking_preference": "无来源审美偏好只记录为建议", "sourced_blocking_defect": "身份克隆等硬伤绑定规则、范围和当前哈希"}, "critical_errors": []}
+  ]
+}

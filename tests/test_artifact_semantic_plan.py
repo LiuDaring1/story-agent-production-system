@@ -118,6 +118,41 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
         agent, _ = _lock_contract(project, manifest, contract_payload=_contract(project, manifest, kinds))
         return temporary, project, manifest, source, agent
 
+
+
+
+
+
+
+
+
+
+
+    def test_runtime_removes_only_stale_runtime_default_kinds(self) -> None:
+        from story_contract_runtime import contract_paths
+        from story_project import save_json
+
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        project, manifest = _new_project(Path(temporary.name))
+        source = Path(manifest["inputs"]["story_text"])
+        source.write_text("主角走进森林。\n不要只注重外表。\n", encoding="utf-8")
+        contract = _contract(project, manifest, ("story_body",))
+        paths = contract_paths(project)
+        save_json(paths["contract"], contract)
+        with_moral = MockStorySemanticsAdapter(kinds=("story_body", "moral"))
+        first = reconcile_semantic_mappings(paths["contract"], source, with_moral)
+        self.assertEqual(len(first["added_mappings"]), 7)
+
+        without_moral = MockStorySemanticsAdapter(kinds=("story_body", "story_body"))
+        second = reconcile_semantic_mappings(paths["contract"], source, without_moral)
+        self.assertEqual(len(second["removed_mappings"]), 7)
+        updated = json.loads(paths["contract"].read_text(encoding="utf-8"))
+        self.assertEqual(
+            {item["semantic_kind"] for item in updated["contracts"]["semantic_artifacts"]["mappings"]},
+            {"story_body"},
+        )
+
     def test_schema_python_parity_and_byte_determinism(self) -> None:
         temporary, project, _manifest, source, _agent = self._fixture()
         self.addCleanup(temporary.cleanup)
@@ -166,26 +201,6 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
             [2],
         )
 
-    def test_mock_profile_reaches_story_agent_stage_and_writes_only_existing_plan(self) -> None:
-        temporary, project, manifest, source, agent = self._fixture()
-        self.addCleanup(temporary.cleanup)
-        mock = MockStorySemanticsAdapter(kinds=("title", "story_body", "moral"))
-        registry = ModuleRegistry(profile_name="mock-semantics")
-        registry.register("story_semantics", mock)
-        agent._module_registry = registry
-        before = {path.relative_to(project) for path in project.rglob("*") if path.is_file()}
-        with patch.object(mock, "analyze", wraps=mock.analyze) as analyze:
-            result = agent._stage_artifact_semantic_plan(manifest)
-        self.assertEqual(result.status, "done")
-        # One pass verifies the locked contract covers the actual semantic
-        # source; the writer and current-plan loader each compile once more.
-        self.assertEqual(analyze.call_count, 3)
-        after = {path.relative_to(project) for path in project.rglob("*") if path.is_file()}
-        self.assertEqual(after - before, {semantic_plan_path(project).relative_to(project)})
-        self.assertFalse(any("semantic_manifest" in str(path) for path in after))
-        source.write_text(source.read_text() + "又一天，主角继续观察。\n", encoding="utf-8")
-        self.assertFalse(artifact_semantic_plan_is_current(project, source, mock))
-
     def test_missing_required_mock_selection_fails_closed_without_writing_plan(self) -> None:
         temporary, project, _manifest, source, _agent = self._fixture()
         self.addCleanup(temporary.cleanup)
@@ -222,7 +237,8 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
         write_manifest(project_paths(project), manifest)
         contract = _contract(project, manifest, ("story_body",))
         contract["contracts"]["semantic_artifacts"]["mappings"][0]["provenance"] = {"source": "task_input", "source_ref": "invented"}
-        with self.assertRaises(AssertionError):
+        from story_contracts import StoryContractValidationError
+        with self.assertRaises(StoryContractValidationError):
             _lock_contract(project, manifest, contract_payload=contract)
         contract = _contract(project, manifest, ("story_body",))
         _agent, _ = _lock_contract(project, manifest, contract_payload=contract)
@@ -338,98 +354,6 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
             {"title_card", "moral_card"},
         )
 
-    def test_runtime_removes_only_stale_runtime_default_kinds(self) -> None:
-        from story_contract_runtime import contract_paths
-        from story_project import save_json
-
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        project, manifest = _new_project(Path(temporary.name))
-        source = Path(manifest["inputs"]["story_text"])
-        source.write_text("主角走进森林。\n不要只注重外表。\n", encoding="utf-8")
-        contract = _contract(project, manifest, ("story_body",))
-        paths = contract_paths(project)
-        save_json(paths["contract"], contract)
-        with_moral = MockStorySemanticsAdapter(kinds=("story_body", "moral"))
-        first = reconcile_semantic_mappings(paths["contract"], source, with_moral)
-        self.assertEqual(len(first["added_mappings"]), 7)
-
-        without_moral = MockStorySemanticsAdapter(kinds=("story_body", "story_body"))
-        second = reconcile_semantic_mappings(paths["contract"], source, without_moral)
-        self.assertEqual(len(second["removed_mappings"]), 7)
-        updated = json.loads(paths["contract"].read_text(encoding="utf-8"))
-        self.assertEqual(
-            {item["semantic_kind"] for item in updated["contracts"]["semantic_artifacts"]["mappings"]},
-            {"story_body"},
-        )
-
-    def test_storyboard_plan_requires_semantic_plan_binding(self) -> None:
-        temporary, project, manifest, source, agent = self._fixture()
-        self.addCleanup(temporary.cleanup)
-        plan_path = write_artifact_semantic_plan(project, source)
-        semantic = load_current_artifact_semantic_plan(project, source)
-        staging = Path(temporary.name) / "staging"
-        staging.mkdir()
-        storyboard = staging / "storyboard.txt"
-        storyboard.write_text("主角出发。\n", encoding="utf-8")
-        from story_contract_runtime import contract_consumer_path, write_contract_consumer_context
-        expected_path = write_contract_consumer_context(project, "storyboard_images")
-        expected = json.loads(expected_path.read_text())
-        sample_binding = {
-            "visual_sample_schema_version": "1.0",
-            "visual_sample_plan_sha256": "1" * 64,
-            "visual_sample_review_bundle_sha256": "2" * 64,
-            "visual_sample_lock_sha256": "3" * 64,
-        }
-        shot = {
-            "scene": 1, "story_text": "主角出发。", "narrative_function": "setup",
-            "shot_size": "wide", "focal_character": "主角", "visible_characters": ["主角"],
-            "excluded_characters": [], "continuity_group": "opening", "appearance_ids": [],
-            "visual_description": "主角出发",
-            "speaker": "none", "listener": "none", "narrative_focus": "主角出发",
-            "emotion": "期待", "shot_intent": "建立行动方向", "transition_reason": "开场建立镜头",
-            "scale_basis": {"applicable": False, "relationship_ids": [], "reason": "合同没有尺度关系"},
-            "current_story_state": {}, "visual_state_evidence": {},
-            "location_state": {"location_id": "road", "time_of_day": "day", "change_from_previous": False, "change_cue": ""},
-            "character_knowledge": {"主角": {"aware_of": ["出发"], "unaware_of": [], "gaze_target": "前方"}},
-            "required_visible_actions": [], "state_transition_evidence": {},
-            "subject_action": "主角自然出发",
-            "environment_motion": "环境轻微自然变化",
-            "camera_motion": "稳定跟随",
-            "entry_state": {"story_state": "opening"},
-            "exit_state": {"story_state": "opening"},
-            "screen_direction": "left_to_right",
-            "adjacent_handoff": {"from_previous": "", "to_next": "", "allows_direction_change": False, "allows_state_transition": False},
-            "expected_motion": {
-                "primary": "subject", "subject_level": "moderate",
-                "environment_level": "low", "camera_level": "low",
-                "rationale": "主角正在出发",
-            },
-        }
-        payload = {
-            **{key: expected[key] for key in ("contract_schema_version", "story_contract_sha256", "story_contract_dependency_sha256")},
-            "contract_projection": expected["contract_projection"], **plan_binding(plan_path, semantic),
-            **sample_binding, "shots": [shot],
-        }
-        storyboard_plan = staging / "plan.json"
-        storyboard_plan.write_text(json.dumps(payload), encoding="utf-8")
-        with patch("story_agent.visual_sample_lock_is_current", return_value=True), patch(
-            "story_agent.visual_sample_binding", return_value=sample_binding
-        ):
-            self.assertTrue(agent._storyboard_plan_valid(storyboard_plan, storyboard))
-            payload["artifact_semantic_plan_sha256"] = "0" * 64
-            storyboard_plan.write_text(json.dumps(payload), encoding="utf-8")
-            self.assertFalse(agent._storyboard_plan_valid(storyboard_plan, storyboard))
-
-    def test_runtime_stage_compiles_and_stale_source_blocks_resume(self) -> None:
-        temporary, project, manifest, source, agent = self._fixture()
-        self.addCleanup(temporary.cleanup)
-        result = agent._stage_artifact_semantic_plan(manifest)
-        self.assertEqual(result.status, "done")
-        self.assertTrue(agent._has_artifact_semantic_plan(manifest))
-        source.write_text(source.read_text() + "又一天，主角继续观察。\n", encoding="utf-8")
-        self.assertFalse(agent._has_artifact_semantic_plan(manifest))
-
     def test_assembly_and_product_selectors_consume_current_plan(self) -> None:
         temporary, project, _manifest, source, _agent = self._fixture()
         self.addCleanup(temporary.cleanup)
@@ -520,6 +444,10 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
             [(row["card_kind"], row["start"], row["end"]) for row in card_calls[0]],
             [("title_card", 0.0, 2.0), ("moral_card", 12.0, 15.0)],
         )
+
+
+
+
 
 
 if __name__ == "__main__":

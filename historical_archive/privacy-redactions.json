@@ -1,0 +1,56 @@
+[
+  {
+    "archive": "legacy-source-20260907.tar.gz",
+    "path": "legacy/story_agent_v3/docs/HANDOFF_WORKBENCH_2026-05-08.md",
+    "original_sha256": "dfd20164e0359bf7e3f9763fcb3dcc99cb441859436f9fde061a8e518df1d1fa",
+    "sanitized_sha256": "583168de5fad3cab610f18e72649c7527bbdc40381d728a7340c9811acf140e3"
+  },
+  {
+    "archive": "legacy-source-20260907.tar.gz",
+    "path": "legacy/story_agent_v3/docs/NEXT_CODEX_PROMPT_20260511_HANDAN_DONE.md",
+    "original_sha256": "10edb12090779c81c90b7ca397d5149dd092faeabd5146c8d330668992c90051",
+    "sanitized_sha256": "f0053f9dc35c03c41a93f3b011f59ecb241166f38249f08613cbade30e5fdb04"
+  },
+  {
+    "archive": "legacy-source-20260907.tar.gz",
+    "path": "legacy/story_agent_v3/docs/NEXT_CODEX_PROMPT_20260512_NEW_STORY_VALIDATION.md",
+    "original_sha256": "f01bc82b5383911dde5fa130f9e5f460b8dab9896f04d01289dd27bc6a735153",
+    "sanitized_sha256": "95e294d13fb1827a99000a9002cede99cf3470fb8c23fc1e298c13465ba1116d"
+  },
+  {
+    "archive": "legacy-source-20260907.tar.gz",
+    "path": "legacy/story_agent_v3/docs/NEXT_CODEX_PROMPT_20260512_WOXIN_DONE.md",
+    "original_sha256": "035cc0e1723a15496fb14f4ec86c95cb8a5f478ff1cb5b5108b20b42c5e4d34c",
+    "sanitized_sha256": "83e1215a4aa7f8e7e1e11e05b3b75691142467b4c217a40da6534a0b7f65e96a"
+  },
+  {
+    "archive": "legacy-source-20260907.tar.gz",
+    "path": "legacy/story_agent_v3/docs/NEXT_CODEX_PROMPT_HANDAN_HISTORY.md",
+    "original_sha256": "3cc2d2a325b64effa80c93a396711a2f91cd596dd1592e89b687d8a8962380ac",
+    "sanitized_sha256": "f48aacc69272969f0c12a0be705df4a078f8d6a63b7c54bfeee8c7119841dc48"
+  },
+  {
+    "archive": "legacy-source-20260907.tar.gz",
+    "path": "legacy/story_agent_v3/docs/README_SEMI_AUTO.md",
+    "original_sha256": "c1245536a8ddcc3e0f7c3a01cb5919a1feedcac803894e1e1086d3446ca0aca9",
+    "sanitized_sha256": "c1d1769af9068c6381f712ba0d1a2deeed03c17ab45c89b1c886763b6c957264"
+  },
+  {
+    "archive": "legacy-source-20260907.tar.gz",
+    "path": "legacy/story_agent_v3/docs/README_WORKBENCH_AND_COMPOSER_HISTORY.md",
+    "original_sha256": "b551b041844d1483fff746578bed1d078a15df124e2a4a6354220e79652819e9",
+    "sanitized_sha256": "29ddb864d895d24d77d6899ed14d95dc176b70f360d0971a9196f480680175e0"
+  },
+  {
+    "archive": "legacy-source-20260907.tar.gz",
+    "path": "legacy/story_agent_v3/story_agent.py",
+    "original_sha256": "69df5e45659e3d578c9299af754dbae1d81237f6e74db61800c4f34883a4552e",
+    "sanitized_sha256": "8fcb214e7ad89edb0e433931162988322fec738ceb4e5b1d097c072bfa84679b"
+  },
+  {
+    "archive": "extra-source-20260907.tar.gz",
+    "path": "STORY_AGENT_SPEC.md",
+    "original_sha256": "65e939cb71ffe671efe5fbc8e978eb5758102fb142b4dbaeab867c1f2fd159a3",
+    "sanitized_sha256": "b16f7cd3befc3d9a805085073801e9a705e164c288e9f4adc8edcfa501bba5da"
+  }
+]

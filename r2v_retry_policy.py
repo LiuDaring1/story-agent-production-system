@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Mapping, Sequence
 
 
-POLICY_VERSION = "story-r2v-retry-policy/v1"
+POLICY_VERSION = "story-r2v-retry-policy/v2"
 DEFAULT_MAX_QUALITY_VERSIONS = 2
 ESCALATED_MAX_QUALITY_VERSIONS = 3
 V3_QUOTA_RATIO = 0.10
@@ -79,11 +79,19 @@ def evaluate_quality_redos(
         for row in rows
         if str(row.get("scene") or "").strip()
     }
-    redo_scenes = sorted(
+    requested_redos = sorted(
         scene
         for scene, decision in decisions.items()
         if _decision_text(decision, "review_status").lower() == "redo"
     )
+    # A preference or advisory is retained by the review file, but it is not a
+    # blocking defect and must never become a generation request.
+    redo_scenes = [
+        scene
+        for scene in requested_redos
+        if _decision_text(decisions[scene], "defect_severity").lower()
+        in {"hard", "critical"}
+    ]
     if not redo_scenes:
         return {}
     missing = [scene for scene in redo_scenes if scene not in row_by_scene]
@@ -141,14 +149,50 @@ def evaluate_quality_redos(
             raise RetryPolicyError(
                 f"镜头 {scene} 已达到质量版本上限 V3；本轮停止新增质量版本。"
             )
-        notes = _decision_text(decision, "notes")
-        evidence = _decision_text(decision, "evidence", notes)
-        if not evidence:
-            raise RetryPolicyError(f"镜头 {scene} 缺少有依据的退件证据，不能提交付费重做")
-        defect_code = _decision_text(decision, "defect_code", "director_review")
+        evidence = _decision_text(decision, "evidence")
+        defect_code = _decision_text(decision, "defect_code")
         root_cause = _decision_text(decision, "root_cause")
-        retry_strategy = _decision_text(decision, "retry_strategy", notes)
+        retry_strategy = _decision_text(decision, "retry_strategy")
         severity = _decision_text(decision, "defect_severity").lower()
+        required_basis = {
+            "defect_code": defect_code,
+            "requirement_source": _decision_text(decision, "requirement_source"),
+            "requirement_scope": _decision_text(decision, "requirement_scope"),
+            "artifact_sha256": _decision_text(decision, "artifact_sha256"),
+            "evidence": evidence,
+            "delivery_impact": _decision_text(decision, "delivery_impact"),
+            "retry_strategy": retry_strategy,
+        }
+        missing_basis = [name for name, value in required_basis.items() if not value]
+        artifact_sha = required_basis["artifact_sha256"].lower()
+        if artifact_sha and (
+            len(artifact_sha) != 64
+            or any(ch not in "0123456789abcdef" for ch in artifact_sha)
+        ):
+            missing_basis.append("artifact_sha256(valid)")
+        current_artifact_sha = _decision_text(row, "current_artifact_sha256").lower()
+        if not current_artifact_sha:
+            raise RetryPolicyError(
+                f"镜头 {scene} 缺少当前可播放视频哈希；先补当前证据，不提交重做"
+            )
+        if artifact_sha != current_artifact_sha:
+            raise RetryPolicyError(
+                f"镜头 {scene} 退件绑定的 artifact_sha256 不是当前可播放视频；"
+                "先纠正审核，不提交重做"
+            )
+        if missing_basis:
+            raise RetryPolicyError(
+                f"镜头 {scene} 退件缺少当前规则/范围/产物证据："
+                + ", ".join(missing_basis)
+                + "；先纠正审核，不提交重做"
+            )
+        previous_evidence = _decision_text(decision, "previous_retry_evidence")
+        previous_sha = _decision_text(decision, "previous_artifact_sha256").lower()
+        if previous_evidence == evidence and previous_sha == artifact_sha:
+            raise RetryPolicyError(
+                f"镜头 {scene} 在相同产物哈希上重复相同理由且无新证据；"
+                "停止审核循环，不伪造通过"
+            )
         v3_approved = _truthy(decision.get("v3_escalation_approved"))
         if prior == 1:
             missing_v3 = [

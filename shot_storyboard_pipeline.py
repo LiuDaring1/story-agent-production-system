@@ -652,6 +652,102 @@ def _prompt_with_offscreen_reveal_guard(shot: dict[str, Any]) -> str:
     )
 
 
+def compile_provider_prompt(
+    shot: dict[str, Any], ref_assets: list[dict[str, Any]]
+) -> str:
+    """Compile v4 director facts into the actual provider-facing instruction.
+
+    Free prose remains useful for style and nuance, but it is appended after the
+    locked projection and cannot replace camera, entry/exit, beat, prop, or
+    reference-role facts.
+    """
+
+    camera = _frame(shot, "camera_plan")
+    lines = [
+        "[LOCKED_DIRECTOR_INTENT_V1] One continuous shot; do not cut inside the shot.",
+        (
+            "Audience meaning: "
+            + str(shot.get("visual_focus") or shot.get("story_text") or "").strip()
+        ),
+        (
+            "Camera: setup={setup}; axis={axis}; framing={start}->{end}; movement={movement}; "
+            "screen_direction={direction}; visible_anchors={visible}; excluded_anchors={excluded}."
+        ).format(
+            setup=camera.get("camera_setup_id") or "declared setup",
+            axis=camera.get("axis_id") or camera.get("axis") or "declared axis",
+            start=camera.get("start_size") or "declared",
+            end=camera.get("end_size") or "declared",
+            movement=camera.get("movement") or "locked",
+            direction=camera.get("screen_direction") or "declared",
+            visible=json.dumps(camera.get("visible_anchor_ids") or [], ensure_ascii=False),
+            excluded=json.dumps(camera.get("excluded_anchor_ids") or [], ensure_ascii=False),
+        ),
+        "Entry state: " + json.dumps(shot.get("entry_state") or {}, ensure_ascii=False, sort_keys=True),
+        "Exit state: " + json.dumps(shot.get("exit_state") or {}, ensure_ascii=False, sort_keys=True),
+    ]
+    visualization = shot.get("narrative_visualization")
+    if isinstance(visualization, dict):
+        lines.append(
+            "Narrative layer (current fact / memory / imagination / proposal): "
+            + json.dumps(visualization, ensure_ascii=False, sort_keys=True)
+        )
+    presence_parts = []
+    for item in shot.get("subject_presence") or []:
+        if not isinstance(item, dict):
+            continue
+        presence_parts.append(
+            "{subject}:{entry}@{entry_zone}->{exit}@{exit_zone};world={world_entry}@{world_zone}->{world_exit}".format(
+                subject=item.get("subject_id"),
+                entry=item.get("entry_presence"),
+                entry_zone=item.get("entry_zone_id"),
+                exit=item.get("exit_presence"),
+                exit_zone=item.get("exit_zone_id"),
+                world_entry=item.get("entry_world_presence"),
+                world_zone=item.get("entry_world_zone_id"),
+                world_exit=item.get("exit_world_presence"),
+            )
+        )
+    if presence_parts:
+        lines.append("Subject presence: " + " | ".join(presence_parts))
+    beat_parts = []
+    for beat in shot.get("performance_beats") or []:
+        if not isinstance(beat, dict):
+            continue
+        primary = beat.get("primary_beat") if isinstance(beat.get("primary_beat"), dict) else {}
+        support = beat.get("supporting_actions") if isinstance(beat.get("supporting_actions"), list) else []
+        beat_parts.append(
+            "{start}-{end}s PRIMARY {subject}: {action}; supporting={support}".format(
+                start=beat.get("start_second"),
+                end=beat.get("end_second"),
+                subject=primary.get("subject_id"),
+                action=primary.get("action") or beat.get("performance"),
+                support=json.dumps(support, ensure_ascii=False, sort_keys=True),
+            )
+        )
+    if beat_parts:
+        lines.append("Ordered performance; only each interval's PRIMARY action leads: " + " | ".join(beat_parts))
+    if shot.get("prop_contracts"):
+        lines.append(
+            "Prop physics and state: "
+            + json.dumps(shot["prop_contracts"], ensure_ascii=False, sort_keys=True)
+        )
+    reference_roles = [
+        {
+            "asset_id": asset.get("asset_id"),
+            "kind": asset.get("kind"),
+            "identity_id": asset.get("identity_id"),
+            "prop_id": asset.get("prop_id"),
+            "state_id": asset.get("state_id"),
+        }
+        for asset in ref_assets
+    ]
+    lines.append("Reference image roles in upload order: " + json.dumps(reference_roles, ensure_ascii=False))
+    free = str(shot.get("prompt") or "").split("[LOCKED_DIRECTOR_INTENT_V1]", 1)[0].strip()
+    if free:
+        lines.append("Style/performance nuance (cannot override locked facts): " + free)
+    return _prompt_with_offscreen_reveal_guard({**shot, "prompt": "\n".join(lines)})
+
+
 def _runtime_reference_assets(
     shot: dict[str, Any], ref_assets: list[dict[str, Any]]
 ) -> tuple[list[dict[str, Any]], dict[str, Any]]:
@@ -814,7 +910,8 @@ def build_r2v_jobs(
                 ),
                 "story_text": str(shot.get("story_text") or ""),
                 "visual_description": str(shot.get("visual_focus") or ""),
-                "prompt": _prompt_with_offscreen_reveal_guard(shot),
+                "prompt": compile_provider_prompt(shot, ref_assets),
+                "provider_prompt_compiler": "story-r2v-provider-prompt/v1",
                 "subject_action": _performance_summary(shot),
                 "camera_motion": str(camera.get("movement") or ""),
                 "camera_setup_id": str(camera.get("camera_setup_id") or ""),

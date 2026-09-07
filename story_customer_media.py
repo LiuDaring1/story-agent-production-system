@@ -20,6 +20,7 @@ SCHEMA_VERSION = "story-customer-media-receipt/v1"
 MUSIC_ONLY_CORRELATION_MIN = 0.97
 MUSIC_ONLY_RESIDUAL_MAX = 0.08
 NARRATION_MUSIC_RESIDUAL_MAX = 0.12
+RELEASE_AUDIO_DURATION_TOLERANCE_SECONDS = 0.2
 NARRATION_COMPONENT_RMS_RATIO_MIN = 0.05
 MUSIC_COMPONENT_RMS_RATIO_MIN = 0.01
 
@@ -156,6 +157,17 @@ def narration_music_fit(
     a result when either positive component is missing.
     """
 
+    # The full narration defines the program. A good fit of a short prefix is
+    # not evidence that the release contains the rest of the program.
+    durations = {
+        "rendered": rendered_audio.size / sample_rate,
+        "narration": narration_audio.size / sample_rate,
+        "music": music_audio.size / sample_rate,
+    }
+    if abs(durations["rendered"] - durations["narration"]) > RELEASE_AUDIO_DURATION_TOLERANCE_SECONDS:
+        raise ValueError("发布音轨未覆盖完整口播时长")
+    if durations["music"] + RELEASE_AUDIO_DURATION_TOLERANCE_SECONDS < durations["narration"]:
+        raise ValueError("配乐参考未覆盖完整口播时长")
     length = min(rendered_audio.size, narration_audio.size, music_audio.size)
     if length < sample_rate:
         raise ValueError("音频过短，无法审核旁白+配乐角色")

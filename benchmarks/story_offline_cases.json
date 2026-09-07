@@ -1,0 +1,16 @@
+{
+  "schema_version": "story-offline-directing-benchmark/v1",
+  "cases": [
+    {"case_id": "dialogue-reaction", "source": "一个角色说出消息，另一个角色听见后才反应。", "required": ["ordered_beats", "reaction_after_information"], "rubric": {"passing_score": 85, "critical_checks": ["ordered_beats", "reaction_after_information"], "creative_dimensions": ["child_comprehension", "performable_beats"]}},
+    {"case_id": "three-character-reverse", "source": "三个角色在同一场地对话，需要反打但不能越轴。", "required": ["zones", "axis", "camera_setup", "reference_roles"], "rubric": {"passing_score": 85, "critical_checks": ["zones", "axis", "camera_setup", "reference_roles"], "creative_dimensions": ["locked_constraint_fidelity", "continuity"]}},
+    {"case_id": "future-imagination", "source": "角色提议明天去河边，现在仍在屋内。", "required": ["narrative_layer", "present_reality_anchor"], "rubric": {"passing_score": 85, "critical_checks": ["narrative_layer", "present_reality_anchor"], "creative_dimensions": ["child_comprehension", "locked_constraint_fidelity"]}},
+    {"case_id": "decreasing-prop", "source": "道具被取下一部分，结尾必须看到剩余状态。", "required": ["entry_state", "visible_trigger", "exit_state", "stable_tail"], "rubric": {"passing_score": 85, "critical_checks": ["entry_state", "visible_trigger", "exit_state", "stable_tail"], "creative_dimensions": ["performable_beats", "continuity"]}},
+    {"case_id": "offscreen-character", "source": "主角朝画外人物说话，摄影机不跟随揭示。", "required": ["world_presence", "offscreen_guard"], "rubric": {"passing_score": 85, "critical_checks": ["world_presence", "offscreen_guard"], "creative_dimensions": ["locked_constraint_fidelity", "continuity"]}},
+    {"case_id": "long-dialogue-visual-duty", "source": "长对白中画面要承担可见因果，不只是持续说话。", "required": ["audience_meaning", "visual_focus", "ordered_beats"], "rubric": {"passing_score": 85, "critical_checks": ["audience_meaning", "visual_focus", "ordered_beats"], "creative_dimensions": ["child_comprehension", "performable_beats"]}},
+    {"case_id": "review-preference-vs-defect", "source": "对照无依据审美偏好与身份克隆/持续躯干裁切/时态错误。", "required": ["nonblocking_preference", "sourced_blocking_defect"], "rubric": {"passing_score": 85, "critical_checks": ["nonblocking_preference", "sourced_blocking_defect"], "creative_dimensions": ["review_discipline", "locked_constraint_fidelity"]}}
+  ],
+  "creative_evaluation": {
+    "method": "same source and constraints, anonymized candidates, independent scoring",
+    "pending": "No repeated-model or paid-provider blind comparison was run in this offline optimization."
+  }
+}

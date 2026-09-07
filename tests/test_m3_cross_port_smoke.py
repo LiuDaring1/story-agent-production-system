@@ -10,7 +10,6 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from story_agent_runtime import STORY_STAGE_DEPENDENCIES, STORY_STAGE_SEQUENCE
 from story_module_adapters import (
     ApprovedStoryContractVisualDesignAdapter,
     CodexImageGeneratorAdapter,
@@ -365,45 +364,6 @@ class M3CrossPortSmokeTests(unittest.TestCase):
         self.assertNotEqual(rejected.returncode, 0)
         self.assertIn("required module profile", rejected.stderr + rejected.stdout)
 
-    def test_m3_keeps_schema_v1_and_the_38_stage_dag(self) -> None:
-        schema = json.loads(
-            (ROOT / "schemas/module_ports/v1/module_ports.schema.json").read_text(encoding="utf-8")
-        )
-        self.assertEqual(schema["$id"], "story-module-ports/v1")
-        self.assertEqual(
-            schema["properties"]["kind"]["enum"],
-            [
-                "identity", "capabilities", "failure", "usage_event",
-                "video_request", "video_result", "keyer_request", "keyer_result",
-            ],
-        )
-        independent_schemas = {
-            "story_semantics_port.schema.json": STORY_SEMANTICS_PORT_VERSION,
-            "visual_design_port.schema.json": VISUAL_DESIGN_PORT_VERSION,
-            "image_generator_port.schema.json": IMAGE_GENERATOR_PORT_VERSION,
-            "music_provider_port.schema.json": MUSIC_PROVIDER_PORT_VERSION,
-            "product_package_port.schema.json": PRODUCT_PACKAGE_PORT_VERSION,
-            "compositor_port.schema.json": COMPOSITOR_PORT_VERSION,
-            "release_layout_port.schema.json": RELEASE_LAYOUT_PORT_VERSION,
-            "publish_asset_port.schema.json": PUBLISH_ASSET_PORT_VERSION,
-        }
-        for filename, version in independent_schemas.items():
-            payload = json.loads((ROOT / "schemas/module_ports/v1" / filename).read_text(encoding="utf-8"))
-            self.assertEqual(payload["$id"], version)
-
-        self.assertEqual(len(STORY_STAGE_SEQUENCE), 38)
-        self.assertEqual(len(set(STORY_STAGE_SEQUENCE)), 38)
-        positions = {stage: index for index, stage in enumerate(STORY_STAGE_SEQUENCE)}
-        self.assertEqual(set(STORY_STAGE_DEPENDENCIES), set(STORY_STAGE_SEQUENCE))
-        for stage, dependencies in STORY_STAGE_DEPENDENCIES.items():
-            self.assertEqual(len(dependencies), len(set(dependencies)))
-            for dependency in dependencies:
-                self.assertIn(dependency, positions)
-                self.assertLess(positions[dependency], positions[stage])
-        self.assertIn("product_annotation_review", STORY_STAGE_DEPENDENCIES["release_preview"])
-        self.assertIn("release_preview", STORY_STAGE_DEPENDENCIES["product_package"])
-        self.assertEqual(STORY_STAGE_DEPENDENCIES["package_release"], ("release_preview",))
-        self.assertNotIn("product_package_review", STORY_STAGE_DEPENDENCIES["package_release"])
 
 
 if __name__ == "__main__":

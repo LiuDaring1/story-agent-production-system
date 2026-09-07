@@ -23,7 +23,7 @@ ARCHITECTURE = {
     "state": "99_项目状态/story_run.json",
     "execution": "small deterministic Python/JS modules and provider adapters",
     "evidence": "SHA-256-bound manifests, independent reviews, QA, and delivery receipts",
-    "legacy": "legacy/story_agent_v3",
+    "legacy": "historical_archive/legacy-source-20260907.tar.gz",
     "legacy_is_production_entry": False,
 }
 
@@ -36,9 +36,11 @@ def print_help() -> None:
         "  story_pipeline.py describe\n"
         "  story_pipeline.py init ...\n"
         "  story_pipeline.py record ...\n"
+        "  story_pipeline.py observe-request ...\n"
+        "  story_pipeline.py observe-performance ...\n"
         "  story_pipeline.py status ...\n"
         "  story_pipeline.py finalize ...\n\n"
-        "init/record/status/finalize 参数与 story_run.py 相同。"
+        "内部命令参数与 story_run.py 相同。"
     )
 
 

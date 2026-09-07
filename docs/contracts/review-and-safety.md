@@ -1,4 +1,4 @@
-# 审核、安全、成本与隐私合同
+# 审核、安全、运行事实与隐私合同
 
 ## 审核合同
 
@@ -14,23 +14,21 @@
 
 文件存在、命令返回 0、模型声称完成均不是通过证据。
 
-## 合同前置门禁
+## 当前生产的规则前置与退件依据
 
-V3.5 新任务先执行 `story_contract` 与 `story_contract_review`。合同包含 `semantic_artifacts / visual_style / characters / world_scale / story_state / brand / release_layout` 七节；Luna 只生成草案，Sol 独立审核，Runtime 在重新验证全部绑定后写 crash-safe 锁。规则来源固定为 `task_input > project_config > brand_or_global_default > agent_inference`，模型推断不得伪装为前三类。
+当前入口是 Codex 前台任务与 `skills/story-full-auto`。开工前按该 Skill 的「工作交接与审核依据」读取本工作包的适用规则；生产和审核使用同一份可定位的要求及来源，生产者先运行已有机器自检。退件须绑定现有要求和具体产物证据，模型新增审美偏好不得变成硬门禁。无效退件需纠正审核后按原规则复核，不能直接返工或直接判作品通过。
+
+## 历史 V3.5 合同门禁（只供旧项目取证）
+
+旧 V3.5 Runtime 曾先执行 `story_contract` 与 `story_contract_review`；下面描述只解释历史回执，不能作为启动或恢复旧生产入口的指令。合同包含 `semantic_artifacts / visual_style / characters / world_scale / story_state / brand / release_layout` 七节；Luna 只生成草案，Sol 独立审核，Runtime 在重新验证全部绑定后写 crash-safe 锁。规则来源固定为 `task_input > project_config > brand_or_global_default > agent_inference`，模型推断不得伪装为前三类。
 
 锁不是一个状态字段，而是合同文件、canonical contract、可信来源链、审核 bundle、审核 JSON 的完整 SHA-256 等式。半写、损坏、缺字段或任一哈希变化都阻断生产。六类消费者使用最小 section projection 和 completed receipt；当前实现模块族级增量失效，不是逐镜头依赖图。详见 [`story-production-contract.md`](story-production-contract.md)。
 
-## 预算合同
+## 运行事实合同
 
-- 默认软预算：¥50。
-- 默认硬预算：¥100。
-- 不设默认项目墙钟完成时限；显式配置的时间点只能作为“付费审美返工截止”，不得把未完成项目自动改为 best/accepted_with_exceptions，也不得中断确定性收尾、QA 和必需产物门禁。
-- 超过硬预算不得发起新付费调用。
-- 每次外部生成或模型请求必须记录供应商、模型、request/task_id、开始/结束/等待、重试、Token 以及估算/实际结算状态。供应商未报告的值必须保持 `null` 并标明原因，不得写成 0 或已结算。
+生产链不再管理预算、币种换算、入账、成本汇总或金额门禁。保留 provider/model、request/task ID、请求哈希、起止时间、耗时、等待、重试、成功/失败、错误类型和可获得的 Token。历史金额字段只读保留，既不删除也不参与 status、record、finalize 或供应商准入。
 
-### 当前已知计费问题
-
-ToAPIs Grok Video 1.0 的渠道页面以美元或 credits 报价，而当前配置字段仍名为 `estimated_cost_cny_per_second`。在币种修复、充值换算和账户账单接入完成前，本地“人民币成本”只是按项目配置登记的估算；供应商任务响应没有独立账单字段时，成本回执必须明确标注这一点，不能伪装为正式结算。
+`story_run.py observe-performance` 只登记有证据的计划/机器检查耗时、独立审核轮次、无效退件数和重复编码数；重复 provider 请求由相同 provider + request SHA 的不同 request ID 计算，最长依赖链由当前产物依赖计算。未知值保持 `null`，不得用模拟耗时或金额替代。
 
 ## 密钥合同
 

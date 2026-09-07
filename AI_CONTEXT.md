@@ -12,7 +12,7 @@
 - 生产策略：`skills/story-full-auto/SKILL.md`。
 - 内部控制入口：`story_pipeline.py`。
 - 状态事实源：项目 `99_项目状态/story_run.json`。
-- 旧 `story_agent.py` 不是生产入口；其实现位于 `legacy/story_agent_v3/`。
+- 旧 `story_agent.py` 不是生产入口；其源码位于 `historical_archive/` 的独立归档，根目录别名已移出。
 
 ## 必读顺序
 
@@ -23,14 +23,14 @@
 5. [`skills/story-full-auto/references/codex-native-workflow.md`](skills/story-full-auto/references/codex-native-workflow.md)：并行工作包与汇合顺序。
 6. [`skills/story-r2v-director/SKILL.md`](skills/story-r2v-director/SKILL.md)：R2V 导演、资产与连续性规范。
 7. [`skills/story-full-auto/references/delivery-contract.md`](skills/story-full-auto/references/delivery-contract.md)：最终交付合同。
-8. [`legacy/story_agent_v3/LEGACY.md`](legacy/story_agent_v3/LEGACY.md)：仅在审计旧项目或修改兼容层时读取。
+8. [`historical_archive/README.md`](historical_archive/README.md)：仅在审计旧项目或修改兼容层时读取。
 
 ## 当前代码地图
 
 | 文件/目录 | 责任 |
 |---|---|
 | `story_pipeline.py` | 唯一受支持的内部状态控制入口；转交轻量账本命令并描述架构 |
-| `story_run.py` | 六个工作包、成本、当前产物、哈希、恢复与最终封口 |
+| `story_run.py` | 六个工作包、轻量请求事实、当前产物、哈希、恢复与最终封口（不管理金额） |
 | `story_evidence.py` | 与旧 Runtime 解耦的通用审核 bundle/currentness 能力 |
 | `shot_storyboard_pipeline.py` | 资产审核后逐镜生成/封存故事板，并同源编译 R2V 与 PPT 消费者 |
 | `static_ppt_contract.py` | 动态导演镜头页数、双版静态 PPT 和客户目录交付回执 |
@@ -42,7 +42,7 @@
 | `release_geometry.py` / `release_video.py` | A/B/C 发布布局、故事框遮挡与正式渲染 |
 | `product_package.py` / `product_quality.py` | 示范视频、文稿、朗读标注、PPT 与双版客户资料包 |
 | `publish_package.py` / `cover_quality.py` | 双账号文案与六张封面 |
-| `legacy/story_agent_v3/` | 已退役固定 38 阶段后台系统，只读兼容与审计 |
+| `historical_archive/` | 已退役系统的独立源码包，只读校验与取证 |
 
 ## 架构边界
 

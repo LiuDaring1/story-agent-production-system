@@ -242,7 +242,7 @@ def main() -> None:
     parser.add_argument(
         "--dynamic-ppt-builder",
         type=Path,
-        default=Path(__file__).resolve().parent / "legacy" / "story_agent_v3" / "retired_story_full_auto_ppt_scripts" / "build_dynamic_story_ppt.mjs",
+        default=None,
     )
     args = parser.parse_args()
 

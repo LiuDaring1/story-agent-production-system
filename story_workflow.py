@@ -34,7 +34,7 @@ from story_contract_consumers import (
     compile_release_render_spec,
     release_argument_overrides,
 )
-from story_contract_runtime import read_trusted_story_text
+from story_text import read_trusted_story_text
 from artifact_semantic_plan import load_current_artifact_semantic_plan, semantic_plan_path, selected_line_indices
 from r2v_retry_policy import evaluate_quality_redos
 from presenter_layout import PRESENTER_LAYOUT_POLICY, compile_fixed_anchor, scan_rvm_body_overflow
@@ -1606,6 +1606,7 @@ def run_package_release_project(
     authorized_binding_repair_reason: str = "",
 ) -> None:
     paths = project_paths(project_dir)
+    require_native_run_inputs(paths.status)
     is_preview = preview_times is not None
     preview_dir = paths.status / "release_preview_frames"
     run_id = datetime.now().strftime("%Y%m%d_%H%M%S") if is_preview else ""
@@ -2433,6 +2434,7 @@ def run_publish_package_project(
     main_story_frame: int | None = None,
 ) -> None:
     paths = project_paths(project_dir)
+    require_native_run_inputs(paths.status)
     manifest = refresh_project_outputs(paths.root)
     story = manifest["story"]
     outputs = manifest["outputs"]
@@ -2701,6 +2703,7 @@ def run_product_package_project(
     story_contract_context: Path | None = None,
 ) -> None:
     paths = project_paths(project_dir)
+    require_native_run_inputs(paths.status)
     manifest = detect_project_assets(paths.root, extract_audio=True)
     manifest = refresh_project_outputs(paths.root)
     existing_keying = first_existing(manifest["outputs"].get("keying_preset"), paths.release / "keying" / "keying_preset.json")
@@ -2997,6 +3000,21 @@ def bind_generated_product_outputs(project_dir: Path, story_name: str) -> dict[s
     manifest["outputs"]["product_advanced"] = str(advanced)
     write_manifest(paths, manifest)
     return manifest
+
+
+def require_native_run_inputs(status_dir: Path) -> None:
+    """Fail closed before current producers can discover historical fallbacks."""
+    from story_run import load_run
+    from story_requirements import _current_binding
+    run_file = status_dir / "story_run.json"
+    if not run_file.is_file():
+        raise ValueError("正式生产缺少 story_run.json；历史读取不自动转为生产")
+    ledger = load_run(run_file)
+    for role in ("confirmed_text", "subtitle_txt", "greenscreen_video", "audio"):
+        record = ledger["inputs"].get(role)
+        if not isinstance(record, dict):
+            raise ValueError(f"正式生产缺少当前输入：{role}")
+        _current_binding(record, f"当前运行输入 {role}")
 
 
 def confirmed_text_from_story_run(status_dir: Path) -> Path | None:
@@ -3602,8 +3620,21 @@ def reset_redo_scenes(jobs_csv: Path, videos_dir: Path, decisions_csv: Path) -> 
         rows = list(reader)
         fieldnames = list(reader.fieldnames or [])
 
-    policy_rows = [row for row in rows if row.get("retry_policy_version", "").strip()]
+    policy_rows = []
+    for row in rows:
+        if not row.get("retry_policy_version", "").strip():
+            continue
+        current = dict(row)
+        video_name = row.get("target_video_filename", f"{int(row['scene']):02d}.mp4")
+        video_path = videos_dir / video_name
+        if video_path.is_file():
+            current["current_artifact_sha256"] = hashlib.sha256(video_path.read_bytes()).hexdigest()
+        policy_rows.append(current)
     approvals = evaluate_quality_redos(policy_rows, decisions) if policy_rows else {}
+    if policy_rows:
+        redo_scenes = sorted(int(scene) for scene in approvals)
+        if not redo_scenes:
+            return []
 
     backup_dir = videos_dir / ("_review_redo_backup_" + time.strftime("%Y%m%d_%H%M%S"))
     backup_dir.mkdir(parents=True, exist_ok=True)
@@ -3615,7 +3646,7 @@ def reset_redo_scenes(jobs_csv: Path, videos_dir: Path, decisions_csv: Path) -> 
         video_path = videos_dir / video_name
         if video_path.exists():
             shutil.move(str(video_path), str(backup_dir / video_path.name))
-        for key in ["task_id", "video_url", "error", "api_response", "query_response"]:
+        for key in ["task_id", "client_business_id", "provider_failure_confirmed", "video_url", "error", "api_response", "query_response"]:
             if key in row:
                 row[key] = ""
         row["status"] = "todo"
@@ -3636,18 +3667,25 @@ def reset_redo_scenes(jobs_csv: Path, videos_dir: Path, decisions_csv: Path) -> 
             row["batch_retry_calibration_status"] = approval.batch_calibration_status
             row["batch_retry_calibration_notes"] = approval.batch_calibration_notes
         row["notes"] = decision.get("notes", row.get("notes", ""))
-        reviewed_prompt = _review_prompt(row, decision)
-        if row.get("continuity_state") or row.get("visual_continuity_state"):
-            reviewed_prompt = reviewed_prompt.split("视觉连续性硬约束（机器可读）：", 1)[0].rstrip(" ；;。")
-        reviewed_prompt = _apply_review_notes_to_prompt(reviewed_prompt, row["notes"])
-        row["prompt"] = enforce_prompt_continuity_contract(reviewed_prompt, row)
+        if approval is not None:
+            # Never replace the compiler-owned prompt. The provider runner
+            # appends this scoped repair after the locked director facts.
+            row["provider_retry_prompt"] = (
+                str(decision.get("prompt") or "").strip() or approval.retry_strategy
+            )
+        else:
+            reviewed_prompt = _review_prompt(row, decision)
+            if row.get("continuity_state") or row.get("visual_continuity_state"):
+                reviewed_prompt = reviewed_prompt.split("视觉连续性硬约束（机器可读）：", 1)[0].rstrip(" ；;。")
+            reviewed_prompt = _apply_review_notes_to_prompt(reviewed_prompt, row["notes"])
+            row["prompt"] = enforce_prompt_continuity_contract(reviewed_prompt, row)
         row["review_status"] = "redo"
         row["review_notes"] = row["notes"]
 
     for key in [
         "prompt", "notes", "review_status", "review_notes", "quality_retry_count", "quality_version",
         "retry_defect_code", "retry_evidence", "retry_root_cause", "retry_strategy",
-        "retry_defect_severity", "v3_escalation_approved",
+        "retry_defect_severity", "v3_escalation_approved", "provider_retry_prompt",
         "batch_retry_calibration_status", "batch_retry_calibration_notes",
     ]:
         if key not in fieldnames:

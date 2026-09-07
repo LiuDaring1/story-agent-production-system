@@ -4,6 +4,8 @@ import argparse
 import hashlib
 import json
 import os
+import time
+from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -49,20 +51,23 @@ def provider_prompt_for_row(row: dict[str, str], *, model: str, is_toapis: bool)
     """
 
     retry_prompt = str(row.get("provider_retry_prompt") or "").strip()
-    prompt = retry_prompt or str(row.get("prompt") or "").strip()
-    if retry_prompt:
-        prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        previous_sha = str(row.get("previous_provider_prompt_sha256") or "").strip()
-        if previous_sha and prompt_sha == previous_sha:
-            raise ValueError(
-                f"镜头 {row.get('scene', '')} 的硬伤重试 provider prompt 与上次完全相同，禁止重复付费提交"
-            )
+    prompt = str(row.get("prompt") or "").strip()
     if is_toapis:
         if not retry_prompt:
             marker_offsets = [prompt.find(marker) for marker in INTERNAL_PROMPT_MARKERS]
             marker_offsets = [offset for offset in marker_offsets if offset >= 0]
             if marker_offsets:
                 prompt = prompt[: min(marker_offsets)].rstrip()
+    if retry_prompt:
+        if row.get("provider_prompt_compiler") and "[LOCKED_DIRECTOR_INTENT_V1]" not in prompt:
+            raise ValueError(f"镜头 {row.get('scene', '')} 的重试缺少已编译锁定导演意图")
+        prompt = f"{prompt}\n[TARGETED_DEFECT_REPAIR_V1]\n{retry_prompt}".strip()
+        prompt_sha = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+        previous_sha = str(row.get("previous_provider_prompt_sha256") or "").strip()
+        if previous_sha and prompt_sha == previous_sha:
+            raise ValueError(
+                f"镜头 {row.get('scene', '')} 的硬伤重试 provider prompt 与上次完全相同，禁止重复付费提交"
+            )
     if is_toapis:
         if model.strip().lower() != GROK_VIDEO_1_0_MODEL:
             raise ValueError(
@@ -85,14 +90,18 @@ def reset_retryable_failed_row(row: dict[str, str], video_path: Path) -> bool:
         return False
     if row.get("status", "").strip() not in RETRYABLE_STATUSES:
         return False
+    # Unknown/local failures must resume the same provider request.
+    if row.get("provider_failure_confirmed") != "true":
+        return False
     scene = row.get("scene", "")
     if row.get("task_id", "").strip():
         print(f"重置失败任务 {scene}：清除旧 task_id 后重新提交。", flush=True)
     else:
         print(f"重置提交前失败任务 {scene}：清除错误后重新提交。", flush=True)
-    for key in ["task_id", "video_url", "error", "api_response", "query_response"]:
+    for key in ["task_id", "client_business_id", "video_url", "error", "api_response", "query_response"]:
         if key in row:
             row[key] = ""
+    row["provider_failure_confirmed"] = ""
     row["status"] = "todo"
     row["provider_attempt"] = str(int(row.get("provider_attempt") or "0") + 1)
     return True
@@ -100,6 +109,8 @@ def reset_retryable_failed_row(row: dict[str, str], video_path: Path) -> bool:
 
 def toapis_extra_body(jobs_csv: Path, row: dict[str, str], extra_body: dict[str, object] | None) -> dict[str, object]:
     payload = dict(extra_body or {})
+    if "client_business_id" not in payload and row.get("client_business_id"):
+        payload["client_business_id"] = row["client_business_id"]
     if "client_business_id" not in payload:
         identity = "|".join(
             [
@@ -284,10 +295,149 @@ def _discover_project_root(jobs_csv: Path) -> Path | None:
     return None
 
 
+def _native_run_file(project_dir: Path | None, explicit: Path | None) -> Path | None:
+    if explicit is not None:
+        target = explicit.expanduser().resolve()
+        if not target.is_file():
+            raise FileNotFoundError(f"story_run.json 不存在：{target}")
+        return target
+    if project_dir is None:
+        return None
+    candidate = project_dir.expanduser().resolve() / "99_项目状态" / "story_run.json"
+    return candidate if candidate.is_file() else None
+
+
+def recover_download_binding_from_sidecar(
+    jobs_csv: Path, row: dict[str, str], video_path: Path, *, production_mode: bool,
+) -> bool:
+    """Recover the narrow crash window after receipt write but before CSV write."""
+
+    try:
+        scene = int(str(row.get("scene") or "0"))
+        attempt = int(str(row.get("provider_attempt") or "0"))
+    except ValueError:
+        return False
+    receipt_path = (
+        jobs_csv.expanduser().parent / "video_receipts"
+        / f"scene_{scene:02d}_attempt_{attempt:02d}.json"
+    ).resolve()
+    if not receipt_path.is_file() or not video_path.is_file():
+        return False
+    try:
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    if not isinstance(receipt, dict):
+        return False
+    candidate = dict(row)
+    candidate.update({
+        "video_source_kind": str(receipt.get("source_kind") or ""),
+        "video_provider": str(receipt.get("provider") or ""),
+        "video_model": str(receipt.get("model") or ""),
+        "video_execution_mode": str(receipt.get("execution_mode") or ""),
+        "production_eligible": "true" if receipt.get("production_eligible") is True else "false",
+        "video_receipt_path": str(receipt_path),
+        "video_receipt_sha256": hashlib.sha256(receipt_path.read_bytes()).hexdigest(),
+    })
+    if video_receipt_issues(candidate, video_path, production_mode=production_mode):
+        return False
+    row.update({key: candidate[key] for key in (
+        "video_source_kind", "video_provider", "video_model", "video_execution_mode",
+        "production_eligible", "video_receipt_path", "video_receipt_sha256",
+    )})
+    row["status"] = "downloaded"
+    return True
+
+
+def _preflight_native_requirements(
+    run_file: Path | None,
+    *,
+    model: str,
+    ratio: str,
+    resolution: str,
+    seconds: str,
+    shots: list[str] | None = None,
+) -> None:
+    """Reject stale or out-of-scope rules before any provider request."""
+
+    if run_file is None:
+        return
+    from story_requirements import validate_run_projection
+
+    validate_run_projection(
+        run_file,
+        parameters={
+            "model": model,
+            "ratio": ratio,
+            "resolution": resolution,
+            "seconds": seconds,
+        },
+        consumer_scope={
+            "shots": list(shots or []),
+            "artifacts": ["r2v_provider_group_receipt"],
+        },
+    )
+
+
+def _observe_provider_request(
+    run_file: Path | None,
+    row: dict[str, str],
+    *,
+    provider: str,
+    model: str,
+    status: str,
+    error_type: str = "",
+) -> None:
+    if run_file is None:
+        return
+    from story_run import record_request_observation
+
+    request_id = str(row.get("task_id") or "").strip()
+    if not request_id:
+        return
+    now = datetime.now(timezone.utc).isoformat()
+    started_at = str(row.get("provider_started_at") or "").strip() or now
+    row["provider_started_at"] = started_at
+    ended_at = now if status in {"completed", "failed", "cancelled"} else ""
+    duration_seconds = None
+    if ended_at:
+        try:
+            duration_seconds = max(
+                0.0,
+                (datetime.fromisoformat(ended_at) - datetime.fromisoformat(started_at)).total_seconds(),
+            )
+        except ValueError:
+            duration_seconds = None
+    record_request_observation(
+        run_file=run_file,
+        package="r2v_visuals",
+        provider=provider,
+        request_id=request_id,
+        operation="reference_to_video" if row.get("reference_image_paths_json") else "image_to_video",
+        model=model,
+        status=status,
+        started_at=started_at,
+        ended_at=ended_at,
+        duration_seconds=duration_seconds,
+        wait_seconds=(
+            float(row["provider_wait_seconds"])
+            if str(row.get("provider_wait_seconds") or "").strip()
+            and status in {"completed", "failed", "cancelled"}
+            else None
+        ),
+        retry_index=int(row.get("provider_attempt") or "0"),
+        token_status="not_applicable",
+        request_sha256=str(row.get("provider_prompt_sha256") or ""),
+        error_type=error_type,
+        replace=status != "submitted",
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="通过已配置的视频供应商批量生成图片转视频片段")
     parser.add_argument("--jobs-csv", required=True, type=Path, help="prepare_image_video_jobs.py 生成的任务 CSV")
     parser.add_argument("--project-dir", type=Path, help="V3.5 合同锁项目根目录；合同绑定 jobs 必填（可自动发现）")
+    parser.add_argument("--run-file", type=Path, help="当前 story_run.json；默认从 project-dir 自动发现")
     parser.add_argument("--images-dir", required=True, type=Path, help="稳定命名图片文件夹")
     parser.add_argument("--videos-dir", required=True, type=Path, help="生成视频保存文件夹")
     parser.add_argument("--api-key-env", default=saved_video_adapter_value("api_key_env", "QINGYUN_API_KEY"), help="只读取这个环境变量或同名 macOS Keychain 服务中的 API Key；不会写入 CSV 或日志")
@@ -363,6 +513,9 @@ def main() -> None:
     if contract_bound and project_dir is None:
         raise ValueError("合同绑定 jobs 无法定位 project_dir，已在付费调用前阻断")
     provider_label = "toapis" if is_toapis else "qingyun"
+    run_file = _native_run_file(project_dir, args.run_file)
+    if args.execution_mode == "production" and not args.dry_run and run_file is None:
+        raise ValueError("正式生产必须提供当前 story_run.json；禁止回落旧生产")
 
     def bind_download(row: dict[str, str], video_path: Path) -> None:
         receipt, receipt_sha = write_video_receipt(
@@ -396,6 +549,47 @@ def main() -> None:
     if args.limit:
         selected_rows = selected_rows[: args.limit]
 
+    recovered = False
+    for row in selected_rows:
+        video_path = args.videos_dir.expanduser() / row["target_video_filename"]
+        if (
+            video_path.is_file() and video_path.stat().st_size > 0
+            and video_receipt_issues(
+                row, video_path, production_mode=args.execution_mode == "production"
+            )
+            and recover_download_binding_from_sidecar(
+                args.jobs_csv, row, video_path,
+                production_mode=args.execution_mode == "production",
+            )
+        ):
+            recovered = True
+    if recovered:
+        write_jobs_csv(args.jobs_csv.expanduser(), rows)
+    if args.execution_mode == "production":
+        blocked = []
+        for row in selected_rows:
+            video_path = args.videos_dir.expanduser() / row["target_video_filename"]
+            if video_path.exists() and video_receipt_issues(row, video_path, production_mode=True):
+                row["status"] = "blocked_receipt"
+                row["error"] = "已有媒体缺少有效当前来源回执；保留媒体与任务身份，补证据后恢复"
+                blocked.append(row["scene"])
+        if blocked:
+            write_jobs_csv(args.jobs_csv.expanduser(), rows)
+            raise ValueError("来源 receipt 阻塞镜头：" + ", ".join(blocked))
+
+    for row in selected_rows:
+        request_seconds = row_request_seconds(
+            row, model=args.model, is_toapis=is_toapis, fallback_seconds=args.seconds,
+        )
+        _preflight_native_requirements(
+            run_file,
+            model=args.model,
+            ratio=args.ratio,
+            resolution=args.resolution,
+            seconds=request_seconds,
+            shots=[str(row.get("shot_id") or row.get("scene") or "").strip()],
+        )
+
     # Resolve every selected request before resetting failed rows or issuing a
     # paid call.  A provider-limit violation therefore fails closed without
     # discarding the previous task/error evidence.
@@ -425,7 +619,7 @@ def main() -> None:
         for row in selected_rows:
             video_path = args.videos_dir.expanduser() / row["target_video_filename"]
             if video_path.exists() and video_path.stat().st_size > 0:
-                if contract_bound and video_receipt_issues(row, video_path, production_mode=args.execution_mode == "production"):
+                if (args.execution_mode == "production" or contract_bound) and video_receipt_issues(row, video_path, production_mode=args.execution_mode == "production"):
                     raise ValueError(f"镜头 {row['scene']} 已有视频缺少当前正式来源 receipt，禁止按文件存在跳过")
                 row["status"] = "downloaded"
                 continue
@@ -487,11 +681,16 @@ def main() -> None:
             row["task_id"] = created.task_id
             row["status"] = "submitted"
             row["api_response"] = json.dumps(created.raw, ensure_ascii=False)
+            row["provider_started_at"] = datetime.now(timezone.utc).isoformat()
+            # Persist the provider identity before any secondary ledger write;
+            # a crash here must resume/poll this task rather than resubmit it.
             write_jobs_csv(args.jobs_csv.expanduser(), rows)
+            _observe_provider_request(
+                run_file, row, provider=provider_label, model=args.model, status="submitted"
+            )
             submitted += 1
             in_flight += 1
             if args.submit_delay > 0:
-                import time
                 time.sleep(args.submit_delay)
         print(f"批量提交完成：新增 {submitted} 条任务。", flush=True)
         if args.submit_only:
@@ -516,7 +715,7 @@ def main() -> None:
         status = row.get("status", "")
         video_path = args.videos_dir.expanduser() / row["target_video_filename"]
         if video_path.exists() and video_path.stat().st_size > 0:
-            if contract_bound and video_receipt_issues(row, video_path, production_mode=args.execution_mode == "production"):
+            if (args.execution_mode == "production" or contract_bound) and video_receipt_issues(row, video_path, production_mode=args.execution_mode == "production"):
                 raise ValueError(f"镜头 {row['scene']} 已有视频缺少当前正式来源 receipt，禁止按文件存在跳过")
             row["status"] = "downloaded"
             continue
@@ -621,7 +820,11 @@ def main() -> None:
                     row["task_id"] = created.task_id
                     row["status"] = "submitted"
                     row["api_response"] = json.dumps(created.raw, ensure_ascii=False)
+                    row["provider_started_at"] = datetime.now(timezone.utc).isoformat()
                     write_jobs_csv(args.jobs_csv.expanduser(), rows)
+                    _observe_provider_request(
+                        run_file, row, provider=provider_label, model=args.model, status="submitted"
+                    )
 
             if args.submit_only:
                 processed += 1
@@ -633,13 +836,21 @@ def main() -> None:
 
             print(f"等待任务 {row['scene']}：{task_id}", flush=True)
             assert client is not None
-            result = poll_until_done(
-                client,
-                task_id,
-                interval=args.poll_interval,
-                max_wait_seconds=args.max_wait_seconds,
-                max_poll_errors=args.max_poll_errors,
-            )
+            poll_started = time.perf_counter()
+            try:
+                result = poll_until_done(
+                    client,
+                    task_id,
+                    interval=args.poll_interval,
+                    max_wait_seconds=args.max_wait_seconds,
+                    max_poll_errors=args.max_poll_errors,
+                )
+            finally:
+                previous_wait = float(row.get("provider_wait_seconds") or 0.0)
+                row["provider_wait_seconds"] = str(
+                    round(previous_wait + time.perf_counter() - poll_started, 6)
+                )
+            row["provider_failure_confirmed"] = "true" if result.status in {"failed", "cancelled", "canceled", "expired"} else ""
             row["status"] = result.status
             row["video_url"] = result.video_url or ""
             row["error"] = result.error or ""
@@ -647,20 +858,47 @@ def main() -> None:
 
             if result.status in SUCCESS_STATUSES and result.video_url:
                 print(f"下载视频 {row['scene']}：{video_path.name}", flush=True)
-                client.download(result.video_url, video_path)
+                pending_path = video_path.with_name(video_path.name + ".download-part")
+                client.download(result.video_url, pending_path)
+                pending_path.replace(video_path)
                 row["status"] = "downloaded"
                 bind_download(row, video_path)
             elif result.status in SUCCESS_STATUSES:
                 print(f"下载视频 {row['scene']}：{video_path.name}", flush=True)
-                client.download_task_video(task_id, video_path)
+                pending_path = video_path.with_name(video_path.name + ".download-part")
+                client.download_task_video(task_id, pending_path)
+                pending_path.replace(video_path)
                 row["status"] = "downloaded"
                 bind_download(row, video_path)
+
+            terminal_status = (
+                "completed" if row["status"] == "downloaded"
+                else "cancelled" if row["status"] in {"cancelled", "canceled"}
+                else "failed" if row.get("provider_failure_confirmed") == "true"
+                else "running"
+            )
+            _observe_provider_request(
+                run_file,
+                row,
+                provider=provider_label,
+                model=args.model,
+                status=terminal_status,
+                error_type=str(result.status) if terminal_status in {"failed", "cancelled"} else "",
+            )
 
             write_jobs_csv(args.jobs_csv.expanduser(), rows)
             processed += 1
         except Exception as exc:
-            row["status"] = "error"
+            row["status"] = "resume_pending" if row.get("task_id") else "error"
             row["error"] = str(exc)
+            _observe_provider_request(
+                run_file,
+                row,
+                provider=provider_label,
+                model=args.model,
+                status="failed",
+                error_type=type(exc).__name__,
+            )
             write_jobs_csv(args.jobs_csv.expanduser(), rows)
             print(f"任务 {row['scene']} 失败：{exc}", flush=True)
             raise

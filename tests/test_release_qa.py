@@ -66,6 +66,40 @@ def make_audio(path: Path, frequency: int) -> None:
 
 
 class ReleaseQaTests(unittest.TestCase):
+    def test_truncated_mixed_video_fails_complete_release_qa(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project = root / "project"
+            init_project(project, story_name="音频覆盖测试", slug="audio-coverage")
+            paths = project_paths(project)
+            sources = []
+            for name, frequency in (("voice", 330), ("music", 550)):
+                source = root / f"{name}.wav"
+                subprocess.run([
+                    "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    f"sine=frequency={frequency}:duration=10", str(source),
+                ], check=True)
+                sources.append(source)
+            for account in ("主账号", "宝库号"):
+                video = paths.release / f"{account}发布视频.mp4"
+                subprocess.run([
+                    "ffmpeg", "-v", "error", "-y", "-f", "lavfi", "-i",
+                    "color=c=0x335577:s=300x400:d=2:r=24", "-i", str(sources[0]), "-i", str(sources[1]),
+                    "-filter_complex", "[1:a][2:a]amix=inputs=2:normalize=0[a]",
+                    "-map", "0:v", "-map", "[a]", "-t", "2", "-c:v", "libx264",
+                    "-pix_fmt", "yuv420p", "-c:a", "aac", str(video),
+                ], check=True)
+            from delivery_gate_fixtures import binding
+            contract = {"required_audio_role": "narration_plus_music",
+                        "narration": binding(sources[0]), "music_bed": binding(sources[1])}
+            with patch("story_project.release_audio_role_references", return_value=(contract, [])):
+                qa_release(project)
+            report = json.loads((paths.status / "qa_release_report.json").read_text())
+            self.assertFalse(report["passed"])
+            self.assertEqual(len(report["results"]), 2)
+            for result in report["results"]:
+                self.assertIn("完整口播时长", " ".join(result["issues"]))
+
     def test_terminal_preview_shifts_full_sample_window_before_eof(self) -> None:
         start, duration, frame_time = release_preview_sample_window(179.883, 179.7)
         self.assertAlmostEqual(start, 179.483, places=3)

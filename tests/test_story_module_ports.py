@@ -48,7 +48,6 @@ from story_module_registry import (
     build_registry_for_profile,
     load_pipeline_config,
 )
-from story_agent import AgentContext, StoryAgent
 from story_project import init_project
 from video_provider_adapter import VideoProviderAdapter, resolve_row_generation_seconds, resolve_video_provider
 
@@ -178,41 +177,6 @@ class StoryModulePortTests(unittest.TestCase):
             resolve_row_generation_seconds(row, model=legacy.model, fallback_seconds=8, min_seconds=legacy.min_seconds, max_seconds=legacy.max_seconds),
         )
 
-    def test_story_agent_workflow_subprocess_uses_formal_mock_port_without_concrete_attrs(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            project = root / "project"
-            init_project(project, story_name="adapter fixture", slug="adapter-fixture")
-            images, videos = root / "images", root / "videos"
-            images.mkdir()
-            Image.new("RGB", (32, 18), (30, 80, 120)).save(images / "01.png")
-            jobs = root / "jobs.csv"
-            jobs.write_text(
-                "scene,image_filename,story_text,prompt,target_video_filename,status\n"
-                "1,01.png,body,character_a moves,01.mp4,todo\n",
-                encoding="utf-8-sig",
-            )
-            registry = build_registry_for_profile("mock-video")
-            port = registry.video_generator()
-            for leaked in ("name", "model", "runner", "default_seconds", "estimated_cost_cny_per_clip"):
-                self.assertFalse(hasattr(port, leaked), leaked)
-            context = AgentContext(
-                project, None, "adapter fixture", "adapter-fixture", True, False,
-                "cli", "", "workspace-write", "never", "codex", 30,
-            )
-            result = StoryAgent(context, module_registry=registry)._workflow(
-                [
-                    "generate", "--jobs-csv", str(jobs), "--images-dir", str(images),
-                    "--videos-dir", str(videos), "--skip-prompt-review", "--execution-mode", "test",
-                ],
-                "mock video integration",
-            )
-            self.assertEqual(result.status, "done", result.message)
-            self.assertEqual((videos / "01.mp4").read_bytes(), b"STORY_MODULE_MOCK_VIDEO\n")
-            with jobs.open(encoding="utf-8-sig", newline="") as file:
-                row = next(csv.DictReader(file))
-            self.assertEqual(row["provider"], "mock")
-            self.assertEqual(row["production_eligible"], "false")
 
     def test_missing_required_subprocess_selection_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -289,50 +253,7 @@ class StoryModulePortTests(unittest.TestCase):
             registry.register("video_generator", MockVideoGeneratorAdapter("invalid_output"))
             self.assertEqual(consume(registry).failure.code, ModuleFailureCode.INVALID_OUTPUT)
 
-    def test_story_agent_accepts_registry_injection_without_global_configuration(self) -> None:
-        registry = ModuleRegistry()
-        registry.register("video_generator", MockVideoGeneratorAdapter())
-        registry.register("keyer", MockKeyerAdapter())
-        agent = StoryAgent.__new__(StoryAgent)
-        agent._module_registry = registry
-        self.assertIs(agent._modules(), registry)
-        self.assertEqual(agent._provider_for_stage("generate_videos"), "mock-video")
-        self.assertIs(agent._modules().keyer(), registry.keyer())
 
-    def test_story_agent_propagates_selected_required_profile_and_execution_mode(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            project = root / "project"
-            init_project(project, story_name="media lock", slug="media-lock")
-            locked = {
-                MODULE_PROFILE_ENV: "mock-image",
-                MODULE_PROFILE_REQUIRED_ENV: "mock-image",
-                MODULE_EXECUTION_MODE_ENV: "test",
-                MODULE_EXECUTION_MODE_REQUIRED_ENV: "test",
-            }
-            with patch.dict(os.environ, locked, clear=False):
-                registry = build_registry_for_profile("mock-image", execution_mode="test")
-            context = AgentContext(
-                project, None, "media lock", "media-lock", False, False,
-                "cli", "", "workspace-write", "never", "codex", 30,
-            )
-            agent = StoryAgent(context, module_registry=registry)
-            self.assertEqual(agent._module_subprocess_env(), locked)
-            workflow = agent._workflow(["doctor-project", "--project-dir", str(project)], "doctor")
-            self.assertIn("--module-profile mock-image", workflow.message)
-            self.assertIn("--module-execution-mode test", workflow.message)
-
-            prompt = root / "prompt.md"
-            prompt.write_text("sentinel only", encoding="utf-8")
-            with patch("story_agent.subprocess.Popen") as popen:
-                process = popen.return_value
-                process.communicate.return_value = ("", "")
-                process.returncode = 0
-                agent._run_codex_exec("profile_propagation_test", prompt, [])
-            self.assertEqual(popen.call_args.kwargs["env"][MODULE_PROFILE_ENV], "mock-image")
-            self.assertEqual(popen.call_args.kwargs["env"][MODULE_PROFILE_REQUIRED_ENV], "mock-image")
-            self.assertEqual(popen.call_args.kwargs["env"][MODULE_EXECUTION_MODE_ENV], "test")
-            self.assertEqual(popen.call_args.kwargs["env"][MODULE_EXECUTION_MODE_REQUIRED_ENV], "test")
 
     def test_keyer_adapter_delegates_every_production_fact(self) -> None:
         settings = {

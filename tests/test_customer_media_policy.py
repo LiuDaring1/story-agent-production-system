@@ -17,6 +17,18 @@ from story_customer_media import (
 
 
 class CustomerMediaPolicyTests(unittest.TestCase):
+    def test_release_audio_must_cover_the_complete_program(self) -> None:
+        rng = np.random.default_rng(19)
+        narration = rng.normal(0, 0.15, 80_000)
+        music = rng.normal(0, 0.08, 80_000)
+        mixed = narration + 0.7 * music
+        for rendered, bed in ((mixed[:16_000], music), (mixed, music[:16_000]), (np.tile(mixed, 2), music)):
+            with self.subTest(rendered=rendered.size, music=bed.size):
+                with self.assertRaisesRegex(ValueError, "完整口播时长"):
+                    narration_music_fit(rendered, narration, bed)
+        # A small AAC/frame tail difference remains valid.
+        self.assertTrue(narration_music_fit(mixed[:-400], narration, music)["passed"])
+
     def test_release_mix_requires_both_narration_and_music(self) -> None:
         rng = np.random.default_rng(23)
         narration = rng.normal(0.0, 0.15, 16_000)

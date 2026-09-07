@@ -32,7 +32,7 @@ from demo_quality import (
     write_demo_render_manifest,
 )
 from release_geometry import compile_demo_presenter_geometry
-from story_agent_runtime import write_review_bundle
+from story_evidence import write_review_bundle
 
 
 def _silhouette(*, color=(186, 145, 116, 255)) -> Image.Image:

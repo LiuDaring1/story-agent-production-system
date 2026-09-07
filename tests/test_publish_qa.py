@@ -8,8 +8,7 @@ from unittest.mock import patch
 
 from PIL import Image, ImageDraw
 
-from story_agent import AgentContext, StageResult, StoryAgent
-from story_agent_runtime import file_sha256
+from story_evidence import file_sha256
 from cover_quality import (
     COVER_GRAPH,
     cover_relative,
@@ -20,7 +19,6 @@ from cover_quality import (
     integrated_cover_issues,
     required_cover_issues,
 )
-from story_codex_tasks import build_publish_package_agent_prompt
 from story_project import apply_fixed_cover_branding, init_project, load_manifest, project_paths, qa_publish, save_json
 
 
@@ -102,72 +100,9 @@ def make_required_cover_fixture(project: Path, root: Path) -> tuple[Path, Path]:
     return logo, compiled_path
 
 
-def agent_context(project: Path) -> AgentContext:
-    return AgentContext(
-        project_dir=project,
-        inbox=None,
-        story_name="通用故事标题",
-        slug="required-cover",
-        execute=True,
-        update_latest_episode=False,
-        codex_mode="cli",
-        codex_model="gpt-5.6-sol",
-        codex_sandbox="workspace-write",
-        codex_approval="never",
-        codex_path="codex",
-        codex_timeout=30,
-    )
 
 
 class PublishQaTests(unittest.TestCase):
-    def test_publish_stage_passes_twelve_originals_and_contact_sheet_to_native_review(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            project = root / "故事剪辑：原生视觉输入"
-            logo, compiled_path = make_required_cover_fixture(project, root)
-            with patch("story_project.load_config", return_value={"brand_assets": {"logo": str(logo)}}):
-                apply_fixed_cover_branding(project, contract_spec=compiled_path)
-            paths = project_paths(project)
-            qa_report = paths.status / "qa_publish_report.md"
-            qa_json = paths.status / "qa_publish_report.json"
-            qa_report.write_text("离线机器 QA fixture", encoding="utf-8")
-            qa_json.write_text('{"passed": true, "artifacts": {}}', encoding="utf-8")
-            captured: dict[str, object] = {}
-            expected = [
-                cover_relative(account, ratio, creative=creative)
-                for creative in (False, True)
-                for account in ("main", "library")
-                for ratio in ("3x4", "4x3", "16x9")
-            ]
-
-            def fake_review(**kwargs):
-                captured.update(kwargs)
-                payload = {
-                    "p0_errors": [],
-                    "evidence_matrix": [{"asset": asset, "result": "pass"} for asset in expected],
-                }
-                return StageResult("done", "offline review"), payload
-
-            agent = StoryAgent(agent_context(project))
-            manifest = load_manifest(paths)
-            with (
-                patch.object(agent, "_workflow", return_value=StageResult("done", "offline qa")),
-                patch.object(agent, "_json_qa_report_passes", return_value=True),
-                patch.object(agent, "_structured_review", side_effect=fake_review),
-            ):
-                result = agent._stage_publish_package_review(manifest)
-
-            self.assertEqual(result.status, "done")
-            native_images = captured["images"]
-            self.assertIsInstance(native_images, list)
-            original_paths = [path for path in native_images if path.is_relative_to(paths.publish)]
-            self.assertEqual(
-                {str(path.relative_to(paths.publish)) for path in original_paths},
-                set(expected),
-            )
-            self.assertEqual(len(original_paths), 12)
-            self.assertEqual(len(native_images), 13)
-            self.assertEqual(native_images[-1].name, "publish_covers_contact_sheet.jpg")
 
     def test_required_native_review_receives_six_final_and_six_creative_originals(self) -> None:
         publish = Path("/tmp/neutral-publish")
@@ -229,16 +164,6 @@ class PublishQaTests(unittest.TestCase):
         complete["p0_errors"] = ["fake_logo"]
         self.assertTrue(any("P0" in item for item in cover_review_payload_issues(complete, expected)))
 
-    def test_required_prompt_requires_integrated_imagegen_typography(self) -> None:
-        prompt = build_publish_package_agent_prompt(Path("handoff.md"), Path("project"), required_v1=True)
-        self.assertIn("cover_4x3.png", prompt)
-        self.assertIn("ImageGen 一体成型", prompt)
-        self.assertIn("任何脚本后期叠字", prompt)
-        self.assertIn("official_assets 为空时", prompt)
-        self.assertIn("cover_integrated_generation.json", prompt)
-        self.assertIn("cover_lineage.json", prompt)
-        self.assertIn("semantic_artifacts", prompt)
-        self.assertIn("visual_style", prompt)
 
     def test_integrated_imagegen_receipt_binds_six_final_covers(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

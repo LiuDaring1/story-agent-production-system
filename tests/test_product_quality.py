@@ -38,8 +38,7 @@ from product_quality import (
     stable_sha256,
 )
 from product_text_projection import compile_public_story_lines
-from story_agent import AgentContext, StageResult, StoryAgent
-from story_agent_runtime import file_sha256
+from story_evidence import file_sha256
 from story_project import init_project, project_paths
 from story_video_synthesizer.align import LineTiming
 
@@ -786,89 +785,7 @@ class ProductQualityTests(unittest.TestCase):
             [],
         )
 
-    def test_product_package_review_passes_ppt_evidence_as_native_images(self) -> None:
-        project = self.root / "project"
-        manifest = init_project(project, story_name="通用故事", slug="generic-story")
-        paths = project_paths(project)
-        base = paths.product / "基础版"
-        advanced = paths.product / "进阶版"
-        base.mkdir(parents=True)
-        advanced.mkdir(parents=True)
-        (base / "story.txt").write_text("正文", encoding="utf-8")
-        (advanced / "story.txt").write_text("正文", encoding="utf-8")
-        manifest.setdefault("outputs", {})["product_base"] = str(base)
-        manifest["outputs"]["product_advanced"] = str(advanced)
 
-        evidence_root = paths.status / "product_package_work" / "ppt_evidence"
-        expected_images = [
-            evidence_root / "with_subtitles" / "first.png",
-            evidence_root / "without_subtitles" / "contact_sheet.png",
-        ]
-        for index, image in enumerate(expected_images):
-            image.parent.mkdir(parents=True, exist_ok=True)
-            Image.new("RGB", (320, 180), (80 + index * 20, 110, 140)).save(image)
-
-        report = paths.status / "qa_product_report.md"
-        report.write_text("PASS", encoding="utf-8")
-        report_json = paths.status / "qa_product_report.json"
-        report_json.write_text(json.dumps({
-            "passed": True,
-            "artifacts": {"report": {"path": str(report), "sha256": file_sha256(report)}},
-        }), encoding="utf-8")
-        context = AgentContext(
-            project_dir=project,
-            inbox=None,
-            story_name="通用故事",
-            slug="generic-story",
-            execute=False,
-            update_latest_episode=False,
-            codex_mode="handoff",
-            codex_model="",
-            codex_sandbox="workspace-write",
-            codex_approval="never",
-            codex_path="codex",
-            codex_timeout=30,
-        )
-        agent = StoryAgent(context, read_only=True)
-        review_payload = {"approved": True, "score": 95, "critical_errors": []}
-        with (
-            patch.object(agent, "_workflow", return_value=StageResult("done", "qa")),
-            patch.object(
-                agent,
-                "_structured_review",
-                return_value=(StageResult("done", "review"), review_payload),
-            ) as structured_review,
-            patch("product_quality.product_package_review_payload_issues", return_value=[]),
-        ):
-            result = agent._stage_product_package_review(manifest)
-
-        self.assertEqual(result.status, "done")
-        self.assertEqual(structured_review.call_args.kwargs["images"], sorted(expected_images))
-
-    def test_product_package_review_cannot_remain_current_when_package_inputs_are_stale(self) -> None:
-        project = self.root / "review-currentness-project"
-        manifest = init_project(project, story_name="通用故事", slug="generic-story")
-        context = AgentContext(
-            project_dir=project,
-            inbox=None,
-            story_name="通用故事",
-            slug="generic-story",
-            execute=False,
-            update_latest_episode=False,
-            codex_mode="handoff",
-            codex_model="",
-            codex_sandbox="workspace-write",
-            codex_approval="never",
-            codex_path="codex",
-            codex_timeout=30,
-        )
-        agent = StoryAgent(context, read_only=True)
-        with (
-            patch.object(agent, "_review_stage_current", return_value=True),
-            patch.object(agent, "_legacy_contract_policy", return_value=False),
-            patch.object(agent, "_has_product_package", return_value=False),
-        ):
-            self.assertFalse(agent._has_product_package_review(manifest))
 
 
 if __name__ == "__main__":

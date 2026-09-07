@@ -10,64 +10,13 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from story_agent import StageResult, StoryAgent, canonical_video_prompt_rows, video_prompt_review_matches_current
-from story_agent_runtime import STORY_STAGE_SEQUENCE, file_sha256, write_review_bundle
+from story_evidence import file_sha256, write_review_bundle
 from story_project import final_delivery, init_project, load_config, load_manifest, project_paths, sha256_file, write_manifest
 from story_workflow import release_encode_guard_action
 from tests.test_release_qa import make_vertical_video
 
 
 class FullAutoContractTests(unittest.TestCase):
-    def test_failed_post_encode_visual_review_preserves_videos_and_locked_preset(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            release = root / "04_发布视频"
-            status = root / "99_项目状态"
-            (release / "keying").mkdir(parents=True)
-            status.mkdir(parents=True)
-            videos = [release / "主账号发布视频.mp4", release / "宝库号发布视频.mp4"]
-            for index, video in enumerate(videos):
-                video.write_bytes(f"formal-video-{index}".encode())
-            preset = release / "keying" / "keying_preset.json"
-            preset.write_text('{"locked":true}\n', encoding="utf-8")
-            original_video_bytes = [path.read_bytes() for path in videos]
-            original_preset = preset.read_bytes()
-
-            agent = StoryAgent.__new__(StoryAgent)
-            agent.context = SimpleNamespace(
-                project_dir=root,
-                paths=SimpleNamespace(release=release, status=status),
-            )
-            agent._probe_duration = lambda _path: 120.0
-            agent._release_preview_images = lambda: []
-
-            def fake_ffmpeg(command, **_kwargs):
-                target = Path(command[-1])
-                target.parent.mkdir(parents=True, exist_ok=True)
-                Image.new("RGB", (32, 32), "white").save(target)
-                return SimpleNamespace(returncode=0, stdout="", stderr="")
-
-            def fake_sheet(_sources, target, **_kwargs):
-                target.parent.mkdir(parents=True, exist_ok=True)
-                Image.new("RGB", (32, 32), "white").save(target)
-                return target
-
-            agent._make_contact_sheet = fake_sheet
-            agent._structured_review = lambda **_kwargs: (
-                StageResult("blocked", "视觉不满意", status / "reviews" / "release_video_review_review.json"),
-                {"approved": False, "issues": ["aesthetic"]},
-            )
-            with patch("story_agent.subprocess.run", side_effect=fake_ffmpeg), patch(
-                "story_agent.write_review_bundle", return_value=status / "reviews" / "release_video_bundle.json"
-            ), patch.object(agent, "_codex_task") as codex_revision:
-                result = agent._stage_release_video_review({})
-
-            self.assertEqual(result.status, "blocked")
-            self.assertIn("不会自动修改", result.message)
-            self.assertEqual([path.read_bytes() for path in videos], original_video_bytes)
-            self.assertEqual(preset.read_bytes(), original_preset)
-            self.assertFalse((status / "rejected" / "release_videos").exists())
-            codex_revision.assert_not_called()
 
     def test_formal_encode_guard_allows_only_same_binding_bounded_technical_repair(self) -> None:
         fingerprint = "a" * 64
@@ -155,43 +104,7 @@ class FullAutoContractTests(unittest.TestCase):
         self.assertNotIn("submit_all_first", video_api)
         self.assertEqual(set(video_api["adapters"]), {"toapis_grok_1_0", "mock_local"})
 
-    def test_release_and_product_package_split_after_shared_real_material_preview(self) -> None:
-        self.assertLess(STORY_STAGE_SEQUENCE.index("release_preview"), STORY_STAGE_SEQUENCE.index("product_package"))
-        self.assertLess(STORY_STAGE_SEQUENCE.index("release_preview"), STORY_STAGE_SEQUENCE.index("package_release"))
-        self.assertLess(STORY_STAGE_SEQUENCE.index("package_release"), STORY_STAGE_SEQUENCE.index("product_package"))
-        self.assertLess(STORY_STAGE_SEQUENCE.index("release_video_review"), STORY_STAGE_SEQUENCE.index("publish_package"))
 
-    def test_video_prompt_review_snapshot_survives_status_writeback_but_rejects_content_drift(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            jobs = root / "jobs.csv"
-            snapshot = root / "snapshot.json"
-            decisions = root / "decisions.csv"
-            jobs.write_text(
-                "scene,image_filename,story_text,prompt,status\n1,01.png,小羊出发,小羊向前走,pending\n",
-                encoding="utf-8-sig",
-            )
-            snapshot.write_text(
-                json.dumps({"version": 1, "rows": canonical_video_prompt_rows(jobs)}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            decisions.write_text(
-                "scene,image_filename,story_text,review_status,prompt,notes\n01,01.png,小羊出发,approved,小羊自然地向前走,动作明确\n",
-                encoding="utf-8-sig",
-            )
-            self.assertTrue(video_prompt_review_matches_current(jobs, snapshot, decisions))
-
-            jobs.write_text(
-                "scene,image_filename,story_text,prompt,status,prompt_review_status\n1,01.png,小羊出发,小羊自然地向前走,downloaded,approved\n",
-                encoding="utf-8-sig",
-            )
-            self.assertTrue(video_prompt_review_matches_current(jobs, snapshot, decisions))
-
-            jobs.write_text(
-                "scene,image_filename,story_text,prompt,status\n1,01.png,小羊回家,小羊自然地向前走,downloaded\n",
-                encoding="utf-8-sig",
-            )
-            self.assertFalse(video_prompt_review_matches_current(jobs, snapshot, decisions))
 
     def test_outputs_without_independent_reviews_cannot_complete(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -366,7 +279,8 @@ class FullAutoContractTests(unittest.TestCase):
                 {path: sha256_file(path) for path in bound_qa_files},
                 "Agent 最终交付不得重写已经被独立审核绑定的 QA 报告",
             )
-            for name in ("成本报告.md", "QA汇总.md", "异常说明.md"):
+            self.assertFalse((paths.status / "成本报告.md").exists())
+            for name in ("QA汇总.md", "异常说明.md"):
                 self.assertTrue((paths.status / name).exists())
                 self.assertFalse((base / name).exists())
                 self.assertFalse((advanced / name).exists())

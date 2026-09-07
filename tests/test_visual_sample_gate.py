@@ -10,8 +10,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from story_agent import StageResult, StoryAgent
-from story_agent_runtime import file_sha256, write_review_bundle
+from story_evidence import file_sha256, write_review_bundle
 from story_contract_consumers import projection_sha256
 from story_contract_runtime import (
     contract_consumer_path,
@@ -33,7 +32,6 @@ from story_module_registry import (
     ModuleRegistry,
 )
 from story_project import project_paths, save_json, write_manifest
-from tests.test_story_agent_runtime import as_frozen_v3_legacy
 from tests.test_story_contract_runtime import _lock_contract, _new_project, _runtime_valid_contract
 from tests.test_story_contracts import valid_contract
 from visual_sample_gate import (
@@ -239,6 +237,41 @@ def _lock_samples(project: Path, context: Path) -> dict:
     return plan
 
 
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+def agent_context_for(project: Path):
+    from tests.test_story_contract_runtime import _context
+
+    return _context(project)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
 class VisualSampleGateTests(unittest.TestCase):
     def test_visual_design_port_binding_and_protocol_only_substitution_are_byte_equivalent(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -293,28 +326,6 @@ class VisualSampleGateTests(unittest.TestCase):
                 paths[damaged_name].write_text('{"damaged":true}\n', encoding="utf-8")
                 with self.assertRaisesRegex(ValueError, "visual design port rejected"):
                     compile_visual_sample_plan(project, context)
-
-    def test_mock_visual_design_reaches_story_agent_consumer_without_second_contract(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project, manifest, agent, context = _fixture(
-                Path(directory), state=False, preview_kinds=("style_anchor", "character_sheet", "scale_anchor")
-            )
-            mock = MockVisualDesignAdapter()
-            registry = ModuleRegistry(profile_name="mock-visual-design")
-            registry.register("visual_design", mock)
-            agent._module_registry = registry
-            for item in compile_visual_sample_plan(project, context)["requirements"]:
-                if item["fulfillment"] == "supplemental_sample":
-                    _image(project / item["expected_path"])
-            before = {path.relative_to(project) for path in project.rglob("*") if path.is_file()}
-            with patch.object(mock, "resolve", wraps=mock.resolve) as resolve:
-                result = agent._stage_visual_samples(manifest)
-            self.assertEqual(result.status, "done", result.message)
-            self.assertEqual(resolve.call_count, 2)
-            after = {path.relative_to(project) for path in project.rglob("*") if path.is_file()}
-            self.assertFalse(any("visual_design_contract" in str(path) for path in after))
-            self.assertFalse(any("visual_contract" in str(path) for path in after - before))
-            self.assertTrue(visual_sample_paths(project)["machine_qa"].is_file())
 
     def test_missing_required_mock_visual_selection_fails_closed_without_plan(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -434,50 +445,6 @@ class VisualSampleGateTests(unittest.TestCase):
             self.assertEqual([item["content_refs"][1] for item in states], ["state_0", "state_3", "state_7"])
             self.assertEqual(len({item["sample_id"] for item in states}), 3)
             self.assertTrue(all("contact sheet" in item["need_reason"] for item in states))
-
-    def test_repeated_visual_defect_changes_strategy_and_stops_after_three_total_attempts(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project, _manifest, agent, context = _fixture(Path(directory), preview_kinds=())
-            plan = _ready_plan(project, context)
-            paths = visual_sample_paths(project)
-            write_visual_sample_machine_qa(project, plan)
-            write_review_bundle(
-                paths["bundle"],
-                [paths["plan"], paths["machine_qa"], context, *[project / item["expected_path"] for item in plan["requirements"]]],
-            )
-            state_sample = next(item for item in plan["requirements"] if item["kind"] == "state_anchor")
-            review = _passing_review(plan, paths["bundle"])
-            review.update(
-                approved=False,
-                score=76,
-                p0_errors=["state_contradiction"],
-                retry_sample_ids=[state_sample["sample_id"]],
-                retry_instructions=["The selected finite-prop state is wrong."],
-            )
-            save_json(paths["review"], review)
-
-            first_path = write_visual_sample_supplemental_request(project, plan, review)
-            first = json.loads(first_path.read_text(encoding="utf-8"))
-            self.assertEqual(first["failed_attempt_count"], 1)
-            self.assertEqual(
-                first["generation_strategy_by_sample"][state_sample["sample_id"]],
-                "targeted_regeneration",
-            )
-            self.assertTrue(agent._can_retry_visual_sample_review(first))
-
-            second_path = write_visual_sample_supplemental_request(project, plan, review)
-            second = json.loads(second_path.read_text(encoding="utf-8"))
-            self.assertTrue(second["repeated_failure"])
-            self.assertEqual(
-                second["generation_strategy_by_sample"][state_sample["sample_id"]],
-                "single_state_single_asset",
-            )
-            self.assertTrue(agent._can_retry_visual_sample_review(second))
-
-            third_path = write_visual_sample_supplemental_request(project, plan, review)
-            third = json.loads(third_path.read_text(encoding="utf-8"))
-            self.assertEqual(third["failed_attempt_count"], 3)
-            self.assertFalse(agent._can_retry_visual_sample_review(third))
 
     def test_rich_review_evidence_shape_is_accepted_without_protocol_retry(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -609,64 +576,6 @@ class VisualSampleGateTests(unittest.TestCase):
             plan = compile_visual_sample_plan(project, context)
             self.assertNotIn("scale_anchor", {item["kind"] for item in plan["requirements"]})
 
-    def test_worker_handoff_contains_only_per_sample_projection_and_identity_expansion_ban(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project, manifest, agent, context = _fixture(Path(directory))
-            captured = {}
-
-            def fake_task(**kwargs):
-                captured.update(kwargs)
-                handoff = visual_sample_paths(project)["handoff"].read_text(encoding="utf-8")
-                for name in ("visual_style", "characters", "world_scale", "representative_story_state"):
-                    self.assertIn(f'"{name}"', handoff)
-                self.assertNotIn("## 当前完整视觉投影", handoff)
-                self.assertIn("严禁把 F0～Fn 或所有状态挤在一张接触表里", handoff)
-                self.assertIn("不得擅自新增会成为跨镜头身份锚点的特殊标记", handoff)
-                self.assertIn("时代和场景合理的普通服饰", handoff)
-                self.assertIn("不得升级为永久身份锚点", handoff)
-                plan = compile_visual_sample_plan(project, context)
-                for item in plan["requirements"]:
-                    if not isinstance(item.get("asset"), dict):
-                        _image(project / item["expected_path"])
-                return StageResult("done", "fixture samples created")
-
-            with patch.object(agent, "_codex_task", side_effect=fake_task):
-                result = agent._stage_visual_samples(manifest)
-            self.assertEqual(result.status, "done", result.message)
-            self.assertEqual(captured["stage"], "visual_samples")
-            self.assertEqual(captured["label"], "条件式视觉小样生成")
-            self.assertEqual(
-                captured["prompt"],
-                "严格执行 handoff。使用 ImageGen 仅补齐其中列出的 supplemental_sample；"
-                "重试必须实际传入 reference_assets 或本轮 dependency_sample_ids 产出的母版图片；"
-                "不要修改合同、计划或正式故事图片。完成前逐文件确认可解码且路径精确。",
-            )
-            self.assertEqual(captured["handoff"], visual_sample_paths(project)["handoff"])
-            self.assertTrue(agent._has_visual_samples(manifest))
-
-    def test_three_layer_review_p0_is_a_hard_gate_and_batch_never_starts(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project, manifest, agent, context = _fixture(Path(directory))
-            plan = _ready_plan(project, context)
-            paths = visual_sample_paths(project)
-            bad = _passing_review(plan, paths["plan"])
-            bad.update(score=100, approved=True, p0_errors=["unsupported_identity_feature"])
-            self.assertTrue(any("P0 hard gate" in issue for issue in visual_sample_review_payload_issues(bad, plan)))
-
-            def fake_review(**kwargs):
-                bad["artifact_sha256"] = file_sha256(kwargs["bundle"])
-                save_json(paths["review"], bad)
-                return StageResult("done", "generic score passed", paths["review"]), bad
-
-            with patch.object(agent, "_structured_review", side_effect=fake_review):
-                result = agent._stage_visual_sample_review(manifest)
-            self.assertIn(result.status, {"retrying", "blocked"})
-            self.assertFalse(paths["lock"].exists())
-            with patch.object(agent, "_codex_task") as producer:
-                batch = agent._stage_codex_story_images(manifest)
-            self.assertEqual(batch.status, "blocked")
-            producer.assert_not_called()
-
     def test_failed_sample_request_replaces_only_named_sample(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, _manifest, _agent, context = _fixture(
@@ -706,84 +615,6 @@ class VisualSampleGateTests(unittest.TestCase):
             self.assertFalse(visual_sample_lock_is_current(project, context))
             with self.assertRaisesRegex(ValueError, "stale or manually modified"):
                 load_current_visual_sample_plan(project, context)
-
-    def test_storyboard_requires_current_sample_binding_scale_state_and_evidence(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project, manifest, agent, context = _fixture(Path(directory))
-            _lock_samples(project, context)
-            expected = json.loads(context.read_text(encoding="utf-8"))
-            storyboard = Path(directory) / "storyboard.txt"
-            storyboard.write_text("主角出发。\n", encoding="utf-8")
-            semantic_binding = {
-                "artifact_semantic_plan_sha256": "a" * 64,
-                "artifact_semantic_plan_schema_version": "1.0",
-                "artifact_semantic_plan_dependency_sha256": "b" * 64,
-            }
-            sample_binding = visual_sample_binding(project)
-            shot = {
-                "scene": 1, "story_text": "主角出发。", "narrative_function": "setup",
-                "shot_size": "wide", "focal_character": "protagonist",
-                "visible_characters": ["protagonist"], "excluded_characters": [],
-                "continuity_group": "opening", "appearance_ids": ["protagonist_default"],
-                "visual_description": "The protagonist starts the journey.",
-                "speaker": "none", "listener": "none", "narrative_focus": "journey begins",
-                "emotion": "anticipation", "shot_intent": "establish direction", "transition_reason": "opening setup",
-                "scale_basis": {
-                    "applicable": True, "relationship_ids": ["hero_vs_guide"],
-                    "evidence": "The protagonist is visibly much smaller than the guide.",
-                },
-                "current_story_state": {"protagonist_condition": "state_initial"},
-                "visual_state_evidence": {"protagonist_condition": "Initial feature is visible."},
-                "location_state": {"location_id": "road", "time_of_day": "day", "change_from_previous": False, "change_cue": ""},
-                "character_knowledge": {"protagonist": {"aware_of": ["journey"], "unaware_of": [], "gaze_target": "road ahead"}},
-                "required_visible_actions": [], "state_transition_evidence": {},
-                "subject_action": "The protagonist starts the journey naturally.",
-                "environment_motion": "The environment moves gently.",
-                "camera_motion": "A stable, gentle follow.",
-                "entry_state": {"protagonist_condition": "state_initial"},
-                "exit_state": {"protagonist_condition": "state_initial"},
-                "screen_direction": "left_to_right",
-                "adjacent_handoff": {"from_previous": "", "to_next": "", "allows_direction_change": False, "allows_state_transition": False},
-                "expected_motion": {
-                    "primary": "subject", "subject_level": "moderate",
-                    "environment_level": "low", "camera_level": "low",
-                    "rationale": "The protagonist is beginning the journey.",
-                },
-            }
-            payload = {
-                **{key: expected[key] for key in ("contract_schema_version", "story_contract_sha256", "story_contract_dependency_sha256")},
-                "contract_projection": expected["contract_projection"], **semantic_binding, **sample_binding,
-                "shots": [shot],
-            }
-            plan_path = Path(directory) / "storyboard_plan.json"
-            plan_path.write_text(json.dumps(payload), encoding="utf-8")
-            with patch("story_agent.load_current_artifact_semantic_plan", return_value={}), patch(
-                "story_agent.artifact_semantic_plan_binding", return_value=semantic_binding
-            ):
-                self.assertTrue(agent._storyboard_plan_valid(plan_path, storyboard))
-                payload["shots"][0].pop("visual_state_evidence")
-                plan_path.write_text(json.dumps(payload), encoding="utf-8")
-                self.assertFalse(agent._storyboard_plan_valid(plan_path, storyboard))
-                payload["shots"][0]["visual_state_evidence"] = {
-                    "protagonist_condition": "Initial feature is visible."
-                }
-                payload["visual_sample_plan_sha256"] = "0" * 64
-                plan_path.write_text(json.dumps(payload), encoding="utf-8")
-                self.assertFalse(agent._storyboard_plan_valid(plan_path, storyboard))
-
-    def test_full_story_image_review_uses_product_dimensions_and_p0_gate(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project, _manifest, agent, context = _fixture(Path(directory))
-            plan = _ready_plan(project, context)
-            payload = _passing_review(plan, visual_sample_paths(project)["plan"])
-            payload.update({
-                "p0_errors": [],
-                "contract_adherence": {"passed": True, "evidence": "per-shot contract evidence"},
-            })
-            self.assertEqual(agent._story_image_quality_review_issues(payload), [])
-            payload["p0_errors"] = ["anatomy_or_organ_error"]
-            payload["score"] = 100
-            self.assertTrue(any("P0 hard gate" in issue for issue in agent._story_image_quality_review_issues(payload)))
 
     def test_quality_profile_is_style_adaptive_for_cute_historical_and_abstract_stories(self) -> None:
         cases = [
@@ -851,67 +682,6 @@ class VisualSampleGateTests(unittest.TestCase):
                     issues = visual_sample_review_payload_issues(review, plan)
                     self.assertTrue(any("historical atmosphere" in issue for issue in issues))
 
-    def test_anatomical_coherence_is_contract_and_style_relative(self) -> None:
-        cases = [
-            {
-                "name": "strongly_stylized_character",
-                "description": "A strongly stylized cartoon with deliberately oversized heads and tiny bodies.",
-                "required": ["intentional exaggerated proportions"],
-                "forbidden": ["unintended extra limbs"],
-            },
-            {
-                "name": "anthropomorphic_fantasy_character",
-                "description": "An anthropomorphic fantasy character whose contract-defined wings function as arms.",
-                "required": ["contract-consistent fantastical anatomy"],
-                "forbidden": ["unintended duplicate organs"],
-            },
-        ]
-        for case in cases:
-            with self.subTest(case=case["name"]), tempfile.TemporaryDirectory() as directory:
-                project, _manifest, agent, context = _fixture(
-                    Path(directory),
-                    characters=True,
-                    scale=False,
-                    state=False,
-                    style_description=case["description"],
-                    required_traits=case["required"],
-                    forbidden_traits=case["forbidden"],
-                )
-                plan = _ready_plan(project, context)
-                dimensions = set(plan["review_profile"]["product_quality"])
-                self.assertIn("anatomical_coherence", dimensions)
-                self.assertNotIn("natural_anatomy", dimensions)
-                review = _passing_review(plan, visual_sample_paths(project)["plan"])
-                review["contract_adherence"]["evidence"] = "contract-relative structure verified"
-                self.assertEqual(visual_sample_review_payload_issues(review, plan), [])
-                self.assertEqual(agent._story_image_quality_review_issues(review), [])
-
-    def test_anatomy_p0_rejects_unintended_extra_limbs_and_forbidden_anatomy(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project, _manifest, agent, context = _fixture(
-                Path(directory),
-                characters=True,
-                scale=False,
-                state=False,
-                style_description="A coherent illustrated character design.",
-                required_traits=["stable contract-defined body plan"],
-                forbidden_traits=["unintended extra limbs", "forbidden horn anatomy"],
-            )
-            plan = _ready_plan(project, context)
-            for defect in ("unintended extra limb", "contract-forbidden horn anatomy"):
-                with self.subTest(defect=defect):
-                    review = _passing_review(plan, visual_sample_paths(project)["plan"])
-                    review.update(
-                        score=100,
-                        approved=True,
-                        p0_errors=["anatomy_or_organ_error"],
-                    )
-                    review["contract_adherence"]["evidence"] = defect
-                    sample_issues = visual_sample_review_payload_issues(review, plan)
-                    story_issues = agent._story_image_quality_review_issues(review)
-                    self.assertTrue(any("P0 hard gate" in issue for issue in sample_issues))
-                    self.assertTrue(any("P0 hard gate" in issue for issue in story_issues))
-
     def test_identity_policy_allows_ordinary_contextual_detail_without_promoting_it(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, _manifest, _agent, context = _fixture(
@@ -930,26 +700,3 @@ class VisualSampleGateTests(unittest.TestCase):
             self.assertIn("emblem", policy["blocked_inferences"])
             self.assertEqual(policy["inferred_detail_persistence"], "scene_local_unless_contract_promotes")
             self.assertEqual(policy["contract_precedence"], "required_and_forbidden_features_are_authoritative")
-
-    def test_legacy_project_needs_no_visual_samples_or_new_files(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project, manifest = _new_project(Path(directory))
-            manifest["agent"]["story_contract"].pop("policy", None)
-            manifest = as_frozen_v3_legacy(manifest)
-            write_manifest(project_paths(project), manifest)
-            agent = StoryAgent(agent_context_for(project))
-            self.assertTrue(agent._has_visual_samples(manifest))
-            self.assertTrue(agent._has_visual_sample_review(manifest))
-            self.assertEqual(agent._stage_visual_samples(manifest).status, "done")
-            self.assertEqual(agent._stage_visual_sample_review(manifest).status, "done")
-            self.assertFalse(visual_sample_paths(project)["directory"].exists())
-
-
-def agent_context_for(project: Path):
-    from tests.test_story_contract_runtime import _context
-
-    return _context(project)
-
-
-if __name__ == "__main__":
-    unittest.main()

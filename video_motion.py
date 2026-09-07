@@ -383,6 +383,8 @@ def video_receipt_issues(row: Mapping[str, Any], video_path: Path, *, production
         receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         return issues + ["video_receipt_invalid"]
+    if not isinstance(receipt, dict):
+        return issues + ["video_receipt_invalid"]
     if receipt.get("schema_version") != "1.0.0":
         issues.append("video_receipt_schema_version_mismatch")
     if file_sha256(receipt_path) != str(row.get("video_receipt_sha256") or ""):

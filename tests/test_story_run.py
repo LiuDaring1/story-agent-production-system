@@ -13,6 +13,7 @@ from story_artifact_validation import (
     INDEPENDENT_REVIEW_TARGETS,
     MACHINE_QA_ARTIFACTS,
 )
+from delivery_gate_fixtures import make_delivery, release_qa
 from story_timeline import write_authoritative_timeline_receipt
 from story_run import (
     CODEX_NATIVE_REQUIRED_ARTIFACTS,
@@ -23,9 +24,11 @@ from story_run import (
     load_run,
     record_run,
     record_request_observation,
+    record_performance_observation,
     status_summary,
     validate_theme_assets_manifest,
 )
+from story_requirements import write_projection
 
 
 class StoryRunLedgerTests(unittest.TestCase):
@@ -50,6 +53,58 @@ class StoryRunLedgerTests(unittest.TestCase):
         *,
         skip: set[str] | None = None,
     ) -> None:
+        delivery = make_delivery(Path(load_run(run_file)["project_dir"]))
+        delivery_bindings = delivery["artifacts"]
+        product_bindings = [
+            item for item in delivery_bindings
+            if "故事锦囊（基础版）" in item["path"] or "故事锦囊（进阶版）" in item["path"]
+        ]
+        publish_bindings = {
+            f"{account}:copy": next(
+                item for item in delivery_bindings
+                if f"publish_package/{account}/copy.md" in item["path"]
+            )
+            for account in ("main", "library")
+        }
+        for account in ("main", "library"):
+            for ratio in ("3x4", "4x3", "16x9"):
+                publish_bindings[f"{account}:cover_{ratio}"] = next(
+                    item for item in delivery_bindings
+                    if f"publish_package/{account}/covers/cover_{ratio}.png" in item["path"]
+                )
+        run = load_run(run_file)
+        projection = root / "requirements_projection.json"
+        write_projection(
+            projection,
+            scope="test-delivery",
+            inputs={"confirmed_text": Path(run["inputs"]["confirmed_text"]["path"])},
+            rule_sources=[(Path(__file__), "test-v1")],
+            applicability={"artifacts": ["delivery"]},
+            requirements=[{"requirement_id": "fixture", "source": "test", "scope": "delivery", "requirement": "fixture currentness"}],
+            executable_checks=[],
+            acceptance_evidence=["machine_qa"],
+        )
+        record_run(run_file=run_file, package="director_plan", status="done", artifact_id="requirements_projection", artifact_path=projection)
+        from tests.test_keying_quality import _locked_fixture
+        from keying_quality import lock_keying_preset
+        keying_root = root / "keying-fixture"
+        preset, _lock, _candidate, _evidence, _source = _locked_fixture(keying_root)
+        review_path = keying_root / "keying_review_review.json"
+        bundle_path = keying_root / "keying_review_bundle.json"
+        keying_review = json.loads(review_path.read_text())
+        keying_review.update({
+            "schema_version": "independent-keying-review/v1",
+            "artifact_path": str(bundle_path),
+            "artifact_sha256": file_sha256(bundle_path),
+        })
+        review_path.write_text(json.dumps(keying_review))
+        keying_lock = lock_keying_preset(
+            preset,
+            machine_qa_path=keying_root / "keying_machine_qa.json",
+            evidence_manifest_path=keying_root / "evidence_manifest.json",
+            review_bundle_path=bundle_path,
+            review_path=review_path,
+        )
         with (
             patch("story_run.validate_compile_receipt", return_value={"shot_count": 1}),
             patch("story_run.validate_delivery_receipt", return_value={}),
@@ -57,15 +112,29 @@ class StoryRunLedgerTests(unittest.TestCase):
             patch("story_run.semantic_card_generation_receipt_issues", return_value=[]),
             patch("story_run.semantic_card_motion_receipt_issues", return_value=[]),
             patch("story_artifact_validation.validate_release_package_receipt", return_value={}),
+            patch("story_artifact_validation.probe_duration", return_value=2.0),
         ):
             for artifact_id in CODEX_NATIVE_REQUIRED_ARTIFACTS:
                 existing = load_run(run_file)["artifacts"]
                 if artifact_id in existing or artifact_id in (skip or set()):
                     continue
                 artifact = root / f"{artifact_id}.json"
+                if artifact_id == "keying_preset_lock":
+                    artifact = keying_lock
+                elif artifact_id == "keying_visual_review":
+                    artifact = review_path
                 if artifact_id in INDEPENDENT_REVIEW_TARGETS:
                     target_id = INDEPENDENT_REVIEW_TARGETS[artifact_id]
-                    if target_id:
+                    if artifact_id == "final_delivery_review":
+                        checklist = json.loads(Path(existing["final_delivery_checklist"]["path"]).read_text())
+                        members = checklist["artifacts"] + [existing["final_delivery_checklist"], existing["qa_release_report"]]
+                        reviewed_path = root / "final_delivery.bundle.json"
+                        reviewed_path.write_text(json.dumps({"artifacts": members}))
+                        reviewed_sha = file_sha256(reviewed_path)
+                    elif artifact_id == "keying_visual_review":
+                        reviewed_path = bundle_path
+                        reviewed_sha = file_sha256(bundle_path)
+                    elif target_id:
                         target = existing[target_id]
                         reviewed_path = Path(target["path"])
                         reviewed_sha = target["sha256"]
@@ -95,8 +164,12 @@ class StoryRunLedgerTests(unittest.TestCase):
                         "artifact_path": str(reviewed_path),
                         "artifact_sha256": reviewed_sha,
                     }
-                    if artifact_id == "customer_media_independent_review":
-                        customer_media = json.loads(reviewed_path.read_text(encoding="utf-8"))
+                    if artifact_id in {"customer_media_independent_review", "final_delivery_review"}:
+                        customer_media_path = (
+                            reviewed_path if artifact_id == "customer_media_independent_review"
+                            else Path(existing["customer_media_receipt"]["path"])
+                        )
+                        customer_media = json.loads(customer_media_path.read_text(encoding="utf-8"))
                         demo = customer_media["artifacts"]["product_demo"]
                         full_srt = root / "customer-media-full.srt"
                         logo = root / "official-logo.png"
@@ -152,22 +225,43 @@ class StoryRunLedgerTests(unittest.TestCase):
                                 "formal_frame_evidence": frames,
                             }
                         )
-                    artifact.write_text(
-                        json.dumps(review_payload),
-                        encoding="utf-8",
-                    )
-                elif artifact_id in MACHINE_QA_ARTIFACTS:
-                    artifact.write_text(
-                        json.dumps(
-                            {
-                                "schema_version": f"{artifact_id}-fixture/v1",
-                                "passed": True,
-                                "critical_errors": [],
-                                "errors": [],
-                            }
-                        ),
-                        encoding="utf-8",
-                    )
+                        if artifact_id == "final_delivery_review":
+                            review_payload["schema_version"] = "final-delivery-independent-review/v2"
+                    if artifact_id != "keying_visual_review":
+                        artifact.write_text(json.dumps(review_payload), encoding="utf-8")
+                elif artifact_id == "qa_release_report":
+                    narration = Path(load_run(run_file)["inputs"]["audio"]["path"])
+                    music = root / "reviewed_music.mp3"
+                    artifact.write_text(json.dumps(release_qa(
+                        {name: existing[name] for name in ("main_release_video", "library_release_video")},
+                        narration, music,
+                    )))
+                elif artifact_id in {"main_release_video", "library_release_video"}:
+                    filename = "主账号发布视频.mp4" if artifact_id == "main_release_video" else "宝库号发布视频.mp4"
+                    artifact = Path(load_run(run_file)["project_dir"]) / "04_发布视频" / filename
+                elif artifact_id == "r2v_group_machine_qa":
+                    plan = root / "r2v-qa-plan.json"; plan.write_text("{}")
+                    receipt = root / "r2v-qa-receipt.json"; receipt.write_text("{}")
+                    clip = root / "r2v-qa-S01.mp4"; clip.write_bytes(b"video")
+                    artifact.write_text(json.dumps({
+                        "schema_version": "story-r2v-group-machine-qa-v1", "passed": True,
+                        "critical_errors": [], "errors": [], "plan_path": str(plan),
+                        "plan_sha256": file_sha256(plan), "receipt_path": str(receipt),
+                        "receipt_sha256": file_sha256(receipt), "expected_shots": 1,
+                        "checked_shots": 1, "clips": [{"shot_id": "S01", "path": str(clip), "sha256": file_sha256(clip), "issues": []}],
+                    }))
+                elif artifact_id in {"qa_product_report", "qa_publish_report"}:
+                    if artifact_id == "qa_publish_report":
+                        members = publish_bindings
+                    else:
+                        members = {
+                            f"member-{index}": item
+                            for index, item in enumerate(product_bindings)
+                        }
+                    artifact.write_text(json.dumps({
+                        "schema_version": "story-product-machine-qa/v2" if artifact_id == "qa_product_report" else "story-publish-machine-qa/v2",
+                        "passed": True, "critical_errors": [], "errors": [], "artifacts": members,
+                    }))
                 elif artifact_id == "qa_music_report":
                     music = root / "reviewed_music.mp3"
                     narration = root / "bound_narration.wav"
@@ -251,15 +345,18 @@ class StoryRunLedgerTests(unittest.TestCase):
                         load_run(run_file)["artifacts"]["authoritative_timeline_receipt"]["path"]
                     )
                     roles = {
-                        "product_background_with_subtitles": "music_only",
-                        "product_background_without_subtitles": "music_only",
-                        "product_a_only_background": "music_only",
-                        "product_demo": "narration_plus_music",
+                        "product_background_with_subtitles": ("背景视频：测试（含字幕）.mp4", "music_only"),
+                        "product_background_without_subtitles": ("背景视频：测试（无字幕）.mp4", "music_only"),
+                        "product_a_only_background": ("A镜无人物背景视频：测试.mp4", "music_only"),
+                        "product_demo": ("示范表演：测试.mp4", "narration_plus_music"),
                     }
                     role_payload = {}
-                    for role, audio_role in roles.items():
-                        media = root / f"{role}.mp4"
-                        media.write_bytes(role.encode("utf-8"))
+                    for role, (filename, audio_role) in roles.items():
+                        media = next(
+                            Path(item["path"]) for item in delivery_bindings
+                            if "故事锦囊（进阶版）" in item["path"]
+                            and Path(item["path"]).name == filename
+                        )
                         role_payload[role] = {
                             "path": str(media),
                             "sha256": file_sha256(media),
@@ -293,32 +390,9 @@ class StoryRunLedgerTests(unittest.TestCase):
                         encoding="utf-8",
                     )
                 elif artifact_id == "final_delivery_checklist":
-                    delivered = root / "delivered.bin"
-                    delivered.write_bytes(b"delivered")
-                    artifact.write_text(
-                        json.dumps(
-                            {
-                                "schema_version": "story-final-delivery-checklist/v1",
-                                "status": "complete_pending_independent_final_review",
-                                "missing": [],
-                                "matrix": {
-                                    "release_videos": 2,
-                                    "account_copy_files": 2,
-                                    "covers": 6,
-                                    "basic_customer_files": 5,
-                                    "advanced_customer_files": 10,
-                                    "static_ppt_variants": 2,
-                                },
-                                "artifacts": [
-                                    {
-                                        "path": str(delivered),
-                                        "sha256": file_sha256(delivered),
-                                    }
-                                ],
-                            }
-                        ),
-                        encoding="utf-8",
-                    )
+                    artifact.write_text(json.dumps(delivery), encoding="utf-8")
+                elif artifact_id == "keying_preset_lock":
+                    pass
                 else:
                     artifact.write_text(
                         f'{{"artifact_id": "{artifact_id}"}}\n',
@@ -373,7 +447,7 @@ class StoryRunLedgerTests(unittest.TestCase):
                 artifact_path=artifact,
             )
             self.assertEqual(first["artifacts"]["story_r2v_plan"]["sha256"], second["artifacts"]["story_r2v_plan"]["sha256"])
-            self.assertEqual(second["paid_total"], 1.25)
+            self.assertNotIn("paid_total", second)
             artifact.write_text('{"version": 2}\n', encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "--replace"):
                 record_run(
@@ -384,7 +458,7 @@ class StoryRunLedgerTests(unittest.TestCase):
                     artifact_path=artifact,
                 )
 
-    def test_hard_budget_blocks_record_and_status_warns_at_soft_budget(self) -> None:
+    def test_legacy_budget_arguments_are_accepted_but_do_not_gate_or_surface(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, text, video, audio, run_file = self.fixture(Path(directory))
             init_run(
@@ -398,12 +472,12 @@ class StoryRunLedgerTests(unittest.TestCase):
             )
             record_run(run_file=run_file, package="music", status="running", paid_amount=2)
             summary = status_summary(load_run(run_file))
-            self.assertTrue(summary["soft_budget_warning"])
-            self.assertTrue(summary["can_start_paid_work"])
-            with self.assertRaisesRegex(RuntimeError, "硬预算"):
-                record_run(run_file=run_file, package="music", status="done", paid_amount=1.01)
+            self.assertNotIn("soft_budget_warning", summary)
+            self.assertNotIn("remaining_hard_budget", summary)
+            self.assertNotIn("can_start_paid_work", summary)
+            record_run(run_file=run_file, package="music", status="done", paid_amount=1000)
 
-    def test_unreported_request_cost_and_tokens_remain_null_and_block_new_paid_work(self) -> None:
+    def test_unreported_tokens_remain_null_and_legacy_cost_does_not_gate(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, text, video, audio, run_file = self.fixture(Path(directory))
             init_run(
@@ -425,23 +499,14 @@ class StoryRunLedgerTests(unittest.TestCase):
                 cost_status="provider_not_exposed",
             )
             request = recorded["observability"]["requests"]["toapis:video-unknown-cost"]
-            self.assertIsNone(request["actual_cost"])
+            self.assertNotIn("actual_cost", request)
             self.assertIsNone(request["input_tokens"])
             self.assertIsNone(request["total_tokens"])
             summary = status_summary(recorded)
-            self.assertIsNone(summary["paid_total"])
-            self.assertIsNone(summary["remaining_hard_budget"])
-            self.assertEqual(summary["unsettled_request_count"], 1)
-            self.assertFalse(summary["can_start_paid_work"])
-            with self.assertRaisesRegex(RuntimeError, "未知不得当作 0"):
-                record_run(
-                    run_file=run_file,
-                    package="music",
-                    status="running",
-                    paid_amount=0.01,
-                )
+            self.assertNotIn("paid_total", summary)
+            record_run(run_file=run_file, package="music", status="running", paid_amount=0.01)
 
-    def test_reported_request_tokens_and_settled_cost_are_aggregated(self) -> None:
+    def test_reported_request_tokens_are_aggregated_without_cost_summary(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             project, text, video, audio, run_file = self.fixture(Path(directory))
             init_run(
@@ -469,14 +534,56 @@ class StoryRunLedgerTests(unittest.TestCase):
                 cost_status="settled",
             )
             summary = status_summary(recorded)
-            self.assertEqual(summary["paid_total"], 1.25)
             self.assertEqual(summary["token_usage"]["total_tokens"], 125)
-            self.assertEqual(summary["remaining_hard_budget"], 98.75)
-            self.assertTrue(summary["can_start_paid_work"])
+            self.assertNotIn("paid_total", summary)
+            request = recorded["observability"]["requests"]["codex:director-1"]
+            self.assertEqual(request["legacy_financial_evidence"]["actual_cost"], 1.25)
             metrics = recorded["observability"]["packages"]["director_plan"]
             self.assertEqual(metrics["active_seconds"], 12.5)
             self.assertEqual(metrics["wait_seconds"], 1.5)
             self.assertEqual(metrics["retry_count"], 0)
+
+    def test_performance_metrics_record_measurements_and_derive_duplicates_and_chain(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            project, text, video, audio, run_file = self.fixture(root)
+            init_run(run_file=run_file, confirmed_text=text, greenscreen_video=video, audio=audio, project_dir=project)
+            first = root / "first.bin"; first.write_bytes(b"first")
+            second = root / "second.bin"; second.write_bytes(b"second")
+            recorded = record_run(
+                run_file=run_file, package="director_plan", status="done",
+                artifact_id="first", artifact_path=first,
+            )
+            record_run(
+                run_file=run_file, package="r2v_visuals", status="done",
+                artifact_id="second", artifact_path=second,
+                input_hashes={"first": recorded["artifacts"]["first"]["sha256"]},
+            )
+            digest = "a" * 64
+            for request_id in ("request-a", "request-b"):
+                record_request_observation(
+                    run_file=run_file, package="r2v_visuals", provider="fixture",
+                    request_id=request_id, operation="image_to_video", status="completed",
+                    request_sha256=digest, token_status="not_applicable",
+                )
+            payload = record_performance_observation(
+                run_file=run_file, plan_duration_seconds=12.25,
+                machine_check_duration_seconds=3.5, independent_review_rounds=2,
+                invalid_rejection_count=1, duplicate_encode_count=0,
+            )
+            metrics = status_summary(payload)["performance"]
+            self.assertEqual(metrics["plan_duration_seconds"], 12.25)
+            self.assertEqual(metrics["duplicate_provider_request_count"], 1)
+            self.assertEqual(metrics["longest_dependency_chain"], 2)
+            self.assertEqual(metrics["missing_measurements"], [])
+
+    def test_unknown_performance_measurements_remain_null(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            project, text, video, audio, run_file = self.fixture(Path(directory))
+            payload = init_run(run_file=run_file, confirmed_text=text, greenscreen_video=video, audio=audio, project_dir=project)
+            metrics = status_summary(payload)["performance"]
+            self.assertIsNone(metrics["plan_duration_seconds"])
+            self.assertIn("plan_duration_seconds", metrics["missing_measurements"])
 
     def test_foreground_and_fifteen_minute_background_fixture_is_lock_safe(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -530,7 +637,7 @@ class StoryRunLedgerTests(unittest.TestCase):
                 ),
                 40,
             )
-            self.assertEqual(status_summary(payload)["cost_status"], "settled")
+            self.assertEqual(status_summary(payload)["request_count"], 40)
 
     def test_foreground_and_fifteen_minute_background_processes_share_file_lock(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
@@ -633,6 +740,7 @@ for index in range(20):
                 patch("story_run.semantic_card_generation_receipt_issues", return_value=[]),
                 patch("story_run.semantic_card_motion_receipt_issues", return_value=[]),
                 patch("story_artifact_validation.validate_release_package_receipt", return_value={}),
+                patch("story_artifact_validation.probe_duration", return_value=2.0),
             ):
                 payload = finalize_run(run_file=run_file, required_artifacts=["delivery_manifest"])
             self.assertTrue(payload["finalized_at"])
@@ -853,6 +961,7 @@ for index in range(20):
                 patch("story_run.validate_compile_receipt", return_value={"shot_count": 2}),
                 patch("story_run.validate_delivery_receipt", return_value=bound),
                 patch("story_artifact_validation.validate_release_package_receipt", return_value={}),
+                patch("story_artifact_validation.probe_duration", return_value=2.0),
                 patch("story_run.semantic_card_generation_receipt_issues", return_value=[]),
                 patch("story_run.semantic_card_motion_receipt_issues", return_value=[]),
             ):
@@ -1135,6 +1244,7 @@ for index in range(20):
                 patch("story_run.semantic_card_generation_receipt_issues", return_value=[]),
                 patch("story_run.semantic_card_motion_receipt_issues", return_value=[]),
                 patch("story_artifact_validation.validate_release_package_receipt", return_value={}),
+                patch("story_artifact_validation.probe_duration", return_value=2.0),
             ):
                 with self.assertRaisesRegex(RuntimeError, "产物语义门禁失败.*独立审核"):
                     finalize_run(run_file=run_file, required_artifacts=[])

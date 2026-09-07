@@ -20,8 +20,9 @@
 - 两份 PPT 的逐页 `TITLE + 导演 shot_id + 可选 MORAL` 图片/字幕/时长清单、导演计划 SHA-256、内嵌配乐与自动翻页 QA；客户 PPT 不含逐句灌页、视频、GIF 或外链媒体目录。
 - `shot_storyboard_compile_receipt.json` 与 `static_ppt_delivery_receipt.json`。前者证明 R2V/PPT 计划来自同一封存故事板，后者进一步绑定客户进阶版目录中含/无字幕两份最终 PPTX 的当前 SHA-256；两者必须互相绑定。
 - `01_分镜与图片/semantic_cards/semantic_card_generation_receipt.json` 与同目录的 `semantic_card_motion_receipt.json`：前者证明片头/寓意文字与画面由 ImageGen 一体生成，后者绑定正式 provider/API 请求、任务 ID、视频哈希和首中末帧文字稳定性。
-- 当前有效的独立审核文件、总成本和 `story_run.json`。
-- 成本报告、QA 汇总与异常说明只允许出现在 `99_项目状态`，不得混入客户资料包。
+- 当前有效的独立审核文件、请求恢复事实和 `story_run.json`。
+- `requirements_projection.json`（`story-applicable-requirements/v1`），绑定当前输入、规则源版本、适用范围、执行参数和验收证据。
+- QA 汇总与异常说明只允许出现在 `99_项目状态`，不得混入客户资料包。
 
 ## 完成门禁
 
@@ -31,6 +32,7 @@
 
 ```text
 master_director_plan
+requirements_projection
 director_plan_review
 storyboard_manifest_sealed
 storyboard_review
@@ -50,11 +52,14 @@ qa_publish_report
 main_release_video
 library_release_video
 qa_release_report
-final_delivery_review
 final_delivery_checklist
+final_delivery_review
 ```
 
 - 文件存在不能替代 QA；独立审核必须 `approved: true`、分数至少 85、关键错误为空且 SHA-256 当前有效。
+- 先登记双账号视频和 `qa_release_report`，再登记 `final_delivery_checklist`，最后登记 `final_delivery_review`。最终审核 bundle 必须包含当前清单本身、清单的所有成员和当前发布 QA，旧版本文件仍存在不代表旧审核能覆盖新交付。
+- 发布 QA 使用现行 `story-release-machine-qa/v3`，包含双账号当前文件、完整权威旁白和配乐参考的哈希、两种音频成分的检测指标。成片须覆盖完整口播，仅允许编解码尾差；旧报告缺少证据时重跑机器 QA，不重新生成素材。
+- 清单中的数量必须来自实际交付角色：双账号各三张封面、一份文案，基础版五项、进阶版十项。两份 PPT 就在进阶版内，不额外复制或重复计数；内部审核证据不算作客户文件。保留既有标准文件命名即可，无需为合格旧交付重写清单。
 - 每个视频任务必须逐一匹配计划中的目标文件，不能用 MP4 数量代替。
 - 任何输入或依赖哈希变化都会使对应下游产物失效，但不得使无关分支或上游自动重跑。
 - 外部登录、CAPTCHA、支付、磁盘或密钥问题应记录为分支阻塞，禁止伪造成功。

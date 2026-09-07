@@ -193,6 +193,33 @@ def validate_person_grade(value: str) -> str:
     return value
 
 
+def preflight_release_requirements(
+    *, output_dir: Path, variant: str, explicit_run_file: Path | None,
+    output_scale: int,
+) -> None:
+    """Apply account/artifact scope before preview or full release rendering."""
+
+    run_file = explicit_run_file.expanduser().resolve() if explicit_run_file else None
+    if run_file is None:
+        start = output_dir.expanduser().resolve()
+        for parent in (start, *start.parents):
+            candidate = parent / "99_项目状态" / "story_run.json"
+            if candidate.is_file():
+                run_file = candidate
+                break
+    if run_file is None:
+        raise ValueError("发布生产缺少 story_run.json；禁止回落旧生产")
+    from story_requirements import validate_run_projection
+
+    accounts = ["main", "library"] if variant == "both" else [variant]
+    artifacts = [f"{account}_release_video" for account in accounts]
+    validate_run_projection(
+        run_file,
+        consumer_scope={"accounts": accounts, "artifacts": artifacts},
+        parameters={"output_scale": output_scale, "variant": variant},
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="把故事背景视频包装成两个小红书发布版")
     parser.add_argument("--story-name", required=True, help="故事名，例如《猴子捞月》或 猴子捞月")
@@ -270,7 +297,15 @@ def main() -> None:
     parser.add_argument("--age-text", required=True, help="用户指定的发布信息栏年龄文案；禁止模型猜测")
     parser.add_argument("--usage-text", default="适用于朗诵比赛、故事表演、少儿口才、技能比拼", help="发布信息栏固定用途文案")
     parser.add_argument("--story-type", default="儿童故事", help="发布上条带故事/栏目类型")
+    parser.add_argument("--run-file", type=Path, help="当前 story_run.json；省略时从输出目录向上发现")
     args = parser.parse_args()
+
+    preflight_release_requirements(
+        output_dir=args.output_dir,
+        variant=args.variant,
+        explicit_run_file=args.run_file,
+        output_scale=args.output_scale,
+    )
 
     keying = load_keying_preset(args.keying_preset_json.expanduser()) if args.keying_preset_json else {}
     keyer = str(keying.get("keyer", args.keyer))

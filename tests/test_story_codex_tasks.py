@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import unittest
 
-from story_codex_tasks import infer_image_style_key, resolve_image_style
+from story_style import infer_image_style_key, resolve_image_style
 
 
 class StoryCodexTaskStyleTests(unittest.TestCase):

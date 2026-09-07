@@ -3,7 +3,7 @@
 
 This module deliberately does not schedule work, invoke models, retry tasks, or
 mirror the legacy Story Agent stage graph.  It records the current inputs,
-coarse work-package state, current artifacts, and aggregate paid cost in one
+coarse work-package state, current artifacts, and lightweight request facts in one
 atomic JSON file so a foreground Codex task can resume without rediscovering or
 repeating completed work.
 """
@@ -14,6 +14,7 @@ import argparse
 import fcntl
 import hashlib
 import json
+import math
 import os
 import tempfile
 import threading
@@ -34,8 +35,6 @@ from story_artifact_validation import validate_artifact_semantics
 SCHEMA_VERSION = "story-run-v1"
 THEME_ASSETS_SCHEMA_VERSION = "story-theme-assets-lightweight/v3"
 LEGACY_THEME_ASSETS_SCHEMA_VERSION = "story-theme-assets-lightweight/v2"
-DEFAULT_SOFT_BUDGET = 50.0
-DEFAULT_HARD_BUDGET = 100.0
 PACKAGE_NAMES = (
     "director_plan",
     "r2v_visuals",
@@ -46,14 +45,14 @@ PACKAGE_NAMES = (
 )
 PACKAGE_STATES = {"pending", "running", "done", "blocked"}
 REQUEST_STATES = {"submitted", "running", "completed", "failed", "cancelled"}
-COST_STATES = {
-    "settled",
-    "pending",
-    "estimated_only",
-    "provider_not_exposed",
-    "not_applicable",
-}
 TOKEN_STATES = {"reported", "not_reported", "not_applicable"}
+PERFORMANCE_OBSERVATION_FIELDS = (
+    "plan_duration_seconds",
+    "machine_check_duration_seconds",
+    "independent_review_rounds",
+    "invalid_rejection_count",
+    "duplicate_encode_count",
+)
 _RUN_THREAD_LOCKS: dict[str, threading.RLock] = {}
 _RUN_THREAD_LOCKS_GUARD = threading.Lock()
 CODEX_NATIVE_REQUIRED_ARTIFACTS = (
@@ -74,15 +73,14 @@ CODEX_NATIVE_REQUIRED_ARTIFACTS = (
     "theme_assets_manifest",
     "static_ppt_delivery_receipt",
     "customer_media_receipt",
-    "customer_media_independent_review",
     "qa_product_report",
     "qa_publish_report",
     "release_package_receipt",
     "main_release_video",
     "library_release_video",
     "qa_release_report",
-    "final_delivery_review",
     "final_delivery_checklist",
+    "final_delivery_review",
 )
 
 
@@ -141,6 +139,40 @@ def _new_package_observation(*, history_complete: bool) -> dict[str, Any]:
     }
 
 
+def _new_performance_observation() -> dict[str, Any]:
+    return {
+        "schema_version": "story-performance-observation/v1",
+        **{name: None for name in PERFORMANCE_OBSERVATION_FIELDS},
+        "duplicate_provider_request_count": 0,
+        "longest_dependency_chain": 0,
+        "missing_measurements": list(PERFORMANCE_OBSERVATION_FIELDS),
+    }
+
+
+def _longest_dependency_chain(payload: dict[str, Any]) -> int:
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, dict) or not artifacts:
+        return 0
+    memo: dict[str, int] = {}
+
+    def depth(artifact_id: str, visiting: set[str]) -> int:
+        if artifact_id in memo:
+            return memo[artifact_id]
+        if artifact_id in visiting:
+            return 0
+        record = artifacts.get(artifact_id)
+        bindings = record.get("input_sha256s") if isinstance(record, dict) else None
+        upstream = [
+            str(name) for name in bindings or {}
+            if str(name) in artifacts
+        ] if isinstance(bindings, dict) else []
+        value = 1 + max((depth(name, visiting | {artifact_id}) for name in upstream), default=0)
+        memo[artifact_id] = value
+        return value
+
+    return max(depth(str(name), set()) for name in artifacts)
+
+
 def ensure_observability(payload: dict[str, Any], *, new_run: bool = False) -> dict[str, Any]:
     """Add the native request/event ledger without inventing historical values."""
 
@@ -151,6 +183,13 @@ def ensure_observability(payload: dict[str, Any], *, new_run: bool = False) -> d
     observability.setdefault("history_complete", bool(new_run) if migrated else False)
     observability.setdefault("events", [])
     observability.setdefault("requests", {})
+    performance = observability.setdefault("performance", _new_performance_observation())
+    if not isinstance(performance, dict):
+        observability["performance"] = _new_performance_observation()
+    else:
+        defaults = _new_performance_observation()
+        for name, value in defaults.items():
+            performance.setdefault(name, value)
     package_rows = observability.setdefault("packages", {})
     history_complete = bool(observability.get("history_complete"))
     for package in PACKAGE_NAMES:
@@ -158,7 +197,6 @@ def ensure_observability(payload: dict[str, Any], *, new_run: bool = False) -> d
             package,
             _new_package_observation(history_complete=history_complete),
         )
-    payload.setdefault("manual_paid_total", float(payload.get("paid_total") or 0.0))
     refresh_observability_summary(payload)
     return observability
 
@@ -172,41 +210,10 @@ def refresh_observability_summary(payload: dict[str, Any]) -> None:
         requests = {}
         observability["requests"] = requests
 
-    settled = float(payload.get("manual_paid_total") or 0.0)
-    unresolved_cost = 0
-    known_estimated = 0.0
-    for item in requests.values():
-        if not isinstance(item, dict):
-            continue
-        cost_state = str(item.get("cost_status") or "")
-        actual = item.get("actual_cost")
-        estimated = item.get("estimated_cost")
-        if cost_state == "settled" and isinstance(actual, (int, float)) and not isinstance(actual, bool):
-            settled += float(actual)
-        elif cost_state not in {"not_applicable"}:
-            unresolved_cost += 1
-        if isinstance(estimated, (int, float)) and not isinstance(estimated, bool):
-            known_estimated += float(estimated)
-
-    total_actual = None if unresolved_cost else round(settled, 4)
-    cost_status = (
-        "unsettled_requests"
-        if unresolved_cost
-        else "settled" if requests or settled else "known_zero_no_requests"
-    )
-    observability["cost_summary"] = {
-        "currency": "CNY",
-        "settled_actual_cny": round(settled, 4),
-        "known_estimated_cny": round(known_estimated, 4),
-        "unsettled_request_count": unresolved_cost,
-        "total_actual_cny": total_actual,
-        "status": cost_status,
-    }
-    payload["paid_total"] = round(settled, 4)
-    payload["paid_total_status"] = cost_status
-
     token_applicable = 0
-    token_unknown = 0
+    unknown_input = 0
+    unknown_output = 0
+    unknown_total = 0
     known_input = 0
     known_output = 0
     known_total = 0
@@ -218,11 +225,22 @@ def refresh_observability_summary(payload: dict[str, Any]) -> None:
             continue
         token_applicable += 1
         if token_state != "reported":
-            token_unknown += 1
+            unknown_input += 1
+            unknown_output += 1
+            unknown_total += 1
             continue
-        known_input += int(item.get("input_tokens") or 0)
-        known_output += int(item.get("output_tokens") or 0)
-        known_total += int(item.get("total_tokens") or 0)
+        if item.get("input_tokens") is None:
+            unknown_input += 1
+        else:
+            known_input += int(item["input_tokens"])
+        if item.get("output_tokens") is None:
+            unknown_output += 1
+        else:
+            known_output += int(item["output_tokens"])
+        if item.get("total_tokens") is None:
+            unknown_total += 1
+        else:
+            known_total += int(item["total_tokens"])
     if not token_applicable:
         token_summary = {
             "input_tokens": None,
@@ -236,16 +254,32 @@ def refresh_observability_summary(payload: dict[str, Any]) -> None:
         }
     else:
         token_summary = {
-            "input_tokens": None if token_unknown else known_input,
-            "output_tokens": None if token_unknown else known_output,
-            "total_tokens": None if token_unknown else known_total,
+            "input_tokens": None if unknown_input else known_input,
+            "output_tokens": None if unknown_output else known_output,
+            "total_tokens": None if unknown_total else known_total,
             "known_input_tokens": known_input,
             "known_output_tokens": known_output,
             "known_total_tokens": known_total,
-            "unreported_request_count": token_unknown,
-            "status": "partial_unreported" if token_unknown else "reported",
+            "unreported_request_count": max(unknown_input, unknown_output, unknown_total),
+            "status": "partial_unreported" if any((unknown_input, unknown_output, unknown_total)) else "reported",
         }
     observability["token_summary"] = token_summary
+
+    performance = observability["performance"]
+    fingerprints: dict[tuple[str, str], set[str]] = {}
+    for item in requests.values():
+        if not isinstance(item, dict) or not item.get("request_sha256"):
+            continue
+        key = (str(item.get("provider") or ""), str(item["request_sha256"]))
+        fingerprints.setdefault(key, set()).add(str(item.get("request_id") or ""))
+    performance["duplicate_provider_request_count"] = sum(
+        max(0, len(request_ids) - 1) for request_ids in fingerprints.values()
+    )
+    performance["longest_dependency_chain"] = _longest_dependency_chain(payload)
+    performance["missing_measurements"] = [
+        name for name in PERFORMANCE_OBSERVATION_FIELDS
+        if performance.get(name) is None
+    ]
 
     package_rows = observability.get("packages")
     if not isinstance(package_rows, dict):
@@ -576,9 +610,6 @@ def validate_run(payload: dict[str, Any]) -> None:
             raise ValueError(f"工作包状态无效：{name}")
     if not isinstance(payload.get("artifacts"), dict):
         raise ValueError("story_run.json 缺少 artifacts")
-    paid_total = payload.get("paid_total")
-    if not isinstance(paid_total, (int, float)) or paid_total < 0:
-        raise ValueError("story_run.json 的 paid_total 无效")
     observability = payload.get("observability")
     if not isinstance(observability, dict):
         raise ValueError("story_run.json 缺少 observability")
@@ -594,10 +625,11 @@ def validate_run(payload: dict[str, Any]) -> None:
             raise ValueError(f"请求观测记录无效：{request_key}")
         if request.get("status") not in REQUEST_STATES:
             raise ValueError(f"请求状态无效：{request_key}")
-        if request.get("cost_status") not in COST_STATES:
-            raise ValueError(f"请求成本状态无效：{request_key}")
         if request.get("token_status") not in TOKEN_STATES:
             raise ValueError(f"请求 Token 状态无效：{request_key}")
+    performance = observability.get("performance")
+    if not isinstance(performance, dict) or performance.get("schema_version") != "story-performance-observation/v1":
+        raise ValueError("story_run.json 的 performance 观测无效")
 
 
 def init_run(
@@ -608,12 +640,10 @@ def init_run(
     audio: Path,
     project_dir: Path,
     subtitle_txt: Path | None = None,
-    soft_budget: float = DEFAULT_SOFT_BUDGET,
-    hard_budget: float = DEFAULT_HARD_BUDGET,
+    soft_budget: float | None = None,
+    hard_budget: float | None = None,
 ) -> dict[str, Any]:
     target = run_file.expanduser().resolve()
-    if soft_budget < 0 or hard_budget <= 0 or soft_budget > hard_budget:
-        raise ValueError("预算必须满足 0 <= soft_budget <= hard_budget")
     project = project_dir.expanduser().resolve()
     project.mkdir(parents=True, exist_ok=True)
     authoritative_subtitle = (
@@ -631,6 +661,7 @@ def init_run(
         "created_at": now,
         "updated_at": now,
         "finalized_at": "",
+        "requirements_policy": "story-applicable-requirements/v1",
         "inputs": {
             "confirmed_text": input_record(confirmed_text, "确认文本"),
             "greenscreen_video": input_record(greenscreen_video, "绿幕视频"),
@@ -641,8 +672,6 @@ def init_run(
             name: {"status": "pending", "blocker": ""} for name in PACKAGE_NAMES
         },
         "artifacts": {},
-        "paid_total": 0.0,
-        "budget": {"soft": float(soft_budget), "hard": float(hard_budget)},
         "blocker": "",
     }
     ensure_observability(payload, new_run=True)
@@ -683,8 +712,6 @@ def _record_run_unlocked(
         raise ValueError(f"未知工作包：{package}")
     if status not in PACKAGE_STATES:
         raise ValueError(f"未知工作包状态：{status}")
-    if paid_amount < 0:
-        raise ValueError("--paid-amount 不能为负数")
     if status == "blocked" and not blocker.strip():
         raise ValueError("blocked 状态必须提供 --blocker")
     if artifact_id and artifact_path is None:
@@ -695,22 +722,6 @@ def _record_run_unlocked(
     target = run_file.expanduser().resolve()
     payload = load_run(target)
     observability = ensure_observability(payload)
-    cost_summary = observability["cost_summary"]
-    if paid_amount > 0 and int(cost_summary["unsettled_request_count"]) > 0:
-        raise RuntimeError("存在未结算请求成本；未知不得当作 0，禁止新增付费工作")
-    new_manual_paid_total = round(
-        float(payload.get("manual_paid_total") or 0.0) + float(paid_amount),
-        4,
-    )
-    new_paid_total = round(
-        float(cost_summary["settled_actual_cny"]) + float(paid_amount),
-        4,
-    )
-    hard = float(payload["budget"]["hard"])
-    if new_paid_total > hard:
-        raise RuntimeError(
-            f"登记后将超过硬预算：{new_paid_total:.2f} > {hard:.2f}；禁止开始新的付费工作"
-        )
 
     if artifact_id:
         artifact = require_file(artifact_path or Path(), "产物")
@@ -742,6 +753,13 @@ def _record_run_unlocked(
             registered_artifacts=payload["artifacts"],
             registered_inputs=payload["inputs"],
         )
+        if artifact_id == "requirements_projection":
+            # The projection itself declares the minimal applicable dependency
+            # set. Persist it so status invalidates only these input roles.
+            projection_inputs = json.loads(artifact.read_text(encoding="utf-8"))["inputs"]
+            input_hashes = {**(input_hashes or {}), **{
+                role: item["sha256"] for role, item in projection_inputs.items()
+            }}
         digest = file_sha256(artifact)
         existing = payload["artifacts"].get(artifact_id)
         if existing and existing.get("sha256") != digest and not replace:
@@ -764,7 +782,6 @@ def _record_run_unlocked(
         "status": status,
         "blocker": blocker.strip() if status == "blocked" else "",
     }
-    payload["manual_paid_total"] = new_manual_paid_total
     package_observation = observability["packages"][package]
     package_observation["first_observed_at"] = (
         package_observation.get("first_observed_at") or observed_at
@@ -784,7 +801,11 @@ def _record_run_unlocked(
             "previous_status": previous_status,
             "status": status,
             "artifact_id": artifact_id.strip() or None,
-            "paid_amount_cny": float(paid_amount) if paid_amount else None,
+            "legacy_financial_evidence": (
+                {"paid_amount": float(paid_amount), "currency": "CNY", "deprecated": True}
+                if paid_amount
+                else None
+            ),
         }
     )
     refresh_observability_summary(payload)
@@ -847,6 +868,8 @@ def _record_request_observation_unlocked(
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     total_tokens: int | None = None,
+    request_sha256: str = "",
+    error_type: str = "",
     estimated_cost: float | None = None,
     actual_cost: float | None = None,
     currency: str = "CNY",
@@ -862,8 +885,6 @@ def _record_request_observation_unlocked(
         raise ValueError("请求观测必须提供 provider、request_id 和 operation")
     if status not in REQUEST_STATES:
         raise ValueError(f"请求状态无效：{status}")
-    if cost_status not in COST_STATES:
-        raise ValueError(f"成本状态无效：{cost_status}")
     if token_status not in TOKEN_STATES:
         raise ValueError(f"Token 状态无效：{token_status}")
     duration_seconds = _optional_nonnegative_number(duration_seconds, "duration_seconds")
@@ -885,14 +906,11 @@ def _record_request_observation_unlocked(
             total_tokens = input_tokens + output_tokens
     elif any(value is not None for value in token_values):
         raise ValueError("未报告/不适用 Token 不得写成 0 或其他数字")
-    if cost_status == "settled" and actual_cost is None:
-        raise ValueError("cost_status=settled 时必须提供 actual_cost")
-    if cost_status != "settled" and actual_cost is not None:
-        raise ValueError("未结算成本不得写 actual_cost")
-    if cost_status == "not_applicable" and estimated_cost is not None:
-        raise ValueError("cost_status=not_applicable 时不得写估算成本")
-    if not currency.strip():
-        raise ValueError("currency 不得为空")
+    request_sha256 = request_sha256.strip().lower()
+    if request_sha256 and (
+        len(request_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in request_sha256)
+    ):
+        raise ValueError("request_sha256 无效")
 
     target = run_file.expanduser().resolve()
     payload = load_run(target)
@@ -918,24 +936,21 @@ def _record_request_observation_unlocked(
         "input_tokens": input_tokens,
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
-        "estimated_cost": estimated_cost,
-        "actual_cost": actual_cost,
-        "currency": currency.strip().upper(),
-        "cost_status": cost_status,
+        "request_sha256": request_sha256 or None,
+        "error_type": error_type.strip() or None,
         "observed_at": utc_now(),
     }
+    if estimated_cost is not None or actual_cost is not None:
+        record["legacy_financial_evidence"] = {
+            "estimated_cost": estimated_cost,
+            "actual_cost": actual_cost,
+            "currency": currency.strip().upper() or None,
+            "cost_status": cost_status or None,
+            "deprecated": True,
+        }
     old = requests.get(key)
     requests[key] = record
     refresh_observability_summary(payload)
-    hard = float(payload["budget"]["hard"])
-    settled = float(observability["cost_summary"]["settled_actual_cny"])
-    if settled > hard:
-        if old is None:
-            requests.pop(key, None)
-        else:
-            requests[key] = old
-        refresh_observability_summary(payload)
-        raise RuntimeError(f"已结算成本超过硬预算：{settled:.2f} > {hard:.2f}")
 
     package_observation = observability["packages"][package]
     package_observation["first_observed_at"] = (
@@ -958,7 +973,6 @@ def _record_request_observation_unlocked(
             "provider": provider,
             "request_id": request_id,
             "status": status,
-            "cost_status": cost_status,
             "token_status": token_status,
             "replaced_previous_observation": old is not None,
         }
@@ -987,6 +1001,8 @@ def record_request_observation(
     input_tokens: int | None = None,
     output_tokens: int | None = None,
     total_tokens: int | None = None,
+    request_sha256: str = "",
+    error_type: str = "",
     estimated_cost: float | None = None,
     actual_cost: float | None = None,
     currency: str = "CNY",
@@ -1012,6 +1028,8 @@ def record_request_observation(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
+            request_sha256=request_sha256,
+            error_type=error_type,
             estimated_cost=estimated_cost,
             actual_cost=actual_cost,
             currency=currency,
@@ -1020,34 +1038,116 @@ def record_request_observation(
         )
 
 
+def record_performance_observation(
+    *, run_file: Path, plan_duration_seconds: float | None = None,
+    machine_check_duration_seconds: float | None = None,
+    independent_review_rounds: int | None = None,
+    invalid_rejection_count: int | None = None,
+    duplicate_encode_count: int | None = None,
+) -> dict[str, Any]:
+    """Record only measured workflow facts; omitted/unknown values stay null."""
+
+    supplied = {
+        "plan_duration_seconds": plan_duration_seconds,
+        "machine_check_duration_seconds": machine_check_duration_seconds,
+        "independent_review_rounds": independent_review_rounds,
+        "invalid_rejection_count": invalid_rejection_count,
+        "duplicate_encode_count": duplicate_encode_count,
+    }
+    if all(value is None for value in supplied.values()):
+        raise ValueError("性能观测至少提供一个实测值")
+    for name in ("plan_duration_seconds", "machine_check_duration_seconds"):
+        value = supplied[name]
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, (int, float))
+            or not math.isfinite(float(value)) or float(value) < 0
+        ):
+            raise ValueError(f"{name} 必须是有限非负数")
+    for name in ("independent_review_rounds", "invalid_rejection_count", "duplicate_encode_count"):
+        value = supplied[name]
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value < 0
+        ):
+            raise ValueError(f"{name} 必须是非负整数")
+
+    target = run_file.expanduser().resolve()
+    with run_file_lock(target):
+        payload = load_run(target)
+        observability = ensure_observability(payload)
+        performance = observability["performance"]
+        for name, value in supplied.items():
+            if value is not None:
+                performance[name] = float(value) if name.endswith("_seconds") else value
+        observed_at = utc_now()
+        observability["events"].append({
+            "sequence": len(observability["events"]) + 1,
+            "observed_at": observed_at,
+            "event": "performance_observation",
+            "measurements": {name: value for name, value in supplied.items() if value is not None},
+        })
+        refresh_observability_summary(payload)
+        payload["updated_at"] = observed_at
+        payload["finalized_at"] = ""
+        atomic_write_json(target, payload)
+        return payload
+
+
 def status_summary(payload: dict[str, Any]) -> dict[str, Any]:
     ensure_observability(payload)
-    hard = float(payload["budget"]["hard"])
-    soft = float(payload["budget"]["soft"])
-    cost_summary = payload["observability"]["cost_summary"]
-    paid = float(cost_summary["settled_actual_cny"])
-    unresolved = int(cost_summary["unsettled_request_count"])
-    total_actual = cost_summary["total_actual_cny"]
+    stale_dependencies = dependency_staleness(payload)
     return {
         "schema_version": payload["schema_version"],
         "run_id": payload["run_id"],
         "project_dir": payload["project_dir"],
         "work_packages": payload["work_packages"],
         "artifact_ids": sorted(payload["artifacts"]),
-        "paid_total": total_actual,
-        "settled_paid_total": paid,
-        "cost_status": cost_summary["status"],
-        "unsettled_request_count": unresolved,
         "token_usage": payload["observability"]["token_summary"],
         "request_count": len(payload["observability"]["requests"]),
-        "soft_budget_warning": paid >= soft,
-        "remaining_hard_budget": (
-            None if unresolved else round(max(0.0, hard - paid), 4)
-        ),
-        "can_start_paid_work": unresolved == 0 and paid < hard,
+        "performance": payload["observability"]["performance"],
+        "stale_artifacts": stale_dependencies,
         "blocker": payload.get("blocker", ""),
         "finalized": bool(payload.get("finalized_at")),
     }
+
+
+def dependency_staleness(payload: dict[str, Any]) -> dict[str, list[str]]:
+    """Return only artifacts whose explicitly declared upstream hashes are stale.
+
+    A dependency key names either a ledger input or another artifact.  Historical
+    records without ``input_sha256s`` remain readable; they are not retroactively
+    guessed.  Unknown declared keys are evidence gaps and therefore stale.
+    """
+
+    current: dict[str, str] = {}
+    for collection_name in ("inputs", "artifacts"):
+        collection = payload.get(collection_name)
+        if not isinstance(collection, dict):
+            continue
+        for key, record in collection.items():
+            if isinstance(record, dict) and isinstance(record.get("sha256"), str):
+                if collection_name == "inputs":
+                    path = Path(str(record.get("path") or "")).expanduser().resolve()
+                    current[str(key)] = file_sha256(path) if path.is_file() else "missing"
+                else:
+                    current[str(key)] = str(record["sha256"])
+    stale: dict[str, list[str]] = {}
+    artifacts = payload.get("artifacts")
+    if not isinstance(artifacts, dict):
+        return stale
+    for artifact_id, record in artifacts.items():
+        if not isinstance(record, dict):
+            continue
+        bindings = record.get("input_sha256s")
+        if not isinstance(bindings, dict):
+            continue
+        reasons = [
+            f"{key}:expected={expected},current={current.get(str(key), 'missing')}"
+            for key, expected in sorted(bindings.items())
+            if current.get(str(key)) != expected
+        ]
+        if reasons:
+            stale[str(artifact_id)] = reasons
+    return stale
 
 
 def _finalize_run_unlocked(*, run_file: Path, required_artifacts: Iterable[str]) -> dict[str, Any]:
@@ -1058,9 +1158,16 @@ def _finalize_run_unlocked(*, run_file: Path, required_artifacts: Iterable[str])
     ]
     if incomplete:
         raise RuntimeError(f"仍有未完成工作包：{', '.join(incomplete)}")
-    required = tuple(
+    required = list(
         dict.fromkeys([*CODEX_NATIVE_REQUIRED_ARTIFACTS, *required_artifacts])
     )
+    # Historical ledgers predate the merged final review. Keep their real
+    # customer-media review instead of inventing a v2 compatibility shell or
+    # silently dropping its audio/subtitle/logo/geometry checks.
+    if payload.get("requirements_policy") == "story-applicable-requirements/v1":
+        required.append("requirements_projection")
+    else:
+        required.append("customer_media_independent_review")
     missing = [name for name in required if name not in payload["artifacts"]]
     if missing:
         raise RuntimeError(f"缺少必需产物：{', '.join(missing)}")
@@ -1071,6 +1178,13 @@ def _finalize_run_unlocked(*, run_file: Path, required_artifacts: Iterable[str])
             stale.append(artifact_id)
     if stale:
         raise RuntimeError(f"产物缺失或哈希漂移：{', '.join(stale)}")
+    dependency_stale = dependency_staleness(payload)
+    if dependency_stale:
+        detail = "；".join(
+            f"{artifact_id}[{', '.join(reasons)}]"
+            for artifact_id, reasons in sorted(dependency_stale.items())
+        )
+        raise RuntimeError(f"产物依赖已过期：{detail}")
     for artifact_id in required:
         record = payload["artifacts"][artifact_id]
         try:
@@ -1082,6 +1196,15 @@ def _finalize_run_unlocked(*, run_file: Path, required_artifacts: Iterable[str])
             )
         except ValueError as exc:
             raise RuntimeError(f"产物语义门禁失败：{exc}") from exc
+    if payload.get("requirements_policy") == "story-applicable-requirements/v1":
+        final_review = json.loads(
+            Path(payload["artifacts"]["final_delivery_review"]["path"]).read_text(encoding="utf-8")
+        )
+        if final_review.get("schema_version") != "final-delivery-independent-review/v2":
+            raise RuntimeError(
+                "新项目 final_delivery_review 必须合并音频、字幕、Logo、人物几何和证据检查；"
+                "不再新建重复客户媒体独立审核"
+            )
     storyboard_receipt = payload["artifacts"].get("shot_storyboard_compile_receipt")
     theme_manifest = payload["artifacts"].get("theme_assets_manifest")
     if storyboard_receipt is not None and not isinstance(theme_manifest, dict):
@@ -1157,8 +1280,8 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="用户确认且已换好行的字幕 TXT；省略时仅在项目内唯一自动识别",
     )
-    init.add_argument("--soft-budget", type=float, default=DEFAULT_SOFT_BUDGET)
-    init.add_argument("--hard-budget", type=float, default=DEFAULT_HARD_BUDGET)
+    init.add_argument("--soft-budget", type=float, help=argparse.SUPPRESS)
+    init.add_argument("--hard-budget", type=float, help=argparse.SUPPRESS)
 
     record = subparsers.add_parser("record", help="登记一个工作包状态和可选的当前有效产物")
     record.add_argument("--run-file", required=True, type=Path)
@@ -1168,13 +1291,13 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--path", type=Path)
     record.add_argument("--input-hash", action="append", default=[])
     record.add_argument("--provider-task-id", default="")
-    record.add_argument("--paid-amount", type=float, default=0.0)
+    record.add_argument("--paid-amount", type=float, default=0.0, help=argparse.SUPPRESS)
     record.add_argument("--blocker", default="")
     record.add_argument("--replace", action="store_true")
 
     observe = subparsers.add_parser(
         "observe-request",
-        help="登记一次请求的时间、重试、Token 与成本；未知值保持 null",
+        help="登记一次请求的 provider/model/ID、时间、等待、重试和 Token",
     )
     observe.add_argument("--run-file", required=True, type=Path)
     observe.add_argument("--package", required=True, choices=PACKAGE_NAMES)
@@ -1192,13 +1315,26 @@ def build_parser() -> argparse.ArgumentParser:
     observe.add_argument("--input-tokens", type=int)
     observe.add_argument("--output-tokens", type=int)
     observe.add_argument("--total-tokens", type=int)
-    observe.add_argument("--estimated-cost", type=float)
-    observe.add_argument("--actual-cost", type=float)
-    observe.add_argument("--currency", default="CNY")
-    observe.add_argument("--cost-status", choices=sorted(COST_STATES), default="provider_not_exposed")
+    observe.add_argument("--request-sha256", default="")
+    observe.add_argument("--error-type", default="")
+    observe.add_argument("--estimated-cost", type=float, help=argparse.SUPPRESS)
+    observe.add_argument("--actual-cost", type=float, help=argparse.SUPPRESS)
+    observe.add_argument("--currency", default="CNY", help=argparse.SUPPRESS)
+    observe.add_argument("--cost-status", default="provider_not_exposed", help=argparse.SUPPRESS)
     observe.add_argument("--replace", action="store_true")
 
-    status = subparsers.add_parser("status", help="输出六个工作包和预算的简洁状态")
+    performance = subparsers.add_parser(
+        "observe-performance",
+        help="登记计划/机器检查耗时、审核轮次与重复工作实测值",
+    )
+    performance.add_argument("--run-file", required=True, type=Path)
+    performance.add_argument("--plan-duration-seconds", type=float)
+    performance.add_argument("--machine-check-duration-seconds", type=float)
+    performance.add_argument("--independent-review-rounds", type=int)
+    performance.add_argument("--invalid-rejection-count", type=int)
+    performance.add_argument("--duplicate-encode-count", type=int)
+
+    status = subparsers.add_parser("status", help="输出六个工作包、当前产物、请求和过期依赖")
     status.add_argument("--run-file", required=True, type=Path)
 
     finalize = subparsers.add_parser("finalize", help="校验所有工作包、产物文件和哈希后锁定交付")
@@ -1251,11 +1387,22 @@ def main() -> None:
             input_tokens=args.input_tokens,
             output_tokens=args.output_tokens,
             total_tokens=args.total_tokens,
+            request_sha256=args.request_sha256,
+            error_type=args.error_type,
             estimated_cost=args.estimated_cost,
             actual_cost=args.actual_cost,
             currency=args.currency,
             cost_status=args.cost_status,
             replace=args.replace,
+        )
+    elif args.command == "observe-performance":
+        payload = record_performance_observation(
+            run_file=args.run_file,
+            plan_duration_seconds=args.plan_duration_seconds,
+            machine_check_duration_seconds=args.machine_check_duration_seconds,
+            independent_review_rounds=args.independent_review_rounds,
+            invalid_rejection_count=args.invalid_rejection_count,
+            duplicate_encode_count=args.duplicate_encode_count,
         )
     elif args.command == "status":
         payload = status_summary(load_run(args.run_file))

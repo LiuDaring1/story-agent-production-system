@@ -11,7 +11,6 @@ import story_workflow
 import apply_narration_durations
 from assemble_r2v_story import retime_plan_to_authoritative_audio
 from apply_narration_durations import generation_duration_for_target
-from story_agent import AgentContext, StoryAgent
 from story_project import init_project, project_paths, write_manifest
 from story_video_synthesizer.align import LineTiming
 from story_video_synthesizer.pipeline import SynthesisConfig, _render_video_segments, synthesize_story
@@ -196,116 +195,8 @@ class AdaptiveTimingTests(unittest.TestCase):
         self.assertEqual(command[command.index("--min-generation-seconds") + 1], "1.0")
         self.assertEqual(command[command.index("--max-generation-seconds") + 1], "15.0")
 
-    def test_has_timing_rejects_prepare_placeholder_duration(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory) / "故事剪辑：时长闸门"
-            manifest = init_project(project, story_name="时长闸门", slug="timing-gate")
-            jobs = project_paths(project).video_jobs / "timing-gate_image_video_jobs.csv"
-            jobs.parent.mkdir(parents=True, exist_ok=True)
-            jobs.write_text(
-                "scene,target_video_filename,duration,frames,status\n1,01.mp4,10,240,todo\n",
-                encoding="utf-8-sig",
-            )
-            manifest["outputs"]["jobs_csv"] = str(jobs)
-            write_manifest(project_paths(project), manifest)
-            context = AgentContext(
-                project_dir=project,
-                inbox=None,
-                story_name="时长闸门",
-                slug="timing-gate",
-                execute=False,
-                update_latest_episode=False,
-                codex_mode="handoff",
-                codex_model="",
-                codex_sandbox="read-only",
-                codex_approval="never",
-                codex_path="codex",
-                codex_timeout=30,
-            )
-            agent = StoryAgent(context, read_only=True)
-            self.assertFalse(agent._has_timing(manifest))
 
-    def test_has_timing_accepts_real_row_metadata(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory) / "故事剪辑：时长元数据"
-            manifest = init_project(project, story_name="时长元数据", slug="timing-metadata")
-            jobs = project_paths(project).video_jobs / "timing-metadata_image_video_jobs.csv"
-            jobs.parent.mkdir(parents=True, exist_ok=True)
-            jobs.write_text(
-                "scene,target_video_filename,duration,frames,status,target_duration,narration_start,narration_end,generation_duration,duration_mode\n"
-                "1,01.mp4,5,120,todo,4.17,0.000,4.020,5,adaptive-seconds\n",
-                encoding="utf-8-sig",
-            )
-            manifest["outputs"]["jobs_csv"] = str(jobs)
-            write_manifest(project_paths(project), manifest)
-            context = AgentContext(
-                project_dir=project,
-                inbox=None,
-                story_name="时长元数据",
-                slug="timing-metadata",
-                execute=False,
-                update_latest_episode=False,
-                codex_mode="handoff",
-                codex_model="",
-                codex_sandbox="read-only",
-                codex_approval="never",
-                codex_path="codex",
-                codex_timeout=30,
-            )
-            self.assertTrue(StoryAgent(context, read_only=True)._has_timing(manifest))
 
-    def test_stage_timing_selects_adaptive_for_current_grok_capabilities(self) -> None:
-        with tempfile.TemporaryDirectory() as directory:
-            project = Path(directory) / "故事剪辑：Grok 时长"
-            manifest = init_project(project, story_name="Grok 时长", slug="grok-timing")
-            paths = project_paths(project)
-            narration = paths.inputs / "narration.m4a"
-            narration.write_bytes(b"audio")
-            jobs = paths.video_jobs / "grok-timing_image_video_jobs.csv"
-            jobs.parent.mkdir(parents=True, exist_ok=True)
-            jobs.write_text("scene,target_video_filename,status\n1,01.mp4,todo\n", encoding="utf-8-sig")
-            manifest["inputs"]["narration"] = str(narration)
-            manifest["outputs"]["jobs_csv"] = str(jobs)
-            write_manifest(paths, manifest)
-            context = AgentContext(
-                project_dir=project,
-                inbox=None,
-                story_name="Grok 时长",
-                slug="grok-timing",
-                execute=False,
-                update_latest_episode=False,
-                codex_mode="handoff",
-                codex_model="",
-                codex_sandbox="read-only",
-                codex_approval="never",
-                codex_path="codex",
-                codex_timeout=30,
-            )
-            agent = StoryAgent(context, read_only=True)
-            config = {
-                "video_api": {
-                    "provider": "configured_provider",
-                    "adapters": {
-                        "configured_provider": {
-                            "runner": "run_image_video_jobs.py",
-                            "model": "grok-video-1.0",
-                            "min_seconds": 6,
-                            "max_seconds": 10,
-                            "duration_choices": [6, 10],
-                        }
-                    },
-                }
-            }
-            with patch("story_agent.load_config", return_value=config), patch.object(
-                agent, "_workflow", return_value=type("Result", (), {"status": "done", "message": "ok", "handoff": None})()
-            ) as workflow:
-                agent._stage_timing(manifest)
-            command = list(workflow.call_args.args[0])
-            self.assertIn("--duration-mode", command)
-            self.assertEqual(command[command.index("--duration-mode") + 1], "adaptive-seconds")
-            self.assertEqual(command[command.index("--min-generation-seconds") + 1], "6")
-            self.assertEqual(command[command.index("--max-generation-seconds") + 1], "10")
-            self.assertEqual(command[command.index("--generation-duration-choices") + 1], "6,10")
 
 
 if __name__ == "__main__":

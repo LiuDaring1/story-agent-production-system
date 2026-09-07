@@ -22,7 +22,7 @@
 |---|---|---|
 | Codex 前台 | 导演判断、任务分解、结果观察、异常处置、汇合 | 把模型自述当作完成证据 |
 | Skill | 生产策略、质量边界、模块路由、停止条件 | 持久进程、供应商调用、文件状态 |
-| `story_pipeline.py` / `story_run.py` | 六个工作包、成本、当前产物和哈希、恢复与最终封口 | 创意判断、固定 DAG、自动重试 |
+| `story_pipeline.py` / `story_run.py` | 六个工作包、当前产物与依赖哈希、请求恢复事实和最终封口 | 创意判断、固定 DAG、自动重试、金额管理 |
 | 确定性模块 | 媒体处理、计划编译、API 适配、PPT、包装、机器 QA | 自行改变导演意图或绕过审核 |
 | 回执与审核 | 证明输入、产物、审核和交付仍是同一版本 | 因文件存在而推定成功 |
 
@@ -54,4 +54,4 @@
 
 ## Legacy 边界
 
-旧 `story_agent.py`、38 阶段 Runtime、Supervisor、Dashboard、Recovery 和旧 Codex task builder 已归档在 `legacy/story_agent_v3/`。根目录同名文件只保留薄兼容导入，供历史测试、审计和旧项目读取；它们不是生产入口，不得被 `story-full-auto` 调用，也不得向新账本写入阶段状态。
+旧 Agent、固定阶段 Runtime、工作台、恢复工具和根目录别名已移入 `historical_archive/` 的可校验独立源码包，包含清理时的未提交版本。当前样式与只读文本能力位于 `story_style.py` / `story_text.py`；生产导入不再到达旧 Agent。

@@ -34,9 +34,56 @@ from run_image_video_jobs import (
 )
 import run_image_video_jobs
 from story_video_synthesizer.volcengine_video import CreateTaskResult, QueryTaskResult
+from video_motion import write_video_receipt
 
 
 class VideoProviderAdapterTests(unittest.TestCase):
+    def test_download_sidecar_recovers_csv_binding_after_crash_window(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            jobs = root / "jobs.csv"; jobs.write_text("fixture")
+            video = root / "01.mp4"; video.write_bytes(b"downloaded provider video")
+            row = {
+                "scene": "1", "target_video_filename": "01.mp4",
+                "provider_attempt": "0", "task_id": "task-1",
+                "client_business_id": "business-1",
+            }
+            write_video_receipt(
+                jobs, row, video, provider="toapis", model="grok-video-1.0",
+                source_kind="provider_generated", execution_mode="production",
+                production_eligible=True,
+            )
+            recovered = dict(row)
+            self.assertTrue(run_image_video_jobs.recover_download_binding_from_sidecar(
+                jobs, recovered, video, production_mode=True,
+            ))
+            self.assertEqual(recovered["status"], "downloaded")
+            self.assertEqual(recovered["video_provider"], "toapis")
+            self.assertTrue(Path(recovered["video_receipt_path"]).is_file())
+
+    def test_request_observation_records_wait_and_replaces_submitted_state(self) -> None:
+        row = {
+            "task_id": "provider-task-1",
+            "provider_started_at": "2026-09-06T00:00:00+00:00",
+            "provider_wait_seconds": "12.5",
+            "provider_prompt_sha256": "a" * 64,
+            "provider_attempt": "0",
+        }
+        with patch("story_run.record_request_observation") as record:
+            run_image_video_jobs._observe_provider_request(
+                Path("run.json"), row, provider="fixture", model="model",
+                status="completed",
+            )
+        kwargs = record.call_args.kwargs
+        self.assertEqual(kwargs["wait_seconds"], 12.5)
+        self.assertTrue(kwargs["replace"])
+        with patch("story_run.record_request_observation") as record:
+            run_image_video_jobs._observe_provider_request(
+                Path("run.json"), row, provider="fixture", model="model",
+                status="submitted",
+            )
+        self.assertFalse(record.call_args.kwargs["replace"])
+
     def test_formal_runner_has_no_serial_whole_batch_switch(self) -> None:
         root = Path(__file__).resolve().parents[1]
         process = subprocess.run(
@@ -104,18 +151,19 @@ class VideoProviderAdapterTests(unittest.TestCase):
         self.assertEqual(actual, "很长的审核提示。" * 100)
         self.assertIn("[STORY_CONTRACT_V1]", row["prompt"])
 
-    def test_targeted_retry_prompt_reaches_provider_unchanged(self) -> None:
+    def test_targeted_retry_prompt_appends_without_replacing_locked_intent(self) -> None:
         retry = "公鸡自然抬起完整羽翼，羽翼始终为羽毛结构，不出现人手。"
         row = {
             "scene": "08",
-            "prompt": "旧动作提示。[STORY_CONTRACT_V1]{}",
+            "prompt": "[LOCKED_DIRECTOR_INTENT_V1]\n必须先抬翼再收拢。[STORY_CONTRACT_V1]{}",
+            "provider_prompt_compiler": "story-r2v-provider-prompt/v1",
             "provider_retry_prompt": retry,
             "previous_provider_prompt_sha256": "a" * 64,
         }
-        self.assertEqual(
-            provider_prompt_for_row(row, model="grok-video-1.0", is_toapis=True),
-            retry,
-        )
+        actual = provider_prompt_for_row(row, model="grok-video-1.0", is_toapis=True)
+        self.assertIn("[LOCKED_DIRECTOR_INTENT_V1]", actual)
+        self.assertIn("必须先抬翼再收拢", actual)
+        self.assertTrue(actual.endswith(retry))
 
     def test_identical_retry_provider_prompt_is_blocked_before_submission(self) -> None:
         retry = "公鸡自然抬起完整羽翼。"
@@ -123,7 +171,9 @@ class VideoProviderAdapterTests(unittest.TestCase):
             "scene": "08",
             "prompt": "审计提示",
             "provider_retry_prompt": retry,
-            "previous_provider_prompt_sha256": __import__("hashlib").sha256(retry.encode("utf-8")).hexdigest(),
+            "previous_provider_prompt_sha256": __import__("hashlib").sha256(
+                f"审计提示\n[TARGETED_DEFECT_REPAIR_V1]\n{retry}".encode("utf-8")
+            ).hexdigest(),
         }
         with self.assertRaisesRegex(ValueError, "完全相同"):
             provider_prompt_for_row(row, model="grok-video-1.0", is_toapis=True)
@@ -160,6 +210,7 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 "--base-url", "https://toapis.com/v1",
                 "--model", "grok-video-1.5",
                 "--api-key", "test-secret",
+                "--execution-mode", "test",
                 "--submit-only",
             ]
             with (
@@ -294,6 +345,7 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 "test-secret",
                 "--seconds",
                 "6",
+                "--execution-mode", "test",
                 "--submit-only",
             ]
             with patch.object(sys, "argv", argv), patch.object(run_image_video_jobs, "ToAPIsVideoClient", FakeClient):
@@ -337,6 +389,7 @@ class VideoProviderAdapterTests(unittest.TestCase):
                 "--base-url", "https://toapis.com/v1",
                 "--model", "grok-video-1.0",
                 "--api-key", "test-secret",
+                "--execution-mode", "test",
                 "--submit-only",
             ]
             with (
@@ -712,10 +765,10 @@ class VideoProviderAdapterTests(unittest.TestCase):
         }
         with tempfile.TemporaryDirectory() as directory:
             changed = reset_retryable_failed_row(row, Path(directory) / "01.mp4")
-        self.assertTrue(changed)
-        self.assertEqual(row["status"], "todo")
-        self.assertEqual(row["error"], "")
-        self.assertEqual(row["provider_attempt"], "1")
+        self.assertFalse(changed)
+        self.assertEqual(row["status"], "error")
+        self.assertEqual(row["error"], "upload rejected")
+        self.assertEqual(row["provider_attempt"], "0")
 
     def test_unknown_provider_fails_before_paid_generation(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

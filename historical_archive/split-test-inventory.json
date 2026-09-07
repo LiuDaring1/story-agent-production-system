@@ -1,0 +1,107 @@
+{
+  "tests/test_image_generator_seam.py": [
+    "_legacy_story_agent",
+    "test_visual_sample_consumer_uses_mock_port_without_codex_executor",
+    "test_visual_sample_existing_assets_skip_image_port",
+    "test_formal_story_image_consumer_uses_mock_port_without_codex_executor",
+    "test_protocol_only_image_generator_fake_reaches_formal_consumer"
+  ],
+  "tests/test_release_geometry.py": [
+    "test_independent_review_receives_explicit_abc_and_library_previews"
+  ],
+  "tests/test_m3_cross_port_smoke.py": [
+    "test_m3_keeps_schema_v1_and_the_38_stage_dag"
+  ],
+  "tests/test_timing_adaptive.py": [
+    "test_has_timing_rejects_prepare_placeholder_duration",
+    "test_has_timing_accepts_real_row_metadata",
+    "test_stage_timing_selects_adaptive_for_current_grok_capabilities"
+  ],
+  "tests/test_visual_sample_gate.py": [
+    "test_worker_handoff_contains_only_per_sample_projection_and_identity_expansion_ban",
+    "test_three_layer_review_p0_is_a_hard_gate_and_batch_never_starts",
+    "test_legacy_project_needs_no_visual_samples_or_new_files",
+    "fake_task",
+    "fake_review",
+    "test_mock_visual_design_reaches_story_agent_consumer_without_second_contract",
+    "test_repeated_visual_defect_changes_strategy_and_stops_after_three_total_attempts",
+    "test_storyboard_requires_current_sample_binding_scale_state_and_evidence",
+    "test_full_story_image_review_uses_product_dimensions_and_p0_gate",
+    "test_anatomical_coherence_is_contract_and_style_relative",
+    "test_anatomy_p0_rejects_unintended_extra_limbs_and_forbidden_anatomy"
+  ],
+  "tests/test_publish_qa.py": [
+    "agent_context",
+    "test_publish_stage_passes_twelve_originals_and_contact_sheet_to_native_review",
+    "test_required_prompt_requires_integrated_imagegen_typography",
+    "fake_review"
+  ],
+  "tests/test_native_architecture_split.py": [
+    "test_all_nonlegacy_python_modules_do_not_import_legacy_agent",
+    "test_legacy_imports_resolve_to_archived_implementation",
+    "test_legacy_qualification_is_not_exposed_as_a_native_root_module"
+  ],
+  "tests/test_image_video_continuity.py": [
+    "test_staging_sync_copies_flow_prompt_control_files"
+  ],
+  "tests/test_story_module_ports.py": [
+    "test_story_agent_workflow_subprocess_uses_formal_mock_port_without_concrete_attrs",
+    "test_story_agent_accepts_registry_injection_without_global_configuration",
+    "test_story_agent_propagates_selected_required_profile_and_execution_mode"
+  ],
+  "tests/test_full_auto_contract.py": [
+    "test_failed_post_encode_visual_review_preserves_videos_and_locked_preset",
+    "test_release_and_product_package_split_after_shared_real_material_preview",
+    "test_video_prompt_review_snapshot_survives_status_writeback_but_rejects_content_drift"
+  ],
+  "tests/test_story_contract_runtime.py": [
+    "_context",
+    "_new_project",
+    "_lock_contract",
+    "fake_review",
+    "test_manifest_without_historical_evidence_requires_contract",
+    "test_contract_generation_dry_run_does_not_require_outputs",
+    "test_contract_stages_are_before_all_expensive_branches",
+    "test_contract_generation_uses_luna_and_rejects_spoofed_source",
+    "test_contract_generation_is_text_only_and_defers_worker_previews",
+    "test_contract_review_allows_only_one_targeted_revision",
+    "test_independent_review_hash_binds_and_runtime_lock_invalidates_on_tamper",
+    "test_rejected_contract_review_triggers_bounded_automatic_revision",
+    "test_legacy_project_passes_both_new_predicates_without_files",
+    "test_fresh_manifest_cannot_self_declare_legacy_passthrough",
+    "test_legacy_receipt_is_bound_and_policy_edit_cannot_forge_it",
+    "test_diagnostics_report_contract_review_lock_and_consumer_corruption",
+    "test_existing_status_cli_exposes_read_only_contract_diagnostics",
+    "test_diagnostics_never_forges_contract_state_for_eligible_legacy",
+    "test_interrupted_generation_or_failed_review_cannot_leave_a_valid_lock",
+    "fake_task",
+    "fake_task",
+    "fake_review",
+    "fake_review"
+  ],
+  "tests/test_product_quality.py": [
+    "test_product_package_review_passes_ppt_evidence_as_native_images",
+    "test_product_package_review_cannot_remain_current_when_package_inputs_are_stale"
+  ],
+  "tests/test_story_contract_consumers.py": [
+    "test_storyagent_music_chain_passes_projection_and_requires_current_plan_binding",
+    "workflow",
+    "test_storyboard_plan_carries_five_sections_while_batch_request_stays_projection_bound"
+  ],
+  "tests/test_music_provider_seam.py": [
+    "_music_agent",
+    "test_production_default_delegates_suno_stage_to_original_codex_task",
+    "codex_task",
+    "test_mock_music_replaces_real_consumer_without_codex_or_browser_executor",
+    "test_protocol_only_music_provider_fake_reaches_suno_consumer",
+    "test_has_suno_audio_keeps_any_audio_file_semantics",
+    "test_required_contract_requires_every_planned_suno_segment",
+    "test_invalid_planned_target_fails_closed",
+    "test_suno_request_exposes_every_planned_output_target"
+  ],
+  "tests/test_artifact_semantic_plan.py": [
+    "test_mock_profile_reaches_story_agent_stage_and_writes_only_existing_plan",
+    "test_storyboard_plan_requires_semantic_plan_binding",
+    "test_runtime_stage_compiles_and_stale_source_blocks_resume"
+  ]
+}

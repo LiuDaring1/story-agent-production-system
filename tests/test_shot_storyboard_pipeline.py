@@ -14,6 +14,7 @@ from shot_storyboard_pipeline import (
     _prompt_with_offscreen_reveal_guard,
     _runtime_reference_assets,
     build_storyboard_prompt,
+    compile_provider_prompt,
     build_storyboard_manifest,
     compile_consumers,
     create_asset_bundle,
@@ -151,6 +152,21 @@ class ShotStoryboardPipelineTests(unittest.TestCase):
         self.assertIn("Prop contracts:", prompt)
         self.assertIn("One primary action per performance beat:", prompt)
         self.assertIn('"subject_id": "character-b"', prompt)
+
+    def test_provider_prompt_compiles_locked_v4_intent_even_when_free_prompt_is_generic(self) -> None:
+        plan = valid_v4_plan()
+        shot = plan["shots"][0]
+        shot["prompt"] = "Make a beautiful continuous story shot."
+        assets = {item["asset_id"]: item for item in plan["assets"]}
+        refs = [assets[item] for item in shot["reference_asset_ids"]]
+        prompt = compile_provider_prompt(shot, refs)
+        self.assertIn("[LOCKED_DIRECTOR_INTENT_V1]", prompt)
+        self.assertIn("setup-character-a", prompt)
+        self.assertIn("Contact, separation, release", prompt)
+        self.assertIn("one-part-removed", prompt)
+        self.assertIn("character-a", prompt)
+        self.assertIn("Make a beautiful continuous story shot.", prompt)
+        self.assertNotIn("storyboard_review_sha256", prompt)
 
     def test_runtime_offscreen_guard_prevents_eyeline_from_revealing_excluded_zone(self) -> None:
         shot = valid_v4_plan()["shots"][0]

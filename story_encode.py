@@ -78,12 +78,14 @@ def encode_slot(*, limit=None, wait_seconds=60, cancelled=lambda: False):
 
 def run_encode(args, *, timeout=21600, wait_seconds=60, limit=None):
     output = Path(args[-1]).expanduser().resolve()
-    inputs = [binding(args[i + 1]) for i, value in enumerate(args[:-1]) if value == '-i' and Path(args[i + 1]).is_file()]
+    from story_encode_dependencies import snapshot
+    dependencies = snapshot(args)
+    inputs = dependencies['files']
     if any(output == Path(item['path']) or (output.exists() and os.path.samefile(output, item['path'])) for item in inputs):
         raise ValueError('Encode output must never replace an input')
     if Path(args[-1]).is_symlink():
         raise ValueError('Encode output cannot be a symlink')
-    fingerprint = hashlib.sha256(json.dumps({'command': args, 'inputs': inputs}, sort_keys=True).encode()).hexdigest()
+    fingerprint = hashlib.sha256(json.dumps({'command': args, 'dependencies': dependencies}, sort_keys=True).encode()).hexdigest()
     root = state_directory()
     identity = hashlib.sha256(str(output).encode()).hexdigest()
     from story_render_task import encode_task
@@ -98,7 +100,7 @@ def run_encode(args, *, timeout=21600, wait_seconds=60, limit=None):
         old = json.loads(receipt.read_text()) if receipt.exists() else {}
         if old and old.get('task') != task:
             raise ValueError('Encode output is owned by another task')
-        if old.get('status') == 'completed' and old.get('fingerprint') == fingerprint and output.is_file() and sha(output) == old.get('output', {}).get('sha256'):
+        if dependencies['reusable'] and old.get('status') == 'completed' and old.get('fingerprint') == fingerprint and output.is_file() and sha(output) == old.get('output', {}).get('sha256'):
             return
         if output.exists() and (not old.get('output') or sha(output) != old['output']['sha256']):
             raise ValueError('Existing output is not the current managed artifact; preserve it')
@@ -113,7 +115,7 @@ def run_encode(args, *, timeout=21600, wait_seconds=60, limit=None):
             output.parent.mkdir(parents=True, exist_ok=True)
             fd, temporary = tempfile.mkstemp(prefix='.encoding-', suffix=output.suffix, dir=output.parent)
             os.close(fd)
-            state = {'schema_version': 'story-encode/v1', 'fingerprint': fingerprint, 'inputs': inputs, 'role': str(output), 'task': task, 'parent_pid': os.getpid(), 'status': 'running', 'started_at': time.time(), 'heartbeat': time.time()}
+            state = {'schema_version': 'story-encode/v1', 'fingerprint': fingerprint, 'inputs': inputs, 'dependencies': dependencies, 'role': str(output), 'task': task, 'parent_pid': os.getpid(), 'status': 'running', 'started_at': time.time(), 'heartbeat': time.time()}
             if old.get('output'):
                 state['output'] = old['output']
             started = time.monotonic()
@@ -148,9 +150,8 @@ def run_encode(args, *, timeout=21600, wait_seconds=60, limit=None):
                         time.sleep(.1)
                     if process.returncode:
                         raise RuntimeError('Encoded output cannot decode')
-                    for item in inputs:
-                        if sha(item['path']) != item['sha256']:
-                            raise RuntimeError('Input changed during encode')
+                    if snapshot(args) != dependencies:
+                        raise RuntimeError('Input dependencies changed during encode')
                     if cancel.exists():
                         raise InterruptedError('Cancellation requested before publication')
                     os.replace(temporary, output)

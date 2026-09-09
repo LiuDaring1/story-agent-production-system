@@ -336,6 +336,11 @@ def validate_machine_qa(
 ) -> dict[str, Any]:
     label = f"机器 QA {artifact_id}"
     payload = _load_json_object(path, label)
+    if artifact_id == "qa_product_report" and payload.get("schema_version") == "story-managed-package/v2":
+        from story_production_v2 import validate_managed_receipt
+        result = validate_managed_receipt(path, registered_inputs)
+        _validate_product_qa_against_checklist(result, registered_artifacts)
+        return result
     expected_schemas = {
         "r2v_group_machine_qa": "story-r2v-group-machine-qa-v1",
         "qa_product_report": "story-product-machine-qa/v2",
@@ -534,6 +539,10 @@ def _validate_release_audio_qa(
         if (sources["narration"] != _require_current_binding(current_audio, "发布 QA 权威完整音频")
             or str(contract["narration"]["sha256"]).lower() != str(current_audio["sha256"]).lower()):
             raise ValueError("发布 QA 旁白没有绑定账本权威完整音频")
+    if inputs is not None and "finished_music" in inputs:
+        music = inputs["finished_music"]
+        if sources["music_bed"] != _require_current_binding(music, "用户成品音乐") or contract["music_bed"]["sha256"] != music["sha256"]:
+            raise ValueError("发布 QA 配乐没有绑定用户成品音乐")
     duration = _positive_duration(sources["narration"])
     tolerance = RELEASE_AUDIO_DURATION_TOLERANCE_SECONDS
     if _positive_duration(sources["music_bed"]) + tolerance < duration:
@@ -618,6 +627,9 @@ def validate_music_qa(path: Path) -> dict[str, Any]:
 
 
 def validate_final_delivery_checklist(path: Path) -> dict[str, Any]:
+    if json.loads(path.read_text()).get("production_contract") == "story-production/v2":
+        from story_production_v2 import validate_checklist
+        return validate_checklist(path)
     label = "最终交付清单 final_delivery_checklist"
     payload = _load_json_object(path, label)
     if payload.get("status") not in {
@@ -736,6 +748,12 @@ def validate_artifact_semantics(
         )
     if artifact_id == "customer_media_receipt":
         payload = validate_customer_media_receipt(path)
+        if registered_inputs and "finished_music" in registered_inputs:
+            source = payload["music_source"]
+            expected = registered_inputs["finished_music"]
+            if _require_current_binding(source, "客户媒体音乐") != _require_current_binding(expected, "成品音乐") or source["sha256"] != expected["sha256"]:
+                raise ValueError("客户媒体没有使用用户成品音乐")
+            validate_authoritative_timeline_receipt(Path(payload["authoritative_timeline_receipt"]["path"]), expected_inputs=registered_inputs)
         _validate_customer_receipt_against_checklist(payload, registered_artifacts)
         return payload
     if artifact_id == "release_package_receipt":

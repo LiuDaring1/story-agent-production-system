@@ -1006,6 +1006,7 @@ def build_ppt_plan(
         )
         slides.append(
             {
+                **({k: previous_slide[k] for k in ("word_start", "word_text") if k in previous_slide} if previous_slide else {}),
                 "slide_index": index,
                 "shot_id": shot_id,
                 "poster_path": str(entry.get("image_path") or ""),

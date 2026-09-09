@@ -29,6 +29,7 @@ from semantic_card_motion import (
     semantic_card_motion_receipt_issues,
 )
 from static_ppt_contract import validate_delivery_receipt
+import story_production_v2 as production_v2
 from story_artifact_validation import validate_artifact_semantics
 
 
@@ -192,7 +193,7 @@ def ensure_observability(payload: dict[str, Any], *, new_run: bool = False) -> d
             performance.setdefault(name, value)
     package_rows = observability.setdefault("packages", {})
     history_complete = bool(observability.get("history_complete"))
-    for package in PACKAGE_NAMES:
+    for package in payload.get("work_packages", dict.fromkeys(PACKAGE_NAMES)):
         package_rows.setdefault(
             package,
             _new_package_observation(history_complete=history_complete),
@@ -284,7 +285,7 @@ def refresh_observability_summary(payload: dict[str, Any]) -> None:
     package_rows = observability.get("packages")
     if not isinstance(package_rows, dict):
         return
-    for package in PACKAGE_NAMES:
+    for package in payload.get("work_packages", dict.fromkeys(PACKAGE_NAMES)):
         metrics = package_rows.setdefault(
             package,
             _new_package_observation(
@@ -600,10 +601,14 @@ def load_run(path: Path) -> dict[str, Any]:
 
 
 def validate_run(payload: dict[str, Any]) -> None:
+    if payload.get("production_contract") not in (None, production_v2.VERSION):
+        raise ValueError("未知生产合同版本")
+    if production_v2.is_v2(payload) and set(payload.get("inputs", {})) != set(production_v2.INPUTS):
+        raise ValueError("v2 输入角色不完整")
     if not isinstance(payload.get("inputs"), dict):
         raise ValueError("story_run.json 缺少 inputs")
     packages = payload.get("work_packages")
-    if not isinstance(packages, dict) or set(packages) != set(PACKAGE_NAMES):
+    if not isinstance(packages, dict) or set(packages) != set(production_v2.PACKAGES if production_v2.is_v2(payload) else PACKAGE_NAMES):
         raise ValueError("story_run.json 的六个工作包不完整")
     for name, record in packages.items():
         if not isinstance(record, dict) or record.get("status") not in PACKAGE_STATES:
@@ -640,12 +645,15 @@ def init_run(
     audio: Path,
     project_dir: Path,
     subtitle_txt: Path | None = None,
+    production_inputs: dict[str, Path] | None = None,
     soft_budget: float | None = None,
     hard_budget: float | None = None,
 ) -> dict[str, Any]:
     target = run_file.expanduser().resolve()
     project = project_dir.expanduser().resolve()
     project.mkdir(parents=True, exist_ok=True)
+    if production_inputs is not None and subtitle_txt is None:
+        raise ValueError("新合同必须显式绑定字幕 TXT")
     authoritative_subtitle = (
         require_file(subtitle_txt, "确认字幕 TXT")
         if subtitle_txt is not None
@@ -674,6 +682,10 @@ def init_run(
         "artifacts": {},
         "blocker": "",
     }
+    if production_inputs is not None:
+        payload["inputs"] = production_v2.bind_inputs({**{k: Path(v["path"]) for k,v in payload["inputs"].items()}, **production_inputs})
+        payload["production_contract"] = production_v2.VERSION
+        payload["work_packages"] = {name: {"status": "pending", "blocker": ""} for name in production_v2.PACKAGES}
     ensure_observability(payload, new_run=True)
     with run_file_lock(target):
         if target.exists():
@@ -708,7 +720,7 @@ def _record_run_unlocked(
     blocker: str = "",
     replace: bool = False,
 ) -> dict[str, Any]:
-    if package not in PACKAGE_NAMES:
+    if package not in (*PACKAGE_NAMES, *production_v2.PACKAGES):
         raise ValueError(f"未知工作包：{package}")
     if status not in PACKAGE_STATES:
         raise ValueError(f"未知工作包状态：{status}")
@@ -722,6 +734,8 @@ def _record_run_unlocked(
     target = run_file.expanduser().resolve()
     payload = load_run(target)
     observability = ensure_observability(payload)
+    if package not in payload["work_packages"]:
+        raise ValueError("工作包不属于当前合同")
 
     if artifact_id:
         artifact = require_file(artifact_path or Path(), "产物")
@@ -747,6 +761,8 @@ def _record_run_unlocked(
             issues = semantic_card_motion_receipt_issues(request_path, artifact)
             if issues:
                 raise ValueError("片头/寓意卡 API 微动回执未通过：" + "；".join(issues))
+        if production_v2.is_v2(payload):
+            production_v2.validate_special(artifact_id, artifact, payload["inputs"])
         validate_artifact_semantics(
             artifact_id,
             artifact,
@@ -876,7 +892,7 @@ def _record_request_observation_unlocked(
     cost_status: str = "provider_not_exposed",
     replace: bool = False,
 ) -> dict[str, Any]:
-    if package not in PACKAGE_NAMES:
+    if package not in (*PACKAGE_NAMES, *production_v2.PACKAGES):
         raise ValueError(f"未知工作包：{package}")
     provider = provider.strip()
     request_id = request_id.strip()
@@ -1129,7 +1145,8 @@ def dependency_staleness(payload: dict[str, Any]) -> dict[str, list[str]]:
                     path = Path(str(record.get("path") or "")).expanduser().resolve()
                     current[str(key)] = file_sha256(path) if path.is_file() else "missing"
                 else:
-                    current[str(key)] = str(record["sha256"])
+                    path = Path(str(record.get("path") or ""))
+                    current[str(key)] = file_sha256(path) if path.is_file() else "missing"
     stale: dict[str, list[str]] = {}
     artifacts = payload.get("artifacts")
     if not isinstance(artifacts, dict):
@@ -1159,7 +1176,7 @@ def _finalize_run_unlocked(*, run_file: Path, required_artifacts: Iterable[str])
     if incomplete:
         raise RuntimeError(f"仍有未完成工作包：{', '.join(incomplete)}")
     required = list(
-        dict.fromkeys([*CODEX_NATIVE_REQUIRED_ARTIFACTS, *required_artifacts])
+        dict.fromkeys([*(tuple(a for a in CODEX_NATIVE_REQUIRED_ARTIFACTS if a not in production_v2.EXCLUDED) + production_v2.REQUIRED_ADDITIONS if production_v2.is_v2(payload) else CODEX_NATIVE_REQUIRED_ARTIFACTS), *required_artifacts])
     )
     # Historical ledgers predate the merged final review. Keep their real
     # customer-media review instead of inventing a v2 compatibility shell or
@@ -1185,6 +1202,12 @@ def _finalize_run_unlocked(*, run_file: Path, required_artifacts: Iterable[str])
             for artifact_id, reasons in sorted(dependency_stale.items())
         )
         raise RuntimeError(f"产物依赖已过期：{detail}")
+    if production_v2.is_v2(payload):
+        for item in payload["inputs"].values():
+            production_v2.current(item)
+        for name in production_v2.REQUIRED_ADDITIONS:
+            production_v2.validate_special(name, Path(payload["artifacts"][name]["path"]), payload["inputs"])
+        production_v2.validate_delivery_links(payload)
     for artifact_id in required:
         record = payload["artifacts"][artifact_id]
         try:
@@ -1217,7 +1240,7 @@ def _finalize_run_unlocked(*, run_file: Path, required_artifacts: Iterable[str])
             Path(theme_manifest["path"]),
             require_v3=isinstance(storyboard_receipt, dict),
         )
-    if isinstance(storyboard_receipt, dict):
+    if isinstance(storyboard_receipt, dict) and not production_v2.is_v2(payload):
         # The provider mutates status/result columns in the jobs CSV after the
         # storyboard compile receipt is sealed.  Finalization binds the current
         # receipt file and all immutable dependencies, while the delivery
@@ -1280,12 +1303,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         help="用户确认且已换好行的字幕 TXT；省略时仅在项目内唯一自动识别",
     )
+    init.add_argument("--production-contract", choices=["v1", "v2"], default="v1", help="v2 候选新合同；v1 仅兼容旧调用")
+    for role in production_v2.INPUTS:
+        if role not in {"confirmed_text", "subtitle_txt", "greenscreen_video", "audio"}:
+            init.add_argument("--" + role.replace("_", "-"), type=Path)
     init.add_argument("--soft-budget", type=float, help=argparse.SUPPRESS)
     init.add_argument("--hard-budget", type=float, help=argparse.SUPPRESS)
 
     record = subparsers.add_parser("record", help="登记一个工作包状态和可选的当前有效产物")
     record.add_argument("--run-file", required=True, type=Path)
-    record.add_argument("--package", required=True, choices=PACKAGE_NAMES)
+    record.add_argument("--package", required=True, choices=tuple(dict.fromkeys((*PACKAGE_NAMES, *production_v2.PACKAGES))))
     record.add_argument("--status", required=True, choices=sorted(PACKAGE_STATES))
     record.add_argument("--artifact-id", default="")
     record.add_argument("--path", type=Path)
@@ -1300,7 +1327,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="登记一次请求的 provider/model/ID、时间、等待、重试和 Token",
     )
     observe.add_argument("--run-file", required=True, type=Path)
-    observe.add_argument("--package", required=True, choices=PACKAGE_NAMES)
+    observe.add_argument("--package", required=True, choices=tuple(dict.fromkeys((*PACKAGE_NAMES, *production_v2.PACKAGES))))
     observe.add_argument("--provider", required=True)
     observe.add_argument("--request-id", required=True)
     observe.add_argument("--operation", required=True)
@@ -1353,6 +1380,7 @@ def main() -> None:
             audio=args.audio,
             project_dir=args.project_dir,
             subtitle_txt=args.subtitle_txt,
+            production_inputs=({role:getattr(args,role) for role in production_v2.INPUTS if role not in {"confirmed_text","subtitle_txt","greenscreen_video","audio"}} if args.production_contract=="v2" else None),
             soft_budget=args.soft_budget,
             hard_budget=args.hard_budget,
         )

@@ -31,3 +31,7 @@
 - 修改历史归档时运行 `python3 historical_archive/verify.py`；不为验证归档而恢复或执行旧生产入口。
 - 修改项目 Skill 后运行 skill-creator 的 `quick_validate.py skills/story-full-auto`。
 - 不使用工作台按钮作为自动化测试证据；优先用临时目录、模拟供应商和故障注入。
+
+## v2 候选合同适用范围
+
+新项目显式使用 `story-production/v2`，以 `story_production_v2.py` 和生产 Skill 的 v2 合同为准。音乐为用户成品，不要求音乐 QA；独立封面、文案、朗读标注、PPTX 退出主链。上文对应旧交付要求仅用于历史账本读取。保留全部视频、抠像、Logo、字幕和独立审核保护，不改全局模型配置。候选版须经真实新故事 QA 与用户体验接受方可晋级默认。

@@ -1,3 +1,7 @@
+# v2 候选接口说明
+
+新生产合同和职责见 [候选操作手册](../decouple/candidate-guide.md) 与 `story_production_v2.py`。本轮不晋级默认。以下为原执行链/合同的保留说明，仅供历史兼容与模块原理参考；音乐生成、标注、PPTX、封面和文案不属于 v2 主链。
+
 # Story Production Contract
 
 ## 目的与边界

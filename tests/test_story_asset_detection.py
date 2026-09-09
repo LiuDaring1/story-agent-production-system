@@ -16,6 +16,19 @@ from story_project import (
 
 
 class StoryAssetDetectionTests(unittest.TestCase):
+    def setUp(self):
+        from PIL import Image
+        from story_project import load_config
+        self.fixture_dir = tempfile.TemporaryDirectory()
+        self.addCleanup(self.fixture_dir.cleanup)
+        frame = Path(self.fixture_dir.name) / "frame.png"
+        Image.new("RGBA", (160, 90), (255, 0, 255, 255)).save(frame)
+        config = load_config()
+        config["brand_assets"]["frame_reference"] = str(frame)
+        patcher = patch("story_project.load_config", return_value=config)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_extracted_source_audio_is_not_misclassified_as_music(self) -> None:
         narration = Path("elephant-ant_clean_narration.m4a")
         audios = [narration, Path("source_extracted_audio.m4a")]

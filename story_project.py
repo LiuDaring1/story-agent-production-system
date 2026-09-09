@@ -178,10 +178,6 @@ DEFAULT_CONFIG: dict[str, Any] = {
         "whisper_model": "small",
         "working_video_max_width": 0,
         "proxy_video_max_width": 1280,
-        "commander_model": "gpt-5.6-sol",
-        "commander_reasoning_effort": "medium",
-        "worker_model": "gpt-5.6-luna",
-        "worker_reasoning_effort": "high",
     },
 }
 

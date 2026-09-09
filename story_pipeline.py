@@ -15,7 +15,10 @@ import story_run
 
 
 ARCHITECTURE = {
-    "schema_version": "codex-native-story-pipeline/v1",
+    "schema_version": "codex-native-story-pipeline/v2",
+    "candidate_contract": "story-production/v2",
+    "candidate_operations": ["media", "media-preview", "media-approve", "pack", "materials", "packaging", "checklist", "encode-control"],
+    "promotion": "candidate until a real new story passes QA and user acceptance",
     "human_entry": "Codex task + skills/story-full-auto",
     "supported_control_entry": "story_pipeline.py",
     "orchestrator": "foreground Codex task",
@@ -40,7 +43,8 @@ def print_help() -> None:
         "  story_pipeline.py observe-performance ...\n"
         "  story_pipeline.py status ...\n"
         "  story_pipeline.py finalize ...\n\n"
-        "内部命令参数与 story_run.py 相同。"
+        "  候选操作：media / pack / materials / packaging / checklist / encode-control\n"
+        "账本命令参数与 story_run.py 相同；候选操作使用 --run-file 和 --request。"
     )
 
 
@@ -52,6 +56,10 @@ def main() -> None:
         if len(sys.argv) != 2:
             raise SystemExit("describe 不接受其他参数")
         print(json.dumps(ARCHITECTURE, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+    if sys.argv[1] in {"media", "media-preview", "media-approve", "pack", "materials", "packaging", "checklist", "encode-control"}:
+        from story_candidate_cli import main as candidate_main
+        candidate_main(sys.argv[1:])
         return
     story_run.main()
 

@@ -253,6 +253,10 @@ def load_preview_demo_geometry_for_release_review(
     manifest_path: Path,
     project_dir: Path,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    if manifest_path.is_file() and json.loads(manifest_path.read_text()).get("schema_version") == "story-approved-demo/v2":
+        from story_media_preview import load_approved
+        return load_approved(manifest_path, project_dir)
+
     """Load reviewed Demo geometry while evidence-only preset fields refresh.
 
     Release preview is itself the independent review that locks the current

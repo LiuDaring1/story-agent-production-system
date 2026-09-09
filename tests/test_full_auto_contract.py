@@ -84,17 +84,11 @@ class FullAutoContractTests(unittest.TestCase):
     def test_future_projects_keep_the_official_demo_logo_by_default(self) -> None:
         self.assertTrue(load_config()["product_defaults"]["include_demo_logo"])
 
-    def test_default_model_routing_avoids_max_and_xhigh(self) -> None:
+    def test_local_configuration_does_not_claim_to_route_models(self) -> None:
         defaults = load_config()["agent_defaults"]
-        self.assertEqual(defaults["commander_model"], "gpt-5.6-sol")
-        self.assertEqual(defaults["worker_model"], "gpt-5.6-luna")
-        self.assertIn(defaults["commander_reasoning_effort"], {"medium", "high"})
-        self.assertEqual(defaults["worker_reasoning_effort"], "high")
-        self.assertEqual(load_config()["release_defaults"]["output_scale"], 1)
-        self.assertFalse(defaults["runtime_deadline_enabled"])
-        self.assertEqual(defaults["deadline_hours"], 0.0)
-        self.assertIsNone(defaults["target_delivery_seconds"])
-        self.assertEqual(defaults["max_full_resolution_encodes"], 1)
+        for key in ("commander_model", "worker_model", "commander_reasoning_effort", "worker_reasoning_effort"):
+            self.assertNotIn(key, defaults)
+        self.assertEqual(load_config()["resource_limits"]["formal_encode_concurrency"], 1)
 
     def test_video_provider_defaults_to_grok_10_without_15_fallback(self) -> None:
         video_api = load_config()["video_api"]

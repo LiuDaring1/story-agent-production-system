@@ -1,0 +1,17 @@
+{
+  "schema_version": "story-model-comparison/v1",
+  "executed": false,
+  "input_sha256s": {},
+  "candidate_commit": null,
+  "baseline_reference": null,
+  "actual_model": null,
+  "actual_reasoning_setting": null,
+  "settings_source": "unknown",
+  "provider_request_ids": [],
+  "tokens": null,
+  "elapsed_seconds": null,
+  "machine_qa": null,
+  "independent_review": {"score": null, "critical_errors": null, "bundle_sha256": null},
+  "user_film_acceptance": null,
+  "notes": "仅填写实测证据；不填金额、不推断效率或创意收益。"
+}

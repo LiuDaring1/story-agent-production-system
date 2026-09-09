@@ -499,6 +499,9 @@ def required_package_asset_binding(config: ReleaseConfig) -> dict[str, object]:
         receipt = json.loads(config.main_package_receipt.read_text(encoding="utf-8"))
     except json.JSONDecodeError as exc:
         raise ValueError("required_v1 主账号包装合同或回执损坏") from exc
+    if package_spec.get("schema_version") == "story-confirmed-packaging/v2":
+        from story_materials import validate_panel_binding
+        return validate_panel_binding(config, config.main_package_spec, config.main_package_receipt)
     if package_spec.get("reference_role") != "main_vertical_package":
         raise ValueError("required_v1 主账号包装参考图角色无效")
     from story_project import (

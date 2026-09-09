@@ -23,6 +23,10 @@ def sha256_path(path: Path) -> str:
 
 
 def run(command: list[str]) -> None:
+    from story_render_task import current_render_task
+    if current_render_task() is not None:
+        from story_video_synthesizer.media import run_command
+        return run_command(command)
     completed = subprocess.run(command, text=True, capture_output=True)
     if completed.returncode != 0:
         raise RuntimeError(f"命令失败（{completed.returncode}）：{' '.join(command)}\n{completed.stderr[-4000:]}")
@@ -333,6 +337,9 @@ def validate_contiguous_timeline(shots: list[dict[str, Any]], audio_duration: fl
         raise ValueError("末镜头没有覆盖到权威音频结尾，禁止用定帧补齐")
 
 
+from story_render_task import render_entry
+
+@render_entry
 def main() -> int:
     parser = argparse.ArgumentParser(description="按权威音频时间轴拼装完整 R2V 故事视觉母版")
     parser.add_argument("--plan", required=True, type=Path)
@@ -384,6 +391,8 @@ def main() -> int:
         from story_artifact_validation import validate_artifact_semantics
         from story_run import file_sha256 as ledger_sha256, load_run
 
+        from story_render_task import bind_render_task
+        bind_render_task(args.run_file, outputs=[output_path, decisions_path, clips_dir])
         ledger = load_run(args.run_file.expanduser())
         current_audio = ledger.get("inputs", {}).get("audio", {})
         resolved_audio = audio_path.resolve()
@@ -467,7 +476,10 @@ def main() -> int:
 
     rows: list[dict[str, Any]] = []
     clips_dir.mkdir(parents=True, exist_ok=True)
-    with tempfile.TemporaryDirectory(prefix="story-r2v-assembly-") as temporary:
+    from story_render_task import current_render_task
+    if current_render_task() is not None:
+        clips_dir.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="story-r2v-assembly-", dir=clips_dir if current_render_task() is not None else None) as temporary:
         work = Path(temporary)
         segments: list[Path] = []
         title_source_duration = duration(title_video, args.ffprobe)

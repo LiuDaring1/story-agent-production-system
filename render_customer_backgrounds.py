@@ -67,6 +67,9 @@ def body_timings_from_plan(
     return results
 
 
+from story_render_task import render_entry
+
+@render_entry
 def main() -> int:
     parser = argparse.ArgumentParser(description="生成有配乐无旁白的客户 16:9 背景视频")
     parser.add_argument("--visual-master", required=True, type=Path)
@@ -84,9 +87,16 @@ def main() -> int:
     parser.add_argument("--fps", default=30, type=int)
     parser.add_argument("--crf", default=20, type=int)
     parser.add_argument("--preset", default="medium")
+    parser.add_argument("--run-file", type=Path, help="v2 正式渲染必须显式绑定所属 story_run.json")
     args = parser.parse_args()
+    from story_render_task import bind_render_task
+    run = bind_render_task(args.run_file, outputs=[args.output_with_subtitles, args.output_without_subtitles, args.body_srt, args.render_receipt, args.work_dir])
+    if run is not None:
+        from story_production_v2 import binding
+        if binding(args.music) != run["inputs"]["finished_music"]:
+            raise ValueError("Music must be the ledger finished_music input")
 
-    timeline = validate_authoritative_timeline_receipt(args.authoritative_timeline_receipt)
+    timeline = validate_authoritative_timeline_receipt(args.authoritative_timeline_receipt, expected_inputs=run["inputs"] if run else None)
     timing_rows = json.loads(Path(timeline["timings"]["path"]).read_text(encoding="utf-8"))
     assembly_plan = json.loads(args.assembly_plan.read_text(encoding="utf-8"))
     body_timings = body_timings_from_plan(assembly_plan, timing_rows)

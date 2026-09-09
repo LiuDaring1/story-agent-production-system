@@ -209,6 +209,8 @@ def preflight_release_requirements(
                 break
     if run_file is None:
         raise ValueError("发布生产缺少 story_run.json；禁止回落旧生产")
+    from story_render_task import bind_render_task
+    bind_render_task(explicit_run_file, outputs=[output_dir])
     from story_requirements import validate_run_projection
 
     accounts = ["main", "library"] if variant == "both" else [variant]
@@ -220,6 +222,9 @@ def preflight_release_requirements(
     )
 
 
+from story_render_task import render_entry
+
+@render_entry
 def main() -> None:
     parser = argparse.ArgumentParser(description="把故事背景视频包装成两个小红书发布版")
     parser.add_argument("--story-name", required=True, help="故事名，例如《猴子捞月》或 猴子捞月")

@@ -9,8 +9,9 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".m4v", ".avi", ".mkv", ".webm"}
 
 
 def run_command(args: list[str]) -> None:
+    from story_render_task import current_render_task
     if (Path(args[0]).name == "ffmpeg" and Path(args[-1]).suffix.lower() in VIDEO_EXTENSIONS
-        and any(codec in args for codec in ("libx264", "libx265", "h264_videotoolbox", "prores_ks"))):
+        and (current_render_task() is not None or any(codec in args for codec in ("libx264", "libx265", "h264_videotoolbox", "prores_ks")))):
         from story_encode import run_encode
         run_encode(args)
         return

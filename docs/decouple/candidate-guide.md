@@ -64,3 +64,46 @@ python3 story_pipeline.py init --production-contract v2 \
 **修复新版项目：**先保留账本、输入/当前有效产物哈希、请求/编码现场和审核证据；定位受影响消费者，仅修这一部分，重新校验变化及实际下游。不能直接用旧程序操作新版账本。
 
 人工恢复交接至少保留：版本/合同、输入路径与哈希、当前有效产物及证据、在途请求身份、未完成项、已知问题、下一条明确命令。密钥只记环境变量名或安全存储引用。
+
+## 修复候选：正式入口任务身份与取消
+
+v2 每个正式入口都显式传 `--run-file /new/project/99_项目状态/story_run.json`。`story_pipeline.py media-preview/media`、`release_video.py`、`render_customer_backgrounds.py` 和正式 `assemble_r2v_story.py` 从账本验证 run_id 与输出项目归属，再绑定本次进程的编码身份；无需设置 STORY_TASK_ID。v2 缺少显式账本时阻断；旧 v1 调用保留原规则。所有输出/工作目录须位于该账本 project_dir 内，不能把工作目录设为项目外的公共目录。更换输入不会授权接管另一个任务拥有的编码输出。
+
+直接渲染示意（其余参数沿用本指南及各入口 --help）：
+
+```sh
+python3 render_customer_backgrounds.py --run-file /new/project/99_项目状态/story_run.json ...
+python3 release_video.py --run-file /new/project/99_项目状态/story_run.json ...
+python3 assemble_r2v_story.py --run-file /new/project/99_项目状态/story_run.json ...
+```
+
+任务内的视频编码和 copy mux 使用同一受管身份。编码回执在 `STORY_ENCODE_STATE_DIR` 指定目录，未指定时为 Python `tempfile.gettempdir()` 下的 `story-encodes-<uid>`。文件名是**实际受管输出绝对路径字符串的 SHA-256**加 `.json`。背景制作可能正在编码 `work-dir/customer_subtitled_silent.mp4`，应控制这条实际运行回执，不能用尚未编码的最终目标代替。以下只读取本机小型编码池，筛选所属账本的运行项：
+
+```sh
+python3 - /new/project/99_项目状态/story_run.json <<'PY'
+import json, sys
+from pathlib import Path
+from story_encode import state_directory
+from story_run import load_run
+run = load_run(Path(sys.argv[1]))
+for path in state_directory().glob('*.json'):
+    record = json.loads(path.read_text())
+    if record.get('task') == run['run_id'] and record.get('status') == 'running':
+        print(json.dumps({'output': record['role'], 'action': 'cancel',
+                          'expected_fingerprint': record['fingerprint']}, ensure_ascii=False))
+PY
+```
+
+将所需一条 JSON 保存到项目状态目录的 `cancel.json`，执行：
+
+```sh
+python3 story_pipeline.py encode-control --run-file /new/project/99_项目状态/story_run.json --request /new/project/99_项目状态/cancel.json
+```
+
+确认该回执进入 cancelled/failed 且锁已释放后，把同一 JSON 的 action 改为 resume，再执行相同控制命令，之后重跑原始渲染命令。若锁仍由活进程持有，resume/重复编码会拒绝。取消会停止本次命令，不会继续后续渲染；解码校验阶段也响应取消，发布有效产物前再次核对。输入/命令指纹或 run_id 不符则拒绝；残片不登记、不复用。回退不会撤销已完成供应商请求。组装器重新进入时可以复用稳定片段，但临时合并步骤可能重做，不承诺从中断字节继续编码。
+
+## 成品音乐与托管更名
+
+media-preview/media 不比较音乐与旁白的时长差来决定准入。音乐没有新增完整性、长度或审美审核；实际解码错误和最终音轨角色错误照常报告，源音乐不替换、不编辑，混音仍使用既有算法。
+
+WAV→MP3 或其他角色目标路径改变时，pack 先把旧路径、角色、哈希和退役位置写进回执。旧文件只有匹配旧回执哈希才移动至 `output_root` 的同级 `.story-managed-retired/<包路径哈希>/<唯一编号>/`，不会留在客户目录。回执保留 retired 历史，中断后重跑同一请求即可继续。用户修改的旧文件、新目标冲突或备份冲突都会明确报错，保留现场；不要删除回执来绕过冲突。重新打包没有编码调用，用户新增文件原位保留。

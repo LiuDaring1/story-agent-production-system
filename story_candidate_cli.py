@@ -46,8 +46,6 @@ def render_media(run, request, *, preview=False):
     geometry = compile_demo_presenter_geometry(sw, sh, 1920, 1080, person_crop=preset.person_crop, detected_bbox=preset.detected_person_bbox, person_height_ratio=preset.person_height_ratio, crop_mode='source-native', crop_bottom_ratio=0, vertical_alignment='center', keying_preset_sha256=binding(paths['preset'])['sha256'], keying_lock_sha256=binding(paths['preset'].with_name('keying_preset.lock.json'))['sha256'], source_greenscreen_sha256=binding(foreground)['sha256'], production_keying_filter_fingerprint=production_keying_fingerprint(preset))
     from story_video_synthesizer.media import probe_duration
     duration = probe_duration(Path(inputs['audio']['path']))
-    if abs(probe_duration(Path(inputs['finished_music']['path'])) - duration) > 0.2:
-        raise ValueError('Finished music duration must match full program; no automatic trim/loop/pad')
     from story_requirements import validate_projection
     projection = current(request['requirements_projection'])
     validate_projection(projection, registered_inputs=inputs, registered_artifacts=run['artifacts'])
@@ -73,6 +71,9 @@ def render_media(run, request, *, preview=False):
     write_customer_media_receipt(output_path=receipt, music=Path(inputs['finished_music']['path']), authoritative_timeline_receipt=paths['timeline_receipt'], subtitle_srt=paths['body_srt'], background_with_subtitles=paths['background_with_subtitles'], background_without_subtitles=paths['background_without_subtitles'], a_only_video=aonly, demo_video=demo)
     return {'demo': binding(demo), 'a_only_video': binding(aonly), 'customer_media_receipt': binding(receipt), 'presenter_geometry': geometry}
 
+from story_render_task import render_entry
+
+@render_entry
 def main(argv):
     p = argparse.ArgumentParser(description='Candidate deterministic media, packaging and materials operations')
     p.add_argument('operation', choices=['media', 'media-preview', 'media-approve', 'pack', 'materials', 'packaging', 'checklist', 'encode-control'])
@@ -87,8 +88,8 @@ def main(argv):
     if args.operation in {'media','media-preview'}:
         destinations.extend([Path(run['project_dir'])/'03_产品素材'/'media', Path(run['project_dir'])/'99_项目状态'/'media_preview', Path(run['project_dir'])/'99_项目状态'/'media_preview.json',Path(run['project_dir'])/'99_项目状态'/'customer_media_receipt.json'])
     protect_outputs(destinations,protected)
-    import os
-    os.environ['STORY_TASK_ID'] = run['run_id']
+    from story_render_task import bind_render_task
+    bind_render_task(args.run_file, outputs=destinations)
     if args.operation == 'encode-control':
         from story_encode import control_encode
         if Path(run['project_dir']).resolve() not in Path(r['output']).resolve().parents:

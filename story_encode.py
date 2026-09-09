@@ -86,6 +86,8 @@ def run_encode(args, *, timeout=21600, wait_seconds=60, limit=None):
     fingerprint = hashlib.sha256(json.dumps({'command': args, 'inputs': inputs}, sort_keys=True).encode()).hexdigest()
     root = state_directory()
     identity = hashlib.sha256(str(output).encode()).hexdigest()
+    from story_render_task import encode_task
+    task = encode_task(output) or os.environ.get("STORY_TASK_ID", identity)
     receipt = root / (identity + '.json')
     cancel = root / (identity + '.cancel')
     with (root / (identity + '.lock')).open('a+') as owner:
@@ -94,6 +96,8 @@ def run_encode(args, *, timeout=21600, wait_seconds=60, limit=None):
         except BlockingIOError:
             raise RuntimeError(f'Encode already active for {output}; do not restart')
         old = json.loads(receipt.read_text()) if receipt.exists() else {}
+        if old and old.get('task') != task:
+            raise ValueError('Encode output is owned by another task')
         if old.get('status') == 'completed' and old.get('fingerprint') == fingerprint and output.is_file() and sha(output) == old.get('output', {}).get('sha256'):
             return
         if output.exists() and (not old.get('output') or sha(output) != old['output']['sha256']):
@@ -109,7 +113,7 @@ def run_encode(args, *, timeout=21600, wait_seconds=60, limit=None):
             output.parent.mkdir(parents=True, exist_ok=True)
             fd, temporary = tempfile.mkstemp(prefix='.encoding-', suffix=output.suffix, dir=output.parent)
             os.close(fd)
-            state = {'schema_version': 'story-encode/v1', 'fingerprint': fingerprint, 'inputs': inputs, 'role': str(output), 'task': os.environ.get('STORY_TASK_ID', identity), 'parent_pid': os.getpid(), 'status': 'running', 'started_at': time.time(), 'heartbeat': time.time()}
+            state = {'schema_version': 'story-encode/v1', 'fingerprint': fingerprint, 'inputs': inputs, 'role': str(output), 'task': task, 'parent_pid': os.getpid(), 'status': 'running', 'started_at': time.time(), 'heartbeat': time.time()}
             if old.get('output'):
                 state['output'] = old['output']
             started = time.monotonic()
@@ -131,12 +135,24 @@ def run_encode(args, *, timeout=21600, wait_seconds=60, limit=None):
                     if process.returncode:
                         log.seek(0)
                         raise RuntimeError(log.read()[-8000:])
-                    check = subprocess.run(['ffmpeg', '-v', 'error', '-i', temporary, '-f', 'null', '-'], capture_output=True, timeout=timeout)
-                    if check.returncode:
+                    process = subprocess.Popen(['ffmpeg', '-v', 'error', '-i', temporary, '-f', 'null', '-'], stdout=log, stderr=log, pass_fds=(owner.fileno(), *slots))
+                    state.update(pid=process.pid, phase='validating')
+                    write(receipt, state)
+                    while process.poll() is None:
+                        if cancel.exists():
+                            raise InterruptedError('Cancellation requested during decode validation')
+                        if time.monotonic() - started > timeout:
+                            raise TimeoutError('Encode/decode validation timed out')
+                        state['heartbeat'] = time.time()
+                        write(receipt, state)
+                        time.sleep(.1)
+                    if process.returncode:
                         raise RuntimeError('Encoded output cannot decode')
                     for item in inputs:
                         if sha(item['path']) != item['sha256']:
                             raise RuntimeError('Input changed during encode')
+                    if cancel.exists():
+                        raise InterruptedError('Cancellation requested before publication')
                     os.replace(temporary, output)
                     state.update(status='completed', output=binding(output))
                     write(receipt, state)

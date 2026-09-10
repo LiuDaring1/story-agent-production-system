@@ -45,4 +45,4 @@ def material_fixture(root):
     ppt = root / 'compiled.json'
     receipt = root / 'compile.json'
     compile_consumers(sealed, sr, root / 'r2v.json', root / 'jobs.csv', receipt, previous, ppt)
-    return dict(director=d, plan=ppt, compile_receipt=receipt, inputs={r: binding(p) for r, p in [('final_word', word), ('finished_music', music), ('audio', audio)]}, output=root / 'materials.zip', receipt=root / 'materials.json')
+    return dict(director=d, plan=ppt, compile_receipt=receipt, inputs={r: binding(p) for r, p in [('final_word', word), ('finished_music', music), ('audio', audio)]}, output=root / 'materials', receipt=root / 'materials.json')

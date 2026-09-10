@@ -6,6 +6,14 @@ from pathlib import Path
 from story_production_v2 import binding
 
 
+def _closed_subtitle_graph(value):
+    """Only our exact inline numeric overlay grammar; no external file filters."""
+    label = r"\[[A-Za-z0-9_:]+\]"
+    number = r"-?\d+(?:\.\d+)?"
+    chain = label + label + r"overlay=" + number + ":" + number + r":enable='between\(t," + number + "," + number + r"\)'" + label
+    return bool(value) and all(re.fullmatch(chain, part) for part in value.split(';'))
+
+
 def snapshot(args):
     files, groups, reasons = [], [], []
     def add(path):
@@ -78,7 +86,8 @@ def snapshot(args):
             add(value)
             reasons.append('external filter script may reference other files')
         elif arg.startswith(('-filter', '-vf', '-af', '-lavfi')):
-            reasons.append('filter graph may reference external files')
+            if not (arg == '-filter_complex' and _closed_subtitle_graph(value)):
+                reasons.append('filter graph may reference external files')
         elif arg in {'-pass','-passlogfile','-attach','-enable_drefs','-hls_key_info_file'}:
             reasons.append('additional external encoder dependency')
         elif arg.startswith('-') and arg not in {

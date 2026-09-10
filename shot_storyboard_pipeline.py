@@ -176,8 +176,11 @@ def _asset_bundle_payload(director_plan_path: Path) -> dict[str, Any]:
     assets = director.get("assets")
     if not isinstance(assets, list) or not assets:
         raise StoryboardPipelineError("导演计划缺少资产")
-    records = [_asset_record(asset) for asset in assets if isinstance(asset, dict)]
-    if len(records) != len(assets):
+    from story_asset_efficiency import validate_aliases
+    generation_plan = validate_aliases(director)
+    omitted = {r['asset_id'] for r in generation_plan['assets'] if r['operation'] == 'omit_unconsumed'}
+    records = [_asset_record(asset) for asset in assets if isinstance(asset, dict) and asset.get('asset_id') not in omitted]
+    if any(not isinstance(asset, dict) for asset in assets):
         raise StoryboardPipelineError("导演计划 assets 包含非对象")
     continuity_groups = director.get("continuity_groups")
     if not isinstance(continuity_groups, list) or not continuity_groups:
@@ -195,6 +198,7 @@ def _asset_bundle_payload(director_plan_path: Path) -> dict[str, Any]:
         "director_plan_path": str(director_path),
         "director_plan_sha256": file_sha256(director_path),
         "asset_count": len(records),
+        "generation_plan": generation_plan,
         "assets": records,
         "continuity_groups": continuity_groups,
         "asset_bundle_sha256": bundle_hash,

@@ -111,6 +111,9 @@ def _config(root: Path, *, person_region_ready: bool = True) -> ReleaseConfig:
         top_panel=top_panel,
         bottom_panel=bottom_panel,
     )
+    # This fixture explicitly exercises read-only legacy magenta lineage.
+    spec_payload["frame_source_mode"] = "imagegen_magenta_chroma_source"
+    spec_payload["frame_source_background"] = "#FF00FF"
     spec_payload["theme_request_path"] = str(theme_request)
     spec_payload["theme_request_sha256"] = hashlib.sha256(theme_request.read_bytes()).hexdigest()
     save_json(package_spec, spec_payload)

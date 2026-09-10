@@ -493,11 +493,18 @@ def _validate_theme_assets_v3(payload: dict[str, Any]) -> None:
     if environment.get("sha256") != file_sha256(environment_path):
         raise ValueError("环境源图哈希不匹配")
 
-    frame_source = sources.get("story_frame_magenta")
-    _validate_hashed_raster(frame_source, "story_frame_magenta", method_key="method")
+    native_alpha = "story_frame_alpha" in sources
+    source_role = "story_frame_alpha" if native_alpha else "story_frame_magenta"
+    frame_source = sources.get(source_role)
+    source_path = _validate_hashed_raster(frame_source, source_role, method_key="method")
     if frame_source.get("method") not in {"imagegen_raster", "imagegen_reference_edit"}:
-        raise ValueError("洋红故事框源图必须由 ImageGen 栅格生成或参考编辑")
-    if str(frame_source.get("background") or "").upper() != "#FF00FF":
+        raise ValueError("故事框源图必须由 ImageGen 栅格生成或参考编辑")
+    if native_alpha:
+        from PIL import Image
+        from story_frame_alpha import validate_native_frame_alpha
+        with Image.open(source_path) as source_image:
+            validate_native_frame_alpha(source_image)
+    elif str(frame_source.get("background") or "").upper() != "#FF00FF":
         raise ValueError("故事框源图内外必须使用纯 #FF00FF 洋红")
     if frame_source.get("checkerboard") is not False:
         raise ValueError("故事框源图禁止棋盘格")
@@ -510,17 +517,22 @@ def _validate_theme_assets_v3(payload: dict[str, Any]) -> None:
     frame_path = _validate_hashed_raster(frame, "story_frame_png", method_key="method")
     if frame_path.suffix.lower() != ".png":
         raise ValueError("透明故事框必须是 PNG")
-    if frame.get("method") != "connected_magenta_raster_alpha_postprocess":
-        raise ValueError("透明故事框必须由洋红栅格源图做固定 Alpha 后处理")
-    if frame.get("derived_from") != ["story_frame_magenta"] or frame.get("has_true_alpha") is not True:
-        raise ValueError("透明故事框必须绑定同一洋红源图并具有真实 Alpha")
+    allowed_frame_methods = {"native_alpha_passthrough", "raster_alpha_postprocess"} if native_alpha else {"connected_magenta_raster_alpha_postprocess"}
+    if frame.get("method") not in allowed_frame_methods:
+        raise ValueError("透明故事框派生方法与源图模式不符")
+    if frame.get("derived_from") != [source_role] or frame.get("has_true_alpha") is not True:
+        raise ValueError("透明故事框必须绑定同一源图并具有真实 Alpha")
+    from PIL import Image
+    from story_frame_alpha import validate_native_frame_alpha
+    with Image.open(frame_path) as frame_image:
+        validate_native_frame_alpha(frame_image)
 
     frame_review = payload.get("frame_design_review")
     required_frame_checks = (
         "passed",
         "current_story_redesign",
         "no_reference_theme_leak",
-        "solid_magenta_source",
+        "true_alpha_verified" if native_alpha else "solid_magenta_source",
         "continuous_opaque_four_sides",
         "inner_masking_lip",
     )
@@ -892,6 +904,11 @@ def _record_request_observation_unlocked(
     total_tokens: int | None = None,
     request_sha256: str = "",
     error_type: str = "",
+    reasoning_effort: str | None = None,
+    execution_mode: str | None = None,
+    rework_reason: str | None = None,
+    rework_classification: str | None = None,
+    artifact_paths: list[str] | None = None,
     estimated_cost: float | None = None,
     actual_cost: float | None = None,
     currency: str = "CNY",
@@ -942,7 +959,17 @@ def _record_request_observation_unlocked(
     if key in requests and not replace:
         raise RuntimeError(f"请求 {key!r} 已登记；更新状态必须显式使用 --replace")
 
+    if execution_mode not in {None, 'first_execution', 'resume_reuse', 'rework'}:
+        raise ValueError('Invalid execution mode')
+    if rework_classification not in {None, 'valid', 'invalid', 'unknown'}:
+        raise ValueError('Invalid rework classification')
     record = {
+        "reasoning_effort": reasoning_effort,
+        "execution_mode": execution_mode,
+        "rework_reason": rework_reason,
+        "rework_classification": rework_classification,
+        "artifacts": [production_v2.binding(p) for p in (artifact_paths or [])],
+        "configuration_evidence": {"expected": "inherit current task settings", "actual_model": model.strip() or None, "actual_reasoning_effort": reasoning_effort},
         "package": package,
         "provider": provider,
         "request_id": request_id,
@@ -1025,6 +1052,11 @@ def record_request_observation(
     total_tokens: int | None = None,
     request_sha256: str = "",
     error_type: str = "",
+    reasoning_effort: str | None = None,
+    execution_mode: str | None = None,
+    rework_reason: str | None = None,
+    rework_classification: str | None = None,
+    artifact_paths: list[str] | None = None,
     estimated_cost: float | None = None,
     actual_cost: float | None = None,
     currency: str = "CNY",
@@ -1052,6 +1084,8 @@ def record_request_observation(
             total_tokens=total_tokens,
             request_sha256=request_sha256,
             error_type=error_type,
+            reasoning_effort=reasoning_effort, execution_mode=execution_mode, rework_reason=rework_reason,
+            rework_classification=rework_classification, artifact_paths=artifact_paths,
             estimated_cost=estimated_cost,
             actual_cost=actual_cost,
             currency=currency,
@@ -1126,6 +1160,7 @@ def status_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "token_usage": payload["observability"]["token_summary"],
         "request_count": len(payload["observability"]["requests"]),
         "performance": payload["observability"]["performance"],
+        "work_summary": __import__("story_work_observation").summarize(payload),
         "stale_artifacts": stale_dependencies,
         "blocker": payload.get("blocker", ""),
         "finalized": bool(payload.get("finalized_at")),
@@ -1350,6 +1385,11 @@ def build_parser() -> argparse.ArgumentParser:
     observe.add_argument("--total-tokens", type=int)
     observe.add_argument("--request-sha256", default="")
     observe.add_argument("--error-type", default="")
+    observe.add_argument("--reasoning-effort")
+    observe.add_argument("--execution-mode", choices=['first_execution', 'resume_reuse', 'rework'])
+    observe.add_argument("--rework-reason")
+    observe.add_argument("--rework-classification", choices=['valid', 'invalid', 'unknown'])
+    observe.add_argument("--artifact-path", action='append', default=[])
     observe.add_argument("--estimated-cost", type=float, help=argparse.SUPPRESS)
     observe.add_argument("--actual-cost", type=float, help=argparse.SUPPRESS)
     observe.add_argument("--currency", default="CNY", help=argparse.SUPPRESS)
@@ -1426,6 +1466,8 @@ def main() -> None:
             total_tokens=args.total_tokens,
             request_sha256=args.request_sha256,
             error_type=args.error_type,
+            reasoning_effort=args.reasoning_effort, execution_mode=args.execution_mode, rework_reason=args.rework_reason,
+            rework_classification=args.rework_classification, artifact_paths=args.artifact_path,
             estimated_cost=args.estimated_cost,
             actual_cost=args.actual_cost,
             currency=args.currency,

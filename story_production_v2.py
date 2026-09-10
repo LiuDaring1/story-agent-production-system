@@ -15,23 +15,55 @@ ADVANCED_ROLES = (*BASE_ROLES, 'background_video_with_subtitles', 'background_vi
 DELIVERY_ROLES = ('main_release_video', 'library_release_video', *(f'base:{r}' for r in BASE_ROLES), *(f'advanced:{r}' for r in ADVANCED_ROLES))
 
 def sha(path):
+    p = Path(path)
+    if p.is_dir():
+        return directory_binding(p)['sha256']
     h = hashlib.sha256()
-    with Path(path).open('rb') as f:
+    with p.open('rb') as f:
         for b in iter(lambda: f.read(1024 * 1024), b''):
             h.update(b)
     return h.hexdigest()
 
+def directory_binding(path):
+    """Content-address a tree; symbolic links are never managed deliverables."""
+    p = Path(path).resolve()
+    members = []
+    for child in sorted(p.rglob('*')):
+        if child.is_symlink():
+            raise ValueError(f'Symlink in managed directory: {child}')
+        if child.is_file():
+            members.append({'relative_path': child.relative_to(p).as_posix(),
+                            'sha256': sha(child), 'bytes': child.stat().st_size})
+    if not members:
+        raise ValueError('Empty managed directory')
+    digest = hashlib.sha256(json.dumps(members, ensure_ascii=False, sort_keys=True,
+                                      separators=(',', ':')).encode()).hexdigest()
+    return {'path': str(p), 'sha256': digest, 'bytes': sum(x['bytes'] for x in members),
+            'kind': 'directory', 'members': members}
+
+
 def binding(path):
     if path is None:
         raise ValueError('Missing explicit input path')
-    p = Path(path).expanduser().resolve()
+    p = Path(path).expanduser()
+    if p.is_symlink():
+        raise ValueError(f'Symlink bound input: {p}')
+    p = p.resolve()
+    if p.is_dir():
+        return directory_binding(p)
     if not p.is_file():
         raise ValueError(f'Missing bound input: {p}')
     return {'path': str(p), 'sha256': sha(p), 'bytes': p.stat().st_size}
 
+
 def current(item):
     p = Path(item['path'])
-    if not p.is_file() or sha(p) != item['sha256']:
+    if p.is_symlink():
+        raise ValueError(f'Changed binding: {p}')
+    if item.get('kind') == 'directory':
+        if not p.is_dir() or any(item.get(k) != v for k, v in directory_binding(p).items()):
+            raise ValueError(f'Changed directory binding: {p}')
+    elif not p.is_file() or sha(p) != item['sha256']:
         raise ValueError(f'Changed binding: {p}')
     return p
 
@@ -114,8 +146,8 @@ def validate_delivery_links(run):
     materials = json.loads(Path(artifacts['ppt_materials_receipt']['path']).read_text())
     package = validate_managed_receipt(artifacts['managed_package_receipt']['path'], run['inputs'])
     ppt = next((item for item in package['artifacts'] if item['role'] == 'advanced:ppt_materials'))
-    if ppt['sha256'] != materials['archive']['sha256']:
-        raise ValueError('Delivered PPT materials are not the reviewed archive')
+    if ppt['sha256'] != materials.get('directory', materials.get('archive', {}))['sha256']:
+        raise ValueError('Delivered PPT materials are not the reviewed materials')
     if materials['compile_receipt']['sha256'] != artifacts['shot_storyboard_compile_receipt']['sha256']:
         raise ValueError('PPT materials use another storyboard compilation')
     release = json.loads(Path(artifacts['release_package_receipt']['path']).read_text())

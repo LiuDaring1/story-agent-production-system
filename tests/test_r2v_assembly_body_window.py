@@ -16,7 +16,9 @@ class BodyWindowAssemblyTests(unittest.TestCase):
         self.audio = self.root / 'audio.mp3'; self.audio.write_bytes(b'current audio')
         self.title = self.root / 'title.mp4'; self.title.write_bytes(b'reviewed title')
         self.moral = self.root / 'moral.mp4'; self.moral.write_bytes(b'reviewed moral')
-        self.timeline = {'authoritative_audio': self.bind(self.audio), 'audio_duration_seconds': 10.000156}
+        self.confirmed = self.root / 'confirmed.txt'; self.confirmed.write_text('片头。正文。寓意')
+        self.timings = self.write('timings.json', [{'line':'片头','source_start':0,'source_end':1}, {'line':'正文','source_start':1,'source_end':8.000156}, {'line':'寓意','source_start':8.000156,'source_end':10.000156}])
+        self.timeline = {'timings': self.bind(self.timings), 'authoritative_audio': self.bind(self.audio), 'audio_duration_seconds': 10.000156}
         self.timeline_path = self.write('timeline.json', self.timeline)
         self.request = {'cards': [{'card_kind': 'title_card', 'presentation_window_seconds': 1},
                                   {'card_kind': 'moral_card', 'presentation_window_seconds': 2, 'text': '寓意'}]}
@@ -25,7 +27,7 @@ class BodyWindowAssemblyTests(unittest.TestCase):
             {'card_kind': k, 'output_video_path': str(p), 'output_video_sha256': sha256_path(p)}
             for k, p in [('title_card', self.title), ('moral_card', self.moral)]]}
         self.receipt_path = self.write('motion.json', self.receipt)
-        self.ledger = {'inputs': {'audio': self.bind(self.audio)}, 'artifacts': {
+        self.ledger = {'inputs': {'audio': self.bind(self.audio), 'confirmed_text': self.bind(self.confirmed)}, 'artifacts': {
             'authoritative_timeline_receipt': self.bind(self.timeline_path),
             'semantic_card_motion_receipt': self.bind(self.receipt_path)}}
         self.plan = {'source_audio': {**self.bind(self.audio), 'duration_seconds': 10.000156},
@@ -134,6 +136,15 @@ class BodyWindowAssemblyTests(unittest.TestCase):
             self.expand()
         self.request['extra'] = True; self.write(self.request_path.name, self.request)
         with self.assertRaisesRegex(ValueError, '请求哈希'):
+            self.expand()
+
+    def test_abbreviated_moral_rejected_even_when_request_hash_is_current(self):
+        self.request['cards'][1]['text'] = '短词'
+        self.write(self.request_path.name, self.request)
+        self.receipt['request_sha256'] = sha256_path(self.request_path)
+        self.write(self.receipt_path.name, self.receipt)
+        self.ledger['artifacts']['semantic_card_motion_receipt'] = self.bind(self.receipt_path)
+        with self.assertRaisesRegex(ValueError, '完整寓意'):
             self.expand()
 
 

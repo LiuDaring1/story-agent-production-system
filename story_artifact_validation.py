@@ -72,6 +72,9 @@ def _require_current_binding(item: Mapping[str, Any], label: str) -> Path:
     if not path_text or len(expected) != 64:
         raise ValueError(f"{label}缺少 path/sha256 绑定")
     path = Path(path_text).expanduser().resolve()
+    if item.get("kind") == "directory":
+        from story_production_v2 import current
+        return current(item)
     if not path.is_file():
         raise ValueError(f"{label}绑定文件不存在：{path}")
     if file_sha256(path) != expected:
@@ -98,7 +101,14 @@ def _member_bindings(payload: Mapping[str, Any], label: str) -> dict[Path, str]:
         path = _require_current_binding(item, label)
         if path in result:
             raise ValueError(f"{label}重复列出文件：{path}")
-        result[path] = str(item["sha256"]).lower()
+        if item.get("kind") == "directory":
+            for member in item['members']:
+                child = path / member['relative_path']
+                if child in result:
+                    raise ValueError(f"{label}重复列出文件：{child}")
+                result[child] = member['sha256']
+        else:
+            result[path] = str(item["sha256"]).lower()
     return result
 
 
@@ -397,11 +407,11 @@ def _validate_product_qa_against_checklist(
         return
     expected = {
         path: digest for path, digest in checklist.items()
-        if re.search(r"[（(](?:基础版|进阶版)[）)]$", path.parent.name)
+        if any(re.search(r"[（(](?:基础版|进阶版)[）)]$", parent.name) for parent in path.parents)
     }
     actual = _member_bindings(payload, "机器 QA qa_product_report")
     if actual != expected:
-        raise ValueError("资料包机器 QA 未绑定最终交付清单中当前 5+10 个实际成员")
+        raise ValueError("资料包机器 QA 未绑定最终交付清单中当前实际成员")
 
 
 def _validate_publish_qa_against_checklist(

@@ -304,7 +304,7 @@ class ArtifactSemanticPlanTests(unittest.TestCase):
         self.assertEqual(cards["title_card"]["source_line_numbers"], [1, 2])
         self.assertEqual(
             cards["moral_card"]["text"],
-            "光长得好看是不够的，能帮助大家才是真正的美。",
+            "小朋友们，光长得好看是不够的，能帮助大家才是真正的美。",
         )
         self.assertFalse(plan["pre_roll_diagnostic"]["suspected"])
 

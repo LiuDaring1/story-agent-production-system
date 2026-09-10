@@ -58,7 +58,8 @@ class DecoupledProductionTests(unittest.TestCase):
             dest.write_bytes(b'user')
             second = package(**args)
         self.assertEqual(dest.read_bytes(), b'user')
-        self.assertEqual(first, second)
+        self.assertEqual({k:v for k,v in first.items() if k != "reused"}, {k:v for k,v in second.items() if k != "reused"})
+        self.assertTrue(second["reused"])
         for item in second['artifacts']:
             if item['role'].endswith(':music'):
                 self.assertEqual(Path(item['path']).suffix, '.wav')
@@ -129,6 +130,7 @@ class DecoupledProductionTests(unittest.TestCase):
         self.assertEqual(len(validate_checklist(p)['artifacts']), len(DELIVERY_ROLES))
 
     def test_prompt_exact_template_and_reference_hash(self):
+        self.paths['story_requirements'].write_text('{}')
         self.paths['packaging_prompt'].write_text('顶部：{story_type}《{story_name}》。下部：{duration_text}，{age_range}。风格：{theme_style}。固定内容。')
         self.inputs = bind_inputs(self.paths)
         out = self.root / 'prompt.txt'
@@ -175,7 +177,7 @@ if __name__ == '__main__':
 
 class RealMaterialsChainTests(unittest.TestCase):
 
-    def test_compiler_export_and_actual_zip_manifest(self):
+    def test_compiler_export_and_actual_directory_manifest(self):
         from tests.decoupled_material_fixture import material_fixture
         from story_materials import export_materials, validate_materials
         with tempfile.TemporaryDirectory() as d:
@@ -189,16 +191,12 @@ class RealMaterialsChainTests(unittest.TestCase):
             validate_materials(args['receipt'], args['inputs'])
             self.assertEqual(original_word, sha(args['inputs']['final_word']['path']))
             self.assertEqual(original_music, sha(args['inputs']['finished_music']['path']))
-            archive = args['output']
-            with zipfile.ZipFile(archive) as z:
-                members = {n: z.read(n) for n in z.namelist()}
-            manifest = json.loads(members['manifest.json'])
+            directory = args['output']
+            manifest_path = directory / 'manifest.json'
+            manifest = json.loads(manifest_path.read_text())
             manifest['rows'][0]['text'] = '偷偷修改'
-            members['manifest.json'] = json.dumps(manifest).encode()
-            with zipfile.ZipFile(archive, 'w') as z:
-                for n, data in members.items():
-                    z.writestr(n, data)
-            result['archive'] = binding(archive)
+            write(manifest_path, manifest)
+            result['directory'] = binding(directory)
             write(args['receipt'], result)
             with self.assertRaisesRegex(ValueError, 'Packaged manifest'):
                 validate_materials(args['receipt'], args['inputs'])
@@ -230,7 +228,7 @@ class V2FinalizationTests(unittest.TestCase):
             run['inputs'].update(args['inputs'])
             for role in ('subtitle_srt', 'story_requirements', 'packaging_reference', 'packaging_prompt'):
                 p = root / (role + '.txt')
-                p.write_text('confirmed')
+                p.write_text('{}' if role == 'story_requirements' else 'confirmed')
                 run['inputs'][role] = binding(p)
             prompt_receipt = root / 'prompt_receipt.json'
             bind_packaging(inputs=run['inputs'], fields=dict(story_name='测试', story_type='寓言', age_range='6岁', duration_text='22秒', theme_style='水彩'), output=root / 'compiled_prompt.txt', receipt=prompt_receipt)
@@ -341,6 +339,14 @@ class PreviewAndOutputProtectionTests(unittest.TestCase):
             top=root/'top.png';top.write_bytes(b'top');bottom=root/'bottom.png';bottom.write_bytes(b'bottom')
             bundle=root/'bundle.json';write(bundle,{'artifacts':[binding(top),binding(spec)]})
             review=root/'review.json';write(review,dict(approved=True,score=90,critical_errors=[],independent_context=True,reviewer_context='reviewer',artifact_sha256=sha(bundle)))
-            generation=root/'generation.json';write(generation,{'schema_version':'story-confirmed-panels/v2','producer_context':'producer','prompt_receipt_sha256':sha(spec),'reference_attached':True,'imagegen_native':True,'request_id':'offline-fixture','checks':dict(text_matches_confirmed_prompt=True,no_reference_story_leak=True,top_bottom_coherent=True,simple_layout=True),'review':binding(review),'review_bundle':binding(bundle),'outputs':{'library_top_plate':binding(top),'library_bottom_plate':binding(bottom)}})
+            generation=root/'generation.json';write(generation,{'schema_version':'story-confirmed-panels/v2','producer_context':'producer','prompt_receipt_sha256':sha(spec),'reference_attached':True,'imagegen_native':True,'request_id':'offline-fixture','scope_checks':{scope:{key:True for key in rule['review_checks']} for scope,rule in json.loads(spec.read_text())['visual_scopes'].items() if scope in ('main','library')},'review':binding(review),'review_bundle':binding(bundle),'outputs':{'library_top_plate':binding(top),'library_bottom_plate':binding(bottom)}})
             config=SimpleNamespace(main_top_panel=None,main_bottom_panel=None,library_top_panel=top,library_bottom_panel=bottom,duration_text='3秒',story_name='测试')
             with self.assertRaisesRegex(ValueError,'reviewed current output'):validate_panel_binding(config,spec,generation)
+            write(bundle, {'artifacts': [binding(top), binding(bottom), binding(spec)]})
+            review_data = json.loads(review.read_text()); review_data['artifact_sha256'] = sha(bundle)
+            write(review, review_data)
+            generation_data = json.loads(generation.read_text())
+            generation_data.update(review=binding(review), review_bundle=binding(bundle))
+            # No aggregate checks/simple_layout: only main's scoped check applies.
+            write(generation, generation_data)
+            validate_panel_binding(config, spec, generation)

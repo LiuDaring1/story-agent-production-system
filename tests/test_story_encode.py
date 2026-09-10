@@ -50,9 +50,12 @@ class EncodeTests(unittest.TestCase):
         self.addCleanup(lambda: process.poll() is None and process.kill())
         receipt = self.root / 'pool' / (hashlib.sha256(str(out).encode()).hexdigest() + '.json')
         deadline = time.monotonic() + 10
-        while not receipt.exists() and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            if receipt.exists() and json.loads(receipt.read_text()).get('pid'):
+                break
             time.sleep(0.05)
         self.assertTrue(receipt.exists())
+        self.assertIn('pid', json.loads(receipt.read_text()))
         with self.assertRaisesRegex(RuntimeError, 'already active'):
             run_encode(args)
         cancel = receipt.with_suffix('.cancel')
@@ -73,9 +76,12 @@ class EncodeTests(unittest.TestCase):
         process = subprocess.Popen([sys.executable, '-c', 'from story_encode import run_encode;import json,sys;run_encode(json.loads(sys.argv[1]))', json.dumps(args)], stderr=subprocess.DEVNULL)
         receipt = self.root / 'pool' / (hashlib.sha256(str(out).encode()).hexdigest() + '.json')
         deadline = time.monotonic() + 10
-        while not receipt.exists() and time.monotonic() < deadline:
+        while time.monotonic() < deadline:
+            if receipt.exists() and json.loads(receipt.read_text()).get('pid'):
+                break
             time.sleep(0.05)
         self.assertTrue(receipt.exists())
+        self.assertIn('pid', json.loads(receipt.read_text()))
         process.kill()
         process.wait()
         with self.assertRaisesRegex(RuntimeError, 'already active'):
@@ -97,3 +103,38 @@ class ControlOwnershipTests(EncodeTests):
         with self.assertRaisesRegex(ValueError, 'identity/task'):
             control_encode(out, action='cancel', expected_fingerprint=state['fingerprint'], expected_task='unrelated')
         self.assertFalse(receipt.with_suffix('.cancel').exists())
+
+class QueueTests(unittest.TestCase):
+    setUp = EncodeTests.setUp
+    command = EncodeTests.command
+
+    def test_waiting_is_observable_cancellable_and_resumable(self):
+        from story_encode import encode_slot, control_encode
+        out = self.root / 'queued.mp4'
+        args = self.command(out)
+        receipt = self.root / 'pool' / (hashlib.sha256(str(out).encode()).hexdigest() + '.json')
+        with encode_slot(limit=1):
+            process = subprocess.Popen([sys.executable, '-c', 'from story_encode import run_encode;import json,sys;run_encode(json.loads(sys.argv[1]))', json.dumps(args)], stderr=subprocess.PIPE)
+            self.addCleanup(lambda: process.poll() is None and process.kill())
+            deadline = time.monotonic() + 5
+            while not receipt.exists() and time.monotonic() < deadline:
+                time.sleep(.05)
+            state = json.loads(receipt.read_text())
+            self.assertEqual(state['status'], 'waiting')
+            control_encode(out, action='cancel', expected_fingerprint=state['fingerprint'], expected_task=state['task'])
+            process.communicate(timeout=5)
+            self.assertEqual(json.loads(receipt.read_text())['status'], 'cancelled')
+        control_encode(out, action='resume', expected_fingerprint=state['fingerprint'], expected_task=state['task'])
+        run_encode(args)
+        self.assertEqual(json.loads(receipt.read_text())['status'], 'completed')
+
+    def test_explicit_queue_deadline_is_deferred_not_failed(self):
+        from story_encode import encode_slot
+        out = self.root / 'later.mp4'
+        with encode_slot(limit=1):
+            with self.assertRaises(TimeoutError):
+                run_encode(self.command(out), wait_seconds=.02)
+        receipt = self.root / 'pool' / (hashlib.sha256(str(out).encode()).hexdigest() + '.json')
+        self.assertEqual(json.loads(receipt.read_text())['status'], 'waiting')
+        run_encode(self.command(out))
+        self.assertEqual(json.loads(receipt.read_text())['status'], 'completed')

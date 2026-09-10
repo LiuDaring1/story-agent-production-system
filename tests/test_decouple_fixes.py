@@ -32,7 +32,7 @@ class RetirementTests(unittest.TestCase):
         self.change_music(args)
         with patch('subprocess.Popen', side_effect=AssertionError('no encode')):
             result = package(**args)
-            self.assertEqual(result, package(**args))
+            self.assertEqual({k:v for k,v in result.items() if k != "reused"}, {k:v for k,v in package(**args).items() if k != "reused"})
         self.assertEqual(len(result['retired']), 2)
         for item in result['retired']:
             self.assertFalse(Path(item['path']).exists())
@@ -72,7 +72,7 @@ class RetirementTests(unittest.TestCase):
         result = package(**args)
         self.assertEqual(len(result['retired']), 2)
         self.assertTrue(all(i['status'] == 'archived' for i in result['retired']))
-        self.assertEqual(result, package(**args))
+        self.assertEqual({k:v for k,v in result.items() if k != "reused"}, {k:v for k,v in package(**args).items() if k != "reused"})
 
 
 class RenderTaskTests(unittest.TestCase):

@@ -216,6 +216,13 @@ def expand_body_assembly_segments(
         value = cards.get(kind, {}).get("presentation_window_seconds")
         if value is None or not isfinite(float(value)) or abs(float(value) - length) > 0.000501:
             raise ValueError(f"{kind} presentation_window 与正文前后补集不符")
+    moral_text_binding = None
+    if tail > 1e-6:
+        from story_visual_contracts import confirmed_moral_text
+        moral_text_binding = confirmed_moral_text(ledger['inputs'], timeline, end)
+        normalize_layout = lambda text: ''.join(str(text).split())
+        if normalize_layout(cards['moral_card'].get('text', '')) != normalize_layout(moral_text_binding['text']):
+            raise ValueError('MORAL必须保留确认文稿完整寓意文本，不得缩写或删句')
     validate_semantic_card_video_bindings(
         title_video=title_video, moral_video=moral_video,
         motion_receipt_path=motion_path, require_moral=tail > 1e-6,
@@ -229,6 +236,7 @@ def expand_body_assembly_segments(
         "policy": "bound_semantic_card_complements/v1",
         "body_audio_window": copy.deepcopy(window),
         "title_window": [0.0, start], "moral_window": [end, audio_duration] if tail > 1e-6 else None,
+        "moral_text_binding": moral_text_binding,
         "motion_request": {"path": str(request_path), "sha256": sha256_path(request_path)},
         "motion_receipt": {"path": str(motion_path), "sha256": sha256_path(motion_path)},
         "director_plan_unchanged": True,

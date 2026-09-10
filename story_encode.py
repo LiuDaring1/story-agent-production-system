@@ -1,4 +1,4 @@
-"""Local FFmpeg ownership, bounded waits and a shared configurable encode pool."""
+"""Local FFmpeg ownership, cancellable resource queues and a shared encode pool."""
 from __future__ import annotations
 
 from contextlib import contextmanager
@@ -27,17 +27,20 @@ def limit_default():
 
 
 @contextmanager
-def encode_slot(*, limit=None, wait_seconds=60, cancelled=lambda: False):
+def encode_slot(*, limit=None, wait_seconds=None, cancelled=lambda: False, waiting=lambda: None):
     """Capacity cannot change while any encoder or waiter uses the pool."""
     root = state_directory()
     count = limit if limit is not None else limit_default()
     if isinstance(count, bool) or not isinstance(count, int) or count < 1:
         raise ValueError('Encode concurrency must be a positive integer')
-    deadline = time.monotonic() + wait_seconds
+    deadline = None if wait_seconds is None else time.monotonic() + wait_seconds
     with (root / 'capacity.lock').open('a+') as configuration:
         # Hold a shared capacity lock throughout encoding; initialize/change only while idle.
         cap = root / 'capacity.json'
         while True:
+            if cancelled():
+                raise InterruptedError("Encode cancelled while queued")
+            waiting()
             try:
                 fcntl.flock(configuration, fcntl.LOCK_SH | fcntl.LOCK_NB)
                 if cap.exists() and json.loads(cap.read_text())['limit'] == count:
@@ -50,12 +53,15 @@ def encode_slot(*, limit=None, wait_seconds=60, cancelled=lambda: False):
             except BlockingIOError:
                 if cancelled():
                     raise InterruptedError('Encode cancelled while waiting for pool configuration')
-                if time.monotonic() >= deadline:
+                if deadline is not None and time.monotonic() >= deadline:
                     raise TimeoutError('Change encode capacity only when the shared pool is idle')
                 time.sleep(.1)
         slot = None
         try:
             while slot is None:
+                if cancelled():
+                    raise InterruptedError("Encode cancelled while queued")
+                waiting()
                 for index in range(count):
                     candidate = (root / f'slot-{index}.lock').open('a+')
                     try:
@@ -67,7 +73,7 @@ def encode_slot(*, limit=None, wait_seconds=60, cancelled=lambda: False):
                 if slot is None:
                     if cancelled():
                         raise InterruptedError('Encode cancelled while waiting')
-                    if time.monotonic() >= deadline:
+                    if deadline is not None and time.monotonic() >= deadline:
                         raise TimeoutError('Encode slots busy; bounded wait ended')
                     time.sleep(.1)
             yield (slot.fileno(), configuration.fileno())
@@ -76,7 +82,17 @@ def encode_slot(*, limit=None, wait_seconds=60, cancelled=lambda: False):
                 slot.close()
 
 
-def run_encode(args, *, timeout=21600, wait_seconds=60, limit=None):
+def run_encode(args, *, timeout=21600, wait_seconds=None, limit=None):
+    from story_render_task import current_render_task
+    task = current_render_task()
+    if task:
+        from story_work_observation import operation_observation
+        with operation_observation(task['ledger'], 'ffmpeg', 'encode', artifacts=[args[-1]]) as fact:
+            return _run_encode(args, timeout=timeout, wait_seconds=wait_seconds, limit=limit, fact=fact)
+    return _run_encode(args, timeout=timeout, wait_seconds=wait_seconds, limit=limit)
+
+
+def _run_encode(args, *, timeout=21600, wait_seconds=None, limit=None, fact=None):
     output = Path(args[-1]).expanduser().resolve()
     from story_encode_dependencies import snapshot
     dependencies = snapshot(args)
@@ -101,12 +117,44 @@ def run_encode(args, *, timeout=21600, wait_seconds=60, limit=None):
         if old and old.get('task') != task:
             raise ValueError('Encode output is owned by another task')
         if dependencies['reusable'] and old.get('status') == 'completed' and old.get('fingerprint') == fingerprint and output.is_file() and sha(output) == old.get('output', {}).get('sha256'):
+            if fact is not None:
+                fact.update(execution_mode='resume_reuse', wait_seconds=0.0)
             return
+        if old and fact is not None:
+            fact.update(execution_mode='rework', rework_reason='previous output/dependencies not reusable', rework_classification='unknown')
         if output.exists() and (not old.get('output') or sha(output) != old['output']['sha256']):
             raise ValueError('Existing output is not the current managed artifact; preserve it')
         if cancel.exists():
             raise RuntimeError(f'Cancellation remains active: {cancel}; acknowledge before resume')
-        with encode_slot(limit=limit, wait_seconds=wait_seconds, cancelled=cancel.exists) as slots:
+        queued_at = time.time()
+        queued = {'schema_version': 'story-encode/v1', 'fingerprint': fingerprint,
+                  'inputs': inputs, 'dependencies': dependencies, 'role': str(output),
+                  'task': task, 'parent_pid': os.getpid(), 'status': 'waiting',
+                  'queued_at': queued_at, 'heartbeat': queued_at}
+        if old.get('output'):
+            queued['output'] = old['output']
+        write(receipt, queued)
+        def heartbeat_wait():
+            if time.time() - queued['heartbeat'] >= 1:
+                queued['heartbeat'] = time.time()
+                write(receipt, queued)
+        @contextmanager
+        def acquire():
+            acquired = False
+            try:
+                with encode_slot(limit=limit, wait_seconds=wait_seconds, cancelled=cancel.exists,
+                                 waiting=heartbeat_wait) as slots:
+                    acquired = True
+                    yield slots
+            except (InterruptedError, TimeoutError):
+                if acquired:
+                    raise
+                queued.update(status='cancelled' if cancel.exists() else 'waiting', heartbeat=time.time())
+                if fact is not None:
+                    fact.update(status='cancelled' if cancel.exists() else 'deferred', wait_seconds=time.time() - queued_at)
+                write(receipt, queued)
+                raise
+        with acquire() as slots:
             parent = output.parent
             while not parent.exists():
                 parent = parent.parent
@@ -116,6 +164,9 @@ def run_encode(args, *, timeout=21600, wait_seconds=60, limit=None):
             fd, temporary = tempfile.mkstemp(prefix='.encoding-', suffix=output.suffix, dir=output.parent)
             os.close(fd)
             state = {'schema_version': 'story-encode/v1', 'fingerprint': fingerprint, 'inputs': inputs, 'dependencies': dependencies, 'role': str(output), 'task': task, 'parent_pid': os.getpid(), 'status': 'running', 'started_at': time.time(), 'heartbeat': time.time()}
+            state.update(queued_at=queued_at, wait_seconds=time.time() - queued_at)
+            if fact is not None:
+                fact['wait_seconds'] = state['wait_seconds']
             if old.get('output'):
                 state['output'] = old['output']
             started = time.monotonic()
@@ -155,7 +206,7 @@ def run_encode(args, *, timeout=21600, wait_seconds=60, limit=None):
                     if cancel.exists():
                         raise InterruptedError('Cancellation requested before publication')
                     os.replace(temporary, output)
-                    state.update(status='completed', output=binding(output))
+                    state.update(status='completed', output=binding(output), ended_at=time.time())
                     write(receipt, state)
                 except BaseException:
                     if process is not None and process.poll() is None:
@@ -184,7 +235,7 @@ def control_encode(output, *, action, expected_fingerprint, expected_task):
         raise ValueError('Encode identity/task/input fingerprint does not match')
     cancel = path.with_suffix('.cancel')
     if action == 'cancel':
-        if state['status'] == 'running':
+        if state['status'] in {'running', 'waiting'}:
             write(cancel, {'fingerprint': expected_fingerprint, 'task': expected_task})
     elif action == 'resume':
         with path.with_suffix('.lock').open('a+') as owner:

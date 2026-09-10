@@ -833,6 +833,12 @@ for index in range(20):
         evidence = root / "frame-preview.png"
         for path in (reference, environment, frame_source, background, frame_png, evidence):
             path.write_bytes(path.name.encode("utf-8"))
+        from PIL import Image, ImageDraw
+        frame = Image.new("RGBA", (100, 80), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(frame)
+        draw.rectangle((10, 10, 90, 70), fill=(100, 80, 60, 255))
+        draw.rectangle((20, 20, 80, 60), fill=(0, 0, 0, 0))
+        frame.save(frame_png)
         manifest = root / "theme_assets_v3.json"
         manifest.write_text(
             json.dumps(

@@ -1223,8 +1223,8 @@ def build_main_package_spec(
         "frame_reference_sha256": frame_reference["sha256"],
         "frame_reference_role": "geometry_only_not_theme_or_ornament",
         "frame_story_box": list(frame_story_box),
-        "frame_source_background": "#FF00FF",
-        "frame_source_mode": "imagegen_magenta_chroma_source",
+        "frame_source_background": "transparent",
+        "frame_source_mode": "imagegen_native_alpha",
         "frame_design_policy": "redesign_from_current_story_theme",
         **values,
         "top_plate": {"path": str(top_panel), "size": list(MAIN_PACKAGE_PANEL_SIZE)},
@@ -1356,8 +1356,8 @@ def build_theme_asset_handoff(request_path: Path) -> str:
         "不要让 imagegen 直接生成整张 1080x1440 底板。上/下素材里的文字仍必须由 Codex 原生生成。\n"
         "6. 允许用 Pillow 只做后处理：裁切、三段拼接、尺寸整理、透明通道和 QA；不允许用 Pillow 添加、覆盖或修正底板文字。\n"
         "7. 故事框必须把 main_package_spec.json 的 frame_reference_asset 作为几何参考输入，但只能继承占位、开口比例和实用边框厚度；"
-        "不得继承参考图的羊角、祥云、道具或其他故事主题。框体必须按当前故事从零重新设计。ImageGen 源图的整张底色（框内和框外）"
-        "必须是纯 #FF00FF 洋红，禁止棋盘格、白底或直接透明输出；透明 PNG 只能由该洋红源图做固定色键/Alpha 后处理得到。"
+        "不得继承参考图装饰或其他故事主题。框体消费任务书独立frame作用域；新故事独立设计，同项目合格同哈希产物可复用。"
+        "优先真实Alpha源图，框内外实际透明并保留半透明边缘；禁止棋盘格假透明。旧洋红仅为兼容输入，不侵蚀边框。"
         "A/B 景复用同一个框，具体缩放与摆放放到发布视频合成环节处理。禁止使用 SVG、HTML、Canvas、Pillow 或 FFmpeg 从零绘制框体。\n"
         "8. 最终文件必须保存到任务书指定的绝对路径，文件名完全一致；并按任务书写出 main_package_generation_receipt.json，记录参考图、Prompt、任务书、主账号背景、故事框源图/透明框和四张上下包装图哈希，OCR、示例内容泄漏检查、主/宝库号角色区分审核、背景清洁审核、generation_methods、svg_used=false 和 attempt_count（1–3，首次加最多两轮定向修正）。\n"
         "9. 主题素材通过 QA 后，只生成抠像候选与站立/大手势短样本，用来确定人物大小、初始 X 轴、抠像边缘和背景融合；不要在本阶段重复运行完整发布预演。\n"
@@ -1388,6 +1388,7 @@ def build_theme_asset_imagegen_request(
     story_box = release_defaults.get("story_box", "210,270,910,512")
     b_story_box = release_defaults.get("b_story_box", "356,180,1209,680")
     package_spec = json.loads(output_paths["main_package_spec"].read_text(encoding="utf-8"))
+    frame_scope = json.loads((ROOT / "assets/references/visual_scopes.json").read_text())["frame"]["prompt"]
     return f"""# 《{story_name}》发布素材 Codex/imagegen 任务
 
 ## 工作边界
@@ -1453,7 +1454,7 @@ def build_theme_asset_imagegen_request(
 - 底板整体要清爽、直接、信息优先。主账号尤其要简洁，宝库号可以保留更丰富的商品资料包包装感；两者都不要把装饰、徽章、花纹、角色和道具堆满画面。
 - 中间 16:9 视频安全区必须刚好处在 3:4 竖屏画布正中间：x=0, y=416, w=1080, h=608；上方和下方可视包装区各 416px，高度和面积完全相等。
 - 主账号顶部只放故事类型和故事标题，不放时长、适龄段、品牌字或资料包信息；风格按故事类型轻量适配，例如历史故事可偏典雅，儿童童话可更可爱，但只做简单点缀。
-- 类型适配必须克制且明确：童话/动物故事可圆润可爱；民间、成语、神话和历史故事使用清雅中国绘本气质、传统色与少量纹样，禁止通用塑料 3D 装饰或网游仙侠风。
+- 以下类型适配仅适用于主账号，不传给宝库号或框体：童话/动物故事可圆润可爱；民间、成语、神话和历史故事使用清雅中国绘本气质、传统色与少量纹样，禁止通用塑料 3D 装饰或网游仙侠风。
 - 主账号底部只放完整版时长、适合年龄和固定适用说明，避免商品资料清单式堆叠。
 - 底板不得出现绵羊姐姐、羊头、小羊、卡通羊、人偶或任何人物/动物吉祥物形象；除非故事本身需要，避免无关角色或动物进入发布包装。
 - 底板必须拆成 2304x888 顶部源图和 2304x888 底部源图分别生成，再由程序夹入固定 16:9 视频空挡。不要让 imagegen 直接生成完整 1080x1440 底板，因为它容易把安全区画错。Pillow 只负责缩放、拼接、裁切和尺寸整理，不负责生成或修正文案。
@@ -1509,13 +1510,15 @@ def build_theme_asset_imagegen_request(
 
 ## 4. 统一故事框源图
 
+{frame_scope}
+
 生成一张 1920x1080 的统一故事框源图，供后处理导出一个透明故事框。A/B 景复用同一个框，具体缩放与摆放放到发布视频合成环节处理。
 
 要求：
 - 把 `{package_spec['frame_reference_asset']}` 作为 imagegen 的几何参考输入，只继承占位、16:9 开口比例和实用边框厚度；不得继承其主题造型或装饰。
 - 根据《{story_name}》的具体人物、道具、场景和情绪从零设计一套新的框体。禁止只在旧框上换花、换角标，禁止保留旧故事的羊角、祥云、书画道具、动物食物或其他主题元素。
-- 整张 1920x1080 源图必须使用完全一致的纯洋红 `#FF00FF` 底色，包括框外区域和框内开口。禁止棋盘格、白底、渐变底、透明预览或直接透明输出。
-- 透明 PNG 只能由上述 ImageGen 洋红源图做固定色键/Alpha 后处理得到；后处理不得重新设计、增删或移动框体元素，也不得额外裁出一个矩形透明洞。
+- 新生产优先真实Alpha源图，框外与框内开口实际透明，保留半透明抗锯齿边缘。禁止棋盘格、白底或仅显示透明预览的假透明。旧洋红源图仅为既有回执的兼容输入。
+- 真实Alpha源图直接消费原始Alpha；旧洋红源图可用固定连通色键兼容。不得侵蚀框条、重新设计或移动框体元素，也不得额外裁出矩形透明洞。
 - 合成逻辑是“故事视频在下，透明故事框在上”，由不规则框体自然遮挡视频边缘；不要把内缘硬切成直角矩形。
 - 故事框必须是完整闭合的四边矩形框：上、下、左、右四条边和四个角都要完整在画布内，不能生成 L 形、缺左边、缺底边、局部出画或被裁断的框。
 - 框体必须围绕 A 景窗口 `{story_box}`，窗口四周都应能看到框体；不要把右边框放到远离窗口的位置。
@@ -1523,7 +1526,7 @@ def build_theme_asset_imagegen_request(
 - 保留 Logo 安全区，后续会叠加 `{logo}`。
 - 源图按 A 景窗口构图（参考 `{story_box}`），确保框细节完整可读。
 - 框体必须由 ImageGen 直接生成或参考图编辑为栅格位图。禁止用 SVG、HTML、Canvas、Pillow、FFmpeg drawbox/drawtext 或其他程序绘图方式制作框体。
-- 程序只负责对纯洋红源图去底和尺寸整理，不能重新设计框体。
+- 程序负责真实Alpha验证、兼容去底和尺寸整理，不能重新设计框体。
 
 ## 5. A/B 使用规则
 
@@ -1540,11 +1543,11 @@ def build_theme_asset_imagegen_request(
 - 背景图是 1920x1080，且不能自带故事框。
 - 故事框源图为单一设计；只导出一个 1920x1080 透明 PNG，A/B 在发布视频合成环节复用。
 - 文件已经保存到任务书指定路径。
-- `main_package_generation_receipt.json` 使用 `story-main-package-generation/v5`，必须声明 imagegen 同时接收了主账号包装参考图、故事框几何参考图和固定 Prompt，绑定任务书、四张上下包装图、主账号背景、故事框洋红源图与透明框 SHA-256，逐项记录主/宝库号 OCR 观察值并确认示例故事名/时长/年龄/人物没有泄漏；`attempt_count` 为 1–3。
-- 回执写 `generation_methods`：主账号上下图为 `imagegen_reference_edit`，宝库号上下图为 `imagegen_raster` 或 `imagegen_reference_edit`，故事框源图为 `imagegen_raster` 或 `imagegen_reference_edit`，透明框只能为 `raster_alpha_postprocess`；并明确写 `svg_used=false`。
+- `main_package_generation_receipt.json` 使用 `story-main-package-generation/v5`，必须声明 imagegen 同时接收了主账号包装参考图、故事框几何参考图和固定 Prompt，绑定任务书、四张上下包装图、主账号背景、故事框源图与透明框 SHA-256，逐项记录主/宝库号 OCR 观察值并确认示例故事名/时长/年龄/人物没有泄漏；`attempt_count` 为 1–3。
+- 回执写 `generation_methods`：主账号上下图为 `imagegen_reference_edit`，宝库号上下图为 `imagegen_raster` 或 `imagegen_reference_edit`，故事框源图为 `imagegen_raster` 或 `imagegen_reference_edit`，透明框为 `native_alpha_passthrough` 或 `raster_alpha_postprocess`；并明确写 `svg_used=false`。
 - 回执必须写 `story_identity`，并在 `account_role_review` 中确认：参考图的简洁层级被保留、主账号没有做成宝库号资料包商品页、信息层级清楚，并附具体 evidence。
 - 回执必须写 `background_clean_review`，其中 `passed`、`not_preblurred`、`no_vignette`、`no_logo_badge_or_corner_emblem`、`no_text_or_watermark` 均为 true，并附具体 evidence。
-- 回执必须写 `frame_design_review`，其中 `passed`、`frame_reference_attached`、`geometry_preserved`、`current_story_redesign`、`no_reference_theme_leak`、`solid_magenta_source` 均为 true，并附具体 evidence。
+- 回执必须写 `frame_design_review`，其中 `passed`、`frame_reference_attached`、`geometry_preserved`、`current_story_redesign`、`no_reference_theme_leak`、`true_alpha_verified` 均为 true，并附具体 evidence。
 """
 
 
@@ -1626,7 +1629,7 @@ def main_package_generation_receipt_issues(
         "library_bottom_plate": {"imagegen_raster", "imagegen_reference_edit"},
         "main_background": {"imagegen_raster", "imagegen_reference_edit"},
         "story_frame_source": {"imagegen_raster", "imagegen_reference_edit"},
-        "story_frame_a": {"raster_alpha_postprocess"},
+        "story_frame_a": {"raster_alpha_postprocess", "native_alpha_passthrough"},
     }
     for key in expected_outputs:
         if key in allowed_methods and generation_methods.get(key) not in allowed_methods[key]:
@@ -1688,7 +1691,8 @@ def main_package_generation_receipt_issues(
     )
     for field in (
         "passed", "frame_reference_attached", "geometry_preserved",
-        "current_story_redesign", "no_reference_theme_leak", "solid_magenta_source",
+        "current_story_redesign", "no_reference_theme_leak",
+        "true_alpha_verified" if spec.get("frame_source_mode") == "imagegen_native_alpha" else "solid_magenta_source",
     ):
         if frame_review.get(field) is not True:
             issues.append(f"main_package_frame_design_review_failed:{field}")
@@ -1701,6 +1705,17 @@ def main_package_generation_receipt_issues(
             issues.append(f"main_package_output_missing:{key}")
         elif item.get("path") != str(path) or item.get("sha256") != hashlib.sha256(path.read_bytes()).hexdigest():
             issues.append(f"main_package_output_binding_mismatch:{key}")
+    if spec.get("frame_source_mode") == "imagegen_native_alpha":
+        from story_frame_alpha import validate_native_frame_alpha
+        for role in ("story_frame_source", "story_frame_a"):
+            source_path = expected_outputs.get(role)
+            try:
+                if source_path is None:
+                    raise ValueError("missing source")
+                with Image.open(source_path) as source_image:
+                    validate_native_frame_alpha(source_image)
+            except (OSError, ValueError):
+                issues.append(f"main_package_actual_alpha_invalid:{role}")
     ocr = receipt.get("ocr_validation") if isinstance(receipt.get("ocr_validation"), Mapping) else {}
     if ocr.get("passed") is not True:
         issues.append("main_package_ocr_not_passed")
@@ -1915,10 +1930,23 @@ def _normalize_existing_story_frame(frame_path: Path, window: tuple[int, int, in
 
 
 def export_frame_from_source(source: Path, output: Path, window: tuple[int, int, int, int]) -> None:
-    with Image.open(source).convert("RGB") as source_image:
-        frame = cover_crop(source_image, (1920, 1080))
-    frame = normalize_magenta_frame_source(frame)
-    frame_rgba = chroma_to_alpha(frame)
+    with Image.open(source) as source_image:
+        has_alpha = source_image.mode in {"RGBA", "LA"} or "transparency" in source_image.info
+        native_alpha = has_alpha and source_image.convert("RGBA").getchannel("A").getextrema()[0] < 255
+        if has_alpha and not native_alpha:
+            # Some older ImageGen magenta sources were encoded as opaque RGBA.
+            # They remain chroma inputs; an opaque non-key PNG is not transparency.
+            rgb = source_image.convert("RGB")
+            points = ((0, 0), (rgb.width - 1, 0), (0, rgb.height - 1), (rgb.width - 1, rgb.height - 1), (rgb.width // 2, rgb.height // 2))
+            if not all(rgb.getpixel(point) == (255, 0, 255) for point in points):
+                raise ValueError("Opaque RGBA frame is neither actual alpha nor legacy magenta source")
+        frame = cover_crop(source_image.convert("RGBA" if native_alpha else "RGB"), (1920, 1080))
+    if native_alpha:
+        from story_frame_alpha import validate_native_frame_alpha
+        validate_native_frame_alpha(frame)
+        frame_rgba = frame
+    else:
+        frame_rgba = chroma_to_alpha(frame)
     frame_rgba = fit_frame_to_window(frame_rgba, window)
     output.parent.mkdir(parents=True, exist_ok=True)
     frame_rgba.save(output)
@@ -2171,6 +2199,15 @@ def qa_story_frame_source(image: Image.Image) -> list[str]:
     """Validate the fixed ImageGen -> magenta source -> keying contract."""
 
     notes: list[str] = []
+    if (image.mode in {"RGBA", "LA"} or "transparency" in image.info) and image.convert("RGBA").getchannel("A").getextrema()[0] < 255:
+        from story_frame_alpha import validate_native_frame_alpha
+        try:
+            validate_native_frame_alpha(image)
+        except ValueError as exc:
+            notes.append(str(exc))
+        if image.size != (1920, 1080):
+            notes.append("故事框透明源图必须规范化为1920x1080")
+        return notes
     if image.size != (1920, 1080):
         notes.append("故事框洋红源图必须规范化为1920x1080")
     rgb = image.convert("RGB")

@@ -1,0 +1,11 @@
+{
+  "version": "story-visual-scopes/v1",
+  "product_source": "本次用户任务书第四节：商品包含朗读标注及用户最终PPT；既有商品合同六项内容",
+  "main": {"prompt": "固定主账号模板", "review_checks": ["text_matches_confirmed_prompt", "no_reference_story_leak", "top_bottom_coherent", "simple_layout"]},
+  "library": {
+    "prompt": "仅生成宝库号上下包装。保留独立的丰富商品资料包视觉方向、材质和层次；主账号简洁平面要求不得继承。标题、年龄和商品内容形成清晰层级，文字应醒目易读，信息区占比合理，不得缩成小字团而让底图占满。上下分别2304×888，禁止生成中间视频。商品包含内容来自用户确认，绝不能从Agent本轮交付列表推导；PPT表示用户最终PPT，PPT素材是Agent提供的制作输入，两者不可偷换。用户制作PPT和朗读标注不产生生产、等待、审核依赖。历史优秀案例仅供评价，未被明确指定不得作生成模板。",
+    "review_checks": ["text_matches_confirmed_prompt", "no_reference_story_leak", "top_bottom_coherent", "independent_library_style", "readable_information_hierarchy", "confirmed_product_contents"],
+    "historical_visual_target": {"status": "needs_confirmation", "reason": "当前恢复源码没有可追溯、明确认可的宝库号视觉样板；反馈中的当前截图为问题证据，不冒充认可模板"}
+  },
+  "frame": {"prompt": "仅设计A镜框体。固定参考只约束结构、16:9开口和实用遮边厚度，不继承主账号或宝库号包装风格。主题融入框条，不把完整风景铺进宽框。优先真实Alpha透明图，保留半透明边缘；PNG后缀不证明透明。透明窗口与外部必须实际透明，禁止棋盘格假透明。遗留洋红源图可经连通色键兼容，不得通过侵蚀边框或改变窗口几何掩盖粉边。最终需实际预览和独立视觉审核。", "review_checks": ["geometry_preserved", "true_alpha_verified", "no_reference_theme_leak", "edge_composite_review"]}
+}

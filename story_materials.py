@@ -49,8 +49,22 @@ def material_rows(director, plan, word):
         cursor += duration
     return result
 
-def export_materials(*, director, plan, compile_receipt, inputs, output, receipt):
-    protect_outputs([output, receipt], [director, plan, compile_receipt, *(v['path'] for v in inputs.values())])
+def export_materials(*, director, plan, compile_receipt, inputs, output, receipt, archive_output=None):
+    """Export a ready-to-use ordered folder; ZIP requires explicit opt-in."""
+    from story_run import run_file_lock
+    with run_file_lock(Path(receipt)):
+        return _export_materials(director=director, plan=plan, compile_receipt=compile_receipt,
+                                 inputs=inputs, output=output, receipt=receipt, archive_output=archive_output)
+
+
+def _export_materials(*, director, plan, compile_receipt, inputs, output, receipt, archive_output):
+    import shutil, tempfile, os
+    targets = [output, receipt] + ([archive_output] if archive_output else [])
+    protect_outputs(targets, [director, plan, compile_receipt, *(v['path'] for v in inputs.values())])
+    if Path(receipt).resolve().is_relative_to(Path(output).resolve()):
+        raise ValueError('Receipt must be outside materials directory')
+    if archive_output and (Path(archive_output).resolve().is_relative_to(Path(output).resolve()) or Path(archive_output).resolve() == Path(receipt).resolve()):
+        raise ValueError('Archive must be outside materials directory and receipt')
     from shot_storyboard_pipeline import validate_compile_receipt
     compile_data = validate_compile_receipt(Path(compile_receipt), require_current_r2v_jobs=False)
     if compile_data['director_plan_sha256'] != sha(director) or compile_data['ppt_plan_sha256'] != sha(plan):
@@ -61,42 +75,95 @@ def export_materials(*, director, plan, compile_receipt, inputs, output, receipt
     from story_video_synthesizer.media import probe_duration
     if abs(rows[-1]['end_seconds'] - probe_duration(Path(inputs['audio']['path']))) > 0.2:
         raise ValueError('PPT materials do not cover authority audio')
-    out = Path(output)
+    payload = {'schema_version': 'story-ppt-materials/v3', 'rows': rows,
+               'inputs': {k: inputs[k] for k in ('final_word', 'audio', 'finished_music')},
+               'director': binding(director), 'plan': binding(plan), 'compile_receipt': binding(compile_receipt)}
+    for row in rows:
+        if '/' in row['shot_id'] or chr(92) in row['shot_id'] or row['shot_id'] in {'.', '..'}:
+            raise ValueError('Invalid shot ID')
+        row['archive_path'] = f"images/{row['order']:03d}_{row['shot_id']}{Path(row['image']['path']).suffix}"
+    out = Path(output).resolve()
     out.parent.mkdir(parents=True, exist_ok=True)
-    payload = {'schema_version': 'story-ppt-materials/v2', 'rows': rows, 'inputs': {k: inputs[k] for k in ('final_word', 'audio', 'finished_music')}, 'director': binding(director), 'plan': binding(plan), 'compile_receipt': binding(compile_receipt)}
-    import tempfile, os
-    fd, tmp = tempfile.mkstemp(suffix='.zip', dir=out.parent)
-    os.close(fd)
+    # Validate ownership before modifying a previous export. Unchanged exports reuse bytes.
+    old = None
+    if out.exists():
+        if not Path(receipt).is_file():
+            if not (out / 'manifest.json').is_file() or json.loads((out / 'manifest.json').read_text()) != payload:
+                raise ValueError('Unmanaged materials destination collision')
+            recovered = {**payload, 'directory': binding(out)}
+            write(receipt, recovered)
+            validate_materials(receipt, inputs)
+        old = json.loads(Path(receipt).read_text())
+        if old.get('directory', {}).get('path') != str(out):
+            raise ValueError('Cannot overwrite legacy or unmanaged materials')
+        current(old['directory'])
+        if {k: v for k, v in old.items() if k not in {'directory', 'archive'}} == payload:
+            validate_materials(receipt, inputs)
+            _write_optional_archive(old, archive_output, receipt)
+            return {**old, 'reused': True}
+        # Changed input export needs a fresh destination; preserve previous recovery evidence.
+        raise ValueError('Materials changed; export to a new versioned directory')
+    tmp = Path(tempfile.mkdtemp(prefix='.materials-', dir=out.parent))
     try:
-        with zipfile.ZipFile(tmp, 'w', compression=zipfile.ZIP_STORED) as z:
-            for row in rows:
-                name = f"images/{row['order']:03d}_{row['shot_id']}{Path(row['image']['path']).suffix}"
-                if '/' in row['shot_id'] or '\\' in row['shot_id']:
-                    raise ValueError('Invalid shot ID')
-                row['archive_path'] = name
-                z.write(current(row['image']), name)
-            for role in ('audio', 'finished_music'):
-                item = inputs[role]
-                z.write(current(item), role + Path(item['path']).suffix)
-            z.writestr('manifest.json', json.dumps(payload, ensure_ascii=False, indent=2))
+        for row in rows:
+            dest = tmp / row['archive_path']; dest.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(current(row['image']), dest)
+        for role in ('audio', 'finished_music'):
+            item = inputs[role]
+            shutil.copy2(current(item), tmp / (role + Path(item['path']).suffix))
+        write(tmp / 'manifest.json', payload)
         os.replace(tmp, out)
     finally:
-        if os.path.exists(tmp):
-            os.unlink(tmp)
-    payload['archive'] = binding(out)
+        if tmp.exists():
+            shutil.rmtree(tmp)
+    payload['directory'] = binding(out)
+    # Persist directory ownership first, including if optional ZIP creation is interrupted.
     write(receipt, payload)
+    _write_optional_archive(payload, archive_output, receipt)
     validate_materials(receipt, inputs)
     return payload
 
+
+def _write_optional_archive(payload, archive_output, receipt):
+    import os, tempfile
+    if not archive_output:
+        return
+    out = current(payload['directory'])
+    archive = Path(archive_output).resolve()
+    if payload.get('archive', {}).get('path') == str(archive):
+        current(payload['archive'])
+        return
+    if archive.exists():
+        # A crash after ZIP replacement is recoverable only if every entry matches.
+        with zipfile.ZipFile(archive) as z:
+            expected = {m['relative_path'] for m in payload['directory']['members']}
+            if set(z.namelist()) != expected or len(z.namelist()) != len(expected):
+                raise ValueError('Optional archive destination collision')
+            if any(z.read(name) != (out / name).read_bytes() for name in expected):
+                raise ValueError('Optional archive destination collision')
+    else:
+        archive.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmpzip = tempfile.mkstemp(suffix='.zip', dir=archive.parent); os.close(fd)
+        try:
+            with zipfile.ZipFile(tmpzip, 'w', compression=zipfile.ZIP_STORED) as z:
+                for member in payload['directory']['members']:
+                    z.write(out / member['relative_path'], member['relative_path'])
+            os.replace(tmpzip, archive)
+        finally:
+            if os.path.exists(tmpzip): os.unlink(tmpzip)
+    payload['archive'] = binding(archive)
+    write(receipt, payload)
+
+
 def validate_materials(path, inputs=None):
     p = json.loads(Path(path).read_text())
-    if p.get('schema_version') != 'story-ppt-materials/v2':
+    if p.get('schema_version') not in {'story-ppt-materials/v2', 'story-ppt-materials/v3'}:
         raise ValueError('Wrong materials version')
     for role, item in p['inputs'].items():
         current(item)
         if inputs and item != inputs[role]:
             raise ValueError('Materials input binding changed')
-    for key in ('director', 'plan', 'compile_receipt', 'archive'):
+    for key in ('director', 'plan', 'compile_receipt'):
         current(p[key])
     from shot_storyboard_pipeline import validate_compile_receipt
     compile_data = validate_compile_receipt(Path(p['compile_receipt']['path']), require_current_r2v_jobs=False)
@@ -105,18 +172,26 @@ def validate_materials(path, inputs=None):
     expected = material_rows(p['director']['path'], p['plan']['path'], p['inputs']['final_word']['path'])
     if [{k: v for k, v in r.items() if k != 'archive_path'} for r in p['rows']] != expected:
         raise ValueError('Materials order/text/timing mismatch')
-    with zipfile.ZipFile(p['archive']['path']) as z:
-        archived = json.loads(z.read('manifest.json'))
-        if archived != {k: v for k, v in p.items() if k != 'archive'}:
+    def check_contents(read):
+        archived = json.loads(read('manifest.json'))
+        if archived != {k: v for k, v in p.items() if k not in {'directory', 'archive'}}:
             raise ValueError('Packaged manifest differs from reviewed materials')
         import hashlib
         for row in p['rows']:
-            if hashlib.sha256(z.read(row['archive_path'])).hexdigest() != row['image']['sha256']:
+            if hashlib.sha256(read(row['archive_path'])).hexdigest() != row['image']['sha256']:
                 raise ValueError('Packaged image drift')
         for role in ('audio', 'finished_music'):
             item = p['inputs'][role]
-            if hashlib.sha256(z.read(role + Path(item['path']).suffix)).hexdigest() != item['sha256']:
+            if hashlib.sha256(read(role + Path(item['path']).suffix)).hexdigest() != item['sha256']:
                 raise ValueError('Packaged audio edited')
+    if p['schema_version'] == 'story-ppt-materials/v3':
+        root = current(p['directory'])
+        check_contents(lambda name: (root / name).read_bytes())
+    if 'archive' in p:
+        with zipfile.ZipFile(current(p['archive'])) as z:
+            check_contents(z.read)
+    elif p['schema_version'] == 'story-ppt-materials/v2':
+        raise ValueError('Legacy materials archive missing')
     return p
 
 def bind_packaging(*, inputs, output, receipt, fields=None, timeline_receipt=None):
@@ -129,7 +204,8 @@ def bind_packaging(*, inputs, output, receipt, fields=None, timeline_receipt=Non
         fields = story_fields
     if fields is None:
         raise ValueError("Packaging requires current authoritative timeline receipt")
-    protect_outputs([output, receipt], [v['path'] for v in inputs.values()])
+    scope_paths = {'main': Path(output), 'library': Path(output).with_name(Path(output).stem + '.library.txt'), 'frame': Path(output).with_name(Path(output).stem + '.frame.txt')}
+    protect_outputs([*scope_paths.values(), receipt], [v['path'] for v in inputs.values()])
     allowed = {'story_name', 'story_type', 'age_range', 'duration_text', 'theme_style'}
     if set(fields) != allowed:
         raise ValueError('Only story information, duration and theme fields are permitted')
@@ -146,6 +222,13 @@ def bind_packaging(*, inputs, output, receipt, fields=None, timeline_receipt=Non
     if story_fields is not None:
         payload['story_requirements'] = inputs['story_requirements']
         payload['timeline_receipt'] = timeline_receipt
+    from story_visual_contracts import compile_visual_scopes
+    payload['visual_scopes'] = compile_visual_scopes(inputs, fields)
+    for scope, scope_path in scope_paths.items():
+        scope_path.write_text(payload['visual_scopes'][scope]['prompt'])
+    payload['output_scope'] = 'main'
+    payload['scope_prompt_outputs'] = {scope: binding(scope_path) for scope, scope_path in scope_paths.items()}
+    payload['scope_inputs'] = {k: inputs[k] for k in ('story_requirements',) if k in inputs}
     write(receipt, payload)
     return payload
 
@@ -173,6 +256,19 @@ def validate_packaging(path, inputs=None):
             raise ValueError('Packaging input changed')
     if current(p['output']).read_text() != current(p['inputs']['packaging_prompt']).read_text().format(**p['fields']):
         raise ValueError('Packaging prompt diverged from confirmed template')
+    if 'visual_scopes' in p:
+        from story_visual_contracts import compile_visual_scopes
+        scope_inputs = {**p['inputs'], **p.get('scope_inputs', {})}
+        if inputs and any(inputs.get(k) != v for k, v in p.get('scope_inputs', {}).items()):
+            raise ValueError('Visual scope inputs changed')
+        if p['visual_scopes'] != compile_visual_scopes(scope_inputs, p['fields']):
+            raise ValueError('Visual scope rules or references changed')
+        scope_outputs = p.get('scope_prompt_outputs', {})
+        if p.get('output_scope') != 'main' or set(scope_outputs) != {'main', 'library', 'frame'} or scope_outputs['main'] != p['output']:
+            raise ValueError('Packaging prompt output scope is missing or ambiguous')
+        for scope, item in scope_outputs.items():
+            if current(item).read_text() != p['visual_scopes'][scope]['prompt']:
+                raise ValueError('Scoped prompt output differs: ' + scope)
     return p
 
 def validate_panel_binding(config, spec_path, generation_path):
@@ -188,10 +284,19 @@ def validate_panel_binding(config, spec_path, generation_path):
         raise ValueError('Panel reference/native generation evidence missing')
     if not generation.get('request_id'):
         raise ValueError('Panel request ID missing')
-    checks = generation.get('checks', {})
-    for key in ('text_matches_confirmed_prompt', 'no_reference_story_leak', 'top_bottom_coherent', 'simple_layout'):
-        if checks.get(key) is not True:
-            raise ValueError(f'Panel validation missing: {key}')
+    if 'visual_scopes' in spec:
+        scoped = generation.get('scope_checks', {})
+        for scope in ('main', 'library'):
+            for check in spec['visual_scopes'][scope]['review_checks']:
+                if scoped.get(scope, {}).get(check) is not True:
+                    raise ValueError(f'Scoped panel validation missing: {scope}.{check}')
+    else:
+        # Read-only compatibility for pre-scope receipts. Never apply these
+        # aggregate historical checks to newly compiled scoped packaging.
+        checks = generation.get('checks', {})
+        for key in ('text_matches_confirmed_prompt', 'no_reference_story_leak', 'top_bottom_coherent', 'simple_layout'):
+            if checks.get(key) is not True:
+                raise ValueError(f'Panel validation missing: {key}')
     from story_evidence import review_passes, review_bundle_is_current
     review_path = current(generation['review'])
     review = json.loads(review_path.read_text())
@@ -204,6 +309,8 @@ def validate_panel_binding(config, spec_path, generation_path):
     if isinstance(members, dict):
         members = members.values()
     hashes = {x['sha256'] for x in members}
+    if 'visual_scopes' in spec and sha(spec_path) not in hashes:
+        raise ValueError('Panel review bundle must include current scoped prompt receipt')
     for name, p in [('top_plate', config.main_top_panel), ('bottom_plate', config.main_bottom_panel), ('library_top_plate', config.library_top_panel), ('library_bottom_plate', config.library_bottom_panel)]:
         if p is None:
             continue

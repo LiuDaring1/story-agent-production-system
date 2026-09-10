@@ -609,14 +609,8 @@ def _compile_visual_cards(
 
 
 def moral_card_display_text(text: str) -> str:
-    """Strip the spoken child-address from the visual moral card only."""
-
-    return re.sub(
-        r"^\s*(?:(?:亲爱的)\s*)?小朋友们?\s*[,，、:：!！]?\s*",
-        "",
-        text,
-        count=1,
-    ).strip()
+    """Keep the complete confirmed source sentence; layout may only add line breaks."""
+    return text.strip()
 
 
 def _validate_mutual_exclusion(artifacts: Mapping[str, Any]) -> None:

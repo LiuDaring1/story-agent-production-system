@@ -149,7 +149,7 @@ class StoryDeliveryGateTests(unittest.TestCase):
         }
         self.validate("qa_product_report", report)
         report["artifacts"]["member-0"] = self.checklist["artifacts"][0]
-        with self.assertRaisesRegex(ValueError, r"当前 5\+10"):
+        with self.assertRaisesRegex(ValueError, r"当前实际成员"):
             self.validate("qa_product_report", report)
 
     def test_publish_machine_qa_must_bind_exact_final_publish_members(self):

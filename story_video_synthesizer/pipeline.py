@@ -799,7 +799,10 @@ def _burn_subtitles_only(
         shutil.copy2(video_path, output_path)
         return
     subtitle_images = _render_subtitle_images(cues, work_dir / "subtitle_images", config)
-    video_chain = _subtitle_overlay_chain(cues, first_image_input=1)
+    from story_subtitle_layers import crop_subtitle_layers, cropped_overlay_chain
+    layers = crop_subtitle_layers(subtitle_images, width=config.width, height=config.height)
+    subtitle_images = [layer[0] for layer in layers]
+    video_chain = cropped_overlay_chain(cues, layers, first_image_input=1)
     args = [
         "ffmpeg",
         "-y",

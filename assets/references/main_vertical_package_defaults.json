@@ -3,7 +3,7 @@
   "reference": "main_vertical_package_reference.png",
   "reference_sha256": "71dcf40cf3a54021960e151510a3018f6b1b86ffe3ebeee1614459d532a806f5",
   "prompt": "main_vertical_package_prompt.txt",
-  "prompt_sha256": "ce5cdefb967ab1fcfdf5383d5c899b9aa6e6491ca894695df6c7e8a6a64341f5",
+  "prompt_sha256": "cd5db236978adcd0d1c984242234c82c0c7b4337fea9e1b0d59e5a1f2ee46951",
   "prompt_source": "story_project.main_package_fixed_prompt_template/v3; 字段名适配，固定适用说明，增加已确认包装风格字段",
   "theme_style": "典雅端庄、简洁清爽、上下协调"
 }

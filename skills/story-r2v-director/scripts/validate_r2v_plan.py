@@ -1635,7 +1635,20 @@ def validate_plan(plan: Any, *, require_current_schema: bool = False) -> list[st
             max_ratio = policies.get("max_retime_ratio")
             if provider_seconds in PROVIDER_DURATIONS and _number(min_ratio) and _number(max_ratio):
                 ratio = (end - start) / provider_seconds
-                if ratio < min_ratio - EPSILON or ratio > max_ratio + EPSILON:
+                trim = shot.get("assembly_trim")
+                continuous_trim = False
+                if isinstance(trim, dict) and set(trim) <= {"anchor", "start_second"} and trim.get("anchor") in {"start", "center", "end", "explicit"}:
+                    trim_start = trim.get("start_second")
+                    valid_anchor = (
+                        _number(trim_start) and trim_start >= 0
+                        if trim.get("anchor") == "explicit" else trim_start is None
+                    )
+                    offset = trim_start if trim.get("anchor") == "explicit" and _number(trim_start) else 0
+                    continuous_trim = (valid_anchor and end - start < provider_seconds
+                                       and offset + end - start <= provider_seconds + EPSILON)
+                # A declared continuous source trim does not accelerate playback.
+                # Keep the original retiming bounds for all undeclared/invalid trims.
+                if (ratio < min_ratio - EPSILON and not continuous_trim) or ratio > max_ratio + EPSILON:
                     errors.append(
                         f"{path}: retime ratio {ratio:.3f} is outside {min_ratio:.3f}–{max_ratio:.3f}"
                     )
@@ -1805,6 +1818,11 @@ def validate_plan(plan: Any, *, require_current_schema: bool = False) -> list[st
                 if anchor not in {"start", "center", "end", "explicit"}:
                     errors.append(f"{path}.assembly_trim.anchor: unsupported trim anchor")
                 start_second = assembly_trim.get("start_second")
+                if valid_window and provider_seconds in PROVIDER_DURATIONS:
+                    length = end - start
+                    offset = start_second if anchor == "explicit" and _number(start_second) else 0
+                    if length >= provider_seconds or offset + length > provider_seconds + EPSILON:
+                        errors.append(f"{path}.assembly_trim: continuous trim must stay within source and be shorter than it")
                 if anchor == "explicit":
                     if not _number(start_second) or start_second < 0:
                         errors.append(

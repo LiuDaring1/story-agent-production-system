@@ -11,6 +11,16 @@ def load_candidate(path):
         raise ValueError('This operation only accepts an explicit v2 run; no migration')
     return run
 
+def validate_media_frame(preset_path, frame_path):
+    """Reuse existing release mask rules before spending work on previews."""
+    from release_video import story_frame_integrity_issues, format_preset_box, parse_required_box
+    declared_window = json.loads(Path(preset_path).read_text()).get('story_box')
+    if declared_window is not None:
+        window = parse_required_box(format_preset_box(declared_window), 'story_box', 'x,y,w,h')
+        issues = story_frame_integrity_issues(Path(frame_path), window)
+        if issues:
+            raise ValueError('Media frame fails existing release rules: ' + '; '.join(issues))
+
 def render_media(run, request, *, preview=False):
     from product_package import load_keying_preset, render_demo_video, render_a_only_background_video, probe_video_size, validate_formal_demo_logo
     from keying_quality import keying_preset_lock_issues
@@ -37,6 +47,7 @@ def render_media(run, request, *, preview=False):
     lock = json.loads(paths['preset'].with_name('keying_preset.lock.json').read_text())
     if Path(lock['source_video']).resolve() != Path(inputs['greenscreen_video']['path']).resolve() or lock['source_sha256'] != inputs['greenscreen_video']['sha256']:
         raise ValueError('Keying lock belongs to a different source input')
+    validate_media_frame(paths['preset'], paths['story_frame'])
     preset = load_keying_preset(paths['preset'])
     if preset.keyer != 'rvm':
         raise ValueError('Formal media requires full RVM alpha')
@@ -76,7 +87,7 @@ from story_render_task import render_entry
 @render_entry
 def main(argv):
     p = argparse.ArgumentParser(description='Candidate deterministic media, packaging and materials operations')
-    p.add_argument('operation', choices=['media', 'media-preview', 'media-approve', 'pack', 'materials', 'packaging', 'checklist', 'encode-control'])
+    p.add_argument('operation', choices=['timeline', 'release-qa', 'media', 'media-preview', 'media-approve', 'pack', 'materials', 'packaging', 'checklist', 'encode-control'])
     p.add_argument('--run-file', type=Path, required=True)
     p.add_argument('--request', type=Path, required=True, help='Explicit paths and operation parameters JSON')
     args = p.parse_args(argv)
@@ -84,37 +95,55 @@ def main(argv):
     r = json.loads(args.request.read_text())
     from story_production_v2 import protect_outputs
     protected=[args.request,args.run_file,*(v['path'] for v in run['inputs'].values())]
-    destinations=[r[k] for k in ('output','receipt','output_root') if k in r]
+    if args.operation == 'release-qa':
+        protected.extend(v['path'] for v in r['releases'].values())
+    destinations=[r[k] for k in ('output','receipt','output_root','receipt_path','timings_path','evidence_dir') if k in r]
     if args.operation in {'media','media-preview'}:
         destinations.extend([Path(run['project_dir'])/'03_产品素材'/'media', Path(run['project_dir'])/'99_项目状态'/'media_preview', Path(run['project_dir'])/'99_项目状态'/'media_preview.json',Path(run['project_dir'])/'99_项目状态'/'customer_media_receipt.json'])
     protect_outputs(destinations,protected)
     from story_render_task import bind_render_task
     bind_render_task(args.run_file, outputs=destinations)
-    if args.operation == 'encode-control':
-        from story_encode import control_encode
-        if Path(run['project_dir']).resolve() not in Path(r['output']).resolve().parents:
-            raise ValueError('Encode output belongs to another project')
-        result = control_encode(**r, expected_task=run['run_id'])
-    elif args.operation == 'media-approve':
-        from story_media_preview import approve_preview
-        result = approve_preview(**r, project=run['project_dir'])
-    elif args.operation in {'media', 'media-preview'}:
-        result = render_media(run, r, preview=args.operation == 'media-preview')
-    elif args.operation == 'pack':
-        from story_managed_package import package
-        result = package(**r, inputs=run['inputs'])
-    elif args.operation == 'materials':
-        from story_materials import export_materials
-        result = export_materials(**r, inputs=run['inputs'])
-    elif args.operation == 'packaging':
-        from story_materials import bind_packaging
-        if run.get('packaging_config') and not r.get('timeline_receipt'):
-            raise ValueError('System packaging requires authoritative timeline receipt')
-        result = bind_packaging(**r, inputs=run['inputs'])
-    else:
-        from story_production_v2 import validate_managed_receipt, validate_checklist
-        pack = validate_managed_receipt(r['managed_package_receipt'], run['inputs'])
-        result = {'production_contract': VERSION, 'status': 'complete_pending_independent_final_review', 'missing': [], 'artifacts': [*pack['artifacts'], *({'role': role, **binding(r[role])} for role in ('main_release_video', 'library_release_video'))]}
-        write(r['output'], result)
-        validate_checklist(r['output'])
+    from story_work_observation import operation_observation
+    kind = 'review' if args.operation in {'release-qa', 'media-approve'} else ('encode' if args.operation in {'media', 'media-preview'} else 'deterministic')
+    with operation_observation(args.run_file, args.operation, kind, artifacts=destinations) as fact:
+        if args.operation == 'timeline':
+            from story_timeline import import_confirmed_user_srt
+            target = import_confirmed_user_srt(receipt_path=Path(r['receipt_path']), timings_path=Path(r['timings_path']), subtitle_txt=current(run['inputs']['subtitle_txt']), subtitle_srt=current(run['inputs']['subtitle_srt']), authoritative_audio=current(run['inputs']['audio']), expected_inputs=run['inputs'])
+            result = {'authoritative_timeline_receipt': binding(target)}
+        elif args.operation == 'release-qa':
+            from story_final_media_qa import audit_releases
+            result = audit_releases(**r, inputs=run['inputs'])
+        elif args.operation == 'encode-control':
+            from story_encode import control_encode
+            if Path(run['project_dir']).resolve() not in Path(r['output']).resolve().parents:
+                raise ValueError('Encode output belongs to another project')
+            result = control_encode(**r, expected_task=run['run_id'])
+        elif args.operation == 'media-approve':
+            from story_media_preview import approve_preview
+            result = approve_preview(**r, project=run['project_dir'])
+        elif args.operation in {'media', 'media-preview'}:
+            result = render_media(run, r, preview=args.operation == 'media-preview')
+        elif args.operation == 'pack':
+            from story_managed_package import package
+            result = package(**r, inputs=run['inputs'])
+        elif args.operation == 'materials':
+            from story_materials import export_materials
+            result = export_materials(**r, inputs=run['inputs'])
+        elif args.operation == 'packaging':
+            from story_materials import bind_packaging
+            if run.get('packaging_config') and not r.get('timeline_receipt'):
+                raise ValueError('System packaging requires authoritative timeline receipt')
+            result = bind_packaging(**r, inputs=run['inputs'])
+        else:
+            from story_production_v2 import validate_managed_receipt, validate_checklist
+            pack = validate_managed_receipt(r['managed_package_receipt'], run['inputs'])
+            result = {'production_contract': VERSION, 'status': 'complete_pending_independent_final_review', 'missing': [], 'artifacts': [*pack['artifacts'], *({'role': role, **binding(r[role])} for role in ('main_release_video', 'library_release_video'))]}
+            write(r['output'], result)
+            validate_checklist(r['output'])
+        if isinstance(result, dict) and result.get('reused') is True:
+            fact['execution_mode'] = 'resume_reuse'
+        if args.operation == 'release-qa' and not result['passed']:
+            raise ValueError('Release QA failed')
     print(json.dumps(result, ensure_ascii=False, indent=2))
+    if args.operation == 'release-qa' and not result['passed']:
+        raise SystemExit(1)

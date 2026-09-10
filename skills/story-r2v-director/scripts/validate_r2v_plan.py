@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import re
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -809,6 +810,8 @@ def _validate_v4_shot_contracts(
                                 "behind the camera on the scene map"
                             )
         _required_text(presence, "visibility_reason", path, errors)
+        if entry == "off_screen" and exit_value == "off_screen":
+            fully_off_screen.add(subject_id)
         if subject_type == "character":
             if entry == "on_screen":
                 initial.add(subject_id)
@@ -816,9 +819,7 @@ def _validate_v4_shot_contracts(
                 entering.add(subject_id)
             if entry == "on_screen" and exit_value == "off_screen":
                 exiting.add(subject_id)
-            if entry == "off_screen" and exit_value == "off_screen":
-                fully_off_screen.add(subject_id)
-            else:
+            if entry != "off_screen" or exit_value != "off_screen":
                 visible_at_some_point.add(subject_id)
                 if subject_id not in selected_identity_ids:
                     errors.append(f"{path}: on-screen character needs one selected runtime asset")
@@ -1509,6 +1510,59 @@ def _validate_prop_transitions(
                 errors.append(f"{path}.{field}: must be a non-empty string")
 
 
+
+def _validate_body_audio_window(plan: dict[str, Any], errors: list[str]) -> tuple[float, float] | None:
+    """Validate an explicit body slice on the complete authoritative audio clock."""
+    if "body_audio_window" not in plan:
+        return None
+    window = plan["body_audio_window"]
+    label = "body_audio_window"
+    if not isinstance(window, dict):
+        errors.append(f"{label}: must be an object")
+        return None
+    start, end = window.get("source_start"), window.get("source_end")
+    if not _number(start) or not _number(end) or start < 0 or end <= start:
+        errors.append(f"{label}: must form a positive absolute audio interval")
+        return None
+    binding = window.get("authoritative_timeline_receipt")
+    if not isinstance(binding, dict):
+        errors.append(f"{label}: requires authoritative_timeline_receipt path and sha256")
+        return None
+    try:
+        # The validator is also executed directly from its nested skill directory.
+        root = str(Path(__file__).resolve().parents[3])
+        if root not in sys.path:
+            sys.path.insert(0, root)
+        from story_timeline import validate_authoritative_timeline_receipt, file_sha256, _audio_duration
+        receipt_path = Path(binding["path"]).expanduser().resolve()
+        if file_sha256(receipt_path) != binding.get("sha256"):
+            raise ValueError("authoritative receipt hash drift")
+        receipt = validate_authoritative_timeline_receipt(receipt_path)
+        audio = plan.get("source_audio", {})
+        if not isinstance(audio, dict):
+            raise ValueError("source_audio must be an object")
+        bound_audio = receipt["authoritative_audio"]
+        if (Path(audio.get("path", "")).expanduser().resolve() != Path(bound_audio["path"]).resolve()
+                or audio.get("sha256") != bound_audio["sha256"]):
+            raise ValueError("source_audio must bind the receipt's complete authoritative audio")
+        duration = _audio_duration(Path(bound_audio["path"]))
+        if not _number(audio.get("duration_seconds")) or abs(audio["duration_seconds"] - duration) > 0.001:
+            raise ValueError("source_audio duration must equal the complete authoritative audio duration")
+        if end > duration:
+            raise ValueError("body window exceeds complete authoritative audio")
+        rows = json.loads(Path(receipt["timings"]["path"]).read_text(encoding="utf-8"))
+        if not any(row["source_start"] >= start and row["source_end"] <= end for row in rows):
+            raise ValueError("body window contains no complete authoritative cue")
+        for row in rows:
+            for boundary in (start, end):
+                if row["source_start"] < boundary < row["source_end"]:
+                    raise ValueError("body window cuts an authoritative subtitle cue")
+    except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as exc:
+        errors.append(f"{label}: {exc}")
+        return None
+    return float(start), float(end)
+
+
 def validate_plan(plan: Any, *, require_current_schema: bool = False) -> list[str]:
     """Return human-readable validation errors; an empty list means valid."""
     errors: list[str] = []
@@ -1538,6 +1592,7 @@ def validate_plan(plan: Any, *, require_current_schema: bool = False) -> list[st
         if not _number(audio_duration) or audio_duration <= 0:
             errors.append("source_audio.duration_seconds: must be positive")
 
+    body_window = _validate_body_audio_window(plan, errors)
     policies = _validate_policies(plan, errors)
     assets = _index_by_id(plan.get("assets"), "asset_id", "assets", errors)
     groups = _index_by_id(plan.get("continuity_groups"), "group_id", "continuity_groups", errors)
@@ -1569,6 +1624,8 @@ def validate_plan(plan: Any, *, require_current_schema: bool = False) -> list[st
             if previous_shot is not None and _number(previous_shot.get("source_end")):
                 if start < previous_shot["source_end"] - EPSILON:
                     errors.append(f"{path}.source_start: overlaps the previous shot")
+                elif body_window is not None and abs(start - previous_shot["source_end"]) > 1e-6:
+                    errors.append(f"{path}.source_start: body_audio_window requires continuous shot coverage")
                 elif strict_v3_or_newer and start - previous_shot["source_end"] > MAX_TIMELINE_GAP_SECONDS:
                     errors.append(
                         f"{path}.source_start: leaves an unassigned timeline gap of "
@@ -1764,7 +1821,14 @@ def validate_plan(plan: Any, *, require_current_schema: bool = False) -> list[st
             errors.append(f"{path}.prompt: must be a non-empty director prompt")
         previous_shot = shot
 
-    if strict_v3_or_newer and shot_items and _number(audio_duration):
+    if body_window is not None and shot_items:
+        first_start = shot_items[0][1].get("source_start")
+        final_end = shot_items[-1][1].get("source_end")
+        if not _number(first_start) or abs(first_start - body_window[0]) > 1e-6:
+            errors.append("shots: first source_start must equal body_audio_window.source_start")
+        if not _number(final_end) or abs(final_end - body_window[1]) > 1e-6:
+            errors.append("shots: final source_end must equal body_audio_window.source_end")
+    elif strict_v3_or_newer and shot_items and _number(audio_duration):
         final_end = shot_items[-1][1].get("source_end")
         if _number(final_end) and abs(audio_duration - final_end) > MAX_TIMELINE_GAP_SECONDS:
             errors.append(

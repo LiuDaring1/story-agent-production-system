@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import re
+import subprocess
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
@@ -217,6 +219,8 @@ def validate_authoritative_timeline_receipt(
     expected_inputs: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
     payload = _load_json_object(path, "权威时间轴回执")
+    if payload.get("source_kind") == "confirmed_user_srt":
+        return _validate_confirmed_user_srt(payload, expected_inputs=expected_inputs)
     if payload.get("schema_version") != SCHEMA_VERSION:
         raise ValueError("权威时间轴回执版本无效")
     if payload.get("authority") != "confirmed_audio_alignment":
@@ -282,6 +286,89 @@ def validate_authoritative_timeline_receipt(
     return payload
 
 
+def _confirmed_srt_rows(path: Path) -> list[dict[str, Any]]:
+    """Strict one-line cues: never normalize or rewrite confirmed subtitle text."""
+    rows = []
+    previous_end = 0.0
+    for index, block in enumerate(re.split(r"\n[ \t]*\n", path.read_text(encoding="utf-8-sig").strip()), 1):
+        lines = block.splitlines()
+        if len(lines) != 3 or lines[0] != str(index):
+            raise ValueError("确认 SRT 必须连续编号且每个 cue 只有一行原文")
+        match = re.fullmatch(r"(\d{2,}):([0-5]\d):([0-5]\d),(\d{3}) --> (\d{2,}):([0-5]\d):([0-5]\d),(\d{3})", lines[1])
+        if not match:
+            raise ValueError("确认 SRT 时间格式无效")
+        values = list(map(int, match.groups()))
+        start, end = [v[0]*3600 + v[1]*60 + v[2] + v[3]/1000 for v in (values[:4], values[4:])]
+        if not lines[2] or end <= start or start < previous_end:
+            raise ValueError("确认 SRT 时间必须为正、按顺序且不重叠")
+        rows.append(dict(line=lines[2], source_start=start, source_end=end))
+        previous_end = end
+    return rows
+
+
+def _audio_duration(path: Path) -> float:
+    result = subprocess.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(path)], check=True, capture_output=True, text=True, timeout=60)
+    duration = float(json.loads(result.stdout)["format"]["duration"])
+    if not math.isfinite(duration) or duration <= 0:
+        raise ValueError("权威音频时长无效")
+    return duration
+
+
+def _validate_confirmed_user_srt(payload: dict[str, Any], *, expected_inputs=None) -> dict[str, Any]:
+    if (payload.get("schema_version") != SCHEMA_VERSION or payload.get("authority") != "user_confirmed_subtitle_timeline"
+            or payload.get("fallback_used") is not False or payload.get("time_basis") != "source_start_source_end"):
+        raise ValueError("用户确认时间轴声明无效")
+    bound = {}
+    for key in ("timings", "subtitle_txt", "subtitle_srt", "authoritative_audio", "output_srt"):
+        if not isinstance(payload.get(key), dict):
+            raise ValueError(f"确认时间轴缺少 {key}")
+        bound[key] = _current_bound_path(payload[key], key)
+    if payload["output_srt"]["sha256"] != payload["subtitle_srt"]["sha256"]:
+        raise ValueError("确认 SRT 原字节被改变")
+    if expected_inputs is not None:
+        for key, input_key in (("subtitle_txt", "subtitle_txt"), ("subtitle_srt", "subtitle_srt"), ("authoritative_audio", "audio")):
+            expected = expected_inputs.get(input_key)
+            if not isinstance(expected, Mapping) or expected.get("sha256") != payload[key]["sha256"]:
+                raise ValueError(f"确认时间轴未绑定当前输入 {input_key}")
+            _current_bound_path(expected, input_key)
+    rows = _confirmed_srt_rows(bound["subtitle_srt"])
+    lines = bound["subtitle_txt"].read_text(encoding="utf-8-sig").splitlines()
+    if [r["line"] for r in rows] != lines:
+        raise ValueError("确认 SRT 与 TXT 逐行原文不完全一致")
+    if rows != _load_timing_rows(bound["timings"]) or len(rows) != payload.get("line_count"):
+        raise ValueError("确认 SRT 与 timings 不一致")
+    duration = _audio_duration(bound["authoritative_audio"])
+    recorded_duration = float(payload.get("audio_duration_seconds", -1))
+    if not math.isfinite(recorded_duration) or rows[-1]["source_end"] > duration or abs(duration - recorded_duration) > 0.001:
+        raise ValueError("确认时间轴超过音频时长或时长证据失效")
+    return payload
+
+
+def import_confirmed_user_srt(*, receipt_path: Path, timings_path: Path,
+                              subtitle_txt: Path, subtitle_srt: Path,
+                              authoritative_audio: Path, expected_inputs=None) -> Path:
+    """Bind user-confirmed SRT verbatim; this is not an ASR alignment claim."""
+    if receipt_path.resolve() in {subtitle_txt.resolve(), subtitle_srt.resolve(), authoritative_audio.resolve()} or timings_path.resolve() in {subtitle_txt.resolve(), subtitle_srt.resolve(), authoritative_audio.resolve(), receipt_path.resolve()}:
+        raise ValueError("时间轴产物不得覆盖输入或彼此覆盖")
+    rows = _confirmed_srt_rows(subtitle_srt)
+    if [r["line"] for r in rows] != subtitle_txt.read_text(encoding="utf-8-sig").splitlines():
+        raise ValueError("确认 SRT 与 TXT 逐行原文不完全一致")
+    duration = _audio_duration(authoritative_audio)
+    if rows[-1]["source_end"] > duration:
+        raise ValueError("确认 SRT 超过权威音频时长")
+    _atomic_write(timings_path, json.dumps(rows, ensure_ascii=False, indent=2) + "\n")
+    payload = dict(schema_version=SCHEMA_VERSION, authority="user_confirmed_subtitle_timeline",
+                   source_kind="confirmed_user_srt", fallback_used=False,
+                   time_basis="source_start_source_end", line_count=len(rows),
+                   timings=_binding(timings_path), subtitle_txt=_binding(subtitle_txt),
+                   subtitle_srt=_binding(subtitle_srt), output_srt=_binding(subtitle_srt),
+                   authoritative_audio=_binding(authoritative_audio), audio_duration_seconds=duration,
+                   generated_at=datetime.now(timezone.utc).isoformat())
+    _validate_confirmed_user_srt(payload, expected_inputs=expected_inputs)
+    _atomic_write(receipt_path, json.dumps(payload, ensure_ascii=False, indent=2) + "\n")
+    return receipt_path
+
+
 def ensure_authoritative_timeline_srt(status_dir: Path, assembly_dir: Path) -> Path | None:
     """Return only a hash-bound production timeline, never an even fallback."""
 
@@ -344,6 +431,7 @@ def ensure_authoritative_timeline_srt(status_dir: Path, assembly_dir: Path) -> P
 
 __all__ = [
     "SCHEMA_VERSION",
+    "import_confirmed_user_srt",
     "ensure_authoritative_timeline_srt",
     "validate_authoritative_timeline_receipt",
     "write_authoritative_timeline_receipt",

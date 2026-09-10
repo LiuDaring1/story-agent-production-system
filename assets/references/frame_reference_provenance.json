@@ -1,0 +1,20 @@
+{
+  "version": "user-rebound-20260910",
+  "path": "frame_reference.png",
+  "sha256": "85cb6e676943e9f8745d41a6689e2d437ba5767b143f0b007007119eeea06892",
+  "source": "用户本轮提供并要求继续采用的基础木框结构参考；非声称恢复历史同一字节",
+  "role": "geometry_only",
+  "allowed": [
+    "框条比例",
+    "开口",
+    "实用厚度"
+  ],
+  "excluded": [
+    "羊角",
+    "羊毛",
+    "木纹主题模板",
+    "中间杂色",
+    "顶部造型强制复用"
+  ],
+  "quality_examples_are_templates": false
+}

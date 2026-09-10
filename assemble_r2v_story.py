@@ -138,6 +138,104 @@ def validate_semantic_card_video_bindings(
             raise ValueError(f"正式组装的 {option} 不是语义卡微动回执审过的当前视频")
 
 
+def expand_body_assembly_segments(
+    plan: dict[str, Any], *, ledger: dict[str, Any], audio_path: Path,
+    audio_duration: float, title_video: Path, moral_video: Path | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any]]:
+    """Fill only explicitly evidenced card complements, without changing the plan."""
+    from math import isfinite
+    from story_timeline import validate_authoritative_timeline_receipt
+    from semantic_card_motion import semantic_card_motion_receipt_issues
+
+    window = plan.get("body_audio_window")
+    if not isinstance(window, dict):
+        raise ValueError("body_audio_window 必须是带权威时间轴绑定的对象")
+    artifacts = ledger.get("artifacts", {})
+    paths = {}
+    for name in ("authoritative_timeline_receipt", "semantic_card_motion_receipt"):
+        record = artifacts.get(name, {})
+        path = Path(str(record.get("path") or "")).expanduser().resolve()
+        if not path.is_file() or sha256_path(path) != record.get("sha256"):
+            raise ValueError(f"正文窗口组装缺少当前证据或哈希漂移：{name}")
+        paths[name] = path
+    timeline_path = paths["authoritative_timeline_receipt"]
+    binding = window.get("authoritative_timeline_receipt") or {}
+    if (Path(str(binding.get("path") or "")).expanduser().resolve() != timeline_path
+            or binding.get("sha256") != sha256_path(timeline_path)):
+        raise ValueError("body_audio_window 未绑定账本当前权威时间轴")
+    timeline = validate_authoritative_timeline_receipt(
+        timeline_path, expected_inputs=ledger.get("inputs", {}),
+    )
+    actual_audio = audio_path.expanduser().resolve()
+    for label, record in (("ledger", ledger.get("inputs", {}).get("audio", {})),
+                          ("plan", plan.get("source_audio", {})),
+                          ("timeline", timeline.get("authoritative_audio", {}))):
+        if (Path(str(record.get("path") or "")).expanduser().resolve() != actual_audio
+                or record.get("sha256") != sha256_path(actual_audio)):
+            raise ValueError(f"正文窗口 {label} 音频不是当前权威输入")
+    for value in (timeline.get("audio_duration_seconds"), plan.get("source_audio", {}).get("duration_seconds")):
+        if value is None or not isfinite(float(value)) or abs(float(value) - audio_duration) > 0.001:
+            raise ValueError("正文窗口完整音频时长与权威时间轴不符")
+    start, end = float(window.get("source_start", -1)), float(window.get("source_end", -1))
+    if not all(isfinite(v) for v in (start, end, audio_duration)) or not 0 < start < end <= audio_duration:
+        raise ValueError("正文窗口范围无效")
+    shots = copy.deepcopy(plan["shots"])
+    if not shots or any(str(s.get("shot_id", "")).upper() in {"TITLE", "MORAL"} for s in shots):
+        raise ValueError("body_audio_window 只允许正文镜头，语义卡不能重复")
+    cursor = start
+    for shot in shots:
+        left, right = float(shot.get("source_start", -1)), float(shot.get("source_end", -1))
+        if not all(isfinite(v) for v in (left, right)) or abs(left - cursor) > 1e-6 or right <= left:
+            raise ValueError("正文镜头未连续精确覆盖 body_audio_window")
+        cursor = right
+    if abs(cursor - end) > 1e-6:
+        raise ValueError("正文末镜头与 body_audio_window 末尾不符")
+    motion_path = paths["semantic_card_motion_receipt"]
+    request_path = motion_path.parent / "semantic_card_motion_request.json"
+    if not request_path.is_file():
+        raise ValueError("正文窗口组装缺少明确语义卡窗口请求")
+    issues = semantic_card_motion_receipt_issues(request_path, motion_path)
+    if issues:
+        raise ValueError("正文窗口语义卡微动回执失效：" + "；".join(issues))
+    request = json.loads(request_path.read_text(encoding="utf-8"))
+    receipt = json.loads(motion_path.read_text(encoding="utf-8"))
+    if receipt.get("request_sha256") != sha256_path(request_path):
+        raise ValueError("语义卡窗口请求哈希不匹配")
+    cards = {}
+    for card in request.get("cards", []):
+        kind = card.get("card_kind")
+        if kind in cards:
+            raise ValueError("语义卡窗口请求重复")
+        cards[kind] = card
+    tail = audio_duration - end
+    expected = {"title_card": start}
+    if tail > 1e-6:
+        expected["moral_card"] = tail
+    for kind, length in expected.items():
+        # Native requests store milliseconds (round(..., 3)); no frame-sized gap allowance.
+        value = cards.get(kind, {}).get("presentation_window_seconds")
+        if value is None or not isfinite(float(value)) or abs(float(value) - length) > 0.000501:
+            raise ValueError(f"{kind} presentation_window 与正文前后补集不符")
+    validate_semantic_card_video_bindings(
+        title_video=title_video, moral_video=moral_video,
+        motion_receipt_path=motion_path, require_moral=tail > 1e-6,
+    )
+    if tail > 1e-6:
+        shots.append({"shot_id": "MORAL", "source_start": end, "source_end": audio_duration,
+                      "story_text": str(cards["moral_card"].get("text") or ""),
+                      "semantic_card": True})
+    validate_contiguous_timeline(shots, audio_duration)
+    evidence = {
+        "policy": "bound_semantic_card_complements/v1",
+        "body_audio_window": copy.deepcopy(window),
+        "title_window": [0.0, start], "moral_window": [end, audio_duration] if tail > 1e-6 else None,
+        "motion_request": {"path": str(request_path), "sha256": sha256_path(request_path)},
+        "motion_receipt": {"path": str(motion_path), "sha256": sha256_path(motion_path)},
+        "director_plan_unchanged": True,
+    }
+    return shots, evidence
+
+
 def load_authoritative_timings(path: Path) -> list[dict[str, Any]]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(payload, list) or not payload:
@@ -377,6 +475,9 @@ def main() -> int:
     clips_dir = args.clips_dir.expanduser()
     ppt_plan_path = args.ppt_plan.expanduser()
     plan = load_plan(plan_path)
+    ledger = None
+    if "body_audio_window" in plan and (args.authoritative_timings is not None or args.retimed_plan is not None):
+        raise ValueError("body_audio_window 已绑定权威时间轴，禁止现场 retime")
     if not args.diagnostic_preview:
         if args.authoritative_timings is not None or args.retimed_plan is not None:
             raise ValueError(
@@ -466,7 +567,19 @@ def main() -> int:
         plan_path = args.retimed_plan.expanduser()
         plan_path.parent.mkdir(parents=True, exist_ok=True)
         plan_path.write_text(json.dumps(plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    shots = plan["shots"]
+    body_evidence = None
+    if "body_audio_window" in plan:
+        if args.run_file is None:
+            raise ValueError("body_audio_window 组装（含 diagnostic）必须提供 --run-file 和明确语义卡窗口证据")
+        if ledger is None:
+            from story_run import load_run
+            ledger = load_run(args.run_file.expanduser())
+        shots, body_evidence = expand_body_assembly_segments(
+            plan, ledger=ledger, audio_path=audio_path, audio_duration=audio_duration,
+            title_video=title_video, moral_video=args.moral_video,
+        )
+    else:
+        shots = plan["shots"]
     if not shots:
         raise ValueError("R2V 计划没有镜头")
     validate_contiguous_timeline(shots, audio_duration)
@@ -590,6 +703,7 @@ def main() -> int:
         "legacy_reuse_flag_requested": bool(args.reuse_existing_clips),
         "legacy_reuse_performed": False,
         "segments": rows,
+        "body_assembly_evidence": body_evidence,
     }
     decisions_path.parent.mkdir(parents=True, exist_ok=True)
     decisions_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -603,7 +717,7 @@ def main() -> int:
         "shot_id": str(shot.get("shot_id") or ""),
         "video_path": str(clips_dir / f"{shot.get('shot_id')}.mp4"),
         "subtitle": str(shot.get("story_text") or ""),
-        "semantic_card": False,
+        "semantic_card": str(shot.get("shot_id") or "").upper() == "MORAL",
     } for shot in shots)
     ppt_plan = {
         "schema_version": "story-ppt-plan-v1",

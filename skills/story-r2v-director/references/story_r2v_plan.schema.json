@@ -26,6 +26,25 @@
         "duration_seconds": {"type": "number", "exclusiveMinimum": 0}
       }
     },
+    "body_audio_window": {
+      "description": "Absolute body interval on the complete authoritative audio clock; excludes separately rendered TITLE/MORAL cards.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["source_start", "source_end", "authoritative_timeline_receipt"],
+      "properties": {
+        "source_start": {"type": "number", "minimum": 0},
+        "source_end": {"type": "number", "exclusiveMinimum": 0},
+        "authoritative_timeline_receipt": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["path", "sha256"],
+          "properties": {
+            "path": {"type": "string", "minLength": 1},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+          }
+        }
+      }
+    },
     "policies": {
       "type": "object",
       "additionalProperties": false,

@@ -494,6 +494,13 @@ def binding_payload(
         "compiled_release_spec_sha256": compiled_spec_sha256,
         "production_keying_filter_fingerprint": keying_filter_fingerprint,
     }
+    if spec.get("schema_version") == "story-release-render-spec/v2":
+        payload = {key: str(spec.get(key) or "") for key in (
+            "production_contract", "bindings_schema_version", "run_input_sha256",
+            "requirements_projection_sha256", "semantic_card_evidence_sha256", "release_parameters_sha256")}
+        payload.update({"compiled_release_spec_sha256": compiled_spec_sha256,
+            "artifact_semantic_plan_schema_version": str(spec.get("semantic_card_plan_schema_version") or ""),
+            "production_keying_filter_fingerprint": keying_filter_fingerprint})
     if semantic_plan_path is not None:
         payload["artifact_semantic_plan_sha256"] = file_sha256(semantic_plan_path)
     if keying_preset_path is not None:
@@ -530,6 +537,14 @@ def geometry_manifest_issues(
         "keying_lock_sha256", "demo_render_manifest_sha256",
         "approved_demo_geometry_sha256",
     }
+    if isinstance(bindings, Mapping) and bindings.get("bindings_schema_version") == "story-release-bindings/v2":
+        if bindings.get("production_contract") != "story-production/v2":
+            issues.append("release_geometry_v2_production_contract_mismatch")
+        required_bindings -= {"story_contract_sha256", "contract_schema_version", "contract_projection_sha256",
+            "story_contract_dependency_sha256", "release_projection_sha256", "release_dependency_sha256",
+            "artifact_semantic_plan_dependency_sha256"}
+        required_bindings |= {"production_contract", "bindings_schema_version", "run_input_sha256",
+            "requirements_projection_sha256", "semantic_card_evidence_sha256", "release_parameters_sha256"}
     if not isinstance(bindings, Mapping):
         issues.append("release_geometry_bindings_missing")
     else:

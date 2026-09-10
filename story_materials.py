@@ -92,18 +92,6 @@ def validate_materials(path, inputs=None):
     p = json.loads(Path(path).read_text())
     if p.get('schema_version') != 'story-ppt-materials/v2':
         raise ValueError('Wrong materials version')
-    if 'timeline_receipt' in p:
-        from story_packaging_defaults import packaging_fields
-        if inputs is None:
-            from story_timeline import validate_authoritative_timeline_receipt
-            t = validate_authoritative_timeline_receipt(current(p['timeline_receipt']))
-            field_inputs = {'story_requirements': p['story_requirements'], 'audio': t['authoritative_audio'], 'subtitle_txt': t['subtitle_txt']}
-        else:
-            field_inputs = inputs
-            if p['story_requirements'] != inputs['story_requirements']:
-                raise ValueError('Story information changed')
-        if p['fields'] != packaging_fields(field_inputs, p['timeline_receipt']):
-            raise ValueError('Packaging story information/timeline changed')
     for role, item in p['inputs'].items():
         current(item)
         if inputs and item != inputs[role]:
@@ -171,6 +159,8 @@ def validate_packaging(path, inputs=None):
             from story_timeline import validate_authoritative_timeline_receipt
             t = validate_authoritative_timeline_receipt(current(p['timeline_receipt']))
             field_inputs = {'story_requirements': p['story_requirements'], 'audio': t['authoritative_audio'], 'subtitle_txt': t['subtitle_txt']}
+            if 'subtitle_srt' in t:
+                field_inputs['subtitle_srt'] = t['subtitle_srt']
         else:
             field_inputs = inputs
             if p['story_requirements'] != inputs['story_requirements']:

@@ -171,6 +171,10 @@ class ReleaseConfig:
     main_package_spec: Path | None = None
     main_package_receipt: Path | None = None
     approved_preview_geometry: Path | None = None
+    approved_preview_review: Path | None = None
+    release_producer_context: str = ""
+    release_windows_plan: Path | None = None
+    release_windows_review: Path | None = None
     rvm_model_path: str = ""
     rvm_model_sha256: str = ""
     rvm_runtime_path: str = ""
@@ -244,6 +248,10 @@ def main() -> None:
     parser.add_argument("--library-bottom-panel", type=Path, help="ImageGen 原生资料号底部包装板（2304x888）")
     parser.add_argument("--main-package-spec", type=Path, help="参考图+固定 Prompt 主账号包装合同")
     parser.add_argument("--main-package-receipt", type=Path, help="ImageGen 包装生成与 OCR/泄漏检查回执")
+    parser.add_argument("--approved-preview-review", type=Path, help="v2 发布预览的独立审核回执")
+    parser.add_argument("--release-windows-plan", type=Path, help="v2 已审发布 A/B/C 时间选择")
+    parser.add_argument("--release-windows-review", type=Path, help="v2 发布时间选择独立审核")
+    parser.add_argument("--producer-context", default="", help="v2 发布预览生产上下文")
     parser.add_argument("--approved-preview-geometry", type=Path, help="独立审核通过的同素材/同参数短预演几何清单")
     parser.add_argument("--video-box", default="0,416,1080,608", help="视频嵌入窗口：x,y,w,h，基于 1080x1440")
     parser.add_argument("--watermark-width", default=96, type=int, help="防盗 PNG 在中间视频里的显示宽度")
@@ -416,6 +424,10 @@ def main() -> None:
         approved_preview_geometry=(
             args.approved_preview_geometry.expanduser() if args.approved_preview_geometry else None
         ),
+        approved_preview_review=args.approved_preview_review,
+        release_producer_context=args.producer_context,
+        release_windows_plan=args.release_windows_plan,
+        release_windows_review=args.release_windows_review,
         rvm_model_path=str(keying.get("rvm_model_path") or ""),
         rvm_model_sha256=str(keying.get("rvm_model_sha256") or ""),
         rvm_runtime_path=str(keying.get("rvm_runtime_path") or ""),
@@ -429,6 +441,10 @@ def main() -> None:
         person_layout_policy=person_layout_policy,
     )
     contract_spec = load_release_contract_spec(args.contract_render_spec) if args.contract_render_spec else None
+    if contract_spec is None and args.run_file is not None:
+        from story_run import load_run
+        if load_run(args.run_file).get("production_contract") == "story-production/v2":
+            contract_spec = compile_v2_release_spec(config, args.run_file)
     if (
         contract_spec is not None
         and args.preview_dir is None
@@ -449,8 +465,150 @@ def main() -> None:
         package_release_videos(config, contract_spec=contract_spec)
 
 
+V2_RELEASE_SPEC_SCHEMA = "story-release-render-spec/v2"
+
+
+def compile_v2_release_spec(config: ReleaseConfig, run_file: Path) -> dict:
+    """Project current v2 evidence into renderer inputs, never create a story contract."""
+    from story_run import load_run
+    from story_requirements import validate_run_projection
+    from story_production_v2 import binding, current
+    from story_media_preview import load_approved, validate_preview
+    from story_timeline import validate_authoritative_timeline_receipt
+    from semantic_card_motion import semantic_card_generation_receipt_issues, semantic_card_motion_receipt_issues
+
+    run_file = run_file.expanduser().resolve()
+    ledger = load_run(run_file)
+    if ledger.get("production_contract") != "story-production/v2":
+        raise ValueError("v2 release spec requires an explicit v2 run")
+    root = Path(ledger["project_dir"]).resolve()
+    if not config.output_dir.resolve().is_relative_to(root):
+        raise ValueError("v2 release output is outside current project")
+    accounts = ["main", "library"] if config.variant == "both" else [config.variant]
+    validate_run_projection(run_file, consumer_scope={"accounts": accounts,
+        "artifacts": [f"{a}_release_video" for a in accounts]},
+        parameters={"variant": config.variant, "output_scale": config.output_scale})
+    if config.keyer != "rvm":
+        raise ValueError("v2 release requires RVM; no chromakey fallback")
+    if not config.release_producer_context:
+        raise ValueError("v2 release requires producer_context for independent preview review")
+    for item in ledger["inputs"].values():
+        current(item)
+    projection_path = current(ledger["artifacts"]["requirements_projection"])
+    if config.artifact_semantic_plan is None:
+        raise ValueError("v2 release requires the bound semantic card plan")
+    semantic_path = config.artifact_semantic_plan.resolve()
+    if not semantic_path.is_relative_to(root):
+        raise ValueError("v2 semantic card plan is outside current project")
+    semantic = json.loads(semantic_path.read_text(encoding="utf-8"))
+    if semantic.get("production_contract") != "story-production/v2":
+        raise ValueError("v2 semantic card plan production contract mismatch")
+    for role in ("confirmed_text", "subtitle_txt", "subtitle_srt", "audio", "final_word", "story_requirements"):
+        item = semantic.get("inputs", {}).get(role, {})
+        actual = current(item)
+        expected = current(ledger["inputs"][role])
+        if actual.resolve() != expected.resolve() or item.get("sha256") != ledger["inputs"][role]["sha256"]:
+            raise ValueError(f"v2 semantic card input mismatch: {role}")
+    timeline_path = current(ledger["artifacts"]["authoritative_timeline_receipt"])
+    if current(semantic["authoritative_timeline_receipt"]).resolve() != timeline_path.resolve():
+        raise ValueError("v2 semantic card timeline differs from current ledger")
+    validate_authoritative_timeline_receipt(timeline_path, expected_inputs=ledger["inputs"])
+    generation_path = current(ledger["artifacts"]["semantic_card_generation_receipt"])
+    motion_path = current(ledger["artifacts"]["semantic_card_motion_receipt"])
+    request_path = motion_path.parent / "semantic_card_motion_request.json"
+    issues = semantic_card_generation_receipt_issues(generation_path)
+    issues += semantic_card_motion_receipt_issues(request_path, motion_path)
+    if issues:
+        raise ValueError("v2 semantic card evidence invalid: " + "; ".join(issues))
+    evidence = [generation_path, motion_path, request_path]
+    for path in evidence:
+        if json.loads(path.read_text())["artifact_semantic_plan_sha256"] != sha256_path(semantic_path):
+            raise ValueError("v2 semantic card plan hash differs from reviewed evidence")
+    if config.demo_render_manifest is None:
+        raise ValueError("v2 release requires approved Demo evidence")
+    approved, demo = load_approved(config.demo_render_manifest, root)
+    preview = validate_preview(current(approved["preview"]), root)
+    for key, actual in (("preset", config.keying_preset_path), ("background_image", config.bg_image),
+                        ("story_frame", config.frame_image), ("logo", config.story_logo)):
+        if actual is None or current(preview["inputs"][key]).resolve() != actual.resolve():
+            raise ValueError(f"v2 release differs from approved Demo input: {key}")
+    if config.keying_preset_path is None or keying_preset_lock_issues(config.keying_preset_path):
+        raise ValueError("v2 release keying lock invalid")
+    if demo.get("keying_lock_sha256") != sha256_path(config.keying_preset_path.with_name("keying_preset.lock.json")):
+        raise ValueError("v2 release keying lock differs from approved Demo")
+    if config.subtitle_srt is None or config.subtitle_srt.resolve() != current(ledger["inputs"]["subtitle_srt"]).resolve():
+        raise ValueError("v2 release must use full confirmed SRT")
+    if config.person_greenscreen is None or current(preview["inputs"]["foreground"]).resolve() != config.person_greenscreen.resolve():
+        raise ValueError("v2 release foreground differs from approved Demo")
+    if config.antipiracy_logo is None or config.antipiracy_logo.resolve() != config.story_logo.resolve():
+        raise ValueError("v2 library must use the same approved official logo")
+    if (list(config.story_box) != [210, 270, 910, 512]
+            or tuple(config.b_story_box) != CANONICAL_B_STORY_BOX):
+        raise ValueError("v2 release story windows must preserve mature A/B layout")
+    windows_evidence = None
+    if config.b_windows or config.c_windows or config.release_windows_plan is not None:
+        from story_production_v2 import validate_independent_approval
+        if config.release_windows_plan is None or config.release_windows_review is None:
+            raise ValueError("v2 explicit B/C windows require their reviewed source plan")
+        windows = json.loads(config.release_windows_plan.read_text())
+        if windows.get("schema_version") != "story-project-release-windows-plan/v1":
+            raise ValueError("v2 release windows plan schema invalid")
+        for item in list(windows.get("inputs", {}).values()) + windows.get("rules", []):
+            current(item)
+        for role, expected in (("subtitle_srt", current(ledger["inputs"]["subtitle_srt"])),
+                               ("authoritative_timeline_receipt", timeline_path)):
+            if current(windows["inputs"][role]).resolve() != expected.resolve():
+                raise ValueError("v2 release windows bind another timeline or subtitles")
+        for key, actual in (("b_windows", config.b_windows), ("c_windows", config.c_windows)):
+            if parse_b_windows(str(windows.get(key) or "")) != tuple(actual):
+                raise ValueError("v2 release windows differ from reviewed source plan")
+        validate_independent_approval(json.loads(config.release_windows_review.read_text()),
+            config.release_windows_plan, producer_context=config.release_producer_context)
+        windows_evidence = {"plan": binding(config.release_windows_plan), "review": binding(config.release_windows_review)}
+    logo = binding(config.story_logo)
+    # These regions describe the real existing renderer; they do not create a
+    # second user contract or scale the approved presenter to a new safe box.
+    regions = [
+        {"role": "person", "x": 0.0, "y": 0.0, "width": 1.0, "height": 1.0},
+        {"role": "story_media", "x": config.story_box[0] / WIDE_WIDTH,
+         "y": config.story_box[1] / WIDE_HEIGHT, "width": config.story_box[2] / WIDE_WIDTH,
+         "height": config.story_box[3] / WIDE_HEIGHT},
+        {"role": "logo", "x": config.story_logo_x / WIDE_WIDTH,
+         "y": config.story_logo_y / WIDE_HEIGHT, "width": config.story_logo_width_a / WIDE_WIDTH,
+         "height": config.story_logo_width_a / WIDE_HEIGHT},
+    ]
+    layout = {"story_box": list(config.story_box), "b_story_box": list(config.b_story_box),
+        "b_windows": [list(w) for w in config.b_windows], "c_windows": [list(w) for w in config.c_windows],
+        "detected_person_bbox": list(config.detected_person_bbox) if config.detected_person_bbox else None,
+        "subtitle_font_size": config.subtitle_font_size, "subtitle_margin_v": config.subtitle_margin_v,
+        "background_blur": config.background_blur, "output_scale": config.output_scale,
+        "variant": config.variant}
+    run_inputs = {k: {"path": str(Path(v["path"]).resolve()), "sha256": v["sha256"]}
+                  for k, v in ledger["inputs"].items()}
+    return {"schema_version": V2_RELEASE_SPEC_SCHEMA, "consumer": "release_video",
+        "production_contract": "story-production/v2", "bindings_schema_version": "story-release-bindings/v2",
+        "run_file": str(run_file), "project_dir": str(root),
+        "run_input_sha256": canonical_sha256({"project": str(root), "inputs": run_inputs}),
+        "requirements_projection": binding(projection_path),
+        "requirements_projection_sha256": sha256_path(projection_path),
+        "semantic_card_plan": binding(semantic_path),
+        "semantic_card_plan_schema_version": semantic["schema_version"],
+        "semantic_card_evidence": [binding(p) for p in evidence],
+        "semantic_card_evidence_sha256": canonical_sha256([binding(p) for p in evidence]),
+        "approved_demo": binding(config.demo_render_manifest),
+        "producer_context": config.release_producer_context,
+        "layout_parameters": layout, "release_parameters_sha256": canonical_sha256(layout),
+        "release_windows_evidence": windows_evidence,
+        "official_assets": [{"asset_id": "approved_demo_logo", **logo, "allowed_uses": ["release_video"], "max_per_frame": 1}],
+        "layout_rules": [], "variants": [{"variant_id": "main", "aspect_ratio": "16:9", "regions": regions}]}
+
+
 def load_release_contract_spec(path: Path) -> dict:
     payload = json.loads(path.expanduser().read_text(encoding="utf-8"))
+    if payload.get("schema_version") == V2_RELEASE_SPEC_SCHEMA:
+        if payload.get("consumer") != "release_video" or payload.get("production_contract") != "story-production/v2":
+            raise ValueError("v2 release spec identity invalid")
+        return payload
     if payload.get("consumer") != "release_video" or not all(str(payload.get(field) or "") for field in BINDING_FIELDS):
         raise ValueError("发布渲染合同规格无效或缺少绑定字段")
     return payload
@@ -638,8 +796,16 @@ def required_package_asset_binding(config: ReleaseConfig) -> dict[str, object]:
 def compile_release_geometry(config: ReleaseConfig, spec: dict, *, preview: bool = False) -> dict:
     if config.artifact_semantic_plan is None:
         raise ValueError("required_v1 发布渲染缺少 artifact_semantic_plan")
-    project_root = config.artifact_semantic_plan.resolve().parents[2]
-    semantic_plan = load_current_artifact_semantic_plan(project_root)
+    is_v2 = spec.get("schema_version") == V2_RELEASE_SPEC_SCHEMA
+    if is_v2:
+        current_spec = compile_v2_release_spec(config, Path(spec["run_file"]))
+        if current_spec != spec:
+            raise ValueError("v2 release spec is stale or inputs/parameters changed")
+        project_root = Path(spec["project_dir"])
+        semantic_plan = json.loads(config.artifact_semantic_plan.read_text())
+    else:
+        project_root = config.artifact_semantic_plan.resolve().parents[2]
+        semantic_plan = load_current_artifact_semantic_plan(project_root)
     if config.keying_preset_path is None:
         raise ValueError("required_v1 发布渲染缺少审核锁定的 keying preset")
     if not preview:
@@ -728,7 +894,8 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict, *, preview: bool
         bindings["keying_lock_sha256"] = (
             "not_applicable:preview_before_independent_keying_lock"
         )
-    bindings.update(semantic_plan_binding(config.artifact_semantic_plan, semantic_plan))
+    if not is_v2:
+        bindings.update(semantic_plan_binding(config.artifact_semantic_plan, semantic_plan))
     bindings.update({
         "demo_render_manifest_sha256": demo_manifest_sha,
         "approved_demo_geometry_sha256": approved_demo_geometry_sha,
@@ -820,6 +987,16 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict, *, preview: bool
             "preview_sample_seconds": RELEASE_PREVIEW_SAMPLE_SECONDS,
         },
     }
+    if is_v2:
+        payload["production_contract"] = "story-production/v2"
+        payload["producer_context"] = config.release_producer_context
+        if not preview:
+            from story_production_v2 import validate_independent_approval
+            if config.approved_preview_geometry is None or config.approved_preview_review is None:
+                raise ValueError("v2 formal release requires independently approved preview geometry and review")
+            review = json.loads(config.approved_preview_review.read_text())
+            validate_independent_approval(review, config.approved_preview_geometry,
+                                          producer_context=config.release_producer_context)
     payload["formal_render_binding_sha256"] = preview_formal_binding_sha256(payload)
     if not preview and config.approved_preview_geometry is not None:
         try:
@@ -828,6 +1005,8 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict, *, preview: bool
             )
         except (OSError, json.JSONDecodeError) as exc:
             raise ValueError("required_v1 已审核短预演几何清单缺失或损坏") from exc
+        if is_v2 and geometry_manifest_issues(approved_preview):
+            raise ValueError("v2 approved release geometry is damaged")
         if (
             approved_preview.get("formal_render_binding_sha256")
             != payload["formal_render_binding_sha256"]
@@ -1006,7 +1185,8 @@ def build_release_render_manifest(config: ReleaseConfig, spec: dict, outputs: li
     payload = {
         "version": 2,
         "consumer": "release_video",
-        **{field: str(spec[field]) for field in BINDING_FIELDS},
+        **({"production_contract": "story-production/v2"} if spec.get("schema_version") == V2_RELEASE_SPEC_SCHEMA
+           else {field: str(spec[field]) for field in BINDING_FIELDS}),
         **geometry["bindings"],
         "variant": config.variant,
         "release_geometry_schema_version": geometry["schema_version"],
@@ -1280,24 +1460,15 @@ def _prepared_story_frame_for_integrity(
 
 
 def fit_frame_to_window(frame: Image.Image, window: tuple[int, int, int, int]) -> Image.Image:
-    frame = frame.convert("RGBA")
-    bbox = frame.getchannel("A").getbbox()
-    if bbox is None:
-        return frame
-    x, y, width, height = window
-    margin_x = 112
-    margin_y = 116
-    target = (
-        max(0, x - margin_x),
-        max(0, y - margin_y),
-        min(frame.width, x + width + margin_x),
-        min(frame.height, y + height + margin_y),
-    )
-    subject = frame.crop(bbox)
-    fitted = subject.resize((target[2] - target[0], target[3] - target[1]), Image.Resampling.LANCZOS)
-    out = Image.new("RGBA", frame.size, (0, 0, 0, 0))
-    out.alpha_composite(fitted, (target[0], target[1]))
-    return out
+    """Use the same aperture anchor for asset export and formal compositing.
+
+    Re-fitting the outer decoration bounds changes the reviewed opening and
+    can remove its masking lip.  The shared exporter aligns the closed alpha
+    aperture while preserving the generated frame's contour.
+    """
+    from story_project import fit_frame_to_window as fit_by_aperture
+
+    return fit_by_aperture(frame, window)
 
 
 def story_aperture_mask(frame: Image.Image, window: tuple[int, int, int, int], bleed: int = 0) -> Image.Image:

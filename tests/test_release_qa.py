@@ -456,5 +456,38 @@ class ReleaseQaTests(unittest.TestCase):
             self.assertEqual(payload["artifacts"]["library_release_video"]["path"], str(current_library))
 
 
+class ReleaseFrameApertureRegressionTests(unittest.TestCase):
+    def test_preparation_preserves_masking_lip_with_asymmetric_outer_decoration(self) -> None:
+        from release_video import prepare_story_frame_assets
+        from story_project import center_transparent_component_bbox, qa_story_frame_image
+
+        frame = Image.new("RGBA", (1920, 1080), (0, 0, 0, 0))
+        draw = ImageDraw.Draw(frame)
+        draw.rectangle((185, 235, 1145, 815), fill=(160, 100, 50, 255))
+        draw.rectangle((236, 288, 1094, 762), fill=(0, 0, 0, 0))
+        # A thematic extension changes the outer bbox, never the aperture anchor.
+        draw.rectangle((70, 695, 210, 835), fill=(160, 100, 50, 255))
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source = root / "frame.png"
+            frame.save(source)
+            for label, window in (("a", (210, 270, 910, 512)), ("b", CANONICAL_B_STORY_BOX)):
+                prepared, mask, _ = prepare_story_frame_assets(
+                    source, window, root / f"{label}.png", root / f"{label}_mask.png",
+                )
+                with Image.open(prepared) as output:
+                    aperture = center_transparent_component_bbox(output)
+                    self.assertIsNotNone(aperture)
+                    x, y, width, height = window
+                    overlap_x = max(18, min(36, round(width * 0.028)))
+                    overlap_y = max(14, min(28, round(height * 0.035)))
+                    expected = (x + overlap_x, y + overlap_y, x + width - overlap_x, y + height - overlap_y)
+                    self.assertTrue(all(abs(a - b) <= 1 for a, b in zip(aperture, expected)))
+                    self.assertEqual(qa_story_frame_image(output, window), [])
+                    self.assertEqual(story_frame_integrity_issues(output, window), [])
+                with Image.open(mask) as aperture_mask:
+                    self.assertEqual(aperture_mask.getpixel((x + width // 2, y + height // 2)), 255)
+
+
 if __name__ == "__main__":
     unittest.main()

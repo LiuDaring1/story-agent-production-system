@@ -932,14 +932,14 @@ class ReleaseGeometryTests(unittest.TestCase):
             self.assertEqual(geometry["library"]["video_region"], [0, TOP_HEIGHT, FINAL_WIDTH, CENTER_HEIGHT])
             compositing = geometry["video_compositing"]
             self.assertEqual(compositing["canvas_background_rect"], [0, 0, 1920, 1080])
-            self.assertEqual(compositing["frame_outer_rect"], [0, 84, 1112, 732])
-            self.assertEqual(compositing["frame_aperture_mask"]["rect"], [100, 200, 900, 500])
+            self.assertEqual(compositing["frame_outer_rect"], [31, 109, 1051, 681])
+            self.assertEqual(compositing["frame_aperture_mask"]["rect"], [126, 218, 849, 463])
             self.assertEqual(compositing["story_video_transform"]["fit"], "cover")
             self.assertEqual(compositing["story_video_focus_point"], [0.5, 0.5])
             presenter = geometry["presenter"]["a"]
             self.assertEqual(presenter["presenter_initial_y"], presenter["y"])
             self.assertEqual(presenter["presenter_initial_scale"], presenter["scale"])
-            self.assertEqual(presenter["presenter_right_blank_region"]["x"], 1112)
+            self.assertEqual(presenter["presenter_right_blank_region"]["x"], 1082)
             self.assertEqual(geometry_manifest_issues(geometry), [])
 
     def test_formal_geometry_rejects_any_post_preview_material_or_parameter_change(self) -> None:

@@ -93,6 +93,17 @@ def reset_retryable_failed_row(row: dict[str, str], video_path: Path) -> bool:
     # Unknown/local failures must resume the same provider request.
     if row.get("provider_failure_confirmed") != "true":
         return False
+    failure_detail = " ".join(str(row.get(key) or "") for key in (
+        "error", "api_response", "query_response",
+    )).lower()
+    if any(marker in failure_detail for marker in (
+        "safety review", "safety_review", "safety system", "moderation",
+        "content_policy", "content policy", "安全审核", "内容审核",
+    )):
+        raise ValueError(
+            f"镜头 {row.get('scene', '')} 被供应商安全审核拒绝；保留原任务和错误证据，"
+            "禁止自动原样重提。请先审查内容并独立审核必要的安全修订。"
+        )
     scene = row.get("scene", "")
     if row.get("task_id", "").strip():
         print(f"重置失败任务 {scene}：清除旧 task_id 后重新提交。", flush=True)

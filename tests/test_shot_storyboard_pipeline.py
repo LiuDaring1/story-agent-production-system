@@ -13,6 +13,7 @@ from shot_storyboard_pipeline import (
     StoryboardPipelineError,
     _prompt_with_offscreen_reveal_guard,
     _runtime_reference_assets,
+    _storyboard_references,
     build_storyboard_prompt,
     compile_provider_prompt,
     build_storyboard_manifest,
@@ -43,6 +44,31 @@ def write_json(path: Path, payload: dict) -> None:
 
 
 class ShotStoryboardPipelineTests(unittest.TestCase):
+    def test_five_explicit_storyboard_assets_are_retained_in_order(self) -> None:
+        ids = [f"required-{index}" for index in range(5)]
+        assets = {key: {"asset_id": key, "kind": "character"} for key in ids}
+        refs = _storyboard_references(
+            {"shot_id": "five-inputs", "reference_asset_ids": ids}, assets
+        )
+        self.assertEqual([item["asset_id"] for item in refs], ids)
+
+    def test_sixth_required_storyboard_asset_blocks_live_tool_limit(self) -> None:
+        ids = [f"required-{index}" for index in range(6)]
+        assets = {key: {"asset_id": key, "kind": "character"} for key in ids}
+        with self.assertRaisesRegex(StoryboardPipelineError, "6 张必要资产"):
+            _storyboard_references(
+                {"shot_id": "six-inputs", "reference_asset_ids": ids}, assets
+            )
+
+    def test_five_required_assets_only_drop_optional_style(self) -> None:
+        ids = [f"required-{index}" for index in range(5)]
+        assets = {key: {"asset_id": key, "kind": "character"} for key in ids}
+        assets["style"] = {"asset_id": "style", "kind": "style"}
+        refs = _storyboard_references(
+            {"shot_id": "optional-style", "reference_asset_ids": ["style", *ids]}, assets
+        )
+        self.assertEqual([item["asset_id"] for item in refs], ids)
+
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.root = Path(self.temporary.name)

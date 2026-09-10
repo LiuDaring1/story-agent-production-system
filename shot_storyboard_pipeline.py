@@ -36,6 +36,7 @@ STORYBOARD_PROMPT_CLAUSE = (
 )
 OFFSCREEN_REVEAL_GUARD_MARKER = "[OFFSCREEN_REVEAL_GUARD_V1]"
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp"}
+# The live image_gen tool rejects more than five explicit image paths.
 IMAGEGEN_REFERENCE_LIMIT = 5
 
 

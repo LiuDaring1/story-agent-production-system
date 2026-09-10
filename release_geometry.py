@@ -667,6 +667,65 @@ def release_render_manifest_issues(
     return sorted(set(issues))
 
 
+def _v2_package_panels(payload: Mapping[str, Any], geometry: Mapping[str, Any],
+                       package: Mapping[str, Any]) -> dict[str, Any]:
+    """Read existing native-generation and actual vertical-render evidence.
+
+    No legacy flags are synthesized and no render/geometry artifact is rewritten.
+    The output-specific operation receipt binds the panels actually consumed.
+    """
+    from types import SimpleNamespace
+    from story_production_v2 import current
+    from story_materials import validate_panel_binding
+
+    bindings = geometry.get("bindings", {})
+    if bindings.get("bindings_schema_version") != "story-release-bindings/v2":
+        raise ValueError("v2 package bindings version missing")
+    paths = {name: current({"path": package.get(f"{name}_path"),
+                            "sha256": package.get(f"{name}_sha256")})
+             for name in ("main_package_spec", "main_package_receipt")}
+    spec = json.loads(paths["main_package_spec"].read_text())
+    generation = json.loads(paths["main_package_receipt"].read_text())
+    if spec.get("schema_version") != "story-confirmed-packaging/v2":
+        raise ValueError("v2 package spec version missing")
+    roles = {"main_top_panel": "top_plate", "main_bottom_panel": "bottom_plate",
+             "library_top_panel": "library_top_plate", "library_bottom_panel": "library_bottom_plate"}
+    panels = {role: generation["outputs"][name] for role, name in roles.items()}
+    config = SimpleNamespace(**{role: current(item) for role, item in panels.items()},
+                             story_name=spec["fields"]["story_name"],
+                             duration_text=spec["fields"]["duration_text"])
+    validated = validate_panel_binding(config, paths["main_package_spec"], paths["main_package_receipt"])
+    if validated != dict(package):
+        raise ValueError("v2 panel lineage differs from rendered geometry")
+    for request in generation.get("source_requests", []):
+        current(request)
+    for output in payload.get("outputs", []):
+        target = Path(output["path"]).resolve()
+        account = {"主账号发布视频.mp4": "main", "宝库号发布视频.mp4": "library"}.get(target.name)
+        if account is None:
+            raise ValueError("v2 release output account invalid")
+        operation = f"{account}_vertical_render"
+        artifact = f"release-{account}-vertical:{config.story_name}"
+        name = hashlib.sha256(f"{artifact}\0{operation}\0{target}".encode()).hexdigest()
+        proof = json.loads((target.parent / ".release_layout_receipts" / f"{name}.json").read_text())
+        expected = {"top_panel": panels[f"{account}_top_panel"]["sha256"],
+                    "bottom_panel": panels[f"{account}_bottom_panel"]["sha256"],
+                    "artifact_semantic_plan": bindings["artifact_semantic_plan_sha256"],
+                    "demo_render_manifest": bindings["demo_render_manifest_sha256"],
+                    "keying_preset": bindings["keying_preset_sha256"],
+                    "keying_preset_lock": bindings["keying_lock_sha256"]}
+        if (proof.get("schema_version") != "story-release-layout-operation/v1"
+                or proof.get("artifact_id") != artifact or proof.get("operation") != operation
+                or proof.get("production_eligible") is not True
+                or proof.get("output_path") != str(target)
+                or proof.get("output_sha256") != output.get("sha256")
+                or any(proof.get("input_artifact_hashes", {}).get(k) != v for k, v in expected.items())
+                or any(not isinstance(proof.get(k), str) or len(proof[k]) != 64
+                       for k in ("request_fingerprint", "layout_binding_sha256"))):
+            raise ValueError(f"v2 rendered panel usage invalid: {account}")
+    return panels
+
+
 def release_package_receipt_issues(
     payload: Mapping[str, Any],
     *,
@@ -702,11 +761,18 @@ def release_package_receipt_issues(
     if not isinstance(package, Mapping):
         issues.append("release_package_imagegen_binding_missing")
     else:
-        if package.get("text_integration") != "imagegen_native":
-            issues.append("release_package_text_integration_not_imagegen_native")
-        if package.get("render_usage_proof") is not True:
-            issues.append("release_package_render_usage_proof_missing")
-        panels = package.get("panels")
+        if payload.get("production_contract") == "story-production/v2":
+            try:
+                panels = _v2_package_panels(payload, geometry, package)
+            except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
+                issues.append(f"release_package_v2_evidence_invalid:{exc}")
+                panels = None
+        else:
+            if package.get("text_integration") != "imagegen_native":
+                issues.append("release_package_text_integration_not_imagegen_native")
+            if package.get("render_usage_proof") is not True:
+                issues.append("release_package_render_usage_proof_missing")
+            panels = package.get("panels")
         if not isinstance(panels, Mapping) or set(panels) != required_roles:
             issues.append("release_package_four_panel_set_incomplete")
         else:

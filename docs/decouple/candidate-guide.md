@@ -6,7 +6,7 @@
 
 | 工作 | 旧链 | v2 候选 |
 |---|---|---|
-| 输入 | 部分目录发现/派生 | 十个角色显式路径与哈希 |
+| 输入 | 部分目录发现/派生 | 故事输入显式路径；固定包装自动绑定版本与哈希 |
 | 音乐 | 生成与音乐专门 QA | 用户整条成品；最终视频音轨角色 QA |
 | 文稿 | 生成/重写 | 最终 Word 原字节复制 |
 | 资料包 | 媒体、标注、PPT 与复制混合 | media 制作，pack 仅复制 |
@@ -29,11 +29,10 @@ python3 story_pipeline.py init --production-contract v2 \
   --subtitle-srt /inputs/subtitles.srt --video /inputs/greenscreen.mp4 \
   --audio /inputs/authority.wav --final-word /inputs/final.docx \
   --finished-music /inputs/finished.wav \
-  --story-requirements /inputs/requirements.json \
-  --packaging-reference /inputs/reference.png --packaging-prompt /inputs/confirmed-prompt.txt
+  --story-requirements /inputs/requirements.json
 ```
 
-`--production-contract` 保持 v1 默认，仅显式 v2 进入候选。不得将缺失输入用历史目录推测补齐。
+`--production-contract` 保持 v1 默认，仅显式 v2 进入候选。包装参考和提示词不属于逐故事输入。默认从 assets/references/main_vertical_package_defaults.json 解析并校验，参考 PNG 与提示词必须随源码归档；不依赖历史故事目录。旧显式参数仅兼容已有候选调用。不得将缺失故事输入用历史目录推测补齐。
 
 确定性操作均使用 `story_pipeline.py OPERATION --run-file RUN --request REQUEST.json`。请求参数按以下函数签名填写，路径显式给出，输入/产物描述均含 path、sha256、bytes：
 
@@ -41,7 +40,7 @@ python3 story_pipeline.py init --production-contract v2 \
 - `media-approve`：preview、review、output。review 明确 independent_context=true、reviewer_context（与制作上下文不同）、approved=true、score>=85、critical_errors=[]、artifact_sha256。
 - `media`：与预览相同的输入，再给 approved_demo 绑定。输入/几何变化需重新预览审核；无 PPT 参数仍执行时间轴、字幕、Logo、RVM、几何及客户媒体 QA。
 - `materials`：director、plan、compile_receipt、output（ZIP）、receipt。复用 `shot_storyboard_pipeline.compile_consumers` 的同源页计划；TITLE/MORAL 提供 word_text，重复句提供 word_start。编译器保留映射字段。输出失败不会修改视频。
-- `packaging`：fields、output、receipt。fields 固定 story_name、story_type、age_range、duration_text、theme_style；模板其余文字保持原样。该回执证明提示词编译，不能冒充生图完成。后续真正生图需 `story-confirmed-panels/v2` 回执及严格独立审核，所有实际使用的账号面板均绑定审核。宝库号继续独立包装与动态 Logo/片尾规则。
+- `packaging`：timeline_receipt（path/sha256/bytes）、output、receipt；从 story_requirements.story_info 和已校验权威时间轴绑定的完整音频生成字段。显式 fields 仅用于兼容且如同时有时间轴须完全一致。fields 固定 story_name、story_type、age_range、duration_text、theme_style；模板其余文字保持原样。该回执证明提示词编译，不能冒充生图完成。后续真正生图需 `story-confirmed-panels/v2` 回执及严格独立审核，所有实际使用的账号面板均绑定审核。宝库号继续独立包装与动态 Logo/片尾规则。
 - `pack`：output_root、receipt、sources、story_name。sources 固定为 `ADVANCED_ROLES` 八项；两个包共享原 Word/音乐，PPT 素材仅进阶版。更新不移动目录、不编码；用户修改同名托管文件时报冲突。
 - `checklist`：managed_package_receipt、main_release_video、library_release_video、output。只列 Agent 管理角色，不扫描用户新增文件。
 
@@ -119,3 +118,9 @@ WAV→MP3 或其他角色目标路径改变时，pack 先把旧路径、角色�
 缺失的直接文件/空序列/可解析引用会明确失败；未知间接输入的实际解码错误由 FFmpeg 报告，不返回历史成功结果。编码前后依赖快照必须一致才可发布输出。旧指纹不能自动获得新缓存命中；只有显式重新执行相应命令时才会按新规则处理，原历史文件不被批量更新。
 
 恢复时使用本版独立源码目录与原任务账本，不删除编码回执或关闭身份检查来解决缓存问题。活进程锁、取消标记、输出归属和输入保护保持原有规则；回退仍在独立环境启动新项目，不用旧程序写新版账本。真实新故事通过 QA、独立审核和用户接受后才能晋级。
+
+## 项目信息一次整理与恢复
+
+主理人把已确认的信息及逐字段来源存入现有 story_requirements 的 story_info：story_name、story_type、age_range、sources，另保留 expected_duration_seconds、image_style；theme_style 未指定采用固定默认“典雅端庄、简洁清爽、上下协调”。标题优先对话明示，否则只读 Word 的明确 Title 样式标题；不可用目录名。年龄和类型不推断覆盖。初始化把整理后的同一要求记录保存在项目 99_项目状态/story_requirements.json，后续读取账本绑定路径，恢复不用再次收集。包装风格不传给正文导演。
+
+expected_duration_seconds 是预期要求；包装每次编译重新验证 timeline_receipt 并测量其绑定的完整权威音频，按秒四舍五入显示时长。时间轴或故事信息变化使旧包装回执无效，需重新编译并按既有规则审核受影响包装，不重做无关合格素材。固定模板只替换五个允许字段，不复用旧故事成品图。

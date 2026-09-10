@@ -2,7 +2,7 @@
 
 程序权威定义：`story_production_v2.py`；入口、QA、清单和封口消费同一版本。未带该版本的历史账本保留旧校验，不自动升级。
 
-显式输入：confirmed_text、subtitle_txt、subtitle_srt、greenscreen_video、audio、final_word、finished_music、story_requirements、packaging_reference、packaging_prompt。每项路径和 SHA-256 必须当前有效。
+故事输入及内部绑定：confirmed_text、subtitle_txt、subtitle_srt、greenscreen_video、audio、final_word、finished_music、story_requirements、packaging_reference、packaging_prompt。包装参考和提示词默认来自源码内固定配置，无需用户逐故事提供；内部每项路径和 SHA-256 必须当前有效。故事信息与来源保存在 story_requirements.story_info，不新增合同。
 
 Agent 交付：主账号和宝库号视频；基础版含原 Word、原音乐、Demo、背景原图；进阶版含基础版四项、含/无字幕背景视频、A 镜背景视频、PPT 素材 ZIP。ZIP 含 TITLE/shot_id/可选 MORAL 同源图、原旁白、原音乐、顺序/文字/权威时间/哈希清单。用户后来加入的文件不属于完成门禁，不要求目录总数等于清单数。
 

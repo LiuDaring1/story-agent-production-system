@@ -108,6 +108,8 @@ def main(argv):
         result = export_materials(**r, inputs=run['inputs'])
     elif args.operation == 'packaging':
         from story_materials import bind_packaging
+        if run.get('packaging_config') and not r.get('timeline_receipt'):
+            raise ValueError('System packaging requires authoritative timeline receipt')
         result = bind_packaging(**r, inputs=run['inputs'])
     else:
         from story_production_v2 import validate_managed_receipt, validate_checklist

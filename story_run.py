@@ -651,6 +651,8 @@ def init_run(
 ) -> dict[str, Any]:
     target = run_file.expanduser().resolve()
     project = project_dir.expanduser().resolve()
+    if target.exists():
+        raise FileExistsError(f"运行账本已存在，禁止覆盖：{target}")
     project.mkdir(parents=True, exist_ok=True)
     if production_inputs is not None and subtitle_txt is None:
         raise ValueError("新合同必须显式绑定字幕 TXT")
@@ -683,7 +685,11 @@ def init_run(
         "blocker": "",
     }
     if production_inputs is not None:
-        payload["inputs"] = production_v2.bind_inputs({**{k: Path(v["path"]) for k,v in payload["inputs"].items()}, **production_inputs})
+        from story_packaging_defaults import prepare_inputs
+        paths, packaging_config = prepare_inputs({**{k: Path(v["path"]) for k,v in payload["inputs"].items()}, **production_inputs}, project)
+        payload["inputs"] = production_v2.bind_inputs(paths)
+        if packaging_config is not None:
+            payload["packaging_config"] = packaging_config
         payload["production_contract"] = production_v2.VERSION
         payload["work_packages"] = {name: {"status": "pending", "blocker": ""} for name in production_v2.PACKAGES}
     ensure_observability(payload, new_run=True)
@@ -1373,6 +1379,9 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = build_parser().parse_args()
     if args.command == "init":
+        if args.production_contract == "v2":
+            if args.story_requirements is None or "story_info" not in json.loads(args.story_requirements.read_text()):
+                raise ValueError("New v2 projects require saved story_info and sources in story_requirements")
         payload = init_run(
             run_file=args.run_file,
             confirmed_text=args.text,

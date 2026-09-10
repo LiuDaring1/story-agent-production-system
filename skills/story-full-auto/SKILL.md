@@ -11,7 +11,7 @@ description: 在当前 Codex 任务中制作故事视频、抠像、视频内包
 
 ## 输入与版本
 
-新项目通过 `story_pipeline.py init --production-contract v2` 显式绑定确认文本、字幕 TXT/SRT、调色横屏绿幕、完整权威旁白、最终 Word、整条成品音乐、故事要求、包装参考和确认提示词。禁止扫描旧目录猜输入；不从绿幕重新选旁白，不重写字幕或 Word。
+新项目通过 `story_pipeline.py init --production-contract v2` 显式绑定确认文本、字幕 TXT/SRT、调色横屏绿幕、完整权威旁白、最终 Word、整条成品音乐和故事要求。包装参考和固定提示词是随源码交付的系统配置，v2 init 自动绑定路径、版本及 SHA-256，不向用户重复索取。主理人将当前对话与确认文稿已有信息一次整理到 story_requirements 的 story_info（story_name、story_type、age_range、expected_duration_seconds、image_style、theme_style、sources）。标题优先用户明示，否则仅提取文稿明确标题，不从目录猜；类型和年龄遵从用户。sources 逐字段保存来源。包装风格默认“典雅端庄、简洁清爽、上下协调”，与正文 image_style 分开。恢复读取已保存记录，只对真实缺失或无法消解的冲突集中询问。最终包装时长从当前权威时间轴绑定的完整音频计算，不使用 expected_duration_seconds。禁止扫描旧目录猜输入；不从绿幕重新选旁白，不重写字幕或 Word。
 
 v2 账本记录 `production_contract=story-production/v2`。已有 v1 账本仍按 [封存规则](references/legacy-v1.md) 只读解释，不自动迁移、补证据、审核或重做。旧程序不得直接写入 v2 账本。入口仍为当前任务与 `story_pipeline.py`，不恢复 Runtime、后台调度或嵌套代理进程。
 
@@ -23,7 +23,7 @@ v2 账本记录 `production_contract=story-production/v2`。已有 v1 账本仍�
 - 先用 `media-preview` 生成实际几何/首中末与手势候选，再由独立上下文审核，用 `media-approve` 绑定回执。`story_pipeline.py media` 仅制作 Demo/A 镜及媒体回执。背景视频用现有 `render_customer_backgrounds.py`，双账号用现有 `release_video.py` 的显式参数和已审几何；所有 v2 正式渲染入口（含 R2V 组装）都必须显式传当前 `--run-file`，输出与工作目录位于所属项目中，无需手工设置任务环境变量；预览通过才能正式渲染。新账本不要走会扫描旧资产的历史工作流包装入口。
 - 音乐只作为输入：整条使用，不选曲、生成、替换、拼接、循环或预先裁剪；仅做成片混音及最终媒体音轨角色检查。解码失败报告，不自动制作补救。资料包复制原格式。
 - `story_pipeline.py materials` 输出图片、旁白、原格式音乐、清单的 ZIP 与回执。页顺序来自 TITLE + shot_id + 可选 MORAL，时间来自封存计划，文字确定性映射 Word，保留原文标点；仅 display_text 可去末尾句号。卡片需显式 word_text，歧义需 word_start；失败不猜、不改视频字幕、不回滚视频。
-- `story_pipeline.py packaging` 仅按确认模板替换故事信息、实际时长、主题风格，绑定模板和参考 SHA-256。主账号不可自由重设计或沿用旧故事底板；宝库号继续独立规则。模板编译回执不冒充生图完成。
+- `story_pipeline.py packaging` 传 timeline_receipt、output、receipt，自动从项目故事信息取得字段，仅按固定模板替换故事信息、实际时长、包装风格，绑定模板和参考 SHA-256。主账号不可自由重设计或沿用旧故事底板；宝库号继续独立规则。模板编译回执不冒充生图完成。
 - `story_pipeline.py pack` 只复制 Agent 管理文件；两个资料包 Word 与音乐均为输入原字节。用户新增文件原位保留，用户改过的同名文件报冲突。角色目标更名时，先记录旧归属，仅把旧哈希仍匹配的退役文件移到客户目录外的备份，保留退役记录以供中断恢复。不调用编码器、不整体搬目录。
 
 ## 交接、恢复与审核

@@ -92,6 +92,18 @@ def validate_materials(path, inputs=None):
     p = json.loads(Path(path).read_text())
     if p.get('schema_version') != 'story-ppt-materials/v2':
         raise ValueError('Wrong materials version')
+    if 'timeline_receipt' in p:
+        from story_packaging_defaults import packaging_fields
+        if inputs is None:
+            from story_timeline import validate_authoritative_timeline_receipt
+            t = validate_authoritative_timeline_receipt(current(p['timeline_receipt']))
+            field_inputs = {'story_requirements': p['story_requirements'], 'audio': t['authoritative_audio'], 'subtitle_txt': t['subtitle_txt']}
+        else:
+            field_inputs = inputs
+            if p['story_requirements'] != inputs['story_requirements']:
+                raise ValueError('Story information changed')
+        if p['fields'] != packaging_fields(field_inputs, p['timeline_receipt']):
+            raise ValueError('Packaging story information/timeline changed')
     for role, item in p['inputs'].items():
         current(item)
         if inputs and item != inputs[role]:
@@ -119,7 +131,16 @@ def validate_materials(path, inputs=None):
                 raise ValueError('Packaged audio edited')
     return p
 
-def bind_packaging(*, inputs, fields, output, receipt):
+def bind_packaging(*, inputs, output, receipt, fields=None, timeline_receipt=None):
+    story_fields = None
+    if timeline_receipt is not None:
+        from story_packaging_defaults import packaging_fields
+        story_fields = packaging_fields(inputs, timeline_receipt)
+        if fields is not None and fields != story_fields:
+            raise ValueError("Packaging fields differ from project story information/timeline")
+        fields = story_fields
+    if fields is None:
+        raise ValueError("Packaging requires current authoritative timeline receipt")
     protect_outputs([output, receipt], [v['path'] for v in inputs.values()])
     allowed = {'story_name', 'story_type', 'age_range', 'duration_text', 'theme_style'}
     if set(fields) != allowed:
@@ -134,6 +155,9 @@ def bind_packaging(*, inputs, fields, output, receipt):
     Path(output).parent.mkdir(parents=True, exist_ok=True)
     Path(output).write_text(template.format(**fields))
     payload = {'schema_version': 'story-confirmed-packaging/v2', 'inputs': {k: inputs[k] for k in ('packaging_prompt', 'packaging_reference')}, 'fields': fields, 'output': binding(output), 'generated': False}
+    if story_fields is not None:
+        payload['story_requirements'] = inputs['story_requirements']
+        payload['timeline_receipt'] = timeline_receipt
     write(receipt, payload)
     return payload
 
@@ -141,6 +165,18 @@ def validate_packaging(path, inputs=None):
     p = json.loads(Path(path).read_text())
     if p.get('schema_version') != 'story-confirmed-packaging/v2':
         raise ValueError('Invalid packaging version')
+    if 'timeline_receipt' in p:
+        from story_packaging_defaults import packaging_fields
+        if inputs is None:
+            from story_timeline import validate_authoritative_timeline_receipt
+            t = validate_authoritative_timeline_receipt(current(p['timeline_receipt']))
+            field_inputs = {'story_requirements': p['story_requirements'], 'audio': t['authoritative_audio'], 'subtitle_txt': t['subtitle_txt']}
+        else:
+            field_inputs = inputs
+            if p['story_requirements'] != inputs['story_requirements']:
+                raise ValueError('Story information changed')
+        if p['fields'] != packaging_fields(field_inputs, p['timeline_receipt']):
+            raise ValueError('Packaging story information/timeline changed')
     for role, item in p['inputs'].items():
         current(item)
         if inputs and item != inputs[role]:

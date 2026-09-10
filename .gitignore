@@ -64,3 +64,6 @@ docs/conversations/raw/
 故事评价体系3_extracted.txt
 story_music_plan.csv
 story_suno_prompts.md
+
+# Required immutable system packaging reference, included in recovery archives
+!assets/references/main_vertical_package_reference.png

@@ -6,6 +6,8 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -37,6 +39,25 @@ def body_timings_from_plan(
     assembly_plan: dict[str, Any],
     timing_rows: list[dict[str, Any]],
 ) -> list[LineTiming]:
+    if assembly_plan.get("schema_version") == "story-r2v-assembly-decisions-v2":
+        body = [s for s in assembly_plan.get("segments", []) if re.fullmatch(r"S\d+", str(s.get("segment_id", "")))]
+        if not body:
+            raise ValueError("正式拼装决策缺少正文片段")
+        windows = [(float(s["timeline_start"]), float(s["timeline_end"])) for s in body]
+        if any(not math.isfinite(a) or not math.isfinite(b) or a < 0 or b <= a for a, b in windows) or any(abs(windows[i][1] - windows[i+1][0]) > .001 for i in range(len(windows)-1)):
+            raise ValueError("正式正文区间不连续或无效")
+        start, end = windows[0][0], windows[-1][1]
+        selected = []
+        for row in timing_rows:
+            a, b = float(row["source_start"]), float(row["source_end"])
+            if b <= start + .001 or a >= end - .001:
+                continue
+            if a < start - .001 or b > end + .001:
+                raise ValueError("正文边界截断权威字幕，不能自动裁行")
+            selected.append(row)
+        if not selected:
+            raise ValueError("正文区间没有权威字幕")
+        return [LineTiming(index=i, line=str(row["line"]), source_start=float(row["source_start"]), source_end=float(row["source_end"]), duration=float(row["source_end"])-float(row["source_start"]), timeline_start=float(row["source_start"]), timeline_end=float(row["source_end"])) for i, row in enumerate(selected, 1)]
     body = [
         shot
         for shot in assembly_plan.get("shots", [])
@@ -65,6 +86,23 @@ def body_timings_from_plan(
             )
         )
     return results
+
+
+def validate_formal_assembly(payload: dict[str, Any], visual_master: Path, audio: Path) -> None:
+    """Bind the actual assembler receipt, not a second handwritten shot plan."""
+    if payload.get("schema_version") != "story-r2v-assembly-decisions-v2" or payload.get("qualification") != "formal_reviewed_master":
+        raise ValueError("v2 客户背景需要正式已审母版拼装决策")
+    for key, expected in (("output", visual_master), ("audio", audio)):
+        if Path(str(payload.get(key + "_path", ""))).resolve() != expected.resolve() or payload.get(key + "_sha256") != file_sha256(expected):
+            raise ValueError(f"正式拼装 {key} 路径或哈希不匹配")
+    plan_path = Path(str(payload.get("plan_path", "")))
+    if not plan_path.is_file() or payload.get("plan_sha256") != file_sha256(plan_path):
+        raise ValueError("正式拼装源计划哈希不匹配")
+    plan = json.loads(plan_path.read_text(encoding="utf-8"))
+    expected = [(str(s["shot_id"]), float(s["source_start"]), float(s["source_end"])) for s in plan["shots"]]
+    actual = [(str(s["segment_id"]), float(s["timeline_start"]), float(s["timeline_end"])) for s in payload.get("segments", []) if re.fullmatch(r"S\d+", str(s.get("segment_id", "")))]
+    if actual != expected:
+        raise ValueError("正式正文片段与绑定计划不一致")
 
 
 from story_render_task import render_entry
@@ -99,6 +137,8 @@ def main() -> int:
     timeline = validate_authoritative_timeline_receipt(args.authoritative_timeline_receipt, expected_inputs=run["inputs"] if run else None)
     timing_rows = json.loads(Path(timeline["timings"]["path"]).read_text(encoding="utf-8"))
     assembly_plan = json.loads(args.assembly_plan.read_text(encoding="utf-8"))
+    if run is not None and run.get("production_contract") == "story-production/v2":
+        validate_formal_assembly(assembly_plan, args.visual_master, Path(run["inputs"]["audio"]["path"]))
     body_timings = body_timings_from_plan(assembly_plan, timing_rows)
     args.body_srt.parent.mkdir(parents=True, exist_ok=True)
     write_srt(body_timings, args.body_srt, preserve_input_lines=True)

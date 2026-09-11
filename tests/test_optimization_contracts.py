@@ -113,6 +113,26 @@ class WorkReuseTests(unittest.TestCase):
         group['asset_strategy']='single_view_reuse_master';group['camera_setups'].append(copy.deepcopy(setup))
         with self.assertRaisesRegex(ValueError,'single-view'):asset_generation_plan(plan)
 
+    def test_unreachable_derived_asset_does_not_keep_parent_alive(self):
+        from story_asset_efficiency import asset_generation_plan
+        director = dict(
+            story_id='test',
+            assets=[
+                dict(asset_id='unused-master'),
+                dict(asset_id='unused-view', derived_from_asset_id='unused-master'),
+                dict(asset_id='used', derived_from_asset_id='used-master'),
+                dict(asset_id='used-master'),
+            ],
+            shots=[dict(shot_id='s1', reference_asset_ids=['used'])],
+            continuity_groups=[],
+        )
+        rows = {row['asset_id']: row for row in asset_generation_plan(director)['assets']}
+        self.assertEqual(rows['unused-view']['operation'], 'omit_unconsumed')
+        self.assertEqual(rows['unused-master']['operation'], 'omit_unconsumed')
+        self.assertEqual(rows['used']['operation'], 'generate')
+        self.assertEqual(rows['used-master']['operation'], 'generate')
+        self.assertEqual(rows['used-master']['consumers'], ['derive:used'])
+
     def test_closed_subtitle_graph_reuses_only_current_sequence_and_parameters(self):
         from story_encode_dependencies import snapshot
         from story_subtitle_layers import cropped_overlay_chain

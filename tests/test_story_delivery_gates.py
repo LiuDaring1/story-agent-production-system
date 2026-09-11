@@ -29,9 +29,13 @@ class StoryDeliveryGateTests(unittest.TestCase):
         }
         self.qa = release_qa(videos, self.voice, self.music)
         self.qa_path = self.write("qa.json", self.qa)
+        self.release_receipt_path = self.write("release-receipt.json", {
+            "actual_geometry": {"producer_context": "fixture-release-producer"},
+        })
         self.registered = {
             **videos, "final_delivery_checklist": binding(self.checklist_path),
             "qa_release_report": binding(self.qa_path),
+            "release_package_receipt": binding(self.release_receipt_path),
         }
         self.inputs = {"audio": binding(self.voice)}
         self.bundle = {"artifacts": self.checklist["artifacts"] + [binding(self.checklist_path), binding(self.qa_path)]}
@@ -40,6 +44,10 @@ class StoryDeliveryGateTests(unittest.TestCase):
             "schema_version": "independent-review/v1", "approved": True, "score": 97,
             "critical_errors": [], "artifact_path": str(self.bundle_path),
             "artifact_sha256": binding(self.bundle_path)["sha256"],
+            "reviewer_context": "fixture-independent-reviewer", "independent_context": True,
+            "reviewer_independence": {
+                "producer_context": "fixture-release-producer", "producer_claims_trusted": False,
+            },
         }
 
     def write(self, name, payload):
@@ -97,6 +105,29 @@ class StoryDeliveryGateTests(unittest.TestCase):
         del self.registered["final_delivery_checklist"]
         with self.assertRaisesRegex(ValueError, "缺少账本目标"):
             self.validate("final_delivery_review", self.review)
+
+    def test_final_review_requires_verifiable_independent_context(self):
+        cases = [
+            ("reviewer_context", None),
+            ("independent_context", False),
+            ("reviewer_independence", {"producer_context": "fixture-release-producer"}),
+        ]
+        for field, value in cases:
+            with self.subTest(field=field):
+                payload = copy.deepcopy(self.review)
+                payload[field] = value
+                with self.assertRaisesRegex(ValueError, "独立上下文"):
+                    self.validate("final_delivery_review", payload)
+
+    def test_final_review_must_bind_ledger_producer_and_use_another_context(self):
+        payload = copy.deepcopy(self.review)
+        payload["reviewer_independence"]["producer_context"] = "self-declared-other-producer"
+        with self.assertRaisesRegex(ValueError, "生产上下文未独立绑定"):
+            self.validate("final_delivery_review", payload)
+        payload = copy.deepcopy(self.review)
+        payload["reviewer_context"] = "fixture-release-producer"
+        with self.assertRaisesRegex(ValueError, "生产上下文未独立绑定"):
+            self.validate("final_delivery_review", payload)
 
     def test_claimed_counts_do_not_replace_actual_members(self):
         self.checklist["artifacts"] = self.checklist["artifacts"][:1]

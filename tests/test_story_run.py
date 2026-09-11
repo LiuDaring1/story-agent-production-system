@@ -227,6 +227,14 @@ class StoryRunLedgerTests(unittest.TestCase):
                         )
                         if artifact_id == "final_delivery_review":
                             review_payload["schema_version"] = "final-delivery-independent-review/v2"
+                            review_payload.update({
+                                "reviewer_context": "fixture-independent-final-reviewer",
+                                "independent_context": True,
+                                "reviewer_independence": {
+                                    "producer_context": "fixture-release-producer",
+                                    "producer_claims_trusted": False,
+                                },
+                            })
                     if artifact_id != "keying_visual_review":
                         artifact.write_text(json.dumps(review_payload), encoding="utf-8")
                 elif artifact_id == "qa_release_report":
@@ -391,6 +399,11 @@ class StoryRunLedgerTests(unittest.TestCase):
                     )
                 elif artifact_id == "final_delivery_checklist":
                     artifact.write_text(json.dumps(delivery), encoding="utf-8")
+                elif artifact_id == "release_package_receipt":
+                    artifact.write_text(json.dumps({
+                        "artifact_id": artifact_id,
+                        "actual_geometry": {"producer_context": "fixture-release-producer"},
+                    }), encoding="utf-8")
                 elif artifact_id == "keying_preset_lock":
                     pass
                 else:

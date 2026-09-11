@@ -255,6 +255,14 @@ class V2FinalizationTests(unittest.TestCase):
             run['artifacts']['qa_release_report'].update(binding(qa))
             reviewpath = Path(run['artifacts']['final_delivery_review']['path'])
             review = json.loads(reviewpath.read_text())
+            review.update(
+                reviewer_context='fixture-independent-final-reviewer',
+                independent_context=True,
+                reviewer_independence={
+                    'producer_context': 'fixture-release-producer',
+                    'producer_claims_trusted': False,
+                },
+            )
             bundle = Path(review['artifact_path'])
             write(bundle, dict(artifacts=[*json.loads(checklist.read_text())['artifacts'], binding(checklist), binding(qa)]))
             review['artifact_sha256'] = sha(bundle)
@@ -262,7 +270,10 @@ class V2FinalizationTests(unittest.TestCase):
             run['artifacts']['final_delivery_review'].update(binding(reviewpath))
             run['artifacts']['shot_storyboard_compile_receipt'].update(binding(args['compile_receipt']))
             release_path = Path(run['artifacts']['release_package_receipt']['path'])
-            write(release_path, {'actual_geometry': {'main_package_spec': {'main_package_spec_sha256': sha(prompt_receipt)}}})
+            write(release_path, {'actual_geometry': {
+                'producer_context': 'fixture-release-producer',
+                'main_package_spec': {'main_package_spec_sha256': sha(prompt_receipt)},
+            }})
             run['artifacts']['release_package_receipt'].update(binding(release_path))
             atomic_write_json(runfile, run)
             for target in ('story_run.validate_compile_receipt', 'story_run.validate_theme_assets_manifest', 'story_artifact_validation.validate_release_package_receipt'):

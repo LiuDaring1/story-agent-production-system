@@ -10,15 +10,25 @@ def asset_generation_plan(director):
     for shot in director['shots']:
         for key in shot.get('reference_asset_ids', []):
             if key in consumers: consumers[key].append('shot:' + shot['shot_id'])
-    for asset in assets.values():
-        key = asset.get('derived_from_asset_id')
-        if key in consumers: consumers[key].append('derive:' + asset['asset_id'])
     for group in director.get('continuity_groups', []):
         master_id = group.get('environment_asset_id')
         if master_id in consumers: consumers[master_id].append('continuity:' + str(group.get('group_id', 'group')))
         for setup in group.get('camera_setups', []):
             key = setup.get('environment_view_asset_id')
             if key in consumers: consumers[key].append('camera:' + setup['setup_id'])
+    # A derivation is a reason to generate its parent only when the child is
+    # itself reachable from a real shot, continuity or camera consumer.  This
+    # prevents an otherwise omitted child from keeping an unused parent alive.
+    reachable = {key for key, uses in consumers.items() if uses}
+    pending = list(reachable)
+    while pending:
+        child_id = pending.pop()
+        parent_id = assets[child_id].get('derived_from_asset_id')
+        if parent_id in assets:
+            consumers[parent_id].append('derive:' + child_id)
+            if parent_id not in reachable:
+                reachable.add(parent_id)
+                pending.append(parent_id)
     aliases = {}
     for group in director.get('continuity_groups', []):
         setups = group.get('camera_setups', [])

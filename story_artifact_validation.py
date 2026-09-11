@@ -273,6 +273,7 @@ def validate_independent_review(
 
     schema = str(payload.get("schema_version") or "")
     independence = payload.get("reviewer_independence")
+    reviewer_context = payload.get("reviewer_context")
     schema_declares_independence = "independent" in schema.lower()
     object_declares_independence = (
         isinstance(independence, dict)
@@ -319,6 +320,31 @@ def validate_independent_review(
         validate_customer_media_receipt(reviewed_path)
         _validate_customer_media_independent_evidence(payload, registered_artifacts)
     if artifact_id == "final_delivery_review":
+        if (
+            not isinstance(reviewer_context, str)
+            or not reviewer_context.strip()
+            or payload.get("independent_context") is not True
+            or not isinstance(independence, dict)
+            or independence.get("producer_claims_trusted") is not False
+        ):
+            raise ValueError(f"{label}没有独立上下文证据")
+        if registered_artifacts is None:
+            raise ValueError(f"{label}缺少账本正式发布上下文")
+        release_record = registered_artifacts.get("release_package_receipt")
+        if not isinstance(release_record, Mapping):
+            raise ValueError(f"{label}缺少账本当前 release_package_receipt")
+        release_path = _require_current_binding(release_record, f"{label}正式发布回执")
+        release_payload = _load_json_object(release_path, f"{label}正式发布回执")
+        producer_context = str(
+            (release_payload.get("actual_geometry") or {}).get("producer_context") or ""
+        ).strip()
+        declared_producer = str(independence.get("producer_context") or "").strip()
+        if (
+            not producer_context
+            or declared_producer != producer_context
+            or reviewer_context.strip() == producer_context
+        ):
+            raise ValueError(f"{label}审核者与账本正式发布生产上下文未独立绑定")
         _validate_final_review_coverage(reviewed_path, registered_artifacts)
         # The final review now owns the former customer-media review's unique
         # audio/subtitle/logo/presenter evidence.  New runs do not create a

@@ -475,6 +475,7 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path) -> dict:
     from story_production_v2 import binding, current
     from story_media_preview import load_approved, validate_preview
     from story_timeline import validate_authoritative_timeline_receipt
+    from story_customer_media import validate_customer_media_receipt
     from semantic_card_motion import semantic_card_generation_receipt_issues, semantic_card_motion_receipt_issues
 
     run_file = run_file.expanduser().resolve()
@@ -494,6 +495,20 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path) -> dict:
         raise ValueError("v2 release requires producer_context for independent preview review")
     for item in ledger["inputs"].values():
         current(item)
+    authoritative_audio = current(ledger["inputs"]["audio"])
+    if config.audio_mix is None:
+        raise ValueError("v2 release requires the authoritative narration input")
+    configured_audio = config.audio_mix.expanduser().resolve()
+    if configured_audio != authoritative_audio.resolve() or binding(configured_audio)["sha256"] != ledger["inputs"]["audio"]["sha256"]:
+        raise ValueError("v2 release audio_mix differs from authoritative narration")
+    if config.mix_bg_audio is not True:
+        raise ValueError("v2 release must mix the reviewed music-only background with narration")
+    customer_media_path = current(ledger["artifacts"]["customer_media_receipt"])
+    customer_media = validate_customer_media_receipt(customer_media_path)
+    reviewed_background = customer_media["artifacts"]["product_background_without_subtitles"]
+    reviewed_background_path = current(reviewed_background)
+    if config.bg_video.expanduser().resolve() != reviewed_background_path.resolve():
+        raise ValueError("v2 release bg_video differs from current reviewed music-only background")
     projection_path = current(ledger["artifacts"]["requirements_projection"])
     if config.artifact_semantic_plan is None:
         raise ValueError("v2 release requires the bound semantic card plan")
@@ -582,6 +597,12 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path) -> dict:
         "detected_person_bbox": list(config.detected_person_bbox) if config.detected_person_bbox else None,
         "subtitle_font_size": config.subtitle_font_size, "subtitle_margin_v": config.subtitle_margin_v,
         "background_blur": config.background_blur, "output_scale": config.output_scale,
+        "media_inputs": {
+            "authoritative_narration": binding(configured_audio),
+            "reviewed_music_background": binding(reviewed_background_path),
+            "customer_media_receipt": binding(customer_media_path),
+            "mix_bg_audio": True,
+        },
         "variant": config.variant}
     run_inputs = {k: {"path": str(Path(v["path"]).resolve()), "sha256": v["sha256"]}
                   for k, v in ledger["inputs"].items()}

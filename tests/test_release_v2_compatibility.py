@@ -20,6 +20,7 @@ class ReleaseV2CompatibilityTests(unittest.TestCase):
         self.temp = tempfile.TemporaryDirectory(); self.addCleanup(self.temp.cleanup)
         self.root = Path(self.temp.name).resolve()
         self.config = fixture._config(self.root)
+        self.config.bg_video.write_bytes(b'fixture reviewed music background')
         self.project = self.root / 'project'
         self.semantic_path = self.project / '03_产品素材/theme_assets/semantic_cards/artifact_semantic_plan.json'
         self.semantic_path.parent.mkdir(parents=True)
@@ -38,6 +39,7 @@ class ReleaseV2CompatibilityTests(unittest.TestCase):
         self.request = self.write('semantic_card_motion_request.json', evidence)
         self.approved = self.write('approved_demo.json', {'schema_version': 'story-approved-demo/v2'})
         self.preview_path = self.write('preview.json', {})
+        self.customer_media_receipt = self.write('customer_media_receipt.json', {'fixture': True})
         self.logo = self.root / 'logo.png'; Image.new('RGBA',(150,90),(220,150,20,255)).save(self.logo)
         self.run_file = self.write('run.json', {})
         self.ledger = {'production_contract': 'story-production/v2', 'project_dir': str(self.project),
@@ -45,11 +47,14 @@ class ReleaseV2CompatibilityTests(unittest.TestCase):
                           'requirements_projection': self.bind(self.projection),
                           'authoritative_timeline_receipt': self.bind(self.timeline),
                           'semantic_card_generation_receipt': self.bind(self.generation),
-                          'semantic_card_motion_receipt': self.bind(self.motion)}}
+                          'semantic_card_motion_receipt': self.bind(self.motion),
+                          'customer_media_receipt': self.bind(self.customer_media_receipt)}}
         self.config = replace(self.config, artifact_semantic_plan=self.semantic_path,
                               output_dir=self.project / "release", b_windows=(), c_windows=(), story_box=(210, 270, 910, 512), demo_render_manifest=self.approved,
                               keyer='rvm', story_logo=self.logo, antipiracy_logo=self.logo,
-                              subtitle_srt=Path(inputs['subtitle_srt']['path']), release_producer_context='producer')
+                              subtitle_srt=Path(inputs['subtitle_srt']['path']),
+                              audio_mix=Path(inputs['audio']['path']), mix_bg_audio=True,
+                              release_producer_context='producer')
         self.demo = fixture.ReleaseGeometryTests._demo_geometry(self.config)
         self.demo['production_keying_filter_fingerprint'] = production_keying_fingerprint(json.loads(self.config.keying_preset_path.read_text()))
         self.demo.pop('geometry_sha256')
@@ -67,6 +72,8 @@ class ReleaseV2CompatibilityTests(unittest.TestCase):
             patch('semantic_card_motion.semantic_card_motion_receipt_issues', return_value=[]),
             patch('story_media_preview.load_approved', return_value=(self.approval, self.demo)),
             patch('story_media_preview.validate_preview', return_value=self.raw_preview),
+            patch('story_customer_media.validate_customer_media_receipt', return_value={
+                'artifacts': {'product_background_without_subtitles': self.bind(self.config.bg_video)}}),
             patch('release_video.keying_preset_lock_issues', return_value=[]),
         ]
         for p in self.patches: p.start(); self.addCleanup(p.stop)
@@ -113,6 +120,37 @@ class ReleaseV2CompatibilityTests(unittest.TestCase):
         self.config = replace(self.config, keyer='colorkey')
         with self.assertRaisesRegex(ValueError, 'requires RVM'):
             self.spec()
+
+    def test_release_requires_current_narration_music_background_and_mix(self):
+        wrong_audio = self.root / 'wrong-audio'; wrong_audio.write_text('wrong')
+        self.config = replace(self.config, audio_mix=wrong_audio)
+        with self.assertRaisesRegex(ValueError, 'audio_mix differs'):
+            self.spec()
+        self.config = replace(self.config, audio_mix=Path(self.ledger['inputs']['audio']['path']), mix_bg_audio=False)
+        with self.assertRaisesRegex(ValueError, 'must mix'):
+            self.spec()
+        self.config = replace(self.config, mix_bg_audio=True, bg_video=self.root / 'wrong-background')
+        self.config.bg_video.write_text('wrong')
+        with self.assertRaisesRegex(ValueError, 'bg_video differs'):
+            self.spec()
+
+    def test_bound_media_change_invalidates_preview_geometry(self):
+        spec = self.spec()
+        preview = self.compile(spec)
+        original_sha = preview['formal_render_binding_sha256']
+        narration = Path(self.ledger['inputs']['audio']['path'])
+        narration.write_text('new authoritative narration')
+        self.ledger['inputs']['audio'] = self.bind(narration)
+        self.semantic['inputs']['audio'] = self.bind(narration)
+        self.semantic_path.write_text(json.dumps(self.semantic))
+        evidence = {'artifact_semantic_plan_sha256': sha256_path(self.semantic_path)}
+        for path in (self.generation, self.motion, self.request):
+            path.write_text(json.dumps(evidence))
+        self.ledger['artifacts']['semantic_card_generation_receipt'] = self.bind(self.generation)
+        self.ledger['artifacts']['semantic_card_motion_receipt'] = self.bind(self.motion)
+        changed = self.spec()
+        self.assertNotEqual(changed['release_parameters_sha256'], spec['release_parameters_sha256'])
+        self.assertNotEqual(self.compile(changed)['formal_render_binding_sha256'], original_sha)
 
     def compile(self, spec, preview=True):
         with (patch('release_video.load_current_artifact_semantic_plan', side_effect=AssertionError('legacy loader')),

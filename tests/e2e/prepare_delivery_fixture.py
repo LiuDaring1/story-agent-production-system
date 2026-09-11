@@ -21,25 +21,48 @@ def main():
     result=subprocess.run(cmd,capture_output=True,text=True);(root/'formal-pack.log').write_text(result.stdout+result.stderr)
     if result.returncode:raise RuntimeError(result.stderr)
     upstream=project/'materials_upstream'
-    roles={'master_director_plan':upstream/'director.json','storyboard_manifest_sealed':upstream/'storyboard_sealed.json','storyboard_review':upstream/'storyboard_review.json',
-        'shot_storyboard_compile_receipt':upstream/'compile_receipt.json','ppt_materials_receipt':status/'materials_receipt.json',
+    director_review=status/'director_plan_review.json'
+    theme_review=status/'theme_review.json'
+    if not director_review.is_file() or not theme_review.is_file():
+        write(status/'director_review_request.json',dict(artifact=binding(upstream/'director.json'),review_output=str(director_review),
+            scope='Offline synthetic upstream director only. Verify confirmed source text/time windows, explicit contiguous trim and compiler mapping. Not a real story creative-quality approval.',producer_context='offline-fixture-producer',
+            rules=[binding(Path(__file__).resolve().parents[2]/'skills/story-full-auto/references/delivery-contract.md')]))
+        bundle=status/'theme_review_bundle.json'
+        write_review_bundle(bundle,[project/'assets/frame.png',project/'assets/background.png',status/'keying/keying_preset.json',status/'media_preview.json'])
+        write(status/'theme_review_request.json',dict(artifact=binding(bundle),review_output=str(theme_review),producer_context='offline-fixture-producer',
+            scope='Offline mock-native upstream theme fixture. Inspect real frame/background and formal geometry. Native provider origin is simulated, not tested.',
+            frame_checks=['passed','current_story_redesign','no_reference_theme_leak','true_alpha_verified','continuous_opaque_four_sides','inner_masking_lip'],
+            background_checks=['passed','not_preblurred','controlled_high_frequency_detail','no_text_logo_or_vignette'],
+            formal_rule='release_video.story_frame_integrity_issues(frame, expected_size=(1920,1080), story_box=(210,270,910,512)); use actual preset rather than older generic source QA'))
+        print(status/'director_review_request.json');print(status/'theme_review_request.json')
+        return
+    director_target=Path(json.loads(director_review.read_text())['artifact_path'])
+    storyboard_review=upstream/'storyboard_review.json'
+    storyboard_target=Path(json.loads(storyboard_review.read_text())['artifact_path'])
+    materials_receipt=status/'materials_receipt.json'
+    compile_receipt=Path(json.loads(materials_receipt.read_text())['compile_receipt']['path'])
+    keying_lock=status/'keying/keying_preset.lock.json'
+    keying_review=Path(json.loads(keying_lock.read_text())['review_path'])
+    reviewed_theme_bundle=Path(json.loads(theme_review.read_text())['artifact_path'])
+    theme_members=json.loads(reviewed_theme_bundle.read_text())['artifacts']
+    by_name={Path(item['path']).name:Path(item['path']) for item in theme_members}
+    frame=by_name['frame.png'];background=by_name['background.png']
+    theme_manifest=status/'theme_assets_manifest.json'
+    write(theme_manifest,{
+        'schema_version':'story-theme-assets-lightweight/v3','story_name':'FIXTURE',
+        'frame_reference':{**binding(frame),'role':'geometry_only_not_theme_or_ornament','locked_properties':['screen_placement','large_16_9_aperture','continuous_practical_border_thickness']},
+        'sources':{'environment':binding(background),'story_frame_alpha':{**binding(frame),'method':'imagegen_reference_edit','checkerboard':False}},
+        'artifacts':{'main_background_16x9':{**binding(background),'method':'imagegen_reference_edit'},'story_frame_png':{**binding(frame),'method':'native_alpha_passthrough','derived_from':['story_frame_alpha'],'has_true_alpha':True}},
+        'frame_design_review':{'passed':True,'current_story_redesign':True,'no_reference_theme_leak':True,'true_alpha_verified':True,'continuous_opaque_four_sides':True,'inner_masking_lip':True,'evidence':str(theme_review)},
+        'background_clean_review':{'passed':True,'not_preblurred':True,'controlled_high_frequency_detail':True,'no_text_logo_or_vignette':True},
+        'svg_used':False,'fixture_boundary':'SIMULATED native-provider upstream; independent review covers only actual offline fixture pixels and geometry','production_eligible':False})
+    roles={'master_director_plan':director_target,'director_plan_review':director_review,'storyboard_manifest_sealed':storyboard_target,'storyboard_review':storyboard_review,
+        'shot_storyboard_compile_receipt':compile_receipt,'ppt_materials_receipt':materials_receipt,'theme_assets_manifest':theme_manifest,
         'managed_package_receipt':receipt,'qa_product_report':receipt,'customer_media_receipt':status/'customer_media_receipt.json',
         'packaging_prompt_receipt':project/'panels_v2/prompt_receipt.json','keying_preset_lock':status/'keying/keying_preset.lock.json',
-        'keying_visual_review':status/'keying/independent_review.json'}
-    # The actual keying lock path is owned by the preset; do not guess alternatives.
-    preset=json.loads((status/'keying/keying_preset.json').read_text())
+        'keying_visual_review':keying_review}
     for role,path in roles.items():
         record_run(run_file=runfile,package='delivery',status='running',artifact_id=role,artifact_path=path,replace=True)
-    write(status/'director_review_request.json',dict(artifact=binding(upstream/'director.json'),review_output=str(status/'director_plan_review.json'),
-        scope='Offline synthetic upstream director only. Verify confirmed source text/time windows, explicit contiguous trim and compiler mapping. Not a real story creative-quality approval.',producer_context='offline-fixture-producer',
-        rules=[binding(Path(__file__).resolve().parents[2]/'skills/story-full-auto/references/delivery-contract.md')]))
-    bundle=status/'theme_review_bundle.json'
-    write_review_bundle(bundle,[project/'assets/frame.png',project/'assets/background.png',status/'keying/keying_preset.json',status/'media_preview.json'])
-    write(status/'theme_review_request.json',dict(artifact=binding(bundle),review_output=str(status/'theme_review.json'),producer_context='offline-fixture-producer',
-        scope='Offline mock-native upstream theme fixture. Inspect real frame/background and formal geometry. Native provider origin is simulated, not tested.',
-        frame_checks=['passed','current_story_redesign','no_reference_theme_leak','true_alpha_verified','continuous_opaque_four_sides','inner_masking_lip'],
-        background_checks=['passed','not_preblurred','controlled_high_frequency_detail','no_text_logo_or_vignette'],
-        formal_rule='release_video.story_frame_integrity_issues(frame, expected_size=(1920,1080), story_box=(210,270,910,512)); use actual preset rather than older generic source QA'))
-    print(status/'director_review_request.json');print(status/'theme_review_request.json')
+    print('Actual managed package and reviewed delivery dependencies registered')
 
 if __name__=='__main__':main()

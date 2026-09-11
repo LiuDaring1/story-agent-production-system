@@ -45,10 +45,11 @@ presence of files. See the delivered e2e result record for completed coverage.
     and registration, then director/theme review requests. Independent completion
     is required before final checklist/review/finalization.
 
-Current candidate boundary: the isolated run reached dual encoding and directory
-packaging. Its release audio-fit QA failed on periodic synthetic audio; a lossless
-mix adjustment exists in release_fixture.py but requires a new preview binding
-and independent approval before rerender. Final director/theme/delivery and
-frozen-source reviews were interrupted by account usage limits. End-to-end seal
-and recovery have NOT been certified. Do not treat unit-test success as replacing
-these gates. Source bundle restoration is a separate, deterministic verification.
+Recovery note: an earlier isolated run reached dual encoding and directory
+packaging, but its release audio-fit QA was run against videos encoded before the
+fixture mix changed. The fixture must use the same formal path as production:
+authoritative narration in ``--audio-mix``, the music-only customer background as
+``--bg-video``, and ``--mix-bg-audio``. Any changed preview, release, QA, review,
+or delivery binding must be regenerated in dependency order. Do not treat unit
+tests as replacing these gates. Source bundle restoration is a separate,
+deterministic verification from story-run checkpoint recovery.

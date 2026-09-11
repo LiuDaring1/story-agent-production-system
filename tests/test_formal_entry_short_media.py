@@ -24,12 +24,22 @@ class FormalEntryShortMediaTests(unittest.TestCase):
         cls.root.mkdir(parents=True, exist_ok=True)
         cls.project = cls.root/'fixture'; cls.project.mkdir(exist_ok=True)
         cls.runfile = cls.project/'99_项目状态/story_run.json'
-        for name, frequency in [('voice',431),('music',719)]:
-            t = np.arange(48000*3)/48000
-            signal = .25*np.sin(2*np.pi*frequency*t)*(0.65+.35*np.sin(2*np.pi*3.7*t))
+        t = np.arange(48000*3)/48000
+        rng = np.random.default_rng(20260910)
+        voice_phase = 2*np.pi*np.cumsum(155 + 24*np.sin(2*np.pi*.73*t))/48000
+        syllables = sum(np.exp(-.5*((t-center)/.085)**2) for center in (.18,.43,.79,1.08,1.46,1.82,2.17,2.61,2.83))
+        voice = .13*syllables*(np.sin(voice_phase)+.42*np.sin(2*voice_phase)+.2*np.sin(3*voice_phase))
+        voice += .008*syllables*rng.standard_normal(t.size)
+        music = np.zeros_like(t)
+        for start, chord in ((0.,(220,277,330)),(1.,(196,247,294)),(2.,(174,220,262))):
+            window = np.clip(1-np.abs(t-(start+.5))/.58,0,1)
+            music += .055*window*sum(np.sin(2*np.pi*f*t + i*.37) for i,f in enumerate(chord))
+        for beat in np.arange(.12,3,.37):
+            music += .035*np.exp(-np.maximum(0,t-beat)*18)*(t>=beat)*np.sin(2*np.pi*(90+45*np.exp(-np.maximum(0,t-beat)*12))*(t-beat))
+        for name, signal in [('voice',voice),('music',music)]:
             with wave.open(str(cls.root/f'{name}.wav'), 'wb') as f:
                 f.setnchannels(1); f.setsampwidth(2); f.setframerate(48000)
-                f.writeframes((signal*32767).astype('<i2').tobytes())
+                f.writeframes((np.clip(signal,-.95,.95)*32767).astype('<i2').tobytes())
         cls.video = cls.project/'fixture.mp4'
         subprocess.run(['ffmpeg','-v','error','-y','-f','lavfi','-i','color=c=0xaaccee:s=360x480:r=24:d=3',
                         '-i',str(cls.root/'voice.wav'),'-i',str(cls.root/'music.wav'),
@@ -88,7 +98,30 @@ class FormalEntryShortMediaTests(unittest.TestCase):
         self.assertFalse(report['passed'])
         self.assertIn('main_release_video: narration/music fit failed',report['issues'])
 
-    def test_04_media_preflight_reuses_release_mask_rule(self):
+    def test_04_missing_narration_and_wrong_polarity_are_rejected(self):
+        cases = {
+            'music_only': ['-i', str(self.root/'music.wav'), '-map', '0:v', '-map', '1:a'],
+            'wrong_polarity': [
+                '-i', str(self.root/'voice.wav'), '-i', str(self.root/'music.wav'),
+                '-filter_complex', '[2:a]volume=-0.22[inverted_music];[1:a][inverted_music]amix=inputs=2:normalize=0[a]',
+                '-map', '0:v', '-map', '[a]',
+            ],
+        }
+        for label, audio_args in cases.items():
+            with self.subTest(label=label):
+                bad = self.project/f'{label}.mp4'
+                subprocess.run([
+                    'ffmpeg','-v','error','-y','-i',str(self.video),*audio_args,
+                    '-c:v','copy','-c:a','aac','-t','3',str(bad),
+                ],check=True)
+                request={'releases':{'main_release_video':binding(bad),'library_release_video':binding(self.library)},'output':str(self.project/f'99_项目状态/qa_{label}.json'),'evidence_dir':str(self.project/f'99_项目状态/negative_{label}')}
+                result=self.cli('release-qa',request)
+                self.assertNotEqual(result.returncode,0)
+                report=json.loads(Path(request['output']).read_text())
+                self.assertFalse(report['passed'])
+                self.assertIn('main_release_video: narration/music fit failed',report['issues'])
+
+    def test_05_media_preflight_reuses_release_mask_rule(self):
         from PIL import Image, ImageDraw
         from story_candidate_cli import validate_media_frame
         preset=self.project/'frame_preset.json';preset.write_text(json.dumps({'story_box':[210,270,910,512]}))
@@ -100,7 +133,7 @@ class FormalEntryShortMediaTests(unittest.TestCase):
                 with self.assertRaisesRegex(ValueError,'frame_masking_lip_too_thin'):
                     validate_media_frame(preset,frame_path)
 
-    def test_05_formal_entrypoints_offer_original_help(self):
+    def test_06_formal_entrypoints_offer_original_help(self):
         for operation in ('assemble','backgrounds','release','timeline','release-qa'):
             p=subprocess.run([sys.executable,str(ROOT/'story_pipeline.py'),operation,'--help'],capture_output=True,text=True)
             self.assertEqual(p.returncode,0,p.stderr)

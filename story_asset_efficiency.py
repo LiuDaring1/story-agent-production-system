@@ -19,7 +19,10 @@ def asset_generation_plan(director):
     # A derivation is a reason to generate its parent only when the child is
     # itself reachable from a real shot, continuity or camera consumer.  This
     # prevents an otherwise omitted child from keeping an unused parent alive.
-    reachable = {key for key, uses in consumers.items() if uses}
+    reachable = {
+        key for key, uses in consumers.items()
+        if uses or assets[key].get('continuity_constraints')
+    }
     pending = list(reachable)
     while pending:
         child_id = pending.pop()

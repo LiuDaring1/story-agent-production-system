@@ -133,6 +133,26 @@ class WorkReuseTests(unittest.TestCase):
         self.assertEqual(rows['used-master']['operation'], 'generate')
         self.assertEqual(rows['used-master']['consumers'], ['derive:used'])
 
+    def test_constrained_derived_asset_keeps_required_parent_reachable(self):
+        from story_asset_efficiency import asset_generation_plan
+        director = dict(
+            story_id='test',
+            assets=[
+                dict(asset_id='required-master'),
+                dict(
+                    asset_id='required-view',
+                    derived_from_asset_id='required-master',
+                    continuity_constraints=['preserve geography'],
+                ),
+            ],
+            shots=[],
+            continuity_groups=[],
+        )
+        rows = {row['asset_id']: row for row in asset_generation_plan(director)['assets']}
+        self.assertEqual(rows['required-view']['operation'], 'generate')
+        self.assertEqual(rows['required-master']['operation'], 'generate')
+        self.assertEqual(rows['required-master']['consumers'], ['derive:required-view'])
+
     def test_closed_subtitle_graph_reuses_only_current_sequence_and_parameters(self):
         from story_encode_dependencies import snapshot
         from story_subtitle_layers import cropped_overlay_chain

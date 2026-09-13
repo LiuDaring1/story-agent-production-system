@@ -7,7 +7,6 @@ import argparse
 import hashlib
 import json
 import math
-import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -35,12 +34,22 @@ def _binding(path: Path) -> dict[str, Any]:
     }
 
 
+def _body_segments(assembly_plan: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return assembler body segments without assuming a shot-id format."""
+    return [
+        segment
+        for segment in assembly_plan.get("segments", [])
+        if str(segment.get("segment_id") or "").strip().upper()
+        not in {"", "TITLE", "MORAL"}
+    ]
+
+
 def body_timings_from_plan(
     assembly_plan: dict[str, Any],
     timing_rows: list[dict[str, Any]],
 ) -> list[LineTiming]:
     if assembly_plan.get("schema_version") == "story-r2v-assembly-decisions-v2":
-        body = [s for s in assembly_plan.get("segments", []) if re.fullmatch(r"S\d+", str(s.get("segment_id", "")))]
+        body = _body_segments(assembly_plan)
         if not body:
             raise ValueError("正式拼装决策缺少正文片段")
         windows = [(float(s["timeline_start"]), float(s["timeline_end"])) for s in body]
@@ -100,7 +109,10 @@ def validate_formal_assembly(payload: dict[str, Any], visual_master: Path, audio
         raise ValueError("正式拼装源计划哈希不匹配")
     plan = json.loads(plan_path.read_text(encoding="utf-8"))
     expected = [(str(s["shot_id"]), float(s["source_start"]), float(s["source_end"])) for s in plan["shots"]]
-    actual = [(str(s["segment_id"]), float(s["timeline_start"]), float(s["timeline_end"])) for s in payload.get("segments", []) if re.fullmatch(r"S\d+", str(s.get("segment_id", "")))]
+    actual = [
+        (str(s["segment_id"]), float(s["timeline_start"]), float(s["timeline_end"]))
+        for s in _body_segments(payload)
+    ]
     if actual != expected:
         raise ValueError("正式正文片段与绑定计划不一致")
 

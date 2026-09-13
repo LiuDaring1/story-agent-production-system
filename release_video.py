@@ -263,8 +263,8 @@ def main() -> None:
     parser.add_argument("--background-blur", default=14, type=int, help="主账号 16:9 背景虚化半径")
     parser.add_argument("--frame-image-b", type=Path, help="可选 B 画面透明 PNG 大框模板")
     parser.add_argument("--b-story-box", default=DEFAULT_B_STORY_BOX_TEXT, help="B 画面故事视频窗口：x,y,w,h，基于 1920x1080")
-    parser.add_argument("--b-windows", default="", help="B 画面出现时间段，例如 8-14,38.5-55；留空则不切 B")
-    parser.add_argument("--c-windows", default="", help="C 画面（仅人物+主题背景）出现时间段，例如 0-15,52-70")
+    parser.add_argument("--b-windows", default="auto", help="B 画面出现时间段，例如 8-14,38.5-55；留空则不切 B")
+    parser.add_argument("--c-windows", default="auto", help="C 画面（仅人物+主题背景）出现时间段，例如 0-15,52-70")
     parser.add_argument("--story-logo", type=Path, help="叠在故事视频右上角的小台标 PNG")
     parser.add_argument("--story-logo-width-a", default=180, type=int, help="A 画面台标宽度")
     parser.add_argument("--story-logo-width-b", default=210, type=int, help="B 画面台标宽度")
@@ -319,6 +319,25 @@ def main() -> None:
         explicit_run_file=args.run_file,
         output_scale=args.output_scale,
     )
+
+    # auto is resolved before constructing config, so it cannot become empty
+    # renderer arguments after v2 bypasses the historical workflow wrapper.
+    if args.variant in {"main", "both"} and (args.b_windows == "auto" or args.c_windows == "auto"):
+        if args.run_file is None:
+            parser.error("auto A/B/C requires --run-file and a current release windows plan")
+        from story_scene_windows import prepare_plan
+        if args.release_windows_plan is None:
+            from story_run import load_run
+            root = Path(load_run(args.run_file)["project_dir"])
+            args.release_windows_plan = root / "99_项目状态" / "release_windows_auto.json"
+        if not args.release_windows_plan.exists():
+            prepare_plan(args.run_file, args.release_windows_plan)
+        windows = json.loads(args.release_windows_plan.read_text())
+        if args.b_windows == "auto": args.b_windows = windows["b_windows"]
+        if args.c_windows == "auto": args.c_windows = windows["c_windows"]
+    elif args.variant == "library":
+        if args.b_windows == "auto": args.b_windows = ""
+        if args.c_windows == "auto": args.c_windows = ""
 
     keying = load_keying_preset(args.keying_preset_json.expanduser()) if args.keying_preset_json else {}
     keyer = str(keying.get("keyer", args.keyer))
@@ -444,7 +463,7 @@ def main() -> None:
     if contract_spec is None and args.run_file is not None:
         from story_run import load_run
         if load_run(args.run_file).get("production_contract") == "story-production/v2":
-            contract_spec = compile_v2_release_spec(config, args.run_file)
+            contract_spec = compile_v2_release_spec(config, args.run_file, preview=args.preview_dir is not None)
     if (
         contract_spec is not None
         and args.preview_dir is None
@@ -477,7 +496,7 @@ def main() -> None:
 V2_RELEASE_SPEC_SCHEMA = "story-release-render-spec/v2"
 
 
-def compile_v2_release_spec(config: ReleaseConfig, run_file: Path) -> dict:
+def compile_v2_release_spec(config: ReleaseConfig, run_file: Path, *, preview: bool = False) -> dict:
     """Project current v2 evidence into renderer inputs, never create a story contract."""
     from story_run import load_run
     from story_requirements import validate_run_projection
@@ -572,13 +591,14 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path) -> dict:
     windows_evidence = None
     if config.variant in {"main", "both"}:
         from story_production_v2 import validate_independent_approval
-        if config.release_windows_plan is None or config.release_windows_review is None:
+        if config.release_windows_plan is None or (config.release_windows_review is None and not preview and (config.approved_preview_geometry is None or config.approved_preview_review is None)):
             raise ValueError("v2 main release requires a reviewed A/B/C windows plan")
         windows = json.loads(config.release_windows_plan.read_text())
         if windows.get("schema_version") != "story-project-release-windows-plan/v1":
             raise ValueError("v2 release windows plan schema invalid")
-        for item in list(windows.get("inputs", {}).values()) + windows.get("rules", []):
-            current(item)
+        for item in windows.get("inputs", {}).values(): current(item)
+        from story_scene_windows import current_rule
+        for item in windows.get("rules", []): current_rule(item)
         for role, expected in (("subtitle_srt", current(ledger["inputs"]["subtitle_srt"])),
                                ("authoritative_timeline_receipt", timeline_path)):
             if current(windows["inputs"][role]).resolve() != expected.resolve():
@@ -596,9 +616,22 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path) -> dict:
             raise ValueError("v2 main release requires a valid authoritative duration")
         if float(duration) >= 30.0 and (not config.b_windows or not config.c_windows):
             raise ValueError("v2 main release >=30s requires non-empty reviewed B and C windows")
-        validate_independent_approval(json.loads(config.release_windows_review.read_text()),
-            config.release_windows_plan, producer_context=config.release_producer_context)
-        windows_evidence = {"plan": binding(config.release_windows_plan), "review": binding(config.release_windows_review)}
+        from story_scene_windows import segments
+        actual_segments = segments(float(duration), config.b_windows, config.c_windows)
+        validate_main_scene_ending(actual_segments, float(duration), config.subtitle_srt)
+        if not any(item[2] == "a" for item in actual_segments):
+            raise ValueError("main release requires an A segment")
+        if windows.get("preparation") == "mature_auto":
+            from story_workflow import build_abc_scene_windows
+            expected = build_abc_scene_windows(float(duration), config.subtitle_srt)
+            if expected != (windows.get("b_windows"), windows.get("c_windows")):
+                raise ValueError("auto windows differ from mature subtitle/ending rules")
+        if config.release_windows_review is not None:
+            validate_independent_approval(json.loads(config.release_windows_review.read_text()),
+                config.release_windows_plan, producer_context=config.release_producer_context)
+        windows_evidence = {"plan": binding(config.release_windows_plan)}
+        if config.release_windows_review is not None:
+            windows_evidence["review"] = binding(config.release_windows_review)
     logo = binding(config.story_logo)
     # These regions describe the real existing renderer; they do not create a
     # second user contract or scale the approved presenter to a new safe box.
@@ -622,7 +655,7 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path) -> dict:
             "customer_media_receipt": binding(customer_media_path),
             "mix_bg_audio": True,
         },
-        "variant": config.variant}
+        "variant": config.variant, "release_windows_evidence": windows_evidence}
     run_inputs = {k: {"path": str(Path(v["path"]).resolve()), "sha256": v["sha256"]}
                   for k, v in ledger["inputs"].items()}
     return {"schema_version": V2_RELEASE_SPEC_SCHEMA, "consumer": "release_video",
@@ -838,7 +871,7 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict, *, preview: bool
         raise ValueError("required_v1 发布渲染缺少 artifact_semantic_plan")
     is_v2 = spec.get("schema_version") == V2_RELEASE_SPEC_SCHEMA
     if is_v2:
-        current_spec = compile_v2_release_spec(config, Path(spec["run_file"]))
+        current_spec = compile_v2_release_spec(config, Path(spec["run_file"]), preview=preview)
         if current_spec != spec:
             raise ValueError("v2 release spec is stale or inputs/parameters changed")
         project_root = Path(spec["project_dir"])
@@ -1245,6 +1278,10 @@ def build_release_render_manifest(config: ReleaseConfig, spec: dict, outputs: li
             for path in outputs if path.is_file()
         ],
     }
+    if spec.get("schema_version") == V2_RELEASE_SPEC_SCHEMA and config.variant in {"main", "both"}:
+        coverage = config.output_dir / "main_abc_coverage.json"
+        if coverage.is_file():
+            payload["abc_decoded_coverage"] = {"path": str(coverage.resolve()), "sha256": sha256_path(coverage)}
     payload["render_manifest_sha256"] = canonical_sha256(payload)
     return payload
 
@@ -1345,6 +1382,19 @@ def parse_optional_box(value: str, flag: str) -> tuple[int, int, int, int] | Non
     return parse_required_box(value, flag, "0,0,1080,1440")
 
 
+def validate_main_scene_ending(actual_segments, duration, subtitle_srt):
+    """The mature ending is A, or C only after the audited subtitle stream ends."""
+    cues = parse_srt(subtitle_srt) if subtitle_srt is not None else []
+    last_subtitle = max((end for _start, end, _text in cues), default=None)
+    tail_free = last_subtitle is not None and duration - last_subtitle >= 4.0
+    start, _end, mode = actual_segments[-1]
+    if tail_free:
+        if mode != "c" or start < last_subtitle - .001:
+            raise ValueError("main release must preserve subtitle-free C ending")
+    elif mode != "a":
+        raise ValueError("main release ending must be A; C requires a subtitle-free tail of at least 4s")
+
+
 def parse_b_windows(value: str) -> tuple[tuple[float, float], ...]:
     if not value.strip():
         return ()
@@ -1361,7 +1411,7 @@ def parse_b_windows(value: str) -> tuple[tuple[float, float], ...]:
             end = float(raw_end.strip())
         except ValueError as exc:
             raise argparse.ArgumentTypeError("--b-windows 只能包含数字时间") from exc
-        if start < 0 or end <= start:
+        if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
             raise argparse.ArgumentTypeError("--b-windows 每段必须满足 0 <= start < end")
         windows.append((start, end))
     return tuple(windows)
@@ -1663,8 +1713,28 @@ def _execute_release_layout(
     attempt_id: str,
     executor: Callable[[], None],
 ) -> None:
+    from story_render_task import function_code_version, explicit_render_code_version
+    code_root = Path(__file__).resolve().parent
+    roots = {
+        "main_wide_render": "render_main_wide",
+        "preview_main": "render_main_preview_frame",
+        "preview_library": "render_library_preview_frame",
+        "library_window_render": "render_library_window_video",
+        "main_vertical_render": "render_vertical_package",
+        "library_vertical_render": "render_vertical_package",
+        "plate_package_render": "render_plate_package",
+    }
+    code_version = function_code_version(__file__, [roots[operation]], dependencies=[
+        code_root / name for name in (
+            "production_keying.py", "presenter_layout.py", "story_delivery_policy.py",
+            "release_geometry.py", "story_encode.py", "story_encode_dependencies.py",
+            "story_render_task.py", "story_video_synthesizer/media.py",
+            "story_module_adapters.py", "story_module_ports.py",
+        )
+    ])
     request_fingerprint = hashlib.sha256(json.dumps({
         "artifact_id": artifact_id,
+        "render_code_version": code_version,
         "operation": operation,
         "input_artifacts": input_artifacts,
         "layout_binding": layout_binding,
@@ -1682,8 +1752,10 @@ def _execute_release_layout(
         cached = json.loads(receipt_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
         cached = {}
+    from story_render_task import current_render_task
     if (
-        cached.get("schema_version") == "story-release-layout-operation/v1"
+        current_render_task() is None
+        and cached.get("schema_version") == "story-release-layout-operation/v1"
         and cached.get("request_fingerprint") == request_fingerprint
         and cached.get("output_path") == str(output_target.resolve(strict=False))
         and output_target.is_file()
@@ -1706,7 +1778,8 @@ def _execute_release_layout(
     def execute_render(execution_request: ReleaseLayoutRequest) -> ReleaseLayoutResult:
         nonlocal execution_error
         try:
-            executor()
+            with explicit_render_code_version(code_version):
+                executor()
             artifact = {
                 "path": str(output_target),
                 "sha256": sha256_path(output_target),
@@ -1843,6 +1916,17 @@ def package_release_videos(
                     output_scale=config.output_scale,
                 ),
             )
+        if contract_spec.get("schema_version") == V2_RELEASE_SPEC_SCHEMA:
+            from story_scene_windows import frame_templates, audit_video, presenter_evidence
+            from story_production_v2 import binding
+            coverage_path = config.output_dir / "main_abc_coverage.json"
+            templates = frame_templates(config, work_dir / "abc_templates")
+            scale = config.output_scale
+            coverage = audit_video(main_vertical, config.release_windows_plan, templates, coverage_path,
+                video_box=(0, TOP_HEIGHT * scale, FINAL_WIDTH * scale, CENTER_HEIGHT * scale),
+                presenter=presenter_evidence(config, geometry["presenter"]["c"]))
+            if not coverage["passed"]:
+                raise ValueError("main release decoded ABC coverage failed: " + "; ".join(coverage["critical_errors"]))
         print(f"已生成主账号发布视频：{main_vertical}")
         generated.append(main_vertical)
 
@@ -1941,15 +2025,23 @@ def render_release_previews(
     assets = render_static_assets(config, work_dir, geometry)
     port = release_layout_port or build_release_layout_registry().release_layout()
     if config.variant in {"both", "main"}:
+        if contract_spec is not None and contract_spec.get("schema_version") == V2_RELEASE_SPEC_SCHEMA:
+            from story_scene_windows import coverage_samples
+            duration = probe_duration(config.audio_mix)
+            required = coverage_samples(duration, config.b_windows, config.c_windows)
+            times = sorted(set([t for t in times if t < duration] + [x["time_seconds"] for x in required]))
+            write_json_atomic(preview_dir / "abc_review_samples.json", {"plan_sha256": sha256_path(config.release_windows_plan),
+                "samples": required, "scope": "expected modes; final decoded coverage is required separately"})
         validate_main_preview_mode_coverage(times, config.b_windows, config.c_windows)
         if config.bg_image is None or config.person_greenscreen is None or config.frame_image is None:
             raise ValueError("主账号预览需要 --bg-image、--person-greenscreen 和 --frame-image")
         layouts = person_layouts or [("current", config)]
         for timestamp in times:
+            token = f"{int(round(timestamp * 1000)):09d}ms" if contract_spec is not None and contract_spec.get("schema_version") == V2_RELEASE_SPEC_SCHEMA else f"{int(round(timestamp)):03d}s"
             use_b = any(start <= timestamp <= end for start, end in config.b_windows)
             use_c = any(start <= timestamp <= end for start, end in config.c_windows)
             if use_b:
-                output = preview_dir / f"main_{int(round(timestamp)):03d}s_b.png"
+                output = preview_dir / f"main_{token}_b.png"
                 _execute_release_layout(
                     port,
                     artifact_id=f"release-preview-main-b:{config.story_name}:{timestamp:.3f}",
@@ -1974,7 +2066,7 @@ def render_release_previews(
                 print(f"已生成主账号预览帧：{output}")
                 continue
             if use_c:
-                output = preview_dir / f"main_{int(round(timestamp)):03d}s_c.png"
+                output = preview_dir / f"main_{token}_c.png"
                 _execute_release_layout(
                     port,
                     artifact_id=f"release-preview-main-c:{config.story_name}:{timestamp:.3f}",
@@ -2000,7 +2092,7 @@ def render_release_previews(
                 continue
             for label, layout_config in layouts:
                 suffix = "" if label == "current" and len(layouts) == 1 else f"_{label}"
-                output = preview_dir / f"main_{int(round(timestamp)):03d}s_a{suffix}.png"
+                output = preview_dir / f"main_{token}_a{suffix}.png"
                 _execute_release_layout(
                     port,
                     artifact_id=f"release-preview-main-a:{config.story_name}:{timestamp:.3f}:{label}",
@@ -2075,6 +2167,10 @@ def render_main_preview_frame(
             probe_duration(config.audio_mix),
             timestamp,
         )
+        if geometry.get("production_contract") == "story-production/v2":
+            total_duration = probe_duration(config.audio_mix)
+            sample_start = max(0.0, min(timestamp - .16, total_duration - requested_sample_duration))
+            sample_frame_time = max(0.0, timestamp - sample_start)
         render_main_wide(
             config,
             frame_image,
@@ -2083,7 +2179,7 @@ def render_main_preview_frame(
             presenter_c_geometry=geometry["presenter"]["c"],
             sample_start=sample_start,
             sample_duration=requested_sample_duration,
-            sample_scene=scene,
+            sample_scene=None if geometry.get("production_contract") == "story-production/v2" else scene,
         )
         wide_probe = work_dir / f"main_formal_sample_probe_{token}.png"
         extract_video_frame(
@@ -2091,6 +2187,16 @@ def render_main_preview_frame(
             wide_probe,
             sample_frame_time,
         )
+        if geometry.get("production_contract") == "story-production/v2":
+            from story_scene_windows import frame_templates, observed_frame_mode, presenter_evidence, decode_presenter
+            person_image = decode_presenter(presenter_evidence(config, geometry["presenter"]["c"]), timestamp, work_dir / f"abc_presenter_{token}.png") if scene == "c" else None
+            measured = observed_frame_mode(Image.open(wide_probe), frame_templates(config, work_dir / "abc_preview_templates"), person_image)
+            write_json_atomic(work_dir / f"abc_observed_{token}.json", {
+                "time_seconds": timestamp, "expected_mode": scene, **measured,
+                "frame": {"path": str(wide_probe), "sha256": sha256_path(wide_probe)},
+            })
+            if measured["observed_mode"] != scene:
+                raise ValueError(f"preview ABC actual mode mismatch: expected {scene}, observed {measured['observed_mode']}")
         aperture_issues = []
         if scene != "c":
             aperture = config.b_story_box if scene == "b" else config.story_box
@@ -3623,7 +3729,7 @@ def render_main_wide(
         if direct_b_sample:
             current = b_current
         else:
-            b_expr = "+".join(f"between(T\\,{start:.3f}\\,{end:.3f})" for start, end in config.b_windows)
+            b_expr = "+".join(f"between(T+{sample_start:.3f}\\,{start:.3f}\\,{end:.3f})" for start, end in config.b_windows)
             filters.append(f"[{current}][{b_current}]blend=all_expr='if({b_expr},B,A)'[ab_scene]")
             current = "ab_scene"
     if has_c:
@@ -3668,7 +3774,7 @@ def render_main_wide(
         if direct_c_sample:
             current = "c_person"
         else:
-            c_expr = "+".join(f"between(T\\,{start:.3f}\\,{end:.3f})" for start, end in config.c_windows)
+            c_expr = "+".join(f"between(T+{sample_start:.3f}\\,{start:.3f}\\,{end:.3f})" for start, end in config.c_windows)
             filters.append(f"[{current}][c_person]blend=all_expr='if({c_expr},B,A)'[abc_scene]")
             current = "abc_scene"
     if watermark_index is not None:

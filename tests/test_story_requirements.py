@@ -124,7 +124,9 @@ class ApplicableRequirementsTests(unittest.TestCase):
                 run_file, row, provider="offline", model="approved-model", status="submitted",
             )
             request = load_run(run_file)["observability"]["requests"]["offline:offline-task-1"]
-            self.assertEqual(request["request_sha256"], "a" * 64)
+            self.assertIsNone(request["request_sha256"])
+            self.assertEqual(request["prompt_sha256"], "a" * 64)
+            self.assertEqual(request["request_hash_kind"], "unknown")
             self.assertEqual(request["token_status"], "not_applicable")
             self.assertNotIn("legacy_financial_evidence", request)
 

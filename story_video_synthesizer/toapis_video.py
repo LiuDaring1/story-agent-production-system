@@ -169,6 +169,26 @@ def extract_toapis_video_url(payload: dict[str, Any]) -> str | None:
     return None
 
 
+class ToAPIsRequestError(RuntimeError):
+    """Preserve narrow structured non-acceptance evidence for safe later retry."""
+    def __init__(self, status, detail):
+        super().__init__(f"ToAPIs HTTP {status}：{detail}")
+        self.rejection_evidence = None
+        try:
+            payload = json.loads(detail)
+            error = payload.get('error', {})
+            code = error.get('code') if isinstance(error, dict) else None
+            # Only the existing explicit local rejection is classified here.
+            # Message substring, transport timeout and generic 5xx are unknown.
+            if 400 <= status < 500 and code == 'local_quota_not_enough' and not payload.get('task_id') and not payload.get('id'):
+                import hashlib
+                self.rejection_evidence = {'http_status': status, 'error_code': code,
+                    'response_sha256': hashlib.sha256(detail.encode()).hexdigest(),
+                    'provider_acceptance': 'rejected'}
+        except (ValueError, AttributeError, TypeError):
+            pass
+
+
 class ToAPIsVideoClient:
     """Small provider client for ToAPIs' upload + asynchronous Grok video APIs."""
 
@@ -365,7 +385,7 @@ class ToAPIsVideoClient:
                     return json.loads(response.read().decode("utf-8"))
             except HTTPError as exc:
                 detail = exc.read().decode("utf-8", errors="replace")
-                raise RuntimeError(f"ToAPIs HTTP {exc.code}：{detail}") from exc
+                raise ToAPIsRequestError(exc.code, detail) from exc
             except URLError as exc:
                 last_error = exc
                 if attempt < 2:

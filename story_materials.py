@@ -21,15 +21,29 @@ def word_text(path):
 
 def material_rows(director, plan, word):
     from static_ppt_contract import validate_plan
-    ids, slides = validate_plan(Path(director), Path(plan))
+    issues = []
+    try:
+        ids, slides = validate_plan(Path(director), Path(plan))
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        issues.append('plan: ' + str(exc))
+        # Read mappings even if stale poster/plan bindings fail. These rows can
+        # only explain errors; any plan defect still prevents an export.
+        raw = json.loads(Path(plan).read_text())
+        slides = raw.get('slides')
+        if not isinstance(slides, list) or any(not isinstance(row, dict) for row in slides):
+            raise MaterialsPreflightError(issues)
     text = word_text(word)
     result = []
-    issues = []
     cursor = 0.0
     last = 0
     shots = {r['shot_id']: r for r in json.loads(Path(director).read_text())['shots']}
     for row in slides:
-        sid = row['shot_id']
+        sid = str(row.get('shot_id') or '<missing shot_id>')
+        image_binding = None
+        try:
+            image_binding = binding(row['poster_path'])
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            issues.append(f'{sid}: image binding: {exc}')
         try:
             duration = float(row['duration_seconds'])
         except (KeyError, TypeError, ValueError):
@@ -58,14 +72,20 @@ def material_rows(director, plan, word):
             issues.append(f'{sid}: ambiguous Word text; provide word_start')
             continue
         if 'word_start' in row:
-            start = int(row['word_start'])
+            try:
+                start = int(row['word_start'])
+            except (TypeError, ValueError):
+                issues.append(f'{sid}: invalid Word offset')
+                continue
             if start < last or text[start:start + len(source)] != source:
                 issues.append(f'{sid}: invalid Word offset')
                 continue
         last = start + len(source)
         if not duration_valid:
             continue
-        result.append({'order': len(result) + 1, 'shot_id': sid, 'text': source, 'display_text': source[:-1] if source.endswith('。') else source, 'word_start': start, 'word_end': last, 'start_seconds': start_seconds, 'end_seconds': start_seconds + duration, 'image': binding(row['poster_path'])})
+        if image_binding is None:
+            continue
+        result.append({'order': len(result) + 1, 'shot_id': sid, 'text': source, 'display_text': source[:-1] if source.endswith('。') else source, 'word_start': start, 'word_end': last, 'start_seconds': start_seconds, 'end_seconds': start_seconds + duration, 'image': image_binding})
     if issues:
         raise MaterialsPreflightError(issues)
     return result
@@ -94,11 +114,35 @@ def materials_preflight(*, director, plan, compile_receipt, inputs):
         rows = material_rows(director, plan, inputs['final_word']['path'])
     except MaterialsPreflightError as exc:
         issues.extend(exc.issues)
-    except (OSError, KeyError, TypeError, ValueError) as exc:
+    except (OSError, KeyError, TypeError, ValueError, zipfile.BadZipFile, ET.ParseError) as exc:
         issues.append(f'word_mapping: {exc}')
     if issues:
         raise MaterialsPreflightError(issues)
     return compile_data, rows
+
+
+def production_preflight_report(*, director, plan, compile_receipt, inputs):
+    """A read-only early checkpoint; no rendering, copying, approval or migration."""
+    from story_hash_cache import hash_cache_scope
+    with hash_cache_scope():
+        try:
+            compile_data, rows = materials_preflight(director=director, plan=plan,
+                compile_receipt=compile_receipt, inputs=inputs)
+            issues = []
+        except MaterialsPreflightError as exc:
+            compile_data, rows, issues = None, None, exc.issues
+        sources = {}
+        for role, path in [('director', director), ('plan', plan), ('compile_receipt', compile_receipt)]:
+            try:
+                sources[role] = binding(path)
+            except (OSError, TypeError, ValueError):
+                sources[role] = {'path': str(path), 'sha256': None}
+        return {'schema_version': 'story-production-preflight/v1', 'passed': not issues,
+                'issues': issues, 'sources': sources, 'inputs': inputs,
+                'material_page_count': len(rows) if rows is not None else None,
+                'coverage': ['compile_receipt_currentness', 'plan_currentness', 'Word_verbatim_mapping',
+                             'TITLE_MORAL_mapping', 'audio_music_input_bindings'],
+                'independent_review_performed': False}
 
 def export_materials(*, director, plan, compile_receipt, inputs, output, receipt, archive_output=None):
     """Export a ready-to-use ordered folder; ZIP requires explicit opt-in."""

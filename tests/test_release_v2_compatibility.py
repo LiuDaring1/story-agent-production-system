@@ -275,3 +275,48 @@ class ReleaseV2CompatibilityTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'A'):
             validate_main_preview_mode_coverage(
                 [1.5, 3.5], ((1.0, 2.0),), ((3.0, 4.0),))
+
+    def test_windows_plan_joins_existing_preview_review_and_changed_plan_invalidates(self):
+        self.config = replace(self.config, release_windows_review=None)
+        spec = compile_v2_release_spec(self.config, self.run_file, preview=True)
+        preview = self.compile(spec)
+        geometry_path = self.write('merged_review_geometry.json', preview)
+        review_path = self.write('merged_review.json', {'approved': True, 'score': 90, 'critical_errors': [],
+            'reviewer_context': 'independent-merged', 'independent_context': True,
+            'artifact_sha256': sha256_path(geometry_path)})
+        self.config = replace(self.config, approved_preview_geometry=geometry_path, approved_preview_review=review_path)
+        formal = self.compile(spec, preview=False)
+        self.assertEqual(formal['formal_render_binding_sha256'], preview['formal_render_binding_sha256'])
+        payload = json.loads(self.windows.read_text());payload['rule_note']='changed current plan'
+        self.windows.write_text(json.dumps(payload))
+        with self.assertRaisesRegex(ValueError, 'stale|mismatch'):
+            self.compile(spec, preview=False)
+
+    def test_auto_preparation_reaches_real_compiler_and_missing_arguments_fail(self):
+        from story_scene_windows import prepare_plan
+        from release_video import parse_b_windows
+        self.timeline.write_text(json.dumps({'audio_duration_seconds':42.0}))
+        self.config.subtitle_srt.write_text('1\n00:00:00,000 --> 00:00:41,000\ntext\n')
+        self.ledger['inputs']['subtitle_srt'] = self.bind(self.config.subtitle_srt)
+        self.ledger['artifacts']['authoritative_timeline_receipt'] = self.bind(self.timeline)
+        self.semantic['inputs']['subtitle_srt'] = self.bind(self.config.subtitle_srt)
+        self.semantic['authoritative_timeline_receipt'] = self.bind(self.timeline)
+        self.semantic_path.write_text(json.dumps(self.semantic))
+        for path in (self.generation,self.motion,self.request):
+            path.write_text(json.dumps({'artifact_semantic_plan_sha256':sha256_path(self.semantic_path)}))
+        self.ledger['artifacts']['semantic_card_generation_receipt'] = self.bind(self.generation)
+        self.ledger['artifacts']['semantic_card_motion_receipt'] = self.bind(self.motion)
+        plan_path=self.project/'auto_windows.json'; plan=prepare_plan(self.run_file,plan_path)
+        self.config=replace(self.config,release_windows_plan=plan_path,release_windows_review=None,
+            b_windows=parse_b_windows(plan['b_windows']),c_windows=parse_b_windows(plan['c_windows']))
+        spec=compile_v2_release_spec(self.config,self.run_file,preview=True)
+        self.assertEqual(spec['layout_parameters']['b_windows'],[[15.,33.]])
+        self.assertEqual(spec['layout_parameters']['c_windows'],[[0.,15.]])
+        self.config=replace(self.config,b_windows=())
+        with self.assertRaisesRegex(ValueError,'differ from reviewed source'):
+            compile_v2_release_spec(self.config,self.run_file,preview=True)
+
+    def test_library_compiler_is_not_subject_to_main_windows_gate(self):
+        self.config=replace(self.config,variant='library',b_windows=(),c_windows=(),
+            release_windows_plan=None,release_windows_review=None)
+        self.assertIsNone(self.spec()['release_windows_evidence'])

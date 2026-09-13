@@ -266,34 +266,57 @@ def create_provider_task(
     camera_fixed: bool,
     watermark: bool,
     extra_body: dict[str, object] | None,
+    observation_row: dict | None = None,
+    provider: str | None = None,
+    run_file: Path | None = None,
+    submission_scope: dict | None = None,
 ):
-    if reference_paths:
-        if not is_toapis or not hasattr(client, "create_reference_task"):
-            raise ValueError("Reference-to-Video 任务当前只允许通过 ToAPIs 适配器提交")
-        return client.create_reference_task(
+    if observation_row is not None:
+        from story_request_facts import request_fingerprint
+        fingerprint = request_fingerprint(
+            provider=provider, model=model, prompt=prompt,
+            input_paths=reference_paths or [image_path],
+            parameters={'ratio': ratio, 'duration': duration, 'resolution': resolution,
+                        'frames': frames, 'seconds': seconds, 'size': size,
+                        'parameter_style': parameter_style, 'camera_fixed': camera_fixed,
+                        'watermark': watermark, 'extra_body': extra_body},
+        )
+        observation_row['provider_request_sha256'] = fingerprint['request_sha256']
+        observation_row['provider_request_fingerprint_json'] = json.dumps(fingerprint, ensure_ascii=False)
+    def invoke():
+        if reference_paths:
+            if not is_toapis or not hasattr(client, "create_reference_task"):
+                raise ValueError("Reference-to-Video 任务当前只允许通过 ToAPIs 适配器提交")
+            return client.create_reference_task(
+                model=model,
+                prompt=prompt,
+                reference_paths=reference_paths,
+                ratio=ratio,
+                seconds=seconds,
+                resolution=resolution or size,
+                extra_body=extra_body,
+            )
+        return client.create_task(
             model=model,
             prompt=prompt,
-            reference_paths=reference_paths,
+            image_path=image_path,
             ratio=ratio,
+            duration=duration,
+            resolution=resolution,
+            frames=frames,
             seconds=seconds,
-            resolution=resolution or size,
+            size=size,
+            parameter_style=parameter_style,
+            camera_fixed=camera_fixed,
+            watermark=watermark,
             extra_body=extra_body,
         )
-    return client.create_task(
-        model=model,
-        prompt=prompt,
-        image_path=image_path,
-        ratio=ratio,
-        duration=duration,
-        resolution=resolution,
-        frames=frames,
-        seconds=seconds,
-        size=size,
-        parameter_style=parameter_style,
-        camera_fixed=camera_fixed,
-        watermark=watermark,
-        extra_body=extra_body,
-    )
+    if observation_row is not None and run_file is not None:
+        from story_request_facts import observe_submission
+        return observe_submission(run_file, row=observation_row,
+            scope=submission_scope or {'scene': observation_row.get('scene'), 'attempt': observation_row.get('provider_attempt')},
+            provider=provider, model=model, fingerprint=fingerprint, invoke=invoke)
+    return invoke()
 
 
 def _discover_project_root(jobs_csv: Path) -> Path | None:
@@ -438,7 +461,12 @@ def _observe_provider_request(
         ),
         retry_index=int(row.get("provider_attempt") or "0"),
         token_status="not_applicable",
-        request_sha256=str(row.get("provider_prompt_sha256") or ""),
+        request_sha256=str(row.get("provider_request_sha256") or ""),
+        prompt_sha256=str(row.get("provider_prompt_sha256") or ""),
+        request_hash_kind="full_request" if row.get("provider_request_sha256") else "unknown",
+        execution_mode=("rework" if row.get("provider_retry_prompt") else "first_execution") if row.get("provider_request_sha256") else None,
+        rework_reason=str(row.get("provider_retry_prompt") or "") or None,
+        rework_classification="unknown" if row.get("provider_retry_prompt") else None,
         error_type=error_type,
         replace=status != "submitted",
     )
@@ -665,6 +693,9 @@ def main() -> None:
                 if contract_bound:
                     assert_request_contract_binding(project_dir, "image_video", row)
                 created = create_provider_task(
+                    observation_row=row, provider=provider_label, run_file=run_file,
+                    submission_scope={'jobs_csv': str(args.jobs_csv.resolve()), 'scene': row.get('scene'),
+                                      'attempt': row.get('provider_attempt')},
                     client=client,
                     is_toapis=is_toapis,
                     model=args.model,
@@ -692,7 +723,7 @@ def main() -> None:
             row["task_id"] = created.task_id
             row["status"] = "submitted"
             row["api_response"] = json.dumps(created.raw, ensure_ascii=False)
-            row["provider_started_at"] = datetime.now(timezone.utc).isoformat()
+            row["provider_started_at"] = row.get("provider_started_at") or datetime.now(timezone.utc).isoformat()
             # Persist the provider identity before any secondary ledger write;
             # a crash here must resume/poll this task rather than resubmit it.
             write_jobs_csv(args.jobs_csv.expanduser(), rows)
@@ -811,6 +842,9 @@ def main() -> None:
                     if contract_bound:
                         assert_request_contract_binding(project_dir, "image_video", row)
                     created = create_provider_task(
+                        observation_row=row, provider=provider_label, run_file=run_file,
+                    submission_scope={'jobs_csv': str(args.jobs_csv.resolve()), 'scene': row.get('scene'),
+                                      'attempt': row.get('provider_attempt')},
                         client=client,
                         is_toapis=is_toapis,
                         model=args.model,
@@ -831,7 +865,7 @@ def main() -> None:
                     row["task_id"] = created.task_id
                     row["status"] = "submitted"
                     row["api_response"] = json.dumps(created.raw, ensure_ascii=False)
-                    row["provider_started_at"] = datetime.now(timezone.utc).isoformat()
+                    row["provider_started_at"] = row.get("provider_started_at") or datetime.now(timezone.utc).isoformat()
                     write_jobs_csv(args.jobs_csv.expanduser(), rows)
                     _observe_provider_request(
                         run_file, row, provider=provider_label, model=args.model, status="submitted"

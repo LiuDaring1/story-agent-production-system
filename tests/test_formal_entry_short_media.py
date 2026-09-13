@@ -40,8 +40,21 @@ class FormalEntryShortMediaTests(unittest.TestCase):
             with wave.open(str(cls.root/f'{name}.wav'), 'wb') as f:
                 f.setnchannels(1); f.setsampwidth(2); f.setframerate(48000)
                 f.writeframes((np.clip(signal,-.95,.95)*32767).astype('<i2').tobytes())
+        # The three-second QA fixture has a real A frame in its center strip;
+        # ABC requirements for >=30s are exercised by the separate 42s fixture.
+        from PIL import Image, ImageDraw
+        cls.abc_templates={}
+        for mode, box in [('a',(210,270,1120,782)),('b',(350,150,1550,850))]:
+            frame=Image.new('RGBA',(1920,1080))
+            ImageDraw.Draw(frame).rectangle(box,outline=(235,170,20,255),width=30)
+            source=cls.project/f'abc_frame_{mode}.png';frame.save(source)
+            cls.abc_templates[mode]=binding(source)
+        plate=Image.new('RGB',(360,480),(170,204,238))
+        frame=Image.open(cls.abc_templates['a']['path']).convert('RGBA').resize((360,203))
+        plate.paste(frame,(0,139),frame.getchannel('A'))
+        plate_path=cls.project/'synthetic_a_plate.png';plate.save(plate_path)
         cls.video = cls.project/'fixture.mp4'
-        subprocess.run(['ffmpeg','-v','error','-y','-f','lavfi','-i','color=c=0xaaccee:s=360x480:r=24:d=3',
+        subprocess.run(['ffmpeg','-v','error','-y','-loop','1','-framerate','24','-i',str(plate_path),
                         '-i',str(cls.root/'voice.wav'),'-i',str(cls.root/'music.wav'),
                         '-filter_complex','[1:a][2:a]amix=inputs=2:weights=1 0.22:normalize=0[a]',
                         '-map','0:v','-map','[a]','-c:v','libx264','-crf','20','-preset','medium','-c:a','aac','-t','3',str(cls.video)],check=True)
@@ -77,8 +90,26 @@ class FormalEntryShortMediaTests(unittest.TestCase):
             self.srt.write_bytes(original+b'\n')
             with self.assertRaises(ValueError): validate_authoritative_timeline_receipt(receipt)
         finally: self.srt.write_bytes(original)
+    def abc_coverage(self, video):
+        from story_scene_windows import prepare_plan, audit_video
+        run=json.loads(self.runfile.read_text())
+        if 'authoritative_timeline_receipt' not in run.get('artifacts',{}):
+            receipt=self.project/'99_项目状态/timeline.json'
+            result=self.cli('timeline',{'receipt_path':str(receipt),'timings_path':str(self.project/'99_项目状态/timings.json')})
+            self.assertEqual(result.returncode,0,result.stderr)
+            run=json.loads(self.runfile.read_text())
+            run['artifacts']['authoritative_timeline_receipt']=binding(receipt)
+            self.runfile.write_text(json.dumps(run))
+        plan=self.project/'99_项目状态/fixture_abc_plan.json'
+        prepare_plan(self.runfile,plan)
+        report=self.project/f'99_项目状态/{video.stem}_abc_coverage.json'
+        actual=audit_video(video,plan,self.abc_templates,report,video_box=(0,139,360,203))
+        self.assertTrue(actual['passed'],actual['critical_errors'])
+        return binding(report)
+
     def test_02_real_dual_release_machine_qa_and_hash_rejection(self):
         request={'releases':{'main_release_video':binding(self.video),'library_release_video':binding(self.library)},'output':str(self.project/'99_项目状态/qa_release_report.json'),'evidence_dir':str(self.project/'99_项目状态/final_qa')}
+        request['abc_coverage']=self.abc_coverage(self.video)
         result=self.cli('release-qa',request)
         self.assertEqual(result.returncode,0,result.stdout+result.stderr)
         report=json.loads(Path(request['output']).read_text())
@@ -92,6 +123,7 @@ class FormalEntryShortMediaTests(unittest.TestCase):
         bad=self.project/'voice_only.mp4'
         subprocess.run(['ffmpeg','-v','error','-y','-i',str(self.video),'-i',str(self.root/'voice.wav'),'-map','0:v','-map','1:a','-c:v','copy','-c:a','aac','-t','3',str(bad)],check=True)
         request={'releases':{'main_release_video':binding(bad),'library_release_video':binding(self.library)},'output':str(self.project/'99_项目状态/qa_missing_music.json'),'evidence_dir':str(self.project/'99_项目状态/negative_qa')}
+        request['abc_coverage']=self.abc_coverage(bad)
         result=self.cli('release-qa',request)
         self.assertNotEqual(result.returncode,0)
         report=json.loads(Path(request['output']).read_text())
@@ -115,6 +147,7 @@ class FormalEntryShortMediaTests(unittest.TestCase):
                     '-c:v','copy','-c:a','aac','-t','3',str(bad),
                 ],check=True)
                 request={'releases':{'main_release_video':binding(bad),'library_release_video':binding(self.library)},'output':str(self.project/f'99_项目状态/qa_{label}.json'),'evidence_dir':str(self.project/f'99_项目状态/negative_{label}')}
+                request['abc_coverage']=self.abc_coverage(bad)
                 result=self.cli('release-qa',request)
                 self.assertNotEqual(result.returncode,0)
                 report=json.loads(Path(request['output']).read_text())

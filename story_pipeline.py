@@ -17,8 +17,8 @@ import story_run
 ARCHITECTURE = {
     "schema_version": "codex-native-story-pipeline/v2",
     "candidate_contract": "story-production/v2",
-    "deterministic_entrypoints": {"asset-plan": "story_asset_efficiency.py", "prepare-review": "story_review_preparation.py", "assemble": "assemble_r2v_story.py", "backgrounds": "render_customer_backgrounds.py", "release": "release_video.py"},
-    "candidate_operations": ["timeline", "release-qa", "media", "media-preview", "media-approve", "pack", "materials", "packaging", "checklist", "encode-control"],
+    "deterministic_entrypoints": {"asset-plan": "story_asset_efficiency.py", "prepare-review": "story_review_preparation.py", "assemble": "assemble_r2v_story.py", "backgrounds": "render_customer_backgrounds.py", "release": "release_video.py", "release-windows": "story_scene_windows.py"},
+    "candidate_operations": ["preflight", "review-create", "timeline", "release-qa", "media", "media-preview", "media-approve", "pack", "materials", "packaging", "checklist", "encode-control"],
     "promotion": "candidate until a real new story passes QA and user acceptance",
     "human_entry": "Codex task + skills/story-full-auto",
     "supported_control_entry": "story_pipeline.py",
@@ -44,7 +44,7 @@ def print_help() -> None:
         "  story_pipeline.py observe-performance ...\n"
         "  story_pipeline.py status ...\n"
         "  story_pipeline.py finalize ...\n\n"
-        "  正式执行：assemble / backgrounds / release（沿用对应模块参数）\n"
+        "  正式执行：assemble / backgrounds / release-windows / release（沿用对应模块参数）\n"
         "  候选操作：timeline / release-qa / media / pack / materials / packaging / checklist / encode-control\n"
         "账本命令参数与 story_run.py 相同；候选操作使用 --run-file 和 --request。"
     )
@@ -66,7 +66,7 @@ def main() -> None:
         sys.argv = [str(script), *sys.argv[2:]]
         runpy.run_path(str(script), run_name="__main__")
         return
-    if sys.argv[1] in {"timeline", "release-qa", "media", "media-preview", "media-approve", "pack", "materials", "packaging", "checklist", "encode-control"}:
+    if sys.argv[1] in {"preflight", "review-create", "timeline", "release-qa", "media", "media-preview", "media-approve", "pack", "materials", "packaging", "checklist", "encode-control"}:
         from story_candidate_cli import main as candidate_main
         candidate_main(sys.argv[1:])
         return

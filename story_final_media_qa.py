@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from story_production_v2 import binding, current, write, protect_outputs
 
 
-def audit_releases(*, inputs, releases, output, evidence_dir, video_boxes=None, demo=None, logo=None, gesture_times=None):
+def audit_releases(*, inputs, releases, output, evidence_dir, video_boxes=None, demo=None, logo=None, gesture_times=None, abc_coverage=None):
     from story_customer_media import decode_audio, narration_music_fit, RELEASE_AUDIO_DURATION_TOLERANCE_SECONDS
     from story_project import probe_av_alignment
     from story_video_synthesizer.media import probe_duration
@@ -46,6 +46,17 @@ def audit_releases(*, inputs, releases, output, evidence_dir, video_boxes=None, 
         if decoded.returncode or decoded.stderr.strip():
             notes.append('full decode errors; inspect log')
         out = root / role; out.mkdir()
+        abc_result = None
+        if role == 'main_release_video':
+            from story_scene_windows import validate_coverage_report, audit_video
+            coverage_path = current(abc_coverage) if abc_coverage else path.parent/'main_abc_coverage.json'
+            try:
+                coverage = validate_coverage_report(coverage_path, path)
+                abc_result = audit_video(path, current(coverage['plan']), coverage['templates'], out/'abc_coverage.json', video_box=coverage.get('video_box'), presenter=coverage.get('presenter'))
+                notes.extend(abc_result['critical_errors'])
+            except (OSError, ValueError, KeyError) as exc:
+                notes.append('ABC decoded coverage invalid: '+str(exc))
+
         for command in build_tail_frame_probe_commands(path, out, actual, fps=12, window_seconds=min(2., actual)):
             subprocess.run(command, check=True, capture_output=True)
         tails = sorted(out.glob('tail_*.jpg'))
@@ -71,7 +82,7 @@ def audit_releases(*, inputs, releases, output, evidence_dir, video_boxes=None, 
         results.append({'label': role, 'path': str(path), 'duration_sec': actual, **alignment,
                         'audio_role': 'narration_plus_music', 'audio_role_fit': fit, 'issues': notes,
                         'tail_probe_dir': str(out), 'tail_probe_frame_count': len(tails),
-                        'formal_frame_evidence': samples, 'video_box': box,
+                        'formal_frame_evidence': samples, 'video_box': box, 'abc_decoded_coverage': abc_result,
                         'full_decode': {'returncode': decoded.returncode, 'stderr_log': binding(log)}})
     current(inputs['audio']); current(inputs['finished_music'])
     report = {'schema_version':'story-release-machine-qa/v3', 'version':3, 'passed':not issues,

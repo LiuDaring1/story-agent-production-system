@@ -21,6 +21,14 @@ _CACHE: ContextVar[dict[tuple[str, tuple[int, ...]], str] | None] = ContextVar(
 )
 
 
+_TREES = ContextVar("story_finalize_directory_snapshots", default=None)
+
+def remember_directory(path, inventory):
+    snapshots = _TREES.get()
+    if snapshots is not None:
+        snapshots[str(Path(path).resolve())] = {str(p): sig for p, sig in inventory.items()}
+
+
 def _signature(stat: os.stat_result) -> tuple[int, ...]:
     return (
         stat.st_dev,
@@ -43,7 +51,8 @@ def sha256_file(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
         for chunk in iter(lambda: handle.read(chunk_size), b""):
             digest.update(chunk)
         after = os.fstat(handle.fileno())
-    if _signature(before) != _signature(after):
+    if (_signature(before) != _signature(after)
+            or _signature(after) != _signature(target.stat())):
         raise RuntimeError(f"File changed while hashing: {target}")
     value = digest.hexdigest()
     if cache is not None:
@@ -51,11 +60,33 @@ def sha256_file(path: Path | str, *, chunk_size: int = 1024 * 1024) -> str:
     return value
 
 
+def validate_hash_cache() -> None:
+    """Recheck identities at the commit boundary; never persist this trust."""
+    cache = _CACHE.get()
+    latest = {}
+    for path, signature in cache or {}:
+        latest[path] = signature
+    for root, expected in (_TREES.get() or {}).items():
+        actual = {}
+        for child in Path(root).rglob('*'):
+            if child.is_symlink():
+                raise RuntimeError(f'Directory changed during validation: {root}')
+            if child.is_file():
+                actual[str(child)] = _signature(child.stat())
+        if actual != expected:
+            raise RuntimeError(f'Directory changed during validation: {root}')
+    for path, signature in latest.items():
+        if _signature(Path(path).stat()) != signature:
+            raise RuntimeError(f"File changed during validation: {path}")
+
+
 @contextmanager
 def hash_cache_scope() -> Iterator[dict[tuple[str, tuple[int, ...]], str]]:
     cache: dict[tuple[str, tuple[int, ...]], str] = {}
     token = _CACHE.set(cache)
+    trees_token = _TREES.set({})
     try:
         yield cache
     finally:
         _CACHE.reset(token)
+        _TREES.reset(trees_token)

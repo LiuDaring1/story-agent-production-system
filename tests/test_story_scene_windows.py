@@ -58,6 +58,14 @@ class StorySceneWindowTests(unittest.TestCase):
             _b_windows, c_windows = build_abc_scene_windows(30.0, srt)
             self.assertIn("18.000-30.000", c_windows)
 
+    def test_final_full_subtitle_cue_is_not_misclassified_as_free_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            srt=Path(directory)/"full.srt"
+            srt.write_text("1\n00:00:00,000 --> 00:00:30,000\nfirst\n\n2\n00:00:31,000 --> 00:00:42,000\nlast\n",encoding="utf-8")
+            b,c=build_abc_scene_windows(42.,srt)
+            self.assertEqual(b,"15.000-30.000")
+            self.assertEqual(c,"0.000-15.000")
+
     def test_library_preview_always_samples_blurred_tail(self) -> None:
         result = preview_times_with_library_tail_coverage("12,72", 192.667, 0.0)
         times = [float(item) for item in result.split(",")]

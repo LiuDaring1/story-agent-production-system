@@ -14,6 +14,44 @@ def _closed_subtitle_graph(value):
     return bool(value) and all(re.fullmatch(chain, part) for part in value.split(';'))
 
 
+# These filters consume only inline numeric expressions and explicitly supplied
+# input streams. File-reading filters (movie, subtitles, drawtext, sendcmd,
+# lut3d, zmq, etc.) remain unresolved and never authorize cached reuse.
+_PURE_FILTERS = frozenset({
+    'overlay', 'scale', 'crop', 'pad', 'setsar', 'setdar', 'format', 'split',
+    'asplit', 'null', 'anull', 'color', 'gblur', 'hflip', 'vflip', 'transpose',
+    'alphamerge', 'alphaextract', 'premultiply', 'unpremultiply', 'blend',
+    'colorchannelmixer', 'eq', 'curves', 'hue', 'lut', 'lutrgb', 'lutyuv',
+    'fps', 'trim', 'atrim', 'setpts', 'asetpts', 'tpad', 'apad', 'volume',
+    'amix', 'alimiter', 'aresample', 'aformat', 'fade', 'afade', 'concat',
+    'colorkey', 'chromakey', 'despill', 'hqdn3d', 'unsharp', 'boxblur',
+}) - {'curves'}  # curves has a file option.
+
+
+def _closed_filter_graph(value):
+    if not value or any(token in value for token in ('random(', 'randomi(', 'time(', '\n', '\r')):
+        return False
+    pieces, start, quoted, escaped = [], 0, False, False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+        elif char == '\\':
+            escaped = True
+        elif char == "'":
+            quoted = not quoted
+        elif not quoted and char in ',;':
+            pieces.append(value[start:index]); start = index + 1
+    if quoted or escaped:
+        return False
+    pieces.append(value[start:])
+    for part in pieces:
+        part = re.sub(r'^(?:\[[A-Za-z0-9_:]+\])*', '', part.strip())
+        match = re.match(r'^([a-zA-Z0-9_]+)(?:@[a-zA-Z0-9_]+)?(?==|\[|$)', part)
+        if not match or match[1] not in _PURE_FILTERS:
+            return False
+    return True
+
+
 def snapshot(args):
     files, groups, reasons = [], [], []
     def add(path):
@@ -85,8 +123,8 @@ def snapshot(args):
         elif arg.startswith(('-filter_complex_script', '-filter_script', '-/filter')):
             add(value)
             reasons.append('external filter script may reference other files')
-        elif arg.startswith(('-filter', '-vf', '-af', '-lavfi')):
-            if not (arg == '-filter_complex' and _closed_subtitle_graph(value)):
+        elif arg in {'-filter_complex', '-vf', '-af', '-lavfi', '-filter'} or arg.startswith(('-filter:v', '-filter:a')):
+            if not _closed_filter_graph(value):
                 reasons.append('filter graph may reference external files')
         elif arg in {'-pass','-passlogfile','-attach','-enable_drefs','-hls_key_info_file'}:
             reasons.append('additional external encoder dependency')

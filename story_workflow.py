@@ -1391,10 +1391,13 @@ def build_abc_scene_windows(duration: float, subtitle_srt: Path | None = None) -
     the A composition.
     """
     cue_ends: list[float] = []
+    final_cue_end: float | None = None
     if subtitle_srt is not None and subtitle_srt.exists():
         from release_video import parse_srt
 
-        cue_ends = [end for _start, end, _text in parse_srt(subtitle_srt) if 1.0 < end < duration - 1.0]
+        all_cue_ends = [end for _start, end, _text in parse_srt(subtitle_srt)]
+        final_cue_end = max(all_cue_ends) if all_cue_ends else None
+        cue_ends = [end for end in all_cue_ends if 1.0 < end < duration - 1.0]
     boundaries: list[float] = []
     target = 15.0
     while target < duration - 8.0:
@@ -1403,7 +1406,9 @@ def build_abc_scene_windows(duration: float, subtitle_srt: Path | None = None) -
         if not boundaries or chosen - boundaries[-1] >= 8.0:
             boundaries.append(chosen)
         target = chosen + 18.0
-    tail_c_start = max(cue_ends) if cue_ends and duration - max(cue_ends) >= 4.0 else None
+    # Boundary snapping omits the final second; ending detection must still
+    # inspect the complete subtitle stream, including its last cue.
+    tail_c_start = final_cue_end if final_cue_end is not None and duration - final_cue_end >= 4.0 else None
     if tail_c_start is not None and all(abs(tail_c_start - value) >= 0.05 for value in boundaries):
         boundaries.append(tail_c_start)
         boundaries.sort()

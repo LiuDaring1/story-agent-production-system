@@ -23,15 +23,25 @@ def sha(path):
 def directory_binding(path):
     """Content-address a tree; symbolic links are never managed deliverables."""
     p = Path(path).resolve()
-    members = []
-    for child in sorted(p.rglob('*')):
-        if child.is_symlink():
-            raise ValueError(f'Symlink in managed directory: {child}')
-        if child.is_file():
-            members.append({'relative_path': child.relative_to(p).as_posix(),
-                            'sha256': sha(child), 'bytes': child.stat().st_size})
+    from story_hash_cache import _signature
+    def inventory():
+        result = {}
+        for child in sorted(p.rglob('*')):
+            if child.is_symlink():
+                raise ValueError(f'Symlink in managed directory: {child}')
+            if child.is_file():
+                result[child] = _signature(child.stat())
+        return result
+    before = inventory()
+    members = [{'relative_path': child.relative_to(p).as_posix(),
+                'sha256': sha(child), 'bytes': signature[2]}
+               for child, signature in before.items()]
+    if before != inventory():
+        raise RuntimeError(f'Directory changed during validation: {p}')
     if not members:
         raise ValueError('Empty managed directory')
+    from story_hash_cache import remember_directory
+    remember_directory(p, before)
     import hashlib
     digest = hashlib.sha256(json.dumps(members, ensure_ascii=False, sort_keys=True,
                                       separators=(',', ':')).encode()).hexdigest()
@@ -58,6 +68,8 @@ def current(item):
     if p.is_symlink():
         raise ValueError(f'Changed binding: {p}')
     if item.get('kind') == 'directory':
+        from story_evidence_store import resolve_evidence
+        item = resolve_evidence(item)
         if not p.is_dir() or any(item.get(k) != v for k, v in directory_binding(p).items()):
             raise ValueError(f'Changed directory binding: {p}')
     elif not p.is_file() or sha(p) != item['sha256']:

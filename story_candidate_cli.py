@@ -95,14 +95,19 @@ from story_render_task import render_entry
 @render_entry
 def main(argv):
     p = argparse.ArgumentParser(description='Candidate deterministic media, packaging and materials operations')
-    p.add_argument('operation', choices=['timeline', 'release-qa', 'media', 'media-preview', 'media-approve', 'pack', 'materials', 'packaging', 'checklist', 'encode-control'])
+    p.add_argument('operation', choices=['preflight', 'review-create', 'timeline', 'release-qa', 'media', 'media-preview', 'media-approve', 'pack', 'materials', 'packaging', 'checklist', 'encode-control'])
     p.add_argument('--run-file', type=Path, required=True)
     p.add_argument('--request', type=Path, required=True, help='Explicit paths and operation parameters JSON')
+    p.add_argument('--full-json', '--verbose', dest='full_json', action='store_true', help='输出完整结果；默认保存完整结果文件并输出摘要')
     args = p.parse_args(argv)
     run = load_candidate(args.run_file)
     r = json.loads(args.request.read_text())
     from story_production_v2 import protect_outputs
     protected=[args.request,args.run_file,*(v['path'] for v in run['inputs'].values())]
+    if args.operation == 'preflight':
+        protected.extend(r[k] for k in ('director', 'plan', 'compile_receipt') if k in r)
+    if args.operation == 'review-create':
+        protected.extend([r['artifact'], *r.get('requirements', []), *r.get('evidence', [])])
     if args.operation == 'release-qa':
         protected.extend(v['path'] for v in r['releases'].values())
     destinations=[r[k] for k in ('output','receipt','output_root','receipt_path','timings_path','evidence_dir') if k in r]
@@ -114,7 +119,15 @@ def main(argv):
     from story_work_observation import operation_observation
     kind = 'review' if args.operation in {'release-qa', 'media-approve'} else ('encode' if args.operation in {'media', 'media-preview'} else 'deterministic')
     with operation_observation(args.run_file, args.operation, kind, artifacts=destinations) as fact:
-        if args.operation == 'timeline':
+        if args.operation == 'preflight':
+            from story_materials import production_preflight_report
+            result = production_preflight_report(**{k: v for k, v in r.items() if k != 'output'}, inputs=run['inputs'])
+            write(r['output'], result)
+        elif args.operation == 'review-create':
+            from story_review_schema import create_review_request
+            result = create_review_request(**{k: v for k, v in r.items() if k != 'output'})
+            write(r['output'], result)
+        elif args.operation == 'timeline':
             from story_timeline import import_confirmed_user_srt
             target = import_confirmed_user_srt(receipt_path=Path(r['receipt_path']), timings_path=Path(r['timings_path']), subtitle_txt=current(run['inputs']['subtitle_txt']), subtitle_srt=current(run['inputs']['subtitle_srt']), authoritative_audio=current(run['inputs']['audio']), expected_inputs=run['inputs'])
             result = {'authoritative_timeline_receipt': binding(target)}
@@ -150,8 +163,17 @@ def main(argv):
             validate_checklist(r['output'])
         if isinstance(result, dict) and result.get('reused') is True:
             fact['execution_mode'] = 'resume_reuse'
-        if args.operation == 'release-qa' and not result['passed']:
-            raise ValueError('Release QA failed')
-    print(json.dumps(result, ensure_ascii=False, indent=2))
+        if args.operation in {'release-qa', 'preflight'} and not result['passed']:
+            raise ValueError('Validation failed; see persisted report')
+    from story_evidence_store import externalize_evidence
+    from story_cli_output import result_summary
+    import hashlib
+    stored = externalize_evidence(result, Path(run['project_dir']) / '99_项目状态' / 'evidence_members')
+    digest = hashlib.sha256(json.dumps(stored, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+    full_result = Path(run['project_dir']) / '99_项目状态' / 'command_results' / (args.operation + '-' + digest + '.json')
+    write(full_result, stored)
+    shown = result if args.full_json else result_summary(stored, operation=args.operation,
+                                                       run_file=args.run_file, full_result=full_result)
+    print(json.dumps(shown, ensure_ascii=False, indent=2))
     if args.operation == 'release-qa' and not result['passed']:
         raise SystemExit(1)

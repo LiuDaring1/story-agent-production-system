@@ -83,7 +83,7 @@ def render_code_scope(paths):
     """Bind only renderer-relevant source bytes into managed encode reuse."""
     from story_hash_cache import sha256_file
     bindings = [
-        {'path': str(Path(path).resolve()), 'sha256': sha256_file(path)}
+        {'sha256': sha256_file(path)}
         for path in paths
     ]
     value = hashlib.sha256(
@@ -98,3 +98,44 @@ def render_code_scope(paths):
 
 def current_render_code_version():
     return _code_version.get()
+
+
+def function_code_version(path, names, *, dependencies=()):
+    """Hash reachable local functions plus module declarations and explicit helpers.
+
+    Location and comments do not alter semantics. Unknown/dynamic dispatch helpers
+    must be passed in dependencies; this is an explicit renderer boundary, not a
+    claim to infer arbitrary Python dependencies.
+    """
+    import ast
+    from story_hash_cache import sha256_file
+    tree = ast.parse(Path(path).read_text(encoding='utf-8'))
+    functions = {node.name: node for node in tree.body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    pending, selected = list(names), set()
+    while pending:
+        name = pending.pop()
+        if name in selected:
+            continue
+        if name not in functions:
+            raise ValueError(f'Render code function missing: {name}')
+        selected.add(name)
+        pending.extend(node.id for node in ast.walk(functions[name])
+                       if isinstance(node, ast.Name) and node.id in functions and node.id not in selected)
+    declarations = [node for node in tree.body
+                    if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                    and not (isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                             and isinstance(node.test.left, ast.Name) and node.test.left.id == '__name__')]
+    payload = {'functions': {name: ast.dump(functions[name], include_attributes=False) for name in sorted(selected)},
+               'declarations': [ast.dump(node, include_attributes=False) for node in declarations],
+               'dependencies': [sha256_file(p) for p in dependencies]}
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()
+
+
+@contextmanager
+def explicit_render_code_version(version):
+    token = _code_version.set(version)
+    try:
+        yield version
+    finally:
+        _code_version.reset(token)

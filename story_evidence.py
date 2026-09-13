@@ -26,11 +26,8 @@ def now() -> str:
 
 
 def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        while chunk := handle.read(chunk_size):
-            digest.update(chunk)
-    return digest.hexdigest()
+    from story_hash_cache import sha256_file
+    return sha256_file(path, chunk_size=chunk_size)
 
 
 def record_derived_input(

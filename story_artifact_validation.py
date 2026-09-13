@@ -274,7 +274,8 @@ def validate_independent_review(
     if artifact_id == "storyboard_review":
         from story_production_v2 import review_provenance
         try:
-            provenance = review_provenance(payload, allow_legacy_storyboard=True)
+            from story_review_schema import source_review_provenance
+            provenance = source_review_provenance(path, allow_legacy_storyboard=True)
         except ValueError as exc:
             raise ValueError(f"{label}没有独立上下文证据") from exc
         reviewer_context = provenance["reviewer_context"]

@@ -304,6 +304,9 @@ def refresh_observability_summary(payload: dict[str, Any]) -> None:
             classifications[relation] = classifications.get(relation, 0) + 1
             prior.append(item)
     performance["duplicate_provider_request_classification"] = dict(sorted(classifications.items()))
+    from story_request_facts import classify_requests
+    performance['request_facts'] = classify_requests(list(requests.values()))
+    performance['duplicate_count_scope'] = 'Legacy matching-hash count; may be prompt-only. It is not a count of wasted requests.'
     performance["longest_dependency_chain"] = _longest_dependency_chain(payload)
     performance["missing_measurements"] = [
         name for name in PERFORMANCE_OBSERVATION_FIELDS
@@ -955,6 +958,8 @@ def _record_request_observation_unlocked(
     output_tokens: int | None = None,
     total_tokens: int | None = None,
     request_sha256: str = "",
+    prompt_sha256: str = "",
+    request_hash_kind: str = "unknown",
     error_type: str = "",
     reasoning_effort: str | None = None,
     execution_mode: str | None = None,
@@ -998,6 +1003,13 @@ def _record_request_observation_unlocked(
             total_tokens = input_tokens + output_tokens
     elif any(value is not None for value in token_values):
         raise ValueError("未报告/不适用 Token 不得写成 0 或其他数字")
+    prompt_sha256 = prompt_sha256.strip().lower()
+    if prompt_sha256 and (len(prompt_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in prompt_sha256)):
+        raise ValueError("prompt_sha256 无效")
+    if request_hash_kind not in {'full_request', 'prompt_only', 'unknown'}:
+        raise ValueError("request_hash_kind 无效")
+    if request_hash_kind == 'full_request' and not request_sha256:
+        raise ValueError("full_request requires a request SHA-256")
     request_sha256 = request_sha256.strip().lower()
     if request_sha256 and (
         len(request_sha256) != 64 or any(ch not in "0123456789abcdef" for ch in request_sha256)
@@ -1042,6 +1054,8 @@ def _record_request_observation_unlocked(
         "output_tokens": output_tokens,
         "total_tokens": total_tokens,
         "request_sha256": request_sha256 or None,
+        "prompt_sha256": prompt_sha256 or None,
+        "request_hash_kind": request_hash_kind,
         "error_type": error_type.strip() or None,
         "observed_at": utc_now(),
     }
@@ -1107,6 +1121,8 @@ def record_request_observation(
     output_tokens: int | None = None,
     total_tokens: int | None = None,
     request_sha256: str = "",
+    prompt_sha256: str = "",
+    request_hash_kind: str = "unknown",
     error_type: str = "",
     reasoning_effort: str | None = None,
     execution_mode: str | None = None,
@@ -1139,7 +1155,7 @@ def record_request_observation(
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
-            request_sha256=request_sha256,
+            request_sha256=request_sha256, prompt_sha256=prompt_sha256, request_hash_kind=request_hash_kind,
             error_type=error_type,
             reasoning_effort=reasoning_effort, execution_mode=execution_mode, rework_reason=rework_reason,
             rework_classification=rework_classification, request_relation=request_relation,
@@ -1217,6 +1233,7 @@ def status_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "artifact_ids": sorted(payload["artifacts"]),
         "token_usage": payload["observability"]["token_summary"],
         "request_count": len(payload["observability"]["requests"]),
+        "submission_attempts": __import__("story_request_facts").submission_summary(payload),
         "performance": payload["observability"]["performance"],
         "work_summary": __import__("story_work_observation").summarize(payload),
         "stale_artifacts": stale_dependencies,
@@ -1247,7 +1264,8 @@ def mutation_summary(
     if artifact_id:
         result["artifact_id"] = artifact_id
         result["artifact"] = payload["artifacts"].get(artifact_id)
-    return result
+    from story_cli_output import compact
+    return compact(result)
 
 
 def dependency_staleness(payload: dict[str, Any]) -> dict[str, list[str]]:
@@ -1396,6 +1414,8 @@ def _finalize_run_unlocked(*, run_file: Path, required_artifacts: Iterable[str])
         )
         if issues:
             raise RuntimeError("片头/寓意卡 API 微动回执失效：" + "；".join(issues))
+    from story_hash_cache import validate_hash_cache
+    validate_hash_cache()
     payload["finalized_at"] = utc_now()
     payload["updated_at"] = payload["finalized_at"]
     payload["blocker"] = ""
@@ -1406,6 +1426,8 @@ def _finalize_run_unlocked(*, run_file: Path, required_artifacts: Iterable[str])
 def finalize_run(*, run_file: Path, required_artifacts: Iterable[str]) -> dict[str, Any]:
     target = run_file.expanduser().resolve()
     from story_encode import reconcile_encode_operations
+    from story_operation_recovery import replay_pending_facts
+    replay_pending_facts(target)
     reconcile_encode_operations(target)
     with run_file_lock(target):
         with hash_cache_scope():
@@ -1474,6 +1496,8 @@ def build_parser() -> argparse.ArgumentParser:
     observe.add_argument("--output-tokens", type=int)
     observe.add_argument("--total-tokens", type=int)
     observe.add_argument("--request-sha256", default="")
+    observe.add_argument("--prompt-sha256", default="")
+    observe.add_argument("--request-hash-kind", choices=["full_request", "prompt_only", "unknown"], default="unknown")
     observe.add_argument("--error-type", default="")
     observe.add_argument("--reasoning-effort")
     observe.add_argument("--execution-mode", choices=['first_execution', 'resume_reuse', 'rework'])
@@ -1511,6 +1535,9 @@ def build_parser() -> argparse.ArgumentParser:
         "--full-json", "--verbose", dest="full_json", action="store_true",
         help="显式输出完整 story_run.json；默认仅输出紧凑命令摘要",
     )
+    for command in (init, observe, performance, status):
+        command.add_argument('--full-json', '--verbose', dest='full_json', action='store_true',
+                             help='输出完整账本；默认仅输出摘要，完整数据始终保存在 --run-file')
     return parser
 
 
@@ -1562,7 +1589,7 @@ def main() -> None:
             input_tokens=args.input_tokens,
             output_tokens=args.output_tokens,
             total_tokens=args.total_tokens,
-            request_sha256=args.request_sha256,
+            request_sha256=args.request_sha256, prompt_sha256=args.prompt_sha256, request_hash_kind=args.request_hash_kind,
             error_type=args.error_type,
             reasoning_effort=args.reasoning_effort, execution_mode=args.execution_mode, rework_reason=args.rework_reason,
             rework_classification=args.rework_classification, request_relation=args.request_relation,
@@ -1584,12 +1611,19 @@ def main() -> None:
         )
     elif args.command == "status":
         from story_encode import reconcile_encode_operations
+        from story_operation_recovery import replay_pending_facts
+        replay_pending_facts(args.run_file)
         reconcile_encode_operations(args.run_file)
-        payload = status_summary(load_run(args.run_file))
+        ledger = load_run(args.run_file)
+        payload = ledger if args.full_json else status_summary(ledger)
+        if not args.full_json:
+            from story_cli_output import compact
+            payload = compact(payload)
+            payload['run_file'] = str(args.run_file.expanduser().resolve())
     else:
         payload = finalize_run(run_file=args.run_file, required_artifacts=args.require)
     full_json = bool(getattr(args, "full_json", False))
-    if not full_json and args.command in {"record", "finalize"}:
+    if not full_json and args.command != "status":
         payload = mutation_summary(
             payload,
             command=args.command,

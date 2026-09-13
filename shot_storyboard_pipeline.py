@@ -1105,6 +1105,7 @@ def compile_consumers(
         "storyboard_bundle_sha256": str(manifest.get("storyboard_bundle_sha256") or ""),
         "storyboard_review_path": str(review_path),
         "storyboard_review_sha256": file_sha256(review_path),
+        "storyboard_review_artifact_id": "storyboard_review",
         "shot_count": int(manifest.get("shot_count") or 0),
         "ordered_shot_ids": list(manifest.get("ordered_shot_ids") or []),
         "r2v_plan_path": str(output_r2v_plan.expanduser().resolve()),
@@ -1114,6 +1115,9 @@ def compile_consumers(
         "ppt_plan_path": ppt_path_value,
         "ppt_plan_sha256": ppt_hash_value,
     }
+    if review.get('schema_version'):
+        from story_review_schema import source_review_provenance
+        receipt['storyboard_review_provenance'] = source_review_provenance(review_path, allow_legacy_storyboard=True)
     write_json(output_receipt, receipt)
     return receipt
 
@@ -1158,6 +1162,11 @@ def validate_compile_receipt(
             continue
         if not target.is_file() or file_sha256(target) != raw_hash:
             raise StoryboardPipelineError(f"逐镜故事板编译回执绑定失效：{path_key}")
+    if 'storyboard_review_provenance' in receipt:
+        from story_review_schema import source_review_provenance
+        expected = source_review_provenance(receipt['storyboard_review_path'], allow_legacy_storyboard=True)
+        if receipt['storyboard_review_provenance'] != expected or receipt.get('storyboard_review_artifact_id') != 'storyboard_review':
+            raise StoryboardPipelineError('故事板审核来源与规范产物 ID 不一致')
     return receipt
 
 

@@ -19,3 +19,11 @@
 模型对照和真实故事试用须独立记录输入哈希、模型实际设置（未知可空）、质量结果和实际耗时；不推断额度收益。本轮不做付费实验。
 
 正式确定性入口：`timeline` 绑定确认SRT；`assemble` 消费正式区间；`backgrounds` 导出客户背景；`release` 双账号发布；`release-qa` 通用媒体机器检查。均由 story_pipeline.py 转发现有模块，不另建调度系统。目录素材与受管打包仍用 materials/pack/checklist；最终 finalize 继续核验完整独立审核。
+
+## 主账号 ABC 正式准备
+
+先运行 `story_pipeline.py release-windows --run-file RUN --output PROJECT/99_项目状态/release_windows_vN.json`。它从当前权威时长和字幕边界生成成熟自动窗口及抽样；输入和规则内容未变可复用，变化时用新版本计划。某些边界时长无法同时满足成熟自动规则和 A/B/C 覆盖时显式阻断，由当前任务提供合法且经过合并审核的计划，不静默退化全 A。
+
+`release` 默认 `--b-windows auto --c-windows auto`，显式传 `--release-windows-plan PLAN`。预览根据实际计划抽取每段中点及切换两侧，并运行真实时间窗滤镜。计划SHA并入已有几何独立审核，预览不必另开窗口审核；正式使用当前 `--approved-preview-geometry` 和 `--approved-preview-review`。兼容已有独立窗口回执，不要求每个窗口单独审核。
+
+正式主账号生成 `main_abc_coverage.json`；`release-qa`核验当前计划、视频和模板哈希并重新解码。expected_mode来自计划；observed_mode来自A/B框体实际几何和C镜当前人物源/已审Demo几何像素，空白不当成C。机器检查仍不替代合并独立视觉审核：审核者打开生成的ABC及边界帧，判断人物/构图、字幕、Logo及首尾。宝库号不套主账号切镜规则。

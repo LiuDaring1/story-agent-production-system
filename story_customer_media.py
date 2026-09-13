@@ -260,7 +260,7 @@ def _probe_video(path: Path) -> dict[str, Any]:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height",
+            "stream=width,height,avg_frame_rate",
             "-show_entries",
             "format=duration",
             "-of",
@@ -274,10 +274,16 @@ def _probe_video(path: Path) -> dict[str, Any]:
     )
     payload = json.loads(result.stdout)
     stream = payload.get("streams", [{}])[0]
+    numerator, separator, denominator = str(stream.get("avg_frame_rate") or "").partition("/")
+    try:
+        frame_rate = float(numerator) / float(denominator) if separator else float(numerator)
+    except (TypeError, ValueError, ZeroDivisionError):
+        frame_rate = 0.0
     return {
         "width": int(stream.get("width") or 0),
         "height": int(stream.get("height") or 0),
         "duration_seconds": round(float(payload.get("format", {}).get("duration") or 0), 3),
+        "frame_rate": round(frame_rate, 6),
     }
 
 
@@ -390,6 +396,23 @@ def subtitle_geometry_from_frames(
     }
 
 
+def _best_subtitle_geometry_candidate(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Prefer a compact valid text band after bounded paired-frame alignment."""
+    passing = [item for item in candidates if item.get("passed") is True]
+    if not passing:
+        return candidates[0]
+
+    def rank(item: dict[str, Any]) -> tuple[float, float, float]:
+        x0, y0, x1, y1 = item["bbox"]
+        return (
+            float((x1 - x0) * (y1 - y0)),
+            float(item.get("horizontal_center_error_ratio") or 0),
+            abs(float(item.get("temporal_alignment_offset_seconds") or 0)),
+        )
+
+    return min(passing, key=rank)
+
+
 def subtitle_geometry_from_videos(
     with_subtitles: Path,
     without_subtitles: Path,
@@ -401,13 +424,38 @@ def subtitle_geometry_from_videos(
         return {"passed": False, "reason": "paired_video_canvas_mismatch"}
     width, height = probe_with["width"], probe_with["height"]
     samples = []
+    frame_rate = float(probe_without.get("frame_rate") or 0)
+    frame_step = 1.0 / frame_rate if frame_rate > 0 else 1.0 / 30.0
     for timestamp in _parse_srt_midpoints(subtitle_srt):
         with_frame = _frame_rgb(with_subtitles, timestamp, width, height)
         without_frame = _frame_rgb(without_subtitles, timestamp, width, height)
+        exact = {
+            **subtitle_geometry_from_frames(with_frame, without_frame),
+            "temporal_alignment_offset_seconds": 0.0,
+        }
+        candidates = [exact]
+        if exact.get("passed") is not True:
+            # A subtitle burn converts the same VFR/near-CFR source to CFR. At
+            # a motion boundary the paired stream-copy output can therefore be
+            # one source frame away. Compare only the immediate neighbours;
+            # this corrects temporal alignment without relaxing geometry.
+            for offset in (-frame_step, frame_step):
+                if timestamp + offset < 0:
+                    continue
+                candidate_frame = _frame_rgb(
+                    without_subtitles, timestamp + offset, width, height
+                )
+                candidates.append(
+                    {
+                        **subtitle_geometry_from_frames(with_frame, candidate_frame),
+                        "temporal_alignment_offset_seconds": round(offset, 6),
+                    }
+                )
+        selected = _best_subtitle_geometry_candidate(candidates)
         samples.append(
             {
                 "time_seconds": round(timestamp, 3),
-                **subtitle_geometry_from_frames(with_frame, without_frame),
+                **selected,
             }
         )
     return {

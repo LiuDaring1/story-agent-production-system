@@ -8,6 +8,7 @@ from pathlib import Path
 import numpy as np
 
 from story_customer_media import (
+    _best_subtitle_geometry_candidate,
     file_sha256,
     music_only_fit,
     narration_music_fit,
@@ -76,6 +77,32 @@ class CustomerMediaPolicyTests(unittest.TestCase):
 
         self.assertTrue(result["passed"])
         self.assertEqual(result["bbox"], [700, 930, 1220, 970])
+
+    def test_temporal_alignment_prefers_compact_valid_subtitle_band(self) -> None:
+        exact_misaligned = {
+            "passed": False,
+            "bbox": [746, 951, 1920, 1080],
+            "horizontal_center_error_ratio": 0.194,
+            "temporal_alignment_offset_seconds": 0.0,
+        }
+        aligned = {
+            "passed": True,
+            "bbox": [873, 979, 1047, 1019],
+            "horizontal_center_error_ratio": 0.00026,
+            "temporal_alignment_offset_seconds": -1 / 30,
+        }
+        broad_motion_difference = {
+            "passed": True,
+            "bbox": [413, 721, 1920, 1080],
+            "horizontal_center_error_ratio": 0.107,
+            "temporal_alignment_offset_seconds": 1 / 30,
+        }
+
+        selected = _best_subtitle_geometry_candidate(
+            [exact_misaligned, broad_motion_difference, aligned]
+        )
+
+        self.assertIs(selected, aligned)
 
     def test_receipt_rejects_self_reported_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

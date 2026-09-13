@@ -82,17 +82,24 @@ def encode_slot(*, limit=None, wait_seconds=None, cancelled=lambda: False, waiti
                 slot.close()
 
 
-def run_encode(args, *, timeout=21600, wait_seconds=None, limit=None):
+def run_encode(args, *, timeout=21600, wait_seconds=None, limit=None, code_version=None):
     from story_render_task import current_render_task
     task = current_render_task()
     if task:
         from story_work_observation import operation_observation
+        reconcile_encode_operations(task['ledger'])
         with operation_observation(task['ledger'], 'ffmpeg', 'encode', artifacts=[args[-1]]) as fact:
-            return _run_encode(args, timeout=timeout, wait_seconds=wait_seconds, limit=limit, fact=fact)
-    return _run_encode(args, timeout=timeout, wait_seconds=wait_seconds, limit=limit)
+            return _run_encode(
+                args, timeout=timeout, wait_seconds=wait_seconds, limit=limit,
+                fact=fact, ledger=task['ledger'], code_version=code_version,
+            )
+    return _run_encode(
+        args, timeout=timeout, wait_seconds=wait_seconds, limit=limit,
+        code_version=code_version,
+    )
 
 
-def _run_encode(args, *, timeout=21600, wait_seconds=None, limit=None, fact=None):
+def _run_encode(args, *, timeout=21600, wait_seconds=None, limit=None, fact=None, ledger=None, code_version=None):
     output = Path(args[-1]).expanduser().resolve()
     from story_encode_dependencies import snapshot
     dependencies = snapshot(args)
@@ -101,7 +108,11 @@ def _run_encode(args, *, timeout=21600, wait_seconds=None, limit=None, fact=None
         raise ValueError('Encode output must never replace an input')
     if Path(args[-1]).is_symlink():
         raise ValueError('Encode output cannot be a symlink')
-    fingerprint = hashlib.sha256(json.dumps({'command': args, 'dependencies': dependencies}, sort_keys=True).encode()).hexdigest()
+    fingerprint = hashlib.sha256(json.dumps({
+        'command': args,
+        'dependencies': dependencies,
+        'render_code_version': code_version,
+    }, sort_keys=True).encode()).hexdigest()
     root = state_directory()
     identity = hashlib.sha256(str(output).encode()).hexdigest()
     from story_render_task import encode_task
@@ -131,6 +142,9 @@ def _run_encode(args, *, timeout=21600, wait_seconds=None, limit=None, fact=None
                   'inputs': inputs, 'dependencies': dependencies, 'role': str(output),
                   'task': task, 'parent_pid': os.getpid(), 'status': 'waiting',
                   'queued_at': queued_at, 'heartbeat': queued_at}
+        queued['render_code_version'] = code_version
+        if ledger is not None and fact is not None:
+            queued.update(ledger=str(Path(ledger).resolve()), operation_id=fact['operation_id'])
         if old.get('output'):
             queued['output'] = old['output']
         write(receipt, queued)
@@ -164,6 +178,9 @@ def _run_encode(args, *, timeout=21600, wait_seconds=None, limit=None, fact=None
             fd, temporary = tempfile.mkstemp(prefix='.encoding-', suffix=output.suffix, dir=output.parent)
             os.close(fd)
             state = {'schema_version': 'story-encode/v1', 'fingerprint': fingerprint, 'inputs': inputs, 'dependencies': dependencies, 'role': str(output), 'task': task, 'parent_pid': os.getpid(), 'status': 'running', 'started_at': time.time(), 'heartbeat': time.time()}
+            state['render_code_version'] = code_version
+            if ledger is not None and fact is not None:
+                state.update(ledger=str(Path(ledger).resolve()), operation_id=fact['operation_id'])
             state.update(queued_at=queued_at, wait_seconds=time.time() - queued_at)
             if fact is not None:
                 fact['wait_seconds'] = state['wait_seconds']
@@ -217,11 +234,63 @@ def _run_encode(args, *, timeout=21600, wait_seconds=None, limit=None, fact=None
                             process.kill()
                             process.wait()
                     state['status'] = 'cancelled' if cancel.exists() else 'failed'
+                    state['ended_at'] = time.time()
+                    state['error_type'] = 'cancelled' if cancel.exists() else 'encode_exception'
                     write(receipt, state)
                     raise
                 finally:
                     if os.path.exists(temporary):
                         os.unlink(temporary)
+
+
+def reconcile_encode_operations(run_file):
+    """Close encode facts whose durable owner lock no longer has a live holder."""
+    ledger = str(Path(run_file).expanduser().resolve())
+    recovered = []
+    for receipt in state_directory().glob('*.json'):
+        if receipt.name == 'capacity.json':
+            continue
+        try:
+            state = json.loads(receipt.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if state.get('ledger') != ledger or state.get('status') != 'running' or not state.get('operation_id'):
+            continue
+        lock_path = receipt.with_suffix('.lock')
+        with lock_path.open('a+') as owner:
+            try:
+                fcntl.flock(owner, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                continue
+            original = dict(state)
+            state.update(
+                status='failed',
+                error_type='managed_process_interrupted',
+                ended_at=time.time(),
+                recovered_at=time.time(),
+            )
+            write(receipt, state)
+        from story_work_observation import recover_operation
+        try:
+            closed = recover_operation(
+                ledger,
+                state['operation_id'],
+                error_type='managed_process_interrupted',
+                recovery_evidence={
+                    'encode_receipt': binding(receipt),
+                    'owner_lock_was_free': True,
+                    'previous_parent_pid': state.get('parent_pid'),
+                },
+            )
+        except OSError:
+            # The project volume may still be unavailable.  Preserve the
+            # recoverable running state so the next invocation can close both
+            # records together after remount.
+            write(receipt, original)
+            continue
+        if closed:
+            recovered.append(state['operation_id'])
+    return recovered
 
 
 def control_encode(output, *, action, expected_fingerprint, expected_task):

@@ -75,11 +75,8 @@ def single_line_ppt_subtitle(value: str) -> str:
 
 
 def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    from story_hash_cache import sha256_file
+    return sha256_file(path)
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -1066,6 +1063,15 @@ def compile_consumers(
     validate_review(
         review, str(manifest.get("storyboard_bundle_sha256") or ""), "故事板独立审核"
     )
+    # Versioned production evidence must carry canonical provenance.  The
+    # final ledger validator still rejects unversioned fixtures as delivery
+    # evidence, while keeping lightweight historical compiler fixtures usable.
+    if review.get("schema_version"):
+        from story_production_v2 import review_provenance
+        try:
+            review_provenance(review, allow_legacy_storyboard=True)
+        except ValueError as exc:
+            raise StoryboardPipelineError("故事板独立审核缺少独立上下文证据") from exc
     director_path = Path(str(manifest.get("director_plan_path") or ""))
     director = load_object(director_path, "导演计划")
     compiled = compile_r2v_plan(director, manifest)

@@ -1424,12 +1424,12 @@ def build_abc_scene_windows(duration: float, subtitle_srt: Path | None = None) -
     return ",".join(b_windows), ",".join(c_windows)
 
 
-def preview_times_with_b_coverage(value: str, b_windows: str) -> str:
-    """Add one deterministic review frame inside every B interval."""
+def preview_times_with_b_coverage(value: str, b_windows: str, c_windows: str = "") -> str:
+    """Add one deterministic review frame inside every B/C interval."""
     raw_times = [part.strip() for part in value.replace("，", ",").split(",") if part.strip()]
     times = [max(0.0, float(part)) for part in raw_times]
     occupied_filenames = {int(round(item)) for item in times}
-    for raw_window in b_windows.replace("，", ",").split(","):
+    for raw_window in ",".join(part for part in (b_windows, c_windows) if part).replace("，", ",").split(","):
         raw_window = raw_window.strip()
         if not raw_window:
             continue
@@ -2027,8 +2027,8 @@ def run_package_release_project(
         if preview_times is not None:
             effective_preview_times = preview_times_with_keying_coverage(preview_times, keying_preset)
             if selected_variant == "main":
-                b_windows, _c_windows = resolve_scene_windows(bg_video)
-                effective_preview_times = preview_times_with_b_coverage(effective_preview_times, b_windows)
+                b_windows, c_windows = resolve_scene_windows(bg_video)
+                effective_preview_times = preview_times_with_b_coverage(effective_preview_times, b_windows, c_windows)
             else:
                 effective_preview_times = preview_times_with_library_tail_coverage(
                     effective_preview_times,

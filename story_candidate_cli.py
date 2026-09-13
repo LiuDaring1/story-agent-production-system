@@ -76,8 +76,16 @@ def render_media(run, request, *, preview=False):
     work.mkdir(parents=True, exist_ok=True)
     demo = work / 'demo.mp4'
     aonly = work / 'a_only.mp4'
-    render_demo_video(person_video=foreground, background_image=paths['background_image'], narration=Path(inputs['audio']['path']), music=Path(inputs['finished_music']['path']), subtitles=Path(inputs['subtitle_srt']['path']), output_path=demo, preset=preset, width=1920, height=1080, crf=20, x264_preset='medium', music_volume=0.22, narration_volume=1.0, crop_bottom_ratio=0, crop_mode='source-native', logo_path=paths['logo'], presenter_geometry=geometry)
-    render_a_only_background_video(bg_video=paths['background_without_subtitles'], background_image=paths['background_image'], frame_image=paths['story_frame'], output_path=aonly, keying_preset=paths['preset'], width=1920, height=1080, crf=20, x264_preset='medium')
+    from story_render_task import render_code_scope
+    code_root = Path(__file__).resolve().parent
+    with render_code_scope([
+        code_root / 'product_package.py',
+        code_root / 'story_video_synthesizer' / 'media.py',
+        code_root / 'story_module_adapters.py',
+        code_root / 'story_encode.py',
+    ]):
+        render_demo_video(person_video=foreground, background_image=paths['background_image'], narration=Path(inputs['audio']['path']), music=Path(inputs['finished_music']['path']), subtitles=Path(inputs['subtitle_srt']['path']), output_path=demo, preset=preset, width=1920, height=1080, crf=20, x264_preset='medium', music_volume=0.22, narration_volume=1.0, crop_bottom_ratio=0, crop_mode='source-native', logo_path=paths['logo'], presenter_geometry=geometry)
+        render_a_only_background_video(bg_video=paths['background_without_subtitles'], background_image=paths['background_image'], frame_image=paths['story_frame'], output_path=aonly, keying_preset=paths['preset'], width=1920, height=1080, crf=20, x264_preset='medium')
     receipt = root / '99_项目状态' / 'customer_media_receipt.json'
     write_customer_media_receipt(output_path=receipt, music=Path(inputs['finished_music']['path']), authoritative_timeline_receipt=paths['timeline_receipt'], subtitle_srt=paths['body_srt'], background_with_subtitles=paths['background_with_subtitles'], background_without_subtitles=paths['background_without_subtitles'], a_only_video=aonly, demo_video=demo)
     return {'demo': binding(demo), 'a_only_video': binding(aonly), 'customer_media_receipt': binding(receipt), 'presenter_geometry': geometry}

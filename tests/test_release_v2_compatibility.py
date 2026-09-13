@@ -10,7 +10,8 @@ from release_geometry import canonical_sha256
 from unittest.mock import patch
 
 from release_video import (compile_v2_release_spec, compile_release_geometry,
-    load_release_contract_spec, build_release_render_manifest, sha256_path)
+    load_release_contract_spec, build_release_render_manifest, sha256_path,
+    validate_main_preview_mode_coverage)
 from release_geometry import binding_payload, geometry_manifest_issues
 from tests import test_release_geometry as fixture
 
@@ -27,7 +28,7 @@ class ReleaseV2CompatibilityTests(unittest.TestCase):
         inputs = {}
         for role in ('confirmed_text', 'subtitle_txt', 'subtitle_srt', 'audio', 'final_word', 'story_requirements'):
             path = self.root / role; path.write_text(role); inputs[role] = self.bind(path)
-        self.timeline = self.write('timeline.json', {})
+        self.timeline = self.write('timeline.json', {'audio_duration_seconds': 60.0})
         self.projection = self.write('projection.json', {})
         self.semantic = {'schema_version': 'story-v2-artifact-semantics-preparation/v1',
                          'production_contract': 'story-production/v2', 'inputs': copy.deepcopy(inputs),
@@ -50,11 +51,22 @@ class ReleaseV2CompatibilityTests(unittest.TestCase):
                           'semantic_card_motion_receipt': self.bind(self.motion),
                           'customer_media_receipt': self.bind(self.customer_media_receipt)}}
         self.config = replace(self.config, artifact_semantic_plan=self.semantic_path,
-                              output_dir=self.project / "release", b_windows=(), c_windows=(), story_box=(210, 270, 910, 512), demo_render_manifest=self.approved,
+                              output_dir=self.project / "release", b_windows=((1.0, 2.0),), c_windows=((3.0, 4.0),), story_box=(210, 270, 910, 512), demo_render_manifest=self.approved,
                               keyer='rvm', story_logo=self.logo, antipiracy_logo=self.logo,
                               subtitle_srt=Path(inputs['subtitle_srt']['path']),
                               audio_mix=Path(inputs['audio']['path']), mix_bg_audio=True,
                               release_producer_context='producer')
+        self.windows = self.write('windows.json', {
+            'schema_version': 'story-project-release-windows-plan/v1',
+            'inputs': {'subtitle_srt': inputs['subtitle_srt'],
+                       'authoritative_timeline_receipt': self.bind(self.timeline)},
+            'rules': [], 'b_windows': '1-2', 'c_windows': '3-4'})
+        self.windows_review = self.write('windows_review.json', {
+            'approved': True, 'score': 94, 'critical_errors': [],
+            'reviewer_context': 'independent', 'independent_context': True,
+            'artifact_sha256': sha256_path(self.windows)})
+        self.config = replace(self.config, release_windows_plan=self.windows,
+                              release_windows_review=self.windows_review)
         self.demo = fixture.ReleaseGeometryTests._demo_geometry(self.config)
         self.demo['production_keying_filter_fingerprint'] = production_keying_fingerprint(json.loads(self.config.keying_preset_path.read_text()))
         self.demo.pop('geometry_sha256')
@@ -207,19 +219,59 @@ class ReleaseV2CompatibilityTests(unittest.TestCase):
             self.spec()
 
     def test_explicit_windows_must_match_current_reviewed_source(self):
-        self.config = replace(self.config, b_windows=((1.0, 2.0),))
-        with self.assertRaisesRegex(ValueError, 'reviewed source plan'):
+        self.config = replace(self.config, release_windows_plan=None, release_windows_review=None)
+        with self.assertRaisesRegex(ValueError, 'reviewed A/B/C windows plan'):
             self.spec()
         windows = {'schema_version': 'story-project-release-windows-plan/v1',
                    'inputs': {'subtitle_srt': self.ledger['inputs']['subtitle_srt'],
                               'authoritative_timeline_receipt': self.bind(self.timeline)},
-                   'rules': [], 'b_windows': '1-2', 'c_windows': ''}
+                   'rules': [], 'b_windows': '1-2', 'c_windows': '3-4'}
         path = self.write('windows.json', windows)
         review = self.write('windows_review.json', {'approved': True, 'score': 94, 'critical_errors': [],
             'reviewer_context': 'independent', 'independent_context': True, 'artifact_sha256': sha256_path(path)})
-        self.config = replace(self.config, release_windows_plan=path, release_windows_review=review)
+        self.config = replace(self.config, b_windows=((1.0, 2.0),), c_windows=((3.0, 4.0),),
+                              release_windows_plan=path, release_windows_review=review)
         spec = self.spec()
         self.assertEqual(spec['release_windows_evidence']['plan']['sha256'], sha256_path(path))
         self.config = replace(self.config, b_windows=((1.0, 2.1),))
         with self.assertRaisesRegex(ValueError, 'differ from reviewed source'):
             self.spec()
+
+    def test_long_main_release_rejects_empty_or_unmeasured_abc_windows(self):
+        self.config = replace(self.config, b_windows=(), c_windows=((3.0, 4.0),))
+        windows = {'schema_version': 'story-project-release-windows-plan/v1',
+                   'inputs': {'subtitle_srt': self.ledger['inputs']['subtitle_srt'],
+                              'authoritative_timeline_receipt': self.bind(self.timeline)},
+                   'rules': [], 'b_windows': '', 'c_windows': '3-4'}
+        path = self.write('missing_b_windows.json', windows)
+        review_payload = {'approved': True, 'score': 94,
+            'critical_errors': [], 'reviewer_context': 'independent', 'independent_context': True,
+            'artifact_sha256': sha256_path(path)}
+        review = self.write('missing_b_windows_review.json', review_payload)
+        self.config = replace(self.config, release_windows_plan=path, release_windows_review=review)
+        with self.assertRaisesRegex(ValueError, 'non-empty reviewed B and C windows'):
+            self.spec()
+        self.timeline.write_text('{}')
+        self.ledger['artifacts']['authoritative_timeline_receipt'] = self.bind(self.timeline)
+        self.semantic['authoritative_timeline_receipt'] = self.bind(self.timeline)
+        self.semantic_path.write_text(json.dumps(self.semantic))
+        evidence = {'artifact_semantic_plan_sha256': sha256_path(self.semantic_path)}
+        for evidence_path in (self.generation, self.motion, self.request):
+            evidence_path.write_text(json.dumps(evidence))
+        self.ledger['artifacts']['semantic_card_generation_receipt'] = self.bind(self.generation)
+        self.ledger['artifacts']['semantic_card_motion_receipt'] = self.bind(self.motion)
+        windows['inputs']['authoritative_timeline_receipt'] = self.bind(self.timeline)
+        path.write_text(json.dumps(windows))
+        review_payload['artifact_sha256'] = sha256_path(path); review.write_text(json.dumps(review_payload))
+        with self.assertRaisesRegex(ValueError, 'valid authoritative duration'):
+            self.spec()
+
+    def test_preview_samples_must_cover_a_and_every_b_c_window(self):
+        validate_main_preview_mode_coverage(
+            [1.5, 3.5, 5.0], ((1.0, 2.0),), ((3.0, 4.0),))
+        with self.assertRaisesRegex(ValueError, 'B2'):
+            validate_main_preview_mode_coverage(
+                [1.5, 3.5, 5.0], ((1.0, 2.0), (6.0, 7.0)), ((3.0, 4.0),))
+        with self.assertRaisesRegex(ValueError, 'A'):
+            validate_main_preview_mode_coverage(
+                [1.5, 3.5], ((1.0, 2.0),), ((3.0, 4.0),))

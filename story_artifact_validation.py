@@ -8,7 +8,6 @@ artifacts and rechecks every hash binding at finalization time.
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import re
@@ -28,6 +27,7 @@ from release_geometry import release_package_receipt_issues
 from keying_quality import keying_preset_lock_issues
 from story_requirements import validate_projection
 from story_video_synthesizer.media import probe_duration
+from story_hash_cache import sha256_file
 
 PASS_SCORE = 85.0
 
@@ -49,11 +49,7 @@ MACHINE_QA_ARTIFACTS = {
 
 
 def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_file(path)
 
 
 def _load_json_object(path: Path, label: str) -> dict[str, Any]:
@@ -274,15 +270,32 @@ def validate_independent_review(
     schema = str(payload.get("schema_version") or "")
     independence = payload.get("reviewer_independence")
     reviewer_context = payload.get("reviewer_context")
+    legacy_storyboard_provenance = False
+    if artifact_id == "storyboard_review":
+        from story_production_v2 import review_provenance
+        try:
+            provenance = review_provenance(payload, allow_legacy_storyboard=True)
+        except ValueError as exc:
+            raise ValueError(f"{label}没有独立上下文证据") from exc
+        reviewer_context = provenance["reviewer_context"]
+        legacy_storyboard_provenance = provenance["source"] == "legacy_review_context"
     schema_declares_independence = "independent" in schema.lower()
     object_declares_independence = (
         isinstance(independence, dict)
         and independence.get("producer_claims_trusted") is False
     )
-    if not schema_declares_independence and not object_declares_independence:
+    if not schema_declares_independence and not object_declares_independence and not legacy_storyboard_provenance:
         raise ValueError(f"{label}没有独立上下文证据")
 
     reviewed_path_text = str(payload.get("artifact_path") or "").strip()
+    if (
+        artifact_id == "storyboard_review"
+        and not reviewed_path_text
+        and legacy_storyboard_provenance
+        and registered_artifacts is not None
+        and isinstance(registered_artifacts.get("storyboard_manifest_sealed"), Mapping)
+    ):
+        reviewed_path_text = str(registered_artifacts["storyboard_manifest_sealed"].get("path") or "").strip()
     reviewed_sha = str(payload.get("artifact_sha256") or "").strip().lower()
     if not reviewed_path_text or len(reviewed_sha) != 64:
         raise ValueError(f"{label}缺少被审 artifact_path/artifact_sha256")

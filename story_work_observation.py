@@ -18,6 +18,33 @@ def append_fact(run_file, fact):
         atomic_write_json(Path(run_file), run)
 
 
+def recover_operation(run_file, operation_id, *, error_type, recovery_evidence):
+    """Close one durable orphan fact without inventing model or Token data."""
+    from story_run import load_run
+    run = load_run(Path(run_file))
+    latest = None
+    for event in run.get('observability', {}).get('events', []):
+        if event.get('event') == 'operation_fact' and event.get('operation_id') == operation_id:
+            latest = event
+    if not latest or latest.get('status') != 'running':
+        return False
+    ended_at = datetime.now(timezone.utc).isoformat()
+    recovered = {key: value for key, value in latest.items() if key not in {'sequence', 'observed_at', 'event'}}
+    recovered.update(
+        status='failed',
+        error_type=error_type,
+        ended_at=ended_at,
+        recovery_evidence=recovery_evidence,
+    )
+    try:
+        started = datetime.fromisoformat(str(recovered.get('started_at') or ''))
+        recovered['duration_seconds'] = max(0.0, (datetime.fromisoformat(ended_at) - started).total_seconds())
+    except ValueError:
+        recovered['duration_seconds'] = None
+    append_fact(run_file, recovered)
+    return True
+
+
 @contextmanager
 def operation_observation(run_file, operation, kind, *, artifacts=(), execution_mode='first_execution', rework_reason=None, rework_classification=None):
     if kind not in {'generate', 'edit', 'encode', 'review', 'deterministic'}:

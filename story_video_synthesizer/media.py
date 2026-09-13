@@ -13,7 +13,8 @@ def run_command(args: list[str]) -> None:
     if (Path(args[0]).name == "ffmpeg" and Path(args[-1]).suffix.lower() in VIDEO_EXTENSIONS
         and (current_render_task() is not None or any(codec in args for codec in ("libx264", "libx265", "h264_videotoolbox", "prores_ks")))):
         from story_encode import run_encode
-        run_encode(args)
+        from story_render_task import current_render_code_version
+        run_encode(args, code_version=current_render_code_version())
         return
     process = subprocess.run(args, text=True, capture_output=True)
     if process.returncode != 0:

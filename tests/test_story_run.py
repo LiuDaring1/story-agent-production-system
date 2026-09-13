@@ -163,6 +163,8 @@ class StoryRunLedgerTests(unittest.TestCase):
                         "critical_errors": [],
                         "artifact_path": str(reviewed_path),
                         "artifact_sha256": reviewed_sha,
+                        "reviewer_context": "fixture-independent-reviewer",
+                        "independent_context": True,
                     }
                     if artifact_id in {"customer_media_independent_review", "final_delivery_review"}:
                         customer_media_path = (
@@ -1082,6 +1084,8 @@ for index in range(20):
                 "critical_errors": [],
                 "artifact_path": str(manifest),
                 "artifact_sha256": bundle_sha,
+                "reviewer_context": "fixture-independent-storyboard-reviewer",
+                "independent_context": True,
             }
             review.write_text(json.dumps(review_payload), encoding="utf-8")
             recorded = record_run(
@@ -1141,6 +1145,8 @@ for index in range(20):
                         "critical_errors": [],
                         "artifact_path": str(manifest),
                         "artifact_sha256": file_sha256(manifest),
+                        "reviewer_context": "fixture-independent-storyboard-reviewer",
+                        "independent_context": True,
                     }
                 ),
                 encoding="utf-8",

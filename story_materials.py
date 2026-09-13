@@ -7,6 +7,12 @@ import zipfile
 from xml.etree import ElementTree as ET
 from story_production_v2 import binding, current, sha, write, protect_outputs
 
+
+class MaterialsPreflightError(ValueError):
+    def __init__(self, issues):
+        self.issues = list(issues)
+        super().__init__('Materials preflight failed: ' + '；'.join(self.issues))
+
 def word_text(path):
     with zipfile.ZipFile(path) as z:
         root = ET.fromstring(z.read('word/document.xml'))
@@ -18,36 +24,81 @@ def material_rows(director, plan, word):
     ids, slides = validate_plan(Path(director), Path(plan))
     text = word_text(word)
     result = []
+    issues = []
     cursor = 0.0
     last = 0
     shots = {r['shot_id']: r for r in json.loads(Path(director).read_text())['shots']}
     for row in slides:
         sid = row['shot_id']
+        try:
+            duration = float(row['duration_seconds'])
+        except (KeyError, TypeError, ValueError):
+            duration = math.nan
+        duration_valid = math.isfinite(duration) and duration > 0
+        if not duration_valid:
+            issues.append(f'{sid}: invalid authoritative duration')
+        start_seconds = cursor
+        if duration_valid:
+            if sid in shots:
+                shot = shots[sid]
+                if abs(float(shot['source_start']) - cursor) > 0.002 or abs(float(shot['source_end']) - (cursor + duration)) > 0.002:
+                    issues.append(f'{sid}: materials timing differs from authoritative director window')
+            cursor += duration
         source = str(shots.get(sid, {}).get('story_text') or row.get('word_text') or '')
         if 'word_text' in row and row['word_text']:
             source = str(row['word_text'])
         if not source:
-            raise ValueError(f'{sid}: missing exact Word text mapping')
+            issues.append(f'{sid}: missing exact Word text mapping')
+            continue
         start = text.find(source, last)
         if start < 0:
-            raise ValueError(f'{sid}: text does not map verbatim to Word')
+            issues.append(f'{sid}: text does not map verbatim to Word')
+            continue
         if text.find(source, start + 1) >= 0 and 'word_start' not in row:
-            raise ValueError(f'{sid}: ambiguous Word text; provide word_start')
+            issues.append(f'{sid}: ambiguous Word text; provide word_start')
+            continue
         if 'word_start' in row:
             start = int(row['word_start'])
             if start < last or text[start:start + len(source)] != source:
-                raise ValueError(f'{sid}: invalid Word offset')
+                issues.append(f'{sid}: invalid Word offset')
+                continue
         last = start + len(source)
-        duration = float(row['duration_seconds'])
-        if not math.isfinite(duration) or duration <= 0:
-            raise ValueError('Invalid authoritative duration')
-        if sid in shots:
-            shot = shots[sid]
-            if abs(float(shot['source_start']) - cursor) > 0.002 or abs(float(shot['source_end']) - (cursor + duration)) > 0.002:
-                raise ValueError(f'{sid}: materials timing differs from authoritative director window')
-        result.append({'order': len(result) + 1, 'shot_id': sid, 'text': source, 'display_text': source[:-1] if source.endswith('。') else source, 'word_start': start, 'word_end': last, 'start_seconds': cursor, 'end_seconds': cursor + duration, 'image': binding(row['poster_path'])})
-        cursor += duration
+        if not duration_valid:
+            continue
+        result.append({'order': len(result) + 1, 'shot_id': sid, 'text': source, 'display_text': source[:-1] if source.endswith('。') else source, 'word_start': start, 'word_end': last, 'start_seconds': start_seconds, 'end_seconds': start_seconds + duration, 'image': binding(row['poster_path'])})
+    if issues:
+        raise MaterialsPreflightError(issues)
     return result
+
+
+def materials_preflight(*, director, plan, compile_receipt, inputs):
+    """Report compile/input/Word mapping defects in one read-only pass."""
+    issues = []
+    compile_data = None
+    rows = None
+    from shot_storyboard_pipeline import validate_compile_receipt
+    try:
+        compile_data = validate_compile_receipt(Path(compile_receipt), require_current_r2v_jobs=False)
+        if compile_data['director_plan_sha256'] != sha(director):
+            issues.append('compile_receipt: director plan binding changed')
+        if compile_data['ppt_plan_sha256'] != sha(plan):
+            issues.append('compile_receipt: PPT plan binding changed')
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        issues.append(f'compile_receipt: {exc}')
+    for role in ('final_word', 'audio', 'finished_music'):
+        try:
+            current(inputs[role])
+        except (OSError, KeyError, TypeError, ValueError) as exc:
+            issues.append(f'{role}: {exc}')
+    try:
+        rows = material_rows(director, plan, inputs['final_word']['path'])
+    except MaterialsPreflightError as exc:
+        issues.extend(exc.issues)
+    except (OSError, KeyError, TypeError, ValueError) as exc:
+        issues.append(f'word_mapping: {exc}')
+    if issues:
+        raise MaterialsPreflightError(issues)
+    return compile_data, rows
 
 def export_materials(*, director, plan, compile_receipt, inputs, output, receipt, archive_output=None):
     """Export a ready-to-use ordered folder; ZIP requires explicit opt-in."""
@@ -65,13 +116,12 @@ def _export_materials(*, director, plan, compile_receipt, inputs, output, receip
         raise ValueError('Receipt must be outside materials directory')
     if archive_output and (Path(archive_output).resolve().is_relative_to(Path(output).resolve()) or Path(archive_output).resolve() == Path(receipt).resolve()):
         raise ValueError('Archive must be outside materials directory and receipt')
-    from shot_storyboard_pipeline import validate_compile_receipt
-    compile_data = validate_compile_receipt(Path(compile_receipt), require_current_r2v_jobs=False)
-    if compile_data['director_plan_sha256'] != sha(director) or compile_data['ppt_plan_sha256'] != sha(plan):
-        raise ValueError('Compile receipt binding changed')
-    for role in ('final_word', 'audio', 'finished_music'):
-        current(inputs[role])
-    rows = material_rows(director, plan, inputs['final_word']['path'])
+    _compile_data, rows = materials_preflight(
+        director=director,
+        plan=plan,
+        compile_receipt=compile_receipt,
+        inputs=inputs,
+    )
     from story_video_synthesizer.media import probe_duration
     if abs(rows[-1]['end_seconds'] - probe_duration(Path(inputs['audio']['path']))) > 0.2:
         raise ValueError('PPT materials do not cover authority audio')

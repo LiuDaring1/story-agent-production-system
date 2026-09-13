@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 import numpy as np
@@ -13,6 +14,7 @@ from story_customer_media import (
     music_only_fit,
     narration_music_fit,
     subtitle_geometry_from_frames,
+    subtitle_geometry_from_videos,
     validate_customer_media_receipt,
 )
 
@@ -103,6 +105,27 @@ class CustomerMediaPolicyTests(unittest.TestCase):
         )
 
         self.assertIs(selected, aligned)
+
+    def test_temporal_alignment_never_searches_beyond_one_adjacent_frame(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with_video = root / 'with.mp4'; with_video.write_bytes(b'with')
+            without_video = root / 'without.mp4'; without_video.write_bytes(b'without')
+            srt = root / 'body.srt'; srt.write_text('1\n00:00:01,000 --> 00:00:02,000\n字幕\n')
+            calls = []
+            def frame(path, timestamp, width, height):
+                calls.append((path.name, round(timestamp, 6)))
+                value = 10 if path == with_video else (2 if abs(timestamp - (1.5 + 2 / 30)) < 1e-5 else 0)
+                return np.full((1, 1, 3), value, dtype=np.uint8)
+            def geometry(with_frame, without_frame):
+                passed = int(without_frame[0, 0, 0]) == 2
+                return {'passed': passed, 'reason': None if passed else 'misaligned'}
+            probe = {'width': 1, 'height': 1, 'duration_seconds': 3, 'frame_rate': 30.0}
+            with patch('story_customer_media._probe_video', return_value=probe), patch('story_customer_media._frame_rgb', side_effect=frame), patch('story_customer_media.subtitle_geometry_from_frames', side_effect=geometry):
+                result = subtitle_geometry_from_videos(with_video, without_video, srt)
+            self.assertFalse(result['passed'])
+            sampled_without = [timestamp for name, timestamp in calls if name == 'without.mp4']
+            self.assertEqual(sampled_without, [1.5, round(1.5 - 1 / 30, 6), round(1.5 + 1 / 30, 6)])
 
     def test_receipt_rejects_self_reported_failure(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

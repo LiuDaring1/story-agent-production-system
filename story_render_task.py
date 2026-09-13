@@ -1,9 +1,13 @@
 """Bind formal v2 renderers to a verified ledger, never a hand-set environment ID."""
 from contextvars import ContextVar
+from contextlib import contextmanager
+import hashlib
+import json
 from pathlib import Path
 from story_production_v2 import VERSION, protect_outputs
 
 _task = ContextVar('verified_story_render_task', default=None)
+_code_version = ContextVar('verified_story_render_code_version', default=None)
 
 
 def bind_render_task(run_file=None, *, outputs=()):
@@ -72,3 +76,25 @@ def render_entry(function):
 
 def current_render_task():
     return _task.get()
+
+
+@contextmanager
+def render_code_scope(paths):
+    """Bind only renderer-relevant source bytes into managed encode reuse."""
+    from story_hash_cache import sha256_file
+    bindings = [
+        {'path': str(Path(path).resolve()), 'sha256': sha256_file(path)}
+        for path in paths
+    ]
+    value = hashlib.sha256(
+        json.dumps(bindings, sort_keys=True, separators=(',', ':')).encode()
+    ).hexdigest()
+    token = _code_version.set(value)
+    try:
+        yield value
+    finally:
+        _code_version.reset(token)
+
+
+def current_render_code_version():
+    return _code_version.get()

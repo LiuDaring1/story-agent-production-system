@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 from dataclasses import asdict
 from pathlib import Path
 from typing import Any
@@ -35,13 +36,17 @@ def _binding(path: Path) -> dict[str, Any]:
 
 
 def _body_segments(assembly_plan: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return assembler body segments without assuming a shot-id format."""
-    return [
-        segment
-        for segment in assembly_plan.get("segments", [])
-        if str(segment.get("segment_id") or "").strip().upper()
-        not in {"", "TITLE", "MORAL"}
-    ]
+    """Return only supported legacy/canonical shot IDs, rejecting unknown IDs."""
+    segments = list(assembly_plan.get("segments", []))
+    body: list[dict[str, Any]] = []
+    for segment in segments:
+        segment_id = str(segment.get("segment_id") or "").strip()
+        if segment_id.upper() in {"TITLE", "MORAL"}:
+            continue
+        if not re.fullmatch(r"(?:S\d+|shot-\d+)", segment_id, flags=re.IGNORECASE):
+            raise ValueError(f"正式拼装决策包含未知片段 ID：{segment_id or '<empty>'}")
+        body.append(segment)
+    return body
 
 
 def body_timings_from_plan(

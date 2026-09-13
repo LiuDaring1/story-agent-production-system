@@ -32,6 +32,19 @@ class EncodeTests(unittest.TestCase):
             run_encode(args)
         self.assertEqual(first, out.read_bytes())
 
+    def test_reuse_binds_relevant_render_code_version(self):
+        out = self.root / 'versioned.mp4'
+        args = self.command(out)
+        run_encode(args, code_version='renderer-v1')
+        receipt = self.root / 'pool' / (hashlib.sha256(str(out).encode()).hexdigest() + '.json')
+        first_started = json.loads(receipt.read_text())['started_at']
+        with patch('subprocess.Popen', side_effect=AssertionError('duplicate process')):
+            run_encode(args, code_version='renderer-v1')
+        run_encode(args, code_version='renderer-v2')
+        state = json.loads(receipt.read_text())
+        self.assertEqual(state['render_code_version'], 'renderer-v2')
+        self.assertGreater(state['started_at'], first_started)
+
     def test_input_and_unmanaged_output_protection(self):
         source = self.root / 'input.mp4'
         source.write_bytes(b'original')

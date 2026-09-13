@@ -19,10 +19,13 @@ class StorySceneWindowTests(unittest.TestCase):
         result = preview_times_with_b_coverage(
             "1,2,37,92",
             "14.075-32.979,70.440-88.979,128.160-146.189",
+            "0.000-14.075,50.000-70.440",
         )
         times = [float(item) for item in result.split(",")]
         self.assertEqual(times[:4], [1.0, 2.0, 37.0, 92.0])
         for start, end in ((14.075, 32.979), (70.440, 88.979), (128.160, 146.189)):
+            self.assertTrue(any(start <= item <= end for item in times))
+        for start, end in ((0.0, 14.075), (50.0, 70.44)):
             self.assertTrue(any(start <= item <= end for item in times))
         self.assertEqual(len({round(item) for item in times}), len(times))
 

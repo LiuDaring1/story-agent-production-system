@@ -453,16 +453,25 @@ def main() -> None:
         parser.error("required_v1 正式编码必须提供 --approved-preview-geometry")
     if contract_spec is not None and config.variant in {"main", "both"}:
         config = apply_release_contract_spec(config, contract_spec)
-    if args.preview_dir is not None:
-        render_release_previews(
-            config,
-            args.preview_dir.expanduser(),
-            parse_preview_times(args.preview_times),
-            parse_preview_person_layouts(args.preview_person_layouts, config),
-            contract_spec=contract_spec,
-        )
-    else:
-        package_release_videos(config, contract_spec=contract_spec)
+    from story_render_task import render_code_scope
+    code_root = Path(__file__).resolve().parent
+    with render_code_scope([
+        Path(__file__),
+        code_root / "release_geometry.py",
+        code_root / "production_keying.py",
+        code_root / "story_encode.py",
+        code_root / "story_video_synthesizer" / "media.py",
+    ]):
+        if args.preview_dir is not None:
+            render_release_previews(
+                config,
+                args.preview_dir.expanduser(),
+                parse_preview_times(args.preview_times),
+                parse_preview_person_layouts(args.preview_person_layouts, config),
+                contract_spec=contract_spec,
+            )
+        else:
+            package_release_videos(config, contract_spec=contract_spec)
 
 
 V2_RELEASE_SPEC_SCHEMA = "story-release-render-spec/v2"
@@ -527,7 +536,7 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path) -> dict:
     timeline_path = current(ledger["artifacts"]["authoritative_timeline_receipt"])
     if current(semantic["authoritative_timeline_receipt"]).resolve() != timeline_path.resolve():
         raise ValueError("v2 semantic card timeline differs from current ledger")
-    validate_authoritative_timeline_receipt(timeline_path, expected_inputs=ledger["inputs"])
+    timeline = validate_authoritative_timeline_receipt(timeline_path, expected_inputs=ledger["inputs"])
     generation_path = current(ledger["artifacts"]["semantic_card_generation_receipt"])
     motion_path = current(ledger["artifacts"]["semantic_card_motion_receipt"])
     request_path = motion_path.parent / "semantic_card_motion_request.json"
@@ -561,10 +570,10 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path) -> dict:
             or tuple(config.b_story_box) != CANONICAL_B_STORY_BOX):
         raise ValueError("v2 release story windows must preserve mature A/B layout")
     windows_evidence = None
-    if config.b_windows or config.c_windows or config.release_windows_plan is not None:
+    if config.variant in {"main", "both"}:
         from story_production_v2 import validate_independent_approval
         if config.release_windows_plan is None or config.release_windows_review is None:
-            raise ValueError("v2 explicit B/C windows require their reviewed source plan")
+            raise ValueError("v2 main release requires a reviewed A/B/C windows plan")
         windows = json.loads(config.release_windows_plan.read_text())
         if windows.get("schema_version") != "story-project-release-windows-plan/v1":
             raise ValueError("v2 release windows plan schema invalid")
@@ -577,6 +586,16 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path) -> dict:
         for key, actual in (("b_windows", config.b_windows), ("c_windows", config.c_windows)):
             if parse_b_windows(str(windows.get(key) or "")) != tuple(actual):
                 raise ValueError("v2 release windows differ from reviewed source plan")
+        duration = timeline.get("audio_duration_seconds")
+        if duration is None:
+            # Some validated adapters return a normalized summary instead of
+            # the persisted receipt.  The current, already-validated receipt
+            # remains the authoritative source for this gate.
+            duration = json.loads(timeline_path.read_text()).get("audio_duration_seconds")
+        if not isinstance(duration, (int, float)) or isinstance(duration, bool) or not math.isfinite(float(duration)) or float(duration) <= 0:
+            raise ValueError("v2 main release requires a valid authoritative duration")
+        if float(duration) >= 30.0 and (not config.b_windows or not config.c_windows):
+            raise ValueError("v2 main release >=30s requires non-empty reviewed B and C windows")
         validate_independent_approval(json.loads(config.release_windows_review.read_text()),
             config.release_windows_plan, producer_context=config.release_producer_context)
         windows_evidence = {"plan": binding(config.release_windows_plan), "review": binding(config.release_windows_review)}
@@ -1357,6 +1376,28 @@ def parse_preview_times(value: str) -> list[float]:
     return times or [2.0]
 
 
+def validate_main_preview_mode_coverage(
+    times: list[float],
+    b_windows: tuple[tuple[float, float], ...],
+    c_windows: tuple[tuple[float, float], ...],
+) -> None:
+    """Require preview evidence for A and every reviewed B/C interval."""
+    if not b_windows and not c_windows:
+        return
+    missing: list[str] = []
+    for mode, windows in (("B", b_windows), ("C", c_windows)):
+        for index, (start, end) in enumerate(windows, start=1):
+            if not any(start <= timestamp <= end for timestamp in times):
+                missing.append(f"{mode}{index}")
+    if not any(
+        not any(start <= timestamp <= end for start, end in (*b_windows, *c_windows))
+        for timestamp in times
+    ):
+        missing.append("A")
+    if missing:
+        raise ValueError("main release preview does not cover reviewed A/B/C modes: " + ", ".join(missing))
+
+
 def parse_preview_person_layouts(value: str, config: ReleaseConfig) -> list[tuple[str, ReleaseConfig]]:
     value = value.strip()
     if not value:
@@ -1900,6 +1941,7 @@ def render_release_previews(
     assets = render_static_assets(config, work_dir, geometry)
     port = release_layout_port or build_release_layout_registry().release_layout()
     if config.variant in {"both", "main"}:
+        validate_main_preview_mode_coverage(times, config.b_windows, config.c_windows)
         if config.bg_image is None or config.person_greenscreen is None or config.frame_image is None:
             raise ValueError("主账号预览需要 --bg-image、--person-greenscreen 和 --frame-image")
         layouts = person_layouts or [("current", config)]

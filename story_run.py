@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import argparse
 import fcntl
-import hashlib
 import json
 import math
 import os
@@ -31,6 +30,7 @@ from semantic_card_motion import (
 from static_ppt_contract import validate_delivery_receipt
 import story_production_v2 as production_v2
 from story_artifact_validation import validate_artifact_semantics
+from story_hash_cache import hash_cache_scope, sha256_file
 
 
 SCHEMA_VERSION = "story-run-v1"
@@ -47,6 +47,7 @@ PACKAGE_NAMES = (
 PACKAGE_STATES = {"pending", "running", "done", "blocked"}
 REQUEST_STATES = {"submitted", "running", "completed", "failed", "cancelled"}
 TOKEN_STATES = {"reported", "not_reported", "not_applicable"}
+REQUEST_RELATIONS = {"retry", "parallel_required", "cache_reuse", "true_duplicate", "unknown"}
 PERFORMANCE_OBSERVATION_FIELDS = (
     "plan_duration_seconds",
     "machine_check_duration_seconds",
@@ -109,11 +110,7 @@ def run_file_lock(path: Path) -> Iterator[None]:
 
 
 def file_sha256(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    return sha256_file(path)
 
 
 def _optional_nonnegative_number(value: Any, label: str) -> float | None:
@@ -145,6 +142,7 @@ def _new_performance_observation() -> dict[str, Any]:
         "schema_version": "story-performance-observation/v1",
         **{name: None for name in PERFORMANCE_OBSERVATION_FIELDS},
         "duplicate_provider_request_count": 0,
+        "duplicate_provider_request_classification": {},
         "longest_dependency_chain": 0,
         "missing_measurements": list(PERFORMANCE_OBSERVATION_FIELDS),
     }
@@ -276,6 +274,36 @@ def refresh_observability_summary(payload: dict[str, Any]) -> None:
     performance["duplicate_provider_request_count"] = sum(
         max(0, len(request_ids) - 1) for request_ids in fingerprints.values()
     )
+    classifications: dict[str, int] = {}
+    grouped_records: dict[tuple[str, str], list[dict[str, Any]]] = {}
+    for item in requests.values():
+        if not isinstance(item, dict) or not item.get("request_sha256"):
+            continue
+        key = (str(item.get("provider") or ""), str(item["request_sha256"]))
+        grouped_records.setdefault(key, []).append(item)
+    for group in grouped_records.values():
+        if len(group) < 2:
+            continue
+        ordered = sorted(group, key=lambda item: str(item.get("observed_at") or ""))
+        prior: list[dict[str, Any]] = []
+        for item in ordered[1:]:
+            relation = str(item.get("request_relation") or "")
+            if relation not in REQUEST_RELATIONS:
+                if item.get("retry_index") not in {None, 0}:
+                    relation = "retry"
+                elif item.get("execution_mode") == "resume_reuse":
+                    relation = "cache_reuse"
+                elif any(
+                    earlier.get("status") == "failed"
+                    and earlier.get("operation") == item.get("operation")
+                    for earlier in [ordered[0], *prior]
+                ):
+                    relation = "retry"
+                else:
+                    relation = "unknown"
+            classifications[relation] = classifications.get(relation, 0) + 1
+            prior.append(item)
+    performance["duplicate_provider_request_classification"] = dict(sorted(classifications.items()))
     performance["longest_dependency_chain"] = _longest_dependency_chain(payload)
     performance["missing_measurements"] = [
         name for name in PERFORMANCE_OBSERVATION_FIELDS
@@ -757,6 +785,7 @@ def _record_run_unlocked(
 
     if artifact_id:
         artifact = require_file(artifact_path or Path(), "产物")
+        canonical_companion: tuple[str, Path] | None = None
         if artifact_id == "theme_assets_manifest":
             validate_theme_assets_manifest(artifact)
         if artifact_id == "shot_storyboard_compile_receipt":
@@ -764,10 +793,15 @@ def _record_run_unlocked(
             # the jobs CSV after compilation.  Recording the sealed compiler
             # receipt therefore revalidates only its immutable bindings; the
             # live job results are proven by the downstream provider receipt.
-            validate_compile_receipt(
+            compile_receipt = validate_compile_receipt(
                 artifact,
                 require_current_r2v_jobs=False,
             )
+            if production_v2.is_v2(payload) and "storyboard_review" not in payload["artifacts"]:
+                canonical_companion = (
+                    "storyboard_review",
+                    require_file(Path(compile_receipt["storyboard_review_path"]), "故事板独立审核"),
+                )
         if artifact_id == "static_ppt_delivery_receipt":
             validate_delivery_receipt(artifact)
         if artifact_id == "semantic_card_generation_receipt":
@@ -809,6 +843,24 @@ def _record_run_unlocked(
             "provider_task_id": provider_task_id.strip(),
             "recorded_at": utc_now(),
         }
+        if canonical_companion is not None:
+            companion_id, companion_path = canonical_companion
+            validate_artifact_semantics(
+                companion_id,
+                companion_path,
+                registered_artifacts=payload["artifacts"],
+                registered_inputs=payload["inputs"],
+            )
+            payload["artifacts"][companion_id] = {
+                "package": package,
+                "path": str(companion_path),
+                "sha256": file_sha256(companion_path),
+                "bytes": companion_path.stat().st_size,
+                "input_sha256s": {},
+                "provider_task_id": "",
+                "recorded_at": utc_now(),
+                "registered_by": "shot_storyboard_compile_receipt",
+            }
 
     previous_status = str(payload["work_packages"][package].get("status") or "")
     observed_at = utc_now()
@@ -908,6 +960,7 @@ def _record_request_observation_unlocked(
     execution_mode: str | None = None,
     rework_reason: str | None = None,
     rework_classification: str | None = None,
+    request_relation: str | None = None,
     artifact_paths: list[str] | None = None,
     estimated_cost: float | None = None,
     actual_cost: float | None = None,
@@ -963,11 +1016,14 @@ def _record_request_observation_unlocked(
         raise ValueError('Invalid execution mode')
     if rework_classification not in {None, 'valid', 'invalid', 'unknown'}:
         raise ValueError('Invalid rework classification')
+    if request_relation not in {None, *REQUEST_RELATIONS}:
+        raise ValueError('Invalid request relation')
     record = {
         "reasoning_effort": reasoning_effort,
         "execution_mode": execution_mode,
         "rework_reason": rework_reason,
         "rework_classification": rework_classification,
+        "request_relation": request_relation,
         "artifacts": [production_v2.binding(p) for p in (artifact_paths or [])],
         "configuration_evidence": {"expected": "inherit current task settings", "actual_model": model.strip() or None, "actual_reasoning_effort": reasoning_effort},
         "package": package,
@@ -1056,6 +1112,7 @@ def record_request_observation(
     execution_mode: str | None = None,
     rework_reason: str | None = None,
     rework_classification: str | None = None,
+    request_relation: str | None = None,
     artifact_paths: list[str] | None = None,
     estimated_cost: float | None = None,
     actual_cost: float | None = None,
@@ -1085,7 +1142,8 @@ def record_request_observation(
             request_sha256=request_sha256,
             error_type=error_type,
             reasoning_effort=reasoning_effort, execution_mode=execution_mode, rework_reason=rework_reason,
-            rework_classification=rework_classification, artifact_paths=artifact_paths,
+            rework_classification=rework_classification, request_relation=request_relation,
+            artifact_paths=artifact_paths,
             estimated_cost=estimated_cost,
             actual_cost=actual_cost,
             currency=currency,
@@ -1165,6 +1223,31 @@ def status_summary(payload: dict[str, Any]) -> dict[str, Any]:
         "blocker": payload.get("blocker", ""),
         "finalized": bool(payload.get("finalized_at")),
     }
+
+
+def mutation_summary(
+    payload: dict[str, Any], *, command: str, run_file: Path,
+    package: str | None = None, artifact_id: str | None = None,
+) -> dict[str, Any]:
+    """Return a bounded CLI acknowledgement instead of echoing the full ledger."""
+    result: dict[str, Any] = {
+        "schema_version": "story-run-command-summary/v1",
+        "command": command,
+        "run_file": str(run_file.expanduser().resolve()),
+        "run_id": payload["run_id"],
+        "updated_at": payload.get("updated_at"),
+        "finalized": bool(payload.get("finalized_at")),
+        "work_packages": payload["work_packages"],
+        "artifact_count": len(payload["artifacts"]),
+        "request_count": len(payload.get("observability", {}).get("requests", {})),
+    }
+    if package:
+        result["package"] = package
+        result["package_status"] = payload["work_packages"][package]
+    if artifact_id:
+        result["artifact_id"] = artifact_id
+        result["artifact"] = payload["artifacts"].get(artifact_id)
+    return result
 
 
 def dependency_staleness(payload: dict[str, Any]) -> dict[str, list[str]]:
@@ -1322,11 +1405,14 @@ def _finalize_run_unlocked(*, run_file: Path, required_artifacts: Iterable[str])
 
 def finalize_run(*, run_file: Path, required_artifacts: Iterable[str]) -> dict[str, Any]:
     target = run_file.expanduser().resolve()
+    from story_encode import reconcile_encode_operations
+    reconcile_encode_operations(target)
     with run_file_lock(target):
-        return _finalize_run_unlocked(
-            run_file=target,
-            required_artifacts=required_artifacts,
-        )
+        with hash_cache_scope():
+            return _finalize_run_unlocked(
+                run_file=target,
+                required_artifacts=required_artifacts,
+            )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1362,6 +1448,10 @@ def build_parser() -> argparse.ArgumentParser:
     record.add_argument("--paid-amount", type=float, default=0.0, help=argparse.SUPPRESS)
     record.add_argument("--blocker", default="")
     record.add_argument("--replace", action="store_true")
+    record.add_argument(
+        "--full-json", "--verbose", dest="full_json", action="store_true",
+        help="显式输出完整 story_run.json；默认仅输出紧凑命令摘要",
+    )
 
     observe = subparsers.add_parser(
         "observe-request",
@@ -1389,6 +1479,10 @@ def build_parser() -> argparse.ArgumentParser:
     observe.add_argument("--execution-mode", choices=['first_execution', 'resume_reuse', 'rework'])
     observe.add_argument("--rework-reason")
     observe.add_argument("--rework-classification", choices=['valid', 'invalid', 'unknown'])
+    observe.add_argument(
+        "--request-relation", choices=sorted(REQUEST_RELATIONS),
+        help="相同请求哈希的关系；未知时省略，绝不自动猜成浪费",
+    )
     observe.add_argument("--artifact-path", action='append', default=[])
     observe.add_argument("--estimated-cost", type=float, help=argparse.SUPPRESS)
     observe.add_argument("--actual-cost", type=float, help=argparse.SUPPRESS)
@@ -1413,6 +1507,10 @@ def build_parser() -> argparse.ArgumentParser:
     finalize = subparsers.add_parser("finalize", help="校验所有工作包、产物文件和哈希后锁定交付")
     finalize.add_argument("--run-file", required=True, type=Path)
     finalize.add_argument("--require", action="append", default=[])
+    finalize.add_argument(
+        "--full-json", "--verbose", dest="full_json", action="store_true",
+        help="显式输出完整 story_run.json；默认仅输出紧凑命令摘要",
+    )
     return parser
 
 
@@ -1467,7 +1565,8 @@ def main() -> None:
             request_sha256=args.request_sha256,
             error_type=args.error_type,
             reasoning_effort=args.reasoning_effort, execution_mode=args.execution_mode, rework_reason=args.rework_reason,
-            rework_classification=args.rework_classification, artifact_paths=args.artifact_path,
+            rework_classification=args.rework_classification, request_relation=args.request_relation,
+            artifact_paths=args.artifact_path,
             estimated_cost=args.estimated_cost,
             actual_cost=args.actual_cost,
             currency=args.currency,
@@ -1484,9 +1583,20 @@ def main() -> None:
             duplicate_encode_count=args.duplicate_encode_count,
         )
     elif args.command == "status":
+        from story_encode import reconcile_encode_operations
+        reconcile_encode_operations(args.run_file)
         payload = status_summary(load_run(args.run_file))
     else:
         payload = finalize_run(run_file=args.run_file, required_artifacts=args.require)
+    full_json = bool(getattr(args, "full_json", False))
+    if not full_json and args.command in {"record", "finalize"}:
+        payload = mutation_summary(
+            payload,
+            command=args.command,
+            run_file=args.run_file,
+            package=getattr(args, "package", None),
+            artifact_id=getattr(args, "artifact_id", None),
+        )
     print(json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
 
 

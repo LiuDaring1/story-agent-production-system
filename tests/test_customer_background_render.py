@@ -36,6 +36,16 @@ class CustomerBackgroundRenderTests(unittest.TestCase):
             receipt['segments'][1]['timeline_end']=6;master.write_bytes(b'changed')
             with self.assertRaisesRegex(ValueError,'哈希不匹配'):validate_formal_assembly(receipt,master,audio)
 
+    def test_v2_decisions_reject_unknown_non_story_segment_ids(self):
+        plan = {"schema_version": "story-r2v-assembly-decisions-v2", "segments": [
+            {"segment_id": "TITLE", "timeline_start": 0, "timeline_end": 1},
+            {"segment_id": "chapter-one", "timeline_start": 1, "timeline_end": 2},
+            {"segment_id": "MORAL", "timeline_start": 2, "timeline_end": 3},
+        ]}
+        rows = [{"line": "正文", "source_start": 1, "source_end": 2}]
+        with self.assertRaisesRegex(ValueError, "未知片段 ID"):
+            body_timings_from_plan(plan, rows)
+
     def test_body_srt_uses_only_non_title_non_moral_authoritative_rows(self) -> None:
         plan = {
             "shots": [

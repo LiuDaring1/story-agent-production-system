@@ -1,10 +1,10 @@
 """Versioned, foreground-only video production contract. No external generation."""
 from __future__ import annotations
-import hashlib
 import json
 import os
 import tempfile
 from pathlib import Path
+from story_hash_cache import sha256_file
 VERSION = 'story-production/v2'
 PACKAGES = ('director_plan', 'r2v_visuals', 'presenter_keying', 'media_render', 'product_assets', 'delivery')
 INPUTS = ('confirmed_text', 'subtitle_txt', 'subtitle_srt', 'greenscreen_video', 'audio', 'final_word', 'finished_music', 'story_requirements', 'packaging_reference', 'packaging_prompt')
@@ -18,11 +18,7 @@ def sha(path):
     p = Path(path)
     if p.is_dir():
         return directory_binding(p)['sha256']
-    h = hashlib.sha256()
-    with p.open('rb') as f:
-        for b in iter(lambda: f.read(1024 * 1024), b''):
-            h.update(b)
-    return h.hexdigest()
+    return sha256_file(p)
 
 def directory_binding(path):
     """Content-address a tree; symbolic links are never managed deliverables."""
@@ -36,6 +32,7 @@ def directory_binding(path):
                             'sha256': sha(child), 'bytes': child.stat().st_size})
     if not members:
         raise ValueError('Empty managed directory')
+    import hashlib
     digest = hashlib.sha256(json.dumps(members, ensure_ascii=False, sort_keys=True,
                                       separators=(',', ':')).encode()).hexdigest()
     return {'path': str(p), 'sha256': digest, 'bytes': sum(x['bytes'] for x in members),
@@ -170,6 +167,36 @@ def validate_independent_approval(review, artifact, *, producer_context):
         raise ValueError('Independent review score is below 85 or invalid')
     if review.get('artifact_sha256') != sha(artifact):
         raise ValueError('Independent review does not bind current artifact')
+
+
+def review_provenance(review, *, allow_legacy_storyboard=False):
+    """Read canonical review provenance with one narrow, read-only legacy bridge.
+
+    New evidence must use top-level ``reviewer_context`` and
+    ``independent_context``.  The only accepted nested shape is the historical
+    storyboard v1 file emitted before that contract was unified; callers use it
+    in memory and never rewrite or upgrade the source evidence.
+    """
+    reviewer = review.get('reviewer_context')
+    independent = review.get('independent_context')
+    source = 'top_level'
+    if (
+        (not isinstance(reviewer, str) or not reviewer.strip() or independent is not True)
+        and allow_legacy_storyboard
+        and review.get('schema_version') == 'story-shot-storyboards-review/v1'
+    ):
+        context = review.get('review_context')
+        if isinstance(context, dict):
+            reviewer = context.get('review_role')
+            independent = context.get('independent_context')
+            source = 'legacy_review_context'
+    if not isinstance(reviewer, str) or not reviewer.strip() or independent is not True:
+        raise ValueError('Independent review context provenance is missing')
+    return {
+        'reviewer_context': reviewer.strip(),
+        'independent_context': True,
+        'source': source,
+    }
 
 def protect_outputs(outputs, protected):
     """All deterministic writers protect caller inputs, including aliases."""

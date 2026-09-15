@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 import wave
+from types import SimpleNamespace
 import numpy as np
 from story_production_v2 import INPUTS, PACKAGES, VERSION, binding
 from story_run import init_run
@@ -43,12 +44,15 @@ class FormalEntryShortMediaTests(unittest.TestCase):
         # The three-second QA fixture has a real A frame in its center strip;
         # ABC requirements for >=30s are exercised by the separate 42s fixture.
         from PIL import Image, ImageDraw
-        cls.abc_templates={}
-        for mode, box in [('a',(210,270,1120,782)),('b',(350,150,1550,850))]:
-            frame=Image.new('RGBA',(1920,1080))
-            ImageDraw.Draw(frame).rectangle(box,outline=(235,170,20,255),width=30)
-            source=cls.project/f'abc_frame_{mode}.png';frame.save(source)
-            cls.abc_templates[mode]=binding(source)
+        mother=cls.project/'abc_frame_mother.png'
+        frame=Image.new('RGBA',(1920,1080))
+        ImageDraw.Draw(frame).rectangle((210,270,1120,782),outline=(235,170,20,255),width=30)
+        frame.save(mother)
+        from story_scene_windows import frame_templates
+        cls.abc_templates=frame_templates(SimpleNamespace(
+            frame_image=mother, story_box=(210,270,910,512),
+            b_story_box=(356,180,1209,680), story_bleed=0,
+        ), cls.project/'abc_frame_derivation')
         plate=Image.new('RGB',(360,480),(170,204,238))
         frame=Image.open(cls.abc_templates['a']['path']).convert('RGBA').resize((360,203))
         plate.paste(frame,(0,139),frame.getchannel('A'))
@@ -58,6 +62,16 @@ class FormalEntryShortMediaTests(unittest.TestCase):
                         '-i',str(cls.root/'voice.wav'),'-i',str(cls.root/'music.wav'),
                         '-filter_complex','[1:a][2:a]amix=inputs=2:weights=1 0.22:normalize=0[a]',
                         '-map','0:v','-map','[a]','-c:v','libx264','-crf','20','-preset','medium','-c:a','aac','-t','3',str(cls.video)],check=True)
+        presenter_png=cls.project/'presenter.png'
+        presenter=Image.new('RGBA',(360,480))
+        ImageDraw.Draw(presenter).rectangle((250,80,330,479),fill=(220,35,55,255))
+        presenter.save(presenter_png)
+        cls.presenter=cls.project/'presenter_foreground.webm'
+        subprocess.run([
+            'ffmpeg','-v','error','-y','-loop','1','-framerate','5','-i',str(presenter_png),
+            '-t','3.1','-c:v','libvpx-vp9','-lossless','1','-pix_fmt','yuva420p',
+            '-auto-alt-ref','0',str(cls.presenter),
+        ],check=True)
         cls.library=cls.project/'library.mp4'; cls.library.write_bytes(cls.video.read_bytes())
         cls.txt=cls.root/'text.txt'; cls.txt.write_text('测试原文。\n')
         cls.srt=cls.root/'text.srt'; cls.srt.write_text('1\n00:00:00,000 --> 00:00:02,500\n测试原文。\n')
@@ -101,7 +115,16 @@ class FormalEntryShortMediaTests(unittest.TestCase):
             run['artifacts']['authoritative_timeline_receipt']=binding(receipt)
             self.runfile.write_text(json.dumps(run))
         plan=self.project/'99_项目状态/fixture_abc_plan.json'
-        prepare_plan(self.runfile,plan)
+        prepare_plan(
+            self.runfile, plan,
+            presenter_foreground=self.presenter,
+            fixed_anchor_x=0,
+            canvas_width=360,
+            source_width=360,
+            source_height=480,
+            rendered_height=480,
+            person_layout_policy='',
+        )
         report=self.project/f'99_项目状态/{video.stem}_abc_coverage.json'
         actual=audit_video(video,plan,self.abc_templates,report,video_box=(0,139,360,203))
         self.assertTrue(actual['passed'],actual['critical_errors'])

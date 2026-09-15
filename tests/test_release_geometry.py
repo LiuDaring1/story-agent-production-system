@@ -164,6 +164,7 @@ def _config(root: Path, *, person_region_ready: bool = True) -> ReleaseConfig:
             "geometry_preserved": True,
             "current_story_redesign": True,
             "no_reference_theme_leak": True,
+            "single_mother_asset_ab_derivation": True,
             "solid_magenta_source": True,
             "evidence": "geometry is bound while theme ornaments are redesigned on a solid magenta source",
         },

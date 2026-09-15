@@ -10,6 +10,32 @@ def prepare_review(*, project_id, items, rules, output, previous=None, repairs=(
         raise ValueError('Project, review items and applicable rule sources are required')
     if len({i['scope'] for i in items}) != len(items):
         raise ValueError('Review scopes must be unique')
+    expanded_items = []
+    for original in items:
+        item = dict(original)
+        evidence_path = item.get('release_evidence')
+        if evidence_path:
+            evidence = json.loads(current(binding(evidence_path)).read_text())
+            from story_release_policy import validate_release_review_evidence
+            evidence = validate_release_review_evidence(evidence_path)
+            prepared = evidence['prepared_frames']
+            dependencies = list(item.get('dependencies', []))
+            dependencies.extend([
+                evidence_path,
+                evidence['applicable_requirements']['path'],
+                evidence['plan']['path'],
+                evidence['presenter_overflow_report']['path'],
+                evidence['frame_derivation']['path'],
+                *(row['frame']['path'] for row in prepared),
+            ])
+            item['dependencies'] = list(dict.fromkeys(map(str, dependencies)))
+            item['required_checked_frames'] = prepared
+            item['required_release_safety_checks'] = [
+                'plan_compliance', 'presenter_risk_intervals', 'shared_frame_identity',
+                'switch_boundaries', 'transparent_aperture',
+            ]
+        expanded_items.append(item)
+    items = expanded_items
     protected = [r for r in rules] + [i['path'] for i in items]
     protected += [p for i in items for p in i.get('dependencies', [])]
     protect_outputs([output], protected + ([previous] if previous else []))
@@ -19,6 +45,9 @@ def prepare_review(*, project_id, items, rules, output, previous=None, repairs=(
         row = {'scope': item['scope'], 'artifact': binding(item['path']),
                'dependencies': [binding(p) for p in item.get('dependencies', [])], 'rules': rule_bindings,
                'parameters': item.get('parameters', {})}
+        if item.get('required_checked_frames'):
+            row['required_checked_frames'] = item['required_checked_frames']
+            row['required_release_safety_checks'] = item['required_release_safety_checks']
         row['fingerprint'] = hashlib.sha256(json.dumps({'project_id': project_id, **row}, sort_keys=True).encode()).hexdigest()
         definition_dir = Path(output).parent / 'review_scope_definitions'
         definition = definition_dir / (row['fingerprint'] + '.json')
@@ -74,7 +103,7 @@ def prepare_review(*, project_id, items, rules, output, previous=None, repairs=(
                'items': rows, 'repairs': repair_rows,
                'repair_groups': {code: [r['scope'] for r in repair_rows if r['defect_code'] == code] for code in sorted({r['defect_code'] for r in repair_rows})},
                'independent_review_required': True, 'generation_result_action_review_required': True,
-               'reviewer_instruction': 'Open the actual listed media and bound rule sources. Producer summaries do not replace visual evidence.'}
+               'reviewer_instruction': 'Open the actual listed media and bound rule sources. For release evidence, copy only frames actually inspected with exact time/path/SHA and complete the listed existing-rule checks; never claim periodic or full-film inspection without matching frame evidence. Producer summaries do not replace visual evidence.'}
     # Preparation reuse itself does not require the packet to claim QA approval.
     if Path(output).exists() and json.loads(Path(output).read_text()) == payload:
         return {**payload, 'preparation_reused': True}

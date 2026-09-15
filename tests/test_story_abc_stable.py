@@ -8,6 +8,7 @@ from PIL import Image, ImageDraw
 from story_scene_windows import segments, coverage_samples, observed_frame_mode, prepare_plan, validate_coverage_report
 from story_production_v2 import binding
 from release_video import parse_b_windows, validate_main_scene_ending
+from tests.release_safety_fixture import write_scan_report
 
 
 class ABCStableTests(unittest.TestCase):
@@ -42,13 +43,17 @@ class ABCStableTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             root=Path(directory); srt=root/'speech.srt'; srt.write_text('1\n00:00:00,000 --> 00:00:48,000\ntext\n')
             timeline=root/'timeline.json';timeline.write_text(json.dumps({'audio_duration_seconds':50.}))
+            foreground=root/'foreground.webm';foreground.write_bytes(b'synthetic alpha binding')
             run={'production_contract':'story-production/v2','project_dir':str(root),'inputs':{'subtitle_srt':binding(srt)},'artifacts':{'authoritative_timeline_receipt':binding(timeline)}}
-            with patch('story_run.load_run',return_value=run), patch('story_timeline.validate_authoritative_timeline_receipt'):
-                plan=root/'plan.json';prepare_plan(root/'run.json',plan);first=plan.read_bytes()
-                prepare_plan(root/'run.json',plan);self.assertEqual(first,plan.read_bytes())
+            def scan(source, **kwargs):
+                report_path=kwargs.pop('report_path')
+                return write_scan_report(source,report_path,duration=50.,**kwargs)
+            with patch('story_run.load_run',return_value=run), patch('story_timeline.validate_authoritative_timeline_receipt'), patch('presenter_layout.scan_rvm_body_overflow',side_effect=scan):
+                plan=root/'plan.json';prepare_plan(root/'run.json',plan,presenter_foreground=foreground,fixed_anchor_x=0);first=plan.read_bytes()
+                prepare_plan(root/'run.json',plan,presenter_foreground=foreground,fixed_anchor_x=0);self.assertEqual(first,plan.read_bytes())
                 self.assertEqual({x['mode'] for x in json.loads(first)['segments']},{'a','b','c'})
                 srt.write_text('changed')
-                with self.assertRaises(ValueError): prepare_plan(root/'run.json',plan)
+                with self.assertRaises(ValueError): prepare_plan(root/'run.json',plan,presenter_foreground=foreground,fixed_anchor_x=0)
 
     def test_explicit_c_ending_requires_actual_subtitle_free_tail(self):
         with tempfile.TemporaryDirectory() as directory:

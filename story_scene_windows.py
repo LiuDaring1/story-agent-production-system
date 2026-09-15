@@ -41,6 +41,29 @@ def coverage_samples(duration, b_windows, c_windows, fps=25.):
             for t, reasons in sorted(values.items())]
 
 
+def review_samples(duration, b_windows, c_windows, severe_windows, fps=25.):
+    """Prepare every actual switch plus explicit presenter-risk and A/B evidence."""
+    values = {row['time_seconds']: dict(row) for row in coverage_samples(duration, b_windows, c_windows, fps)}
+    def add(timestamp, reason):
+        timestamp = round(max(0., min(duration - 1 / fps, timestamp)), 3)
+        row = values.setdefault(timestamp, {
+            'time_seconds': timestamp,
+            'expected_mode': mode_at(timestamp, b_windows, c_windows),
+            'reasons': [],
+        })
+        if reason not in row['reasons']:
+            row['reasons'].append(reason)
+    for start, end in severe_windows:
+        add(start + 2 / fps, 'presenter_risk_start')
+        add((start + end) / 2, 'presenter_risk_midpoint')
+        add(end - 2 / fps, 'presenter_risk_end')
+    for mode in ('a', 'b'):
+        candidate = next((row for row in values.values() if row['expected_mode'] == mode), None)
+        if candidate is not None:
+            candidate['reasons'].append('shared_frame_comparison_' + mode)
+    return [values[key] for key in sorted(values)]
+
+
 def mode_at(t, b_windows, c_windows):
     # FFmpeg between() is inclusive; C overlays B at a shared boundary.
     if any(s <= t <= e for s, e in c_windows): return 'c'
@@ -60,12 +83,85 @@ def current_rule(item):
     return current(item)
 
 
-def prepare_plan(run_file, output):
+def validate_plan(path, *, ledger=None):
+    from story_production_v2 import current
+    from story_release_policy import WINDOWS_PLAN_SCHEMA, validate_presenter_scan_report
+    from release_video import parse_b_windows
+    payload = json.loads(Path(path).read_text(encoding='utf-8'))
+    if payload.get('schema_version') != WINDOWS_PLAN_SCHEMA:
+        raise ValueError('v2 release windows plan lacks current presenter protection evidence')
+    for item in payload.get('inputs', {}).values(): current(item)
+    for item in payload.get('rules', []): current_rule(item)
+    protection = payload.get('presenter_protection')
+    if not isinstance(protection, dict) or protection.get('status') != 'all_risks_covered_by_b_or_c':
+        raise ValueError('v2 release windows plan missing presenter protection result')
+    report_path = current(protection.get('report') or {})
+    report = validate_presenter_scan_report(report_path)
+    foreground = current(payload['inputs']['presenter_foreground'])
+    if (Path(report['source']['path']).resolve() != foreground.resolve()
+            or report['source']['sha256'] != payload['inputs']['presenter_foreground']['sha256']):
+        raise ValueError('v2 release windows plan scan binds another presenter foreground')
+    if protection.get('cache_key') != report.get('cache_key'):
+        raise ValueError('v2 release windows plan presenter scan parameters differ from evidence')
+    severe = [tuple(map(float, row)) for row in report.get('severe_windows', [])]
+    if protection.get('severe_windows') != [list(row) for row in severe]:
+        raise ValueError('v2 release windows plan omits presenter risk intervals')
+    timeline = current(payload['inputs']['authoritative_timeline_receipt'])
+    try:
+        duration = float(json.loads(timeline.read_text())['audio_duration_seconds'])
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ValueError('v2 release windows plan lacks a valid authoritative duration') from exc
+    if abs(duration - float(payload.get('duration_seconds') or 0)) > .001:
+        raise ValueError('v2 release windows plan duration differs from authoritative timeline')
+    bw = parse_b_windows(str(payload.get('b_windows') or ''))
+    cw = parse_b_windows(str(payload.get('c_windows') or ''))
+    spans = segments(duration, bw, cw)
+    for start, end in severe:
+        uncovered = [(start, end)]
+        for cover_start, cover_end in sorted([*bw, *cw]):
+            next_rows = []
+            for left, right in uncovered:
+                if cover_end <= left or cover_start >= right:
+                    next_rows.append((left, right))
+                else:
+                    if cover_start > left: next_rows.append((left, min(right, cover_start)))
+                    if cover_end < right: next_rows.append((max(left, cover_end), right))
+            uncovered = next_rows
+        if any(right - left > .002 for left, right in uncovered):
+            raise ValueError('v2 release windows plan leaves presenter torso risk in A')
+    expected_segments = [{'start': s, 'end': e, 'mode': m} for s, e, m in spans]
+    if payload.get('segments') != expected_segments:
+        raise ValueError('v2 release windows plan segments do not match its B/C windows')
+    expected_samples = review_samples(duration, bw, cw, severe)
+    if payload.get('review_samples') != expected_samples:
+        raise ValueError('v2 release windows plan review evidence points are incomplete')
+    if ledger is not None:
+        for role in ('subtitle_srt',):
+            if current(payload['inputs'][role]).resolve() != current(ledger['inputs'][role]).resolve():
+                raise ValueError('v2 release windows plan binds another subtitle input')
+        expected_timeline = current(ledger['artifacts']['authoritative_timeline_receipt'])
+        if timeline.resolve() != expected_timeline.resolve():
+            raise ValueError('v2 release windows plan binds another timeline')
+    return payload
+
+
+def prepare_plan(
+    run_file, output, *, presenter_foreground, fixed_anchor_x,
+    canvas_width=1920, source_width=1920, source_height=1080,
+    rendered_height=1080, fixed_anchor_y=0, person_crop=None,
+    person_layout_policy='source-native-fixed-anchor/v2',
+    b_windows=None, c_windows=None,
+):
     from story_run import load_run
     from story_production_v2 import current, binding, write
     from story_timeline import validate_authoritative_timeline_receipt
     from story_workflow import build_abc_scene_windows
     from release_video import parse_b_windows
+    from presenter_layout import scan_rvm_body_overflow
+    from story_release_policy import (
+        WINDOWS_PLAN_SCHEMA, cover_presenter_risks, format_windows,
+        presenter_scan_cache_path,
+    )
     run = load_run(Path(run_file))
     if run.get('production_contract') != 'story-production/v2':
         raise ValueError('ABC preparation requires story-production/v2')
@@ -76,18 +172,53 @@ def prepare_plan(run_file, output):
     validate_authoritative_timeline_receipt(timeline)
     srt = current(run['inputs']['subtitle_srt'])
     duration = json.loads(timeline.read_text())['audio_duration_seconds']
-    b, c = build_abc_scene_windows(duration, srt)
-    bw, cw = parse_b_windows(b), parse_b_windows(c)
+    if (b_windows is None) != (c_windows is None):
+        raise ValueError('explicit ABC plan requires both b_windows and c_windows')
+    if b_windows is None:
+        base_b, base_c = build_abc_scene_windows(duration, srt)
+        preparation = 'mature_auto_with_presenter_protection'
+    else:
+        base_b, base_c = str(b_windows), str(c_windows)
+        preparation = 'explicit_with_presenter_protection'
+    base_bw, cw = parse_b_windows(base_b), parse_b_windows(base_c)
+    segments(duration, base_bw, cw)
+    scan_parameters = dict(
+        fixed_anchor_x=int(fixed_anchor_x), fixed_anchor_y=int(fixed_anchor_y),
+        canvas_width=int(canvas_width), source_width=int(source_width),
+        source_height=int(source_height), rendered_height=int(rendered_height),
+        person_crop=person_crop, person_layout_policy=person_layout_policy,
+    )
+    report_path, expected_cache_key = presenter_scan_cache_path(
+        root, Path(presenter_foreground), **scan_parameters,
+    )
+    overflow = scan_rvm_body_overflow(
+        Path(presenter_foreground), report_path=report_path, **scan_parameters,
+    )
+    if overflow.get('cache_key') != expected_cache_key:
+        raise ValueError('presenter overflow scan returned stale cache evidence')
+    severe = [tuple(map(float, row)) for row in overflow.get('severe_windows', [])]
+    bw, protection_coverage = cover_presenter_risks(base_bw, cw, severe, duration=duration)
+    b, c = format_windows(bw), format_windows(cw)
     spans = segments(duration, bw, cw)
     if duration >= 30 and (not bw or not cw or not any(x[2] == 'a' for x in spans)):
         raise ValueError('mature auto plan cannot supply all A/B/C at this duration; explicit reviewed plan required')
     rules = [{**binding(Path(__file__).parent/relative), 'source_relative_path':relative} for relative in
-             ['story_scene_windows.py','story_workflow.py','skills/story-full-auto/references/video-invariants.md']]
-    payload = {'schema_version': 'story-project-release-windows-plan/v1', 'preparation': 'mature_auto',
-        'inputs': {'subtitle_srt': binding(srt), 'authoritative_timeline_receipt': binding(timeline)},
+             ['story_scene_windows.py','story_release_policy.py','presenter_layout.py','story_workflow.py',
+              'skills/story-full-auto/references/video-invariants.md']]
+    payload = {'schema_version': WINDOWS_PLAN_SCHEMA, 'preparation': preparation,
+        'inputs': {'subtitle_srt': binding(srt), 'authoritative_timeline_receipt': binding(timeline),
+                   'presenter_foreground': binding(Path(presenter_foreground))},
         'rules': rules, 'duration_seconds': duration, 'b_windows': b, 'c_windows': c,
+        'base_windows': {'b_windows': base_b, 'c_windows': base_c},
+        'presenter_protection': {
+            'status': 'all_risks_covered_by_b_or_c',
+            'report': binding(report_path),
+            'cache_key': overflow['cache_key'],
+            'severe_windows': [list(row) for row in severe],
+            'coverage': protection_coverage,
+        },
         'segments': [{'start': s, 'end': e, 'mode': m} for s,e,m in spans],
-        'review_samples': coverage_samples(duration,bw,cw), 'independent_review': 'merge_with_release_preview'}
+        'review_samples': review_samples(duration,bw,cw,severe), 'independent_review': 'merge_with_release_preview'}
     if output.exists():
         existing = json.loads(output.read_text())
         def identity(value):
@@ -95,19 +226,43 @@ def prepare_plan(run_file, output):
         if identity(existing) != identity(payload):
             raise ValueError('existing ABC plan differs; use a new output path for changed inputs/rules')
         for rule in existing['rules']: current_rule(rule)
+        validate_plan(output, ledger=run)
         return existing
     else: write(output, payload)
+    validate_plan(output, ledger=run)
     return payload
 
 
 def frame_templates(config, directory):
     from release_video import prepare_story_frame_assets
-    from story_production_v2 import binding
+    from story_production_v2 import binding, write
+    from story_release_policy import FRAME_DERIVATION_SCHEMA
     directory = Path(directory); directory.mkdir(parents=True, exist_ok=True)
+    if config.frame_image is None:
+        raise ValueError('shared story-frame mother asset is missing')
     result = {}
-    for mode, source, box in [('a',config.frame_image, config.story_box), ('b',config.frame_image_b or config.frame_image, config.b_story_box)]:
-        path, _, _ = prepare_story_frame_assets(source, box, directory/f'frame_{mode}.png', directory/f'mask_{mode}.png',config.story_bleed)
+    derivatives = {}
+    for mode, box in [('a',config.story_box), ('b',config.b_story_box)]:
+        path, _, _ = prepare_story_frame_assets(config.frame_image, box, directory/f'frame_{mode}.png', directory/f'mask_{mode}.png',config.story_bleed)
         result[mode] = binding(path)
+        derivatives[mode] = {
+            'source_sha256': binding(config.frame_image)['sha256'],
+            'story_window': list(box),
+            'method': 'deterministic_fit_to_story_window',
+            'output': binding(path),
+        }
+    receipt = directory / 'frame_derivation_receipt.json'
+    payload = {
+        'schema_version': FRAME_DERIVATION_SCHEMA,
+        'production_contract': 'story-production/v2',
+        'mother_asset': binding(config.frame_image),
+        'independent_b_asset': False,
+        'derivatives': derivatives,
+    }
+    if receipt.exists() and json.loads(receipt.read_text()) != payload:
+        raise ValueError('existing A/B frame derivation differs; use a new evidence directory')
+    if not receipt.exists(): write(receipt, payload)
+    result['derivation_receipt'] = binding(receipt)
     return result
 
 
@@ -122,7 +277,7 @@ def observed_frame_mode(image, templates, presenter_image=None):
     from story_production_v2 import current
     actual = np.asarray(image.convert('RGB').resize((1920,1080))).astype(float)
     scores = {}
-    for mode, item in templates.items():
+    for mode, item in ((mode, templates[mode]) for mode in ('a', 'b')):
         frame = Image.open(current(item)).convert('RGBA').resize((1920,1080))
         # Erode opaque mask to omit antialiasing; right-hand presenter and bottom
         # subtitles are excluded from the invariant frame-color measurement.
@@ -177,16 +332,16 @@ def audit_video(video, plan, templates, output, *, video_box=None, presenter=Non
     from release_video import parse_b_windows
     video = Path(video); plan = Path(plan); output = Path(output)
     before = binding(video); plan_bound = binding(plan)
-    payload = json.loads(plan.read_text())
-    for item in payload['inputs'].values(): current(item)
-    for item in payload['rules']: current_rule(item)
+    payload = validate_plan(plan)
+    from story_release_policy import validate_frame_derivation
+    derivation = validate_frame_derivation(current(templates.get('derivation_receipt') or {}))
     duration = json.loads(current(payload['inputs']['authoritative_timeline_receipt']).read_text())['audio_duration_seconds']
     bw, cw = parse_b_windows(payload['b_windows']), parse_b_windows(payload['c_windows'])
     spans = segments(duration,bw,cw)
     if duration >= 30 and {x[2] for x in spans} != {'a','b','c'}: raise ValueError('main ABC plan lacks required A/B/C')
     from release_video import validate_main_scene_ending
     validate_main_scene_ending(spans,duration,current(payload['inputs']['subtitle_srt']))
-    samples = coverage_samples(duration,bw,cw)
+    samples = payload['review_samples']
     root = output.parent / (output.stem+'_frames'); root.mkdir(parents=True,exist_ok=True)
     errors = []
     for i, sample in enumerate(samples):
@@ -201,9 +356,13 @@ def audit_video(video, plan, templates, output, *, video_box=None, presenter=Non
         if sample['expected_mode'] != sample['observed_mode']:
             errors.append(f"ABC actual mode mismatch at {sample['time_seconds']}: expected {sample['expected_mode']}, observed {sample['observed_mode']}")
     if binding(video) != before or binding(plan) != plan_bound: errors.append('ABC input changed during audit')
-    report = {'schema_version':'story-abc-decoded-coverage/v1','video':before,'plan':plan_bound,
+    plan_compliance = {'passed': True, 'presenter_protection': payload['presenter_protection']}
+    execution_compliance = {'passed': not errors, 'critical_errors': list(errors)}
+    report = {'schema_version':'story-abc-decoded-coverage/v2','video':before,'plan':plan_bound,
         'templates':templates,'video_box':video_box,'presenter':presenter,'samples':samples,'critical_errors':errors,'passed':not errors,
-        'scope':'frame geometry presence; presenter and composition require merged independent review',
+        'plan_compliance': plan_compliance, 'execution_compliance': execution_compliance,
+        'frame_derivation': {'receipt': templates['derivation_receipt'], 'mother_asset': derivation['mother_asset']},
+        'scope':'plan safety plus decoded frame execution; presenter composition requires merged independent review',
         'independent_visual_review':'required_separately'}
     write(output,report)
     return report
@@ -212,16 +371,18 @@ def audit_video(video, plan, templates, output, *, video_box=None, presenter=Non
 def validate_coverage_report(path, video):
     from story_production_v2 import current
     report = json.loads(Path(path).read_text())
-    if report.get('schema_version') != 'story-abc-decoded-coverage/v1' or report.get('passed') is not True or report.get('critical_errors'):
+    if report.get('schema_version') != 'story-abc-decoded-coverage/v2' or report.get('passed') is not True or report.get('critical_errors'):
         raise ValueError('ABC decoded coverage missing or failed')
     if current(report['video']).resolve() != Path(video).resolve(): raise ValueError('ABC coverage binds another video')
-    plan = json.loads(current(report['plan']).read_text())
-    for item in [*plan['inputs'].values(), *report['templates'].values()]: current(item)
-    for rule in plan['rules']: current_rule(rule)
+    plan_path = current(report['plan'])
+    plan = validate_plan(plan_path)
+    for item in report['templates'].values(): current(item)
+    from story_release_policy import validate_frame_derivation
+    validate_frame_derivation(current(report['frame_derivation']['receipt']))
     if report.get('presenter'): current(report['presenter']['source'])
     from release_video import parse_b_windows
     duration = json.loads(current(plan['inputs']['authoritative_timeline_receipt']).read_text())['audio_duration_seconds']
-    expected = coverage_samples(duration, parse_b_windows(plan['b_windows']), parse_b_windows(plan['c_windows']))
+    expected = plan['review_samples']
     if len(report['samples']) != len(expected): raise ValueError('ABC coverage sample set incomplete')
     for actual, wanted in zip(report['samples'], expected):
         current(actual['frame'])
@@ -233,7 +394,24 @@ def validate_coverage_report(path, video):
 def main():
     parser=argparse.ArgumentParser(description='Prepare mature auto ABC plan for the existing merged release preview review')
     parser.add_argument('--run-file',required=True,type=Path); parser.add_argument('--output',required=True,type=Path)
-    args=parser.parse_args(); p=prepare_plan(args.run_file,args.output)
+    parser.add_argument('--presenter-foreground',required=True,type=Path)
+    parser.add_argument('--fixed-anchor-x',required=True,type=int)
+    parser.add_argument('--fixed-anchor-y',default=0,type=int)
+    parser.add_argument('--canvas-width',default=1920,type=int)
+    parser.add_argument('--source-width',default=1920,type=int)
+    parser.add_argument('--source-height',default=1080,type=int)
+    parser.add_argument('--rendered-height',default=1080,type=int)
+    parser.add_argument('--person-layout-policy',default='source-native-fixed-anchor/v2')
+    parser.add_argument('--b-windows')
+    parser.add_argument('--c-windows')
+    args=parser.parse_args(); p=prepare_plan(
+        args.run_file,args.output,presenter_foreground=args.presenter_foreground,
+        fixed_anchor_x=args.fixed_anchor_x,fixed_anchor_y=args.fixed_anchor_y,
+        canvas_width=args.canvas_width,source_width=args.source_width,
+        source_height=args.source_height,rendered_height=args.rendered_height,
+        person_layout_policy=args.person_layout_policy,
+        b_windows=args.b_windows,c_windows=args.c_windows,
+    )
     print(json.dumps({'plan':str(args.output.resolve()),'b_windows':p['b_windows'],'c_windows':p['c_windows'], 'sample_count':len(p['review_samples'])},ensure_ascii=False))
 
 if __name__ == '__main__': main()

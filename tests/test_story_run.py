@@ -901,6 +901,7 @@ for index in range(20):
                         "passed": True,
                         "current_story_redesign": True,
                         "no_reference_theme_leak": True,
+                        "single_mother_asset_ab_derivation": True,
                         "solid_magenta_source": True,
                         "continuous_opaque_four_sides": True,
                         "inner_masking_lip": True,

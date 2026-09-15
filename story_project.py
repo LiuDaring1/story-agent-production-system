@@ -1547,7 +1547,7 @@ def build_theme_asset_imagegen_request(
 - 回执写 `generation_methods`：主账号上下图为 `imagegen_reference_edit`，宝库号上下图为 `imagegen_raster` 或 `imagegen_reference_edit`，故事框源图为 `imagegen_raster` 或 `imagegen_reference_edit`，透明框为 `native_alpha_passthrough` 或 `raster_alpha_postprocess`；并明确写 `svg_used=false`。
 - 回执必须写 `story_identity`，并在 `account_role_review` 中确认：参考图的简洁层级被保留、主账号没有做成宝库号资料包商品页、信息层级清楚，并附具体 evidence。
 - 回执必须写 `background_clean_review`，其中 `passed`、`not_preblurred`、`no_vignette`、`no_logo_badge_or_corner_emblem`、`no_text_or_watermark` 均为 true，并附具体 evidence。
-- 回执必须写 `frame_design_review`，其中 `passed`、`frame_reference_attached`、`geometry_preserved`、`current_story_redesign`、`no_reference_theme_leak`、`true_alpha_verified` 均为 true，并附具体 evidence。
+- 回执必须写 `frame_design_review`，其中 `passed`、`frame_reference_attached`、`geometry_preserved`、`current_story_redesign`、`no_reference_theme_leak`、`single_mother_asset_ab_derivation`、`true_alpha_verified` 均为 true，并附具体 evidence。
 """
 
 
@@ -1622,6 +1622,10 @@ def main_package_generation_receipt_issues(
     if receipt.get("svg_used") is not False:
         issues.append("main_package_svg_or_unverified_vector_workflow_forbidden")
     generation_methods = receipt.get("generation_methods") if isinstance(receipt.get("generation_methods"), Mapping) else {}
+    outputs = receipt.get("outputs") if isinstance(receipt.get("outputs"), Mapping) else {}
+    if any("frame_b" in str(key).lower() or "story_frame_b" in str(key).lower()
+           for key in [*generation_methods, *outputs]):
+        issues.append("main_package_independent_b_frame_forbidden")
     allowed_methods = {
         "top_plate": {"imagegen_reference_edit"},
         "bottom_plate": {"imagegen_reference_edit"},
@@ -1692,13 +1696,13 @@ def main_package_generation_receipt_issues(
     for field in (
         "passed", "frame_reference_attached", "geometry_preserved",
         "current_story_redesign", "no_reference_theme_leak",
+        "single_mother_asset_ab_derivation",
         "true_alpha_verified" if spec.get("frame_source_mode") == "imagegen_native_alpha" else "solid_magenta_source",
     ):
         if frame_review.get(field) is not True:
             issues.append(f"main_package_frame_design_review_failed:{field}")
     if not str(frame_review.get("evidence") or "").strip():
         issues.append("main_package_frame_design_review_evidence_missing")
-    outputs = receipt.get("outputs") if isinstance(receipt.get("outputs"), Mapping) else {}
     for key, path in expected_outputs.items():
         item = outputs.get(key) if isinstance(outputs.get(key), Mapping) else {}
         if not path.is_file():

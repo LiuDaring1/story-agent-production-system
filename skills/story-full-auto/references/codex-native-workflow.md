@@ -5,6 +5,7 @@
 ## 工作交接与审核依据
 
 每包先读本次实际规则和机器自检，生成 `story-applicable-requirements/v1` 小投影：当前输入哈希、规则源版本、账号/镜头/产物范围、原要求与来源、执行参数、验收证据。生产和独立审核共用此文件。用户要求覆盖默认时保留来源与范围，不能再写回默认。
+涉及 v2 主账号发布时，投影必须直接采用 `story_release_policy.release_safety_requirements()` 的两条完整参数化要求，验收证据至少包含 `presenter_body_overflow_report`、`release_plan_compliance`、`decoded_video_execution`、`shared_frame_derivation` 和 `independent_visual_review`。正式生产入口会对该投影再验证，不接受笼统改写。
 
 导演计划独立审核一次；资产和故事板整组分别审核；RVM 候选锁定独立审核；R2V 下载做逐镜机器检查，连续预览与问题镜头整组审核；最后合并交付审核。只对真实变化及显式依赖扩大检查，不把审美偏好当硬门禁，不默认 Max。
 
@@ -24,6 +25,6 @@
 
 先运行 `story_pipeline.py release-windows --run-file RUN --output PROJECT/99_项目状态/release_windows_vN.json`。它从当前权威时长和字幕边界生成成熟自动窗口及抽样；输入和规则内容未变可复用，变化时用新版本计划。某些边界时长无法同时满足成熟自动规则和 A/B/C 覆盖时显式阻断，由当前任务提供合法且经过合并审核的计划，不静默退化全 A。
 
-`release` 默认 `--b-windows auto --c-windows auto`，显式传 `--release-windows-plan PLAN`。预览根据实际计划抽取每段中点及切换两侧，并运行真实时间窗滤镜。计划SHA并入已有几何独立审核，预览不必另开窗口审核；正式使用当前 `--approved-preview-geometry` 和 `--approved-preview-review`。兼容已有独立窗口回执，不要求每个窗口单独审核。
+`release` 默认 `--b-windows auto --c-windows auto`，显式传 `--release-windows-plan PLAN`。`release-windows` 必须传当前 `--presenter-foreground`、`--fixed-anchor-x` 及实际尺寸/布局策略；显式 B/C 窗口也用同一入口的 `--b-windows/--c-windows` 封存，不手写无扫描计划。预览根据实际计划自动抽取全部躺干风险起/中/止、A/B同源对照与切换两侧，并运行真实时间窗滤镜。`release_review_evidence.json` 只记已准备帧；独立审核回执须逐项写入实际打开的时间、文件和 SHA-256，不得用“每五秒”或“全片”布尔自述代替。计划 SHA 并入已有几何独立审核；正式使用当前 `--approved-preview-geometry` 和 `--approved-preview-review`。
 
 正式主账号生成 `main_abc_coverage.json`；`release-qa`核验当前计划、视频和模板哈希并重新解码。expected_mode来自计划；observed_mode来自A/B框体实际几何和C镜当前人物源/已审Demo几何像素，空白不当成C。机器检查仍不替代合并独立视觉审核：审核者打开生成的ABC及边界帧，判断人物/构图、字幕、Logo及首尾。宝库号不套主账号切镜规则。

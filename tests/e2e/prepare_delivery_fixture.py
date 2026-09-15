@@ -53,7 +53,7 @@ def main():
         'frame_reference':{**binding(frame),'role':'geometry_only_not_theme_or_ornament','locked_properties':['screen_placement','large_16_9_aperture','continuous_practical_border_thickness']},
         'sources':{'environment':binding(background),'story_frame_alpha':{**binding(frame),'method':'imagegen_reference_edit','checkerboard':False}},
         'artifacts':{'main_background_16x9':{**binding(background),'method':'imagegen_reference_edit'},'story_frame_png':{**binding(frame),'method':'native_alpha_passthrough','derived_from':['story_frame_alpha'],'has_true_alpha':True}},
-        'frame_design_review':{'passed':True,'current_story_redesign':True,'no_reference_theme_leak':True,'true_alpha_verified':True,'continuous_opaque_four_sides':True,'inner_masking_lip':True,'evidence':str(theme_review)},
+        'frame_design_review':{'passed':True,'current_story_redesign':True,'no_reference_theme_leak':True,'single_mother_asset_ab_derivation':True,'true_alpha_verified':True,'continuous_opaque_four_sides':True,'inner_masking_lip':True,'evidence':str(theme_review)},
         'background_clean_review':{'passed':True,'not_preblurred':True,'controlled_high_frequency_detail':True,'no_text_logo_or_vignette':True},
         'svg_used':False,'fixture_boundary':'SIMULATED native-provider upstream; independent review covers only actual offline fixture pixels and geometry','production_eligible':False})
     roles={'master_director_plan':director_target,'director_plan_review':director_review,'storyboard_manifest_sealed':storyboard_target,'storyboard_review':storyboard_review,

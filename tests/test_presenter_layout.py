@@ -7,6 +7,7 @@ from PIL import Image, ImageDraw
 from presenter_layout import (
     PRESENTER_LAYOUT_POLICY,
     body_core_visibility_fraction,
+    body_overflow_sample_geometry,
     compile_fixed_anchor,
     severe_body_overflow_windows,
     source_native_fixed_anchor_issues,
@@ -15,6 +16,28 @@ from presenter_layout import (
 
 
 class PresenterLayoutTests(unittest.TestCase):
+    def test_scan_coordinates_include_the_actual_render_scale_and_crop(self) -> None:
+        geometry = body_overflow_sample_geometry(
+            fixed_anchor_x=300,
+            canvas_width=1920,
+            source_width=320,
+            source_height=180,
+            rendered_height=1080,
+        )
+        self.assertEqual(geometry["sample_width"], 320)
+        self.assertAlmostEqual(float(geometry["anchor_x"]), 50.0)
+        self.assertEqual(geometry["canvas_width"], 320)
+        cropped = body_overflow_sample_geometry(
+            fixed_anchor_x=300,
+            canvas_width=1920,
+            source_width=640,
+            source_height=360,
+            rendered_height=1080,
+            person_crop=(160, 0, 320, 180),
+        )
+        self.assertEqual(cropped["person_crop"], [160, 0, 320, 180])
+        self.assertAlmostEqual(float(cropped["anchor_x"]), 50.0)
+
     def test_source_native_policy_blocks_crop_and_scale(self) -> None:
         self.assertEqual(
             source_native_layout_issues(

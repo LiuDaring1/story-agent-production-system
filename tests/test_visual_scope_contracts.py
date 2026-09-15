@@ -120,6 +120,7 @@ class VisualScopeTests(unittest.TestCase):
             handoff = build_theme_asset_handoff(root/'request.md')
             self.assertIn('优先真实Alpha', handoff)
             self.assertNotIn('禁止棋盘格、白底或直接透明输出', handoff)
-            self.assertIn('仅设计A镜框体',result)
+            self.assertIn('仅设计一个故事框母资产',result)
+            self.assertIn('不得生成、登记或伪装第二个B框设计',result)
             self.assertIn('优先真实Alpha',result)
             self.assertNotIn('禁止棋盘格、白底、渐变底、透明预览或直接透明输出',result)

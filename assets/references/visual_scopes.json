@@ -7,5 +7,5 @@
     "review_checks": ["text_matches_confirmed_prompt", "no_reference_story_leak", "top_bottom_coherent", "independent_library_style", "readable_information_hierarchy", "confirmed_product_contents"],
     "historical_visual_target": {"status": "needs_confirmation", "reason": "当前恢复源码没有可追溯、明确认可的宝库号视觉样板；反馈中的当前截图为问题证据，不冒充认可模板"}
   },
-  "frame": {"prompt": "仅设计A镜框体。固定参考只约束结构、16:9开口和实用遮边厚度，不继承主账号或宝库号包装风格。主题融入框条，不把完整风景铺进宽框。优先真实Alpha透明图，保留半透明边缘；PNG后缀不证明透明。透明窗口与外部必须实际透明，禁止棋盘格假透明。遗留洋红源图可经连通色键兼容，不得通过侵蚀边框或改变窗口几何掩盖粉边。最终需实际预览和独立视觉审核。", "review_checks": ["geometry_preserved", "true_alpha_verified", "no_reference_theme_leak", "edge_composite_review"]}
+  "frame": {"prompt": "仅设计一个故事框母资产。A/B镜必须从该母资产确定性适配尺寸和位置，不得生成、登记或伪装第二个B框设计。固定参考只约束结构、16:9开口和实用遮边厚度，不继承主账号或宝库号包装风格。主题融入框条，不把完整风景铺进宽框。优先真实Alpha透明图，保留半透明边缘；PNG后缀不证明透明。透明窗口与外部必须实际透明，禁止棋盘格假透明。遗留洋红源图可经连通色键兼容，不得通过侵蚀边框或改变窗口几何掩盖粉边。最终需实际预览A/B对照、透明开口和独立视觉审核。", "review_checks": ["geometry_preserved", "true_alpha_verified", "no_reference_theme_leak", "edge_composite_review", "single_mother_asset_ab_derivation"]}
 }

@@ -507,6 +507,14 @@ def _validate_theme_assets_v3(payload: dict[str, Any]) -> None:
     artifacts = payload.get("artifacts")
     if not isinstance(sources, dict) or not isinstance(artifacts, dict):
         raise ValueError("v3 发布美术缺少 sources 或 artifacts")
+    forbidden_b_roles = [
+        f"{collection_name}.{name}"
+        for collection_name, collection in (("sources", sources), ("artifacts", artifacts))
+        for name in collection
+        if "frame_b" in str(name).lower() or "story_frame_b" in str(name).lower()
+    ]
+    if forbidden_b_roles:
+        raise ValueError("v3 新生产禁止独立 B 故事框：" + "、".join(forbidden_b_roles))
     vector_lineage = []
     for collection_name, collection in (("sources", sources), ("artifacts", artifacts)):
         for name, item in collection.items():
@@ -563,6 +571,7 @@ def _validate_theme_assets_v3(payload: dict[str, Any]) -> None:
         "passed",
         "current_story_redesign",
         "no_reference_theme_leak",
+        "single_mother_asset_ab_derivation",
         "true_alpha_verified" if native_alpha else "solid_magenta_source",
         "continuous_opaque_four_sides",
         "inner_masking_lip",

@@ -52,6 +52,17 @@ def load_plan(path: Path) -> dict[str, Any]:
     return payload
 
 
+def write_new_or_same_json(path: Path, payload: dict[str, Any], *, label: str) -> None:
+    """Create a derived JSON artifact without replacing different content."""
+    serialized = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    if path.exists():
+        if not path.is_file() or path.read_text(encoding="utf-8") != serialized:
+            raise ValueError(f"{label}目标已存在且内容不同；请使用新的版本化路径")
+        return
+    from story_production_v2 import write
+    write(path, payload)
+
+
 def validate_formal_r2v_bindings(
     *,
     plan_path: Path,
@@ -501,7 +512,7 @@ def main() -> int:
         from story_run import file_sha256 as ledger_sha256, load_run
 
         from story_render_task import bind_render_task
-        bind_render_task(args.run_file, outputs=[output_path, decisions_path, clips_dir])
+        bind_render_task(args.run_file, outputs=[output_path, decisions_path, clips_dir, ppt_plan_path])
         ledger = load_run(args.run_file.expanduser())
         current_audio = ledger.get("inputs", {}).get("audio", {})
         resolved_audio = audio_path.resolve()
@@ -732,8 +743,7 @@ def main() -> int:
         "story_name": str(plan.get("story_name") or plan.get("story_title") or plan.get("story_id") or "story"),
         "slides": ppt_slides,
     }
-    ppt_plan_path.parent.mkdir(parents=True, exist_ok=True)
-    ppt_plan_path.write_text(json.dumps(ppt_plan, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    write_new_or_same_json(ppt_plan_path, ppt_plan, label="PPT 计划")
     print(json.dumps({
         "output": str(output_path),
         "sha256": payload["output_sha256"],

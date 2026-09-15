@@ -320,22 +320,11 @@ def main() -> None:
         output_scale=args.output_scale,
     )
 
-    # auto is resolved before constructing config, so it cannot become empty
-    # renderer arguments after v2 bypasses the historical workflow wrapper.
-    if args.variant in {"main", "both"} and (args.b_windows == "auto" or args.c_windows == "auto"):
-        if args.run_file is None:
-            parser.error("auto A/B/C requires --run-file and a current release windows plan")
-        from story_scene_windows import prepare_plan
-        if args.release_windows_plan is None:
-            from story_run import load_run
-            root = Path(load_run(args.run_file)["project_dir"])
-            args.release_windows_plan = root / "99_项目状态" / "release_windows_auto.json"
-        if not args.release_windows_plan.exists():
-            prepare_plan(args.run_file, args.release_windows_plan)
-        windows = json.loads(args.release_windows_plan.read_text())
-        if args.b_windows == "auto": args.b_windows = windows["b_windows"]
-        if args.c_windows == "auto": args.c_windows = windows["c_windows"]
-    elif args.variant == "library":
+    auto_windows_requested = (
+        args.variant in {"main", "both"}
+        and (args.b_windows == "auto" or args.c_windows == "auto")
+    )
+    if args.variant == "library":
         if args.b_windows == "auto": args.b_windows = ""
         if args.c_windows == "auto": args.c_windows = ""
 
@@ -372,6 +361,29 @@ def main() -> None:
     person_video_path = args.person_greenscreen.expanduser() if args.person_greenscreen else None
     if keyer == "rvm":
         person_video_path = Path(str(keying["rvm_foreground_video"]))
+    if auto_windows_requested:
+        if args.run_file is None or person_video_path is None:
+            parser.error("auto A/B/C requires --run-file and the current RVM presenter foreground")
+        if args.release_windows_plan is None:
+            from story_run import load_run
+            root = Path(load_run(args.run_file)["project_dir"])
+            args.release_windows_plan = root / "99_项目状态" / "release_windows_auto.json"
+        from story_scene_windows import prepare_plan
+        windows = prepare_plan(
+            args.run_file,
+            args.release_windows_plan,
+            presenter_foreground=person_video_path,
+            fixed_anchor_x=person_x,
+            fixed_anchor_y=person_y,
+            canvas_width=1920,
+            source_width=int(keying.get("rvm_input_width", 1920)),
+            source_height=int(keying.get("rvm_input_height", 1080)),
+            rendered_height=person_height,
+            person_crop=parse_optional_box(person_crop_value, "--person-crop"),
+            person_layout_policy=person_layout_policy,
+        )
+        if args.b_windows == "auto": args.b_windows = windows["b_windows"]
+        if args.c_windows == "auto": args.c_windows = windows["c_windows"]
     config = ReleaseConfig(
         story_name=args.story_name,
         duration_text=normalize_duration_label(args.duration_text),
@@ -514,9 +526,6 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path, *, preview: b
     if not config.output_dir.resolve().is_relative_to(root):
         raise ValueError("v2 release output is outside current project")
     accounts = ["main", "library"] if config.variant == "both" else [config.variant]
-    validate_run_projection(run_file, consumer_scope={"accounts": accounts,
-        "artifacts": [f"{a}_release_video" for a in accounts]},
-        parameters={"variant": config.variant, "output_scale": config.output_scale})
     if config.keyer != "rvm":
         raise ValueError("v2 release requires RVM; no chromakey fallback")
     if not config.release_producer_context:
@@ -538,6 +547,22 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path, *, preview: b
     if config.bg_video.expanduser().resolve() != reviewed_background_path.resolve():
         raise ValueError("v2 release bg_video differs from current reviewed music-only background")
     projection_path = current(ledger["artifacts"]["requirements_projection"])
+    projection = validate_run_projection(run_file, consumer_scope={"accounts": accounts,
+        "artifacts": [f"{a}_release_video" for a in accounts]},
+        parameters={"variant": config.variant, "output_scale": config.output_scale})
+    if "main" in accounts:
+        from story_release_policy import validate_release_safety_projection
+        validate_release_safety_projection(projection)
+        if config.frame_image_b is not None:
+            raise ValueError("v2 main release forbids --frame-image-b; A/B must derive from --frame-image")
+        from story_run import validate_theme_assets_manifest
+        if not ledger.get("artifacts", {}).get("theme_assets_manifest"):
+            raise ValueError("v2 main release lacks the current single-source theme manifest")
+        theme_path = current(ledger["artifacts"]["theme_assets_manifest"])
+        theme = validate_theme_assets_manifest(theme_path, require_v3=True)
+        frame_item = theme.get("artifacts", {}).get("story_frame_png", {})
+        if config.frame_image is None or current(frame_item).resolve() != config.frame_image.resolve():
+            raise ValueError("v2 release story frame differs from the current single-source theme manifest")
     if config.artifact_semantic_plan is None:
         raise ValueError("v2 release requires the bound semantic card plan")
     semantic_path = config.artifact_semantic_plan.resolve()
@@ -583,6 +608,33 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path, *, preview: b
         raise ValueError("v2 release must use full confirmed SRT")
     if config.person_greenscreen is None or current(preview["inputs"]["foreground"]).resolve() != config.person_greenscreen.resolve():
         raise ValueError("v2 release foreground differs from approved Demo")
+    expected_crop = [0, 0, int(config.rvm_input_width), int(config.rvm_input_height)]
+    presenter_scan_mismatches: list[str] = []
+    for field, expected in (
+        ("source_width", int(config.rvm_input_width)),
+        ("source_height", int(config.rvm_input_height)),
+        ("rendered_height", int(config.person_height)),
+        ("y", int(config.person_y)),
+    ):
+        try:
+            actual = int(demo.get(field))
+        except (TypeError, ValueError):
+            actual = None
+        if actual != expected:
+            presenter_scan_mismatches.append(field)
+    if demo.get("source_native") is not True or list(demo.get("source_crop") or []) != expected_crop:
+        presenter_scan_mismatches.append("source_crop")
+    try:
+        rendered_width = int(demo.get("rendered_width"))
+    except (TypeError, ValueError):
+        rendered_width = 0
+    if not (-rendered_width + 1 <= int(config.person_x) <= WIDE_WIDTH - 1):
+        presenter_scan_mismatches.append("fixed_anchor_x_clamp")
+    if presenter_scan_mismatches:
+        raise ValueError(
+            "v2 presenter protection scan geometry differs from the approved/actual "
+            "A-shot transform: " + ", ".join(sorted(set(presenter_scan_mismatches)))
+        )
     if config.antipiracy_logo is None or config.antipiracy_logo.resolve() != config.story_logo.resolve():
         raise ValueError("v2 library must use the same approved official logo")
     if (list(config.story_box) != [210, 270, 910, 512]
@@ -593,12 +645,27 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path, *, preview: b
         from story_production_v2 import validate_independent_approval
         if config.release_windows_plan is None or (config.release_windows_review is None and not preview and (config.approved_preview_geometry is None or config.approved_preview_review is None)):
             raise ValueError("v2 main release requires a reviewed A/B/C windows plan")
-        windows = json.loads(config.release_windows_plan.read_text())
-        if windows.get("schema_version") != "story-project-release-windows-plan/v1":
-            raise ValueError("v2 release windows plan schema invalid")
-        for item in windows.get("inputs", {}).values(): current(item)
-        from story_scene_windows import current_rule
-        for item in windows.get("rules", []): current_rule(item)
+        from story_scene_windows import validate_plan
+        windows = validate_plan(config.release_windows_plan, ledger=ledger)
+        from presenter_layout import body_overflow_cache_key
+        scan_path = current(windows["presenter_protection"]["report"])
+        scan_key = json.loads(scan_path.read_text(encoding="utf-8")).get("cache_key")
+        expected_scan_key = body_overflow_cache_key(
+            config.person_greenscreen,
+            fixed_anchor_x=config.person_x,
+            fixed_anchor_y=config.person_y,
+            canvas_width=WIDE_WIDTH,
+            source_width=config.rvm_input_width,
+            source_height=config.rvm_input_height,
+            rendered_height=config.person_height,
+            person_crop=config.person_crop,
+            person_layout_policy=config.person_layout_policy,
+        )
+        if scan_key != expected_scan_key:
+            raise ValueError(
+                "v2 release presenter protection evidence does not bind the actual "
+                "foreground, fixed anchor, size, crop, policy, parameters, and code"
+            )
         for role, expected in (("subtitle_srt", current(ledger["inputs"]["subtitle_srt"])),
                                ("authoritative_timeline_receipt", timeline_path)):
             if current(windows["inputs"][role]).resolve() != expected.resolve():
@@ -621,11 +688,6 @@ def compile_v2_release_spec(config: ReleaseConfig, run_file: Path, *, preview: b
         validate_main_scene_ending(actual_segments, float(duration), config.subtitle_srt)
         if not any(item[2] == "a" for item in actual_segments):
             raise ValueError("main release requires an A segment")
-        if windows.get("preparation") == "mature_auto":
-            from story_workflow import build_abc_scene_windows
-            expected = build_abc_scene_windows(float(duration), config.subtitle_srt)
-            if expected != (windows.get("b_windows"), windows.get("c_windows")):
-                raise ValueError("auto windows differ from mature subtitle/ending rules")
         if config.release_windows_review is not None:
             validate_independent_approval(json.loads(config.release_windows_review.read_text()),
                 config.release_windows_plan, producer_context=config.release_producer_context)
@@ -936,7 +998,13 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict, *, preview: bool
             and config.detected_person_bbox is not None
         ):
             anchor_bbox = list(config.detected_person_bbox)
-        configured_anchor = preset.get("presenter_initial_anchor_x")
+        # Release layout is the reviewed owner of the fixed A-shot placement.
+        # A keying preset may retain an earlier calibration hint, but allowing
+        # that hint to override config.person_x would make the protection scan
+        # describe one anchor while the renderer uses another.
+        configured_anchor = (
+            config.person_x if is_v2 else preset.get("presenter_initial_anchor_x")
+        )
         presenter_a = release_a_geometry(
             demo,
             person_region,
@@ -1070,6 +1138,14 @@ def compile_release_geometry(config: ReleaseConfig, spec: dict, *, preview: bool
             review = json.loads(config.approved_preview_review.read_text())
             validate_independent_approval(review, config.approved_preview_geometry,
                                           producer_context=config.release_producer_context)
+            if config.variant in {"main", "both"}:
+                evidence_path = config.approved_preview_geometry.parent / "release_review_evidence.json"
+                validate_release_preview_review_evidence(
+                    review,
+                    evidence_path,
+                    expected_requirements=spec["requirements_projection"],
+                    expected_mother=config.frame_image,
+                )
     payload["formal_render_binding_sha256"] = preview_formal_binding_sha256(payload)
     if not preview and config.approved_preview_geometry is not None:
         try:
@@ -1446,6 +1522,54 @@ def validate_main_preview_mode_coverage(
         missing.append("A")
     if missing:
         raise ValueError("main release preview does not cover reviewed A/B/C modes: " + ", ".join(missing))
+
+
+def validate_release_preview_review_evidence(
+    review: dict,
+    evidence_path: Path,
+    *,
+    expected_requirements: dict,
+    expected_mother: Path,
+) -> dict:
+    """Prove which prepared frames the independent reviewer actually inspected."""
+    from story_production_v2 import current
+    from story_release_policy import validate_release_review_evidence
+
+    evidence = validate_release_review_evidence(
+        evidence_path,
+        expected_requirements=expected_requirements,
+        expected_mother=expected_mother,
+    )
+    prepared = evidence.get("prepared_frames")
+    checked = review.get("checked_frames")
+    if not isinstance(prepared, list) or not prepared or not isinstance(checked, list):
+        raise ValueError("v2 release review must list actual checked frames")
+    def identity(row):
+        frame = row.get("frame") if isinstance(row, dict) else None
+        if not isinstance(frame, dict):
+            raise ValueError("v2 release checked-frame binding invalid")
+        current(frame)
+        return (
+            round(float(row.get("time_seconds")), 3),
+            str(row.get("mode") or ""),
+            str(frame.get("path") or ""),
+            str(frame.get("sha256") or ""),
+        )
+    prepared_ids = {identity(row) for row in prepared}
+    checked_ids = {identity(row) for row in checked}
+    if prepared_ids != checked_ids:
+        raise ValueError("v2 release review checked frames do not match prepared risk/frame/boundary evidence")
+    checks = review.get("release_safety_checks")
+    required = {
+        "plan_compliance",
+        "presenter_risk_intervals",
+        "shared_frame_identity",
+        "switch_boundaries",
+        "transparent_aperture",
+    }
+    if not isinstance(checks, dict) or any(checks.get(key) is not True for key in required):
+        raise ValueError("v2 release review did not complete all existing safety checks")
+    return evidence
 
 
 def parse_preview_person_layouts(value: str, config: ReleaseConfig) -> list[tuple[str, ReleaseConfig]]:
@@ -2024,14 +2148,24 @@ def render_release_previews(
         write_json_atomic(preview_dir / f"release_geometry_manifest_{config.variant}.json", geometry)
     assets = render_static_assets(config, work_dir, geometry)
     port = release_layout_port or build_release_layout_registry().release_layout()
+    prepared_main_frames: list[dict[str, object]] = []
+    required_by_time: dict[float, dict] = {}
+    frame_derivation = None
+    presenter_report = None
     if config.variant in {"both", "main"}:
         if contract_spec is not None and contract_spec.get("schema_version") == V2_RELEASE_SPEC_SCHEMA:
-            from story_scene_windows import coverage_samples
-            duration = probe_duration(config.audio_mix)
-            required = coverage_samples(duration, config.b_windows, config.c_windows)
+            from story_scene_windows import frame_templates, validate_plan
+            from story_production_v2 import current
+            plan = validate_plan(config.release_windows_plan)
+            duration = float(plan["duration_seconds"])
+            required = plan["review_samples"]
+            required_by_time = {round(float(row["time_seconds"]), 3): row for row in required}
             times = sorted(set([t for t in times if t < duration] + [x["time_seconds"] for x in required]))
             write_json_atomic(preview_dir / "abc_review_samples.json", {"plan_sha256": sha256_path(config.release_windows_plan),
-                "samples": required, "scope": "expected modes; final decoded coverage is required separately"})
+                "samples": required, "scope": "presenter risks, shared A/B comparison, and every switch boundary; final decoded coverage is required separately"})
+            templates = frame_templates(config, preview_dir / "frame_evidence")
+            frame_derivation = templates["derivation_receipt"]
+            presenter_report = plan["presenter_protection"]["report"]
         validate_main_preview_mode_coverage(times, config.b_windows, config.c_windows)
         if config.bg_image is None or config.person_greenscreen is None or config.frame_image is None:
             raise ValueError("主账号预览需要 --bg-image、--person-greenscreen 和 --frame-image")
@@ -2063,6 +2197,13 @@ def render_release_previews(
                         assets["main_top"], assets["main_bottom"],
                     ),
                 )
+                if required_by_time.get(round(timestamp, 3)):
+                    from story_production_v2 import binding
+                    prepared_main_frames.append({
+                        "time_seconds": round(timestamp, 3), "mode": "b",
+                        "reasons": required_by_time[round(timestamp, 3)]["reasons"],
+                        "frame": binding(output),
+                    })
                 print(f"已生成主账号预览帧：{output}")
                 continue
             if use_c:
@@ -2088,6 +2229,13 @@ def render_release_previews(
                         assets["main_top"], assets["main_bottom"],
                     ),
                 )
+                if required_by_time.get(round(timestamp, 3)):
+                    from story_production_v2 import binding
+                    prepared_main_frames.append({
+                        "time_seconds": round(timestamp, 3), "mode": "c",
+                        "reasons": required_by_time[round(timestamp, 3)]["reasons"],
+                        "frame": binding(output),
+                    })
                 print(f"已生成主账号预览帧：{output}")
                 continue
             for label, layout_config in layouts:
@@ -2115,6 +2263,14 @@ def render_release_previews(
                         assets["main_top"], assets["main_bottom"],
                     ),
                 )
+                if required_by_time.get(round(timestamp, 3)):
+                    from story_production_v2 import binding
+                    prepared_main_frames.append({
+                        "time_seconds": round(timestamp, 3), "mode": "a",
+                        "layout_label": label,
+                        "reasons": required_by_time[round(timestamp, 3)]["reasons"],
+                        "frame": binding(output),
+                    })
                 print(f"已生成主账号预览帧：{output}")
     if config.variant in {"both", "library"}:
         for timestamp in times:
@@ -2142,6 +2298,25 @@ def render_release_previews(
                 ),
             )
             print(f"已生成宝库号预览帧：{output}")
+    if required_by_time:
+        from story_production_v2 import binding
+        from story_release_policy import RELEASE_REVIEW_EVIDENCE_SCHEMA
+        prepared_times = {round(float(row["time_seconds"]), 3) for row in prepared_main_frames}
+        if prepared_times != set(required_by_time):
+            raise ValueError("release preview did not prepare every required risk/frame/boundary sample")
+        write_json_atomic(preview_dir / "release_review_evidence.json", {
+            "schema_version": RELEASE_REVIEW_EVIDENCE_SCHEMA,
+            "applicable_requirements": contract_spec["requirements_projection"],
+            "plan": binding(config.release_windows_plan),
+            "presenter_overflow_report": presenter_report,
+            "frame_derivation": frame_derivation,
+            "prepared_frames": prepared_main_frames,
+            "claims": {
+                "prepared_not_automatically_viewed": True,
+                "review_must_copy_exact_checked_frames": True,
+                "full_video_execution_requires_decoded_coverage": True,
+            },
+        })
 
 
 def render_main_preview_frame(

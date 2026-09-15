@@ -12,6 +12,79 @@ from PIL import Image
 
 
 PRESENTER_LAYOUT_POLICY = "source-native-fixed-anchor/v2"
+BODY_OVERFLOW_POLICY = {
+    "schema_version": "story-presenter-body-overflow/v3",
+    "sample_fps": 5.0,
+    "visible_threshold": 0.70,
+    "trigger_threshold": 0.55,
+    "minimum_seconds": 0.40,
+    "padding_seconds": 0.25,
+    "alpha_threshold": 32,
+    "body_core_quantiles": [0.20, 0.80],
+}
+
+
+def _sha256_path(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def body_overflow_cache_key(
+    foreground_video: Path,
+    *,
+    fixed_anchor_x: int,
+    canvas_width: int,
+    source_width: int,
+    source_height: int,
+    rendered_height: int,
+    fixed_anchor_y: int = 0,
+    person_crop: Sequence[int] | None = None,
+    person_layout_policy: str = PRESENTER_LAYOUT_POLICY,
+    sample_fps: float = BODY_OVERFLOW_POLICY["sample_fps"],
+    visible_threshold: float = BODY_OVERFLOW_POLICY["visible_threshold"],
+    trigger_threshold: float = BODY_OVERFLOW_POLICY["trigger_threshold"],
+    minimum_seconds: float = BODY_OVERFLOW_POLICY["minimum_seconds"],
+    padding_seconds: float = BODY_OVERFLOW_POLICY["padding_seconds"],
+) -> dict[str, object]:
+    """Return the complete cache identity for the formal presenter scan."""
+
+    source = foreground_video.expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(f"RVM 前景不存在：{source}")
+    issues = source_native_fixed_anchor_issues(
+        source_width=int(source_width),
+        source_height=int(source_height),
+        rendered_height=int(rendered_height),
+        person_x=int(fixed_anchor_x),
+        person_y=int(fixed_anchor_y),
+        person_crop=person_crop,
+        policy=person_layout_policy,
+        expected_x=int(fixed_anchor_x),
+    )
+    if issues:
+        raise ValueError("人物躯干保护几何无效：" + "; ".join(issues))
+    return {
+        "source_sha256": _sha256_path(source),
+        "fixed_anchor_x": int(fixed_anchor_x),
+        "fixed_anchor_y": int(fixed_anchor_y),
+        "canvas_width": int(canvas_width),
+        "source_width": int(source_width),
+        "source_height": int(source_height),
+        "rendered_height": int(rendered_height),
+        "person_crop": list(person_crop) if person_crop is not None else None,
+        "person_layout_policy": person_layout_policy,
+        "sample_fps": float(sample_fps),
+        "visible_threshold": float(visible_threshold),
+        "trigger_threshold": float(trigger_threshold),
+        "minimum_seconds": float(minimum_seconds),
+        "padding_seconds": float(padding_seconds),
+        "alpha_threshold": int(BODY_OVERFLOW_POLICY["alpha_threshold"]),
+        "body_core_quantiles": list(BODY_OVERFLOW_POLICY["body_core_quantiles"]),
+        "scanner_code_sha256": _sha256_path(Path(__file__).resolve()),
+    }
 
 
 def source_native_layout_issues(
@@ -161,6 +234,48 @@ def body_core_visibility_fraction(
     return max(0.0, min(1.0, visible / width))
 
 
+def body_overflow_sample_geometry(
+    *,
+    fixed_anchor_x: int,
+    canvas_width: int,
+    source_width: int,
+    source_height: int,
+    rendered_height: int,
+    person_crop: Sequence[int] | None = None,
+    maximum_sample_width: int = 480,
+) -> dict[str, float | int | list[int] | None]:
+    """Map release-canvas coordinates into the downsampled alpha scan.
+
+    The scanner decodes source pixels, while Release may render those pixels at
+    another size.  Converting the fixed anchor and canvas width through the
+    same rendered-height scale is therefore required for the scan to describe
+    the actual composition rather than the source file's nominal dimensions.
+    """
+
+    if min(int(source_width), int(source_height), int(rendered_height), int(canvas_width)) <= 0:
+        raise ValueError("presenter scan dimensions must be positive")
+    crop: list[int] | None = None
+    effective_width, effective_height = int(source_width), int(source_height)
+    if person_crop is not None:
+        if len(person_crop) != 4:
+            raise ValueError("presenter scan crop must contain x,y,width,height")
+        crop = [int(value) for value in person_crop]
+        x, y, width, height = crop
+        if min(width, height) <= 0 or min(x, y) < 0 or x + width > source_width or y + height > source_height:
+            raise ValueError("presenter scan crop is outside the source canvas")
+        effective_width, effective_height = width, height
+    sample_width = max(160, min(int(maximum_sample_width), effective_width))
+    render_scale = float(rendered_height) / float(effective_height)
+    canvas_to_sample = float(sample_width) / (float(effective_width) * render_scale)
+    return {
+        "sample_width": sample_width,
+        "anchor_x": float(fixed_anchor_x) * canvas_to_sample,
+        "canvas_width": max(1, round(float(canvas_width) * canvas_to_sample)),
+        "render_scale": render_scale,
+        "person_crop": crop,
+    }
+
+
 def severe_body_overflow_windows(
     samples: Iterable[tuple[float, float | None]],
     *,
@@ -224,12 +339,17 @@ def scan_rvm_body_overflow(
     fixed_anchor_x: int,
     canvas_width: int,
     source_width: int,
+    source_height: int,
+    rendered_height: int,
     report_path: Path,
-    sample_fps: float = 5.0,
-    visible_threshold: float = 0.70,
-    trigger_threshold: float = 0.55,
-    minimum_seconds: float = 0.40,
-    padding_seconds: float = 0.25,
+    fixed_anchor_y: int = 0,
+    person_crop: Sequence[int] | None = None,
+    person_layout_policy: str = PRESENTER_LAYOUT_POLICY,
+    sample_fps: float = BODY_OVERFLOW_POLICY["sample_fps"],
+    visible_threshold: float = BODY_OVERFLOW_POLICY["visible_threshold"],
+    trigger_threshold: float = BODY_OVERFLOW_POLICY["trigger_threshold"],
+    minimum_seconds: float = BODY_OVERFLOW_POLICY["minimum_seconds"],
+    padding_seconds: float = BODY_OVERFLOW_POLICY["padding_seconds"],
 ) -> dict[str, object]:
     """Scan a cached VP9-alpha presenter before the one formal encode.
 
@@ -241,22 +361,22 @@ def scan_rvm_body_overflow(
     source = foreground_video.expanduser().resolve()
     if not source.is_file():
         raise FileNotFoundError(f"RVM 前景不存在：{source}")
-    digest = hashlib.sha256()
-    with source.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    source_sha256 = digest.hexdigest()
-    cache_key = {
-        "source_sha256": source_sha256,
-        "fixed_anchor_x": int(fixed_anchor_x),
-        "canvas_width": int(canvas_width),
-        "source_width": int(source_width),
-        "sample_fps": float(sample_fps),
-        "visible_threshold": float(visible_threshold),
-        "trigger_threshold": float(trigger_threshold),
-        "minimum_seconds": float(minimum_seconds),
-        "padding_seconds": float(padding_seconds),
-    }
+    cache_key = body_overflow_cache_key(
+        source,
+        fixed_anchor_x=fixed_anchor_x,
+        fixed_anchor_y=fixed_anchor_y,
+        canvas_width=canvas_width,
+        source_width=source_width,
+        source_height=source_height,
+        rendered_height=rendered_height,
+        person_crop=person_crop,
+        person_layout_policy=person_layout_policy,
+        sample_fps=sample_fps,
+        visible_threshold=visible_threshold,
+        trigger_threshold=trigger_threshold,
+        minimum_seconds=minimum_seconds,
+        padding_seconds=padding_seconds,
+    )
     try:
         existing = json.loads(report_path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -277,17 +397,28 @@ def scan_rvm_body_overflow(
         duration = float(probe.stdout.strip())
     except ValueError:
         duration = 0.0
-    sample_width = max(160, min(480, int(source_width)))
-    scale = sample_width / max(1.0, float(source_width))
-    anchor_scaled = float(fixed_anchor_x) * scale
-    canvas_scaled = max(1, round(float(canvas_width) * scale))
+    sample_geometry = body_overflow_sample_geometry(
+        fixed_anchor_x=fixed_anchor_x,
+        canvas_width=canvas_width,
+        source_width=source_width,
+        source_height=source_height,
+        rendered_height=rendered_height,
+        person_crop=person_crop,
+    )
+    sample_width = int(sample_geometry["sample_width"])
+    anchor_scaled = float(sample_geometry["anchor_x"])
+    canvas_scaled = int(sample_geometry["canvas_width"])
+    crop_filter = ""
+    if person_crop is not None:
+        crop_x, crop_y, crop_width, crop_height = (int(value) for value in person_crop)
+        crop_filter = f"crop={crop_width}:{crop_height}:{crop_x}:{crop_y},"
     samples: list[tuple[float, float | None]] = []
     with tempfile.TemporaryDirectory(prefix="presenter-core-scan-") as temporary:
         pattern = Path(temporary) / "alpha_%06d.png"
         command = [
             "ffmpeg", "-hide_banner", "-loglevel", "error", "-c:v", "libvpx-vp9",
             "-i", str(source), "-vf",
-            f"fps={sample_fps:.6f},format=rgba,alphaextract,scale={sample_width}:-1:flags=neighbor",
+            f"fps={sample_fps:.6f},{crop_filter}format=rgba,alphaextract,scale={sample_width}:-1:flags=neighbor",
             str(pattern), "-y",
         ]
         process = subprocess.run(command, text=True, capture_output=True, check=False)
@@ -316,15 +447,32 @@ def scan_rvm_body_overflow(
         if visible is not None and visible < visible_threshold
     ]
     payload: dict[str, object] = {
-        "schema_version": "story-presenter-body-overflow/v2",
+        "schema_version": BODY_OVERFLOW_POLICY["schema_version"],
         "cache_key": cache_key,
+        "source": {
+            "path": str(source),
+            "sha256": cache_key["source_sha256"],
+            "bytes": source.stat().st_size,
+        },
+        "scanner_code": {
+            "path": str(Path(__file__).resolve()),
+            "sha256": cache_key["scanner_code_sha256"],
+            "bytes": Path(__file__).stat().st_size,
+            "source_relative_path": "presenter_layout.py",
+        },
         "policy": "fixed_anchor_never_scale_or_move; borderline_arm_or_hand_overflow_allowed; unmistakable_torso_excursion_cuts_to_b",
-        "body_core_quantiles": [0.20, 0.80],
+        "body_core_quantiles": list(BODY_OVERFLOW_POLICY["body_core_quantiles"]),
         "warning_visible_threshold": float(visible_threshold),
         "unmistakable_trigger_threshold": float(trigger_threshold),
+        "duration_seconds": duration if duration > 0 else None,
         "severe_windows": [list(window) for window in windows],
+        "samples": [
+            {"time": timestamp, "visible_core_fraction": None if visible is None else round(float(visible), 4)}
+            for timestamp, visible in samples
+        ],
         "severe_samples": severe_samples,
         "sample_count": len(samples),
+        "scan_complete": True,
     }
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -332,7 +480,9 @@ def scan_rvm_body_overflow(
 
 
 __all__ = [
+    "BODY_OVERFLOW_POLICY",
     "PRESENTER_LAYOUT_POLICY",
+    "body_overflow_cache_key",
     "compile_fixed_anchor",
     "body_core_visibility_fraction",
     "scan_rvm_body_overflow",

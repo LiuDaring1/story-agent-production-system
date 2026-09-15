@@ -1829,8 +1829,13 @@ def run_package_release_project(
             overflow = scan_rvm_body_overflow(
                 foreground,
                 fixed_anchor_x=int(release_person_layout["person_x"]),
+                fixed_anchor_y=int(release_person_layout.get("person_y", 0)),
                 canvas_width=1920,
                 source_width=int(keying_payload.get("rvm_input_width") or 1920),
+                source_height=int(keying_payload.get("rvm_input_height") or 1080),
+                rendered_height=int(release_person_layout.get("person_height", 1080)),
+                person_crop=release_person_layout.get("person_crop"),
+                person_layout_policy=str(keying_payload.get("person_layout_policy") or PRESENTER_LAYOUT_POLICY),
                 report_path=paths.status / "release_preview_frames" / "presenter_body_overflow_report.json",
             )
             severe_presenter_windows = [
@@ -2009,7 +2014,6 @@ def run_package_release_project(
                     ("--person-greenscreen", greenscreen),
                     ("--audio-mix", audio_mix),
                     ("--frame-image", frame_a),
-                    ("--frame-image-b", frame_b),
                     ("--subtitle-srt", release_subtitle_srt),
                 ]
             )

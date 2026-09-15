@@ -11,10 +11,27 @@ from assemble_r2v_story import (
     sha256_path,
     validate_formal_r2v_bindings,
     validate_semantic_card_video_bindings,
+    write_new_or_same_json,
 )
 
 
 class R2VAssemblyGateTests(unittest.TestCase):
+    def test_ppt_plan_writer_reuses_identical_file_and_rejects_overwrite(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            target = Path(directory) / "ppt.json"
+            payload = {"schema_version": "story-ppt-plan-v1", "slides": []}
+            write_new_or_same_json(target, payload, label="PPT 计划")
+            original = target.read_bytes()
+            write_new_or_same_json(target, payload, label="PPT 计划")
+            self.assertEqual(target.read_bytes(), original)
+            with self.assertRaisesRegex(ValueError, "版本化路径"):
+                write_new_or_same_json(
+                    target,
+                    {**payload, "slides": [{"shot_id": "S01"}]},
+                    label="PPT 计划",
+                )
+            self.assertEqual(target.read_bytes(), original)
+
     def fixture(self, root: Path) -> list[str]:
         videos = root / "videos"; videos.mkdir()
         for path in (root / "title.mp4", videos / "S01.mp4"):

@@ -67,3 +67,7 @@ story_suno_prompts.md
 
 # Required immutable system packaging reference, included in recovery archives
 !assets/references/main_vertical_package_reference.png
+
+# Desktop deployment: local runtimes and model weights never enter Git
+.runtime/
+*.onnx

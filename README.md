@@ -1,4 +1,10 @@
-# Codex 原生儿童故事生产系统
+# Story Agent · v2 稳定版
+
+当前稳定发布：`story-agent-v2-stable-20260916`。生产逻辑基线为 `8fdeb3eccf72897ba81cbc5964f4179ca9050e67`，包含已验收的主链和 RVM 缓存/扫描证据修补。版本整理仅增加说明与本机文件忽略规则，不改变生产逻辑。
+
+新项目显式使用 `story-production/v2`。本机使用与无外置盘运行说明见 [桌面部署说明](docs/desktop-stable-release.md)。旧故事不会自动迁移或重做；旧 Git 历史和标签继续保留。
+
+## Codex 原生儿童故事生产系统
 
 ## 唯一生产入口
 

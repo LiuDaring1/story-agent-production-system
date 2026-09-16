@@ -442,7 +442,7 @@ def scan_rvm_body_overflow(
         duration=duration if duration > 0 else None,
     )
     severe_samples = [
-        {"time": timestamp, "visible_core_fraction": round(float(visible), 4)}
+        {"time": timestamp, "visible_core_fraction": float(visible)}
         for timestamp, visible in samples
         if visible is not None and visible < visible_threshold
     ]
@@ -467,7 +467,10 @@ def scan_rvm_body_overflow(
         "duration_seconds": duration if duration > 0 else None,
         "severe_windows": [list(window) for window in windows],
         "samples": [
-            {"time": timestamp, "visible_core_fraction": None if visible is None else round(float(visible), 4)}
+            {
+                "time": timestamp,
+                "visible_core_fraction": None if visible is None else float(visible),
+            }
             for timestamp, visible in samples
         ],
         "severe_samples": severe_samples,

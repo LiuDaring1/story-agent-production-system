@@ -7,6 +7,7 @@ import sys
 import tempfile
 import time
 import urllib.request
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +21,22 @@ OFFICIAL_RVM_MOBILENETV3_FP32_URL = (
     "https://github.com/PeterL1n/RobustVideoMatting/releases/download/v1.0.0/"
     "rvm_mobilenetv3_fp32.onnx"
 )
+RVM_RENDER_DEFAULTS = {
+    "width": 1920,
+    "height": 1080,
+    "fps": 25,
+    "downsample_ratio": 0.4,
+    "start_seconds": 0.0,
+    "duration_seconds": None,
+}
+RVM_RENDER_RECEIPT_FIELDS = {
+    "width": "width",
+    "height": "height",
+    "fps": "fps",
+    "downsample_ratio": "downsample_ratio",
+    "start_seconds": "start_seconds",
+    "duration_seconds": "requested_duration_seconds",
+}
 
 
 def file_sha256(path: Path) -> str:
@@ -339,6 +356,7 @@ def rvm_receipt_issues(
     *,
     expected_source: Path | None = None,
     expected_output: Path | None = None,
+    expected_render_options: Mapping[str, Any] | None = None,
 ) -> list[str]:
     if not receipt_path.is_file():
         return ["rvm_receipt_missing"]
@@ -382,6 +400,53 @@ def rvm_receipt_issues(
             issues.append("rvm_source_missing")
         elif payload.get("source_sha256") != file_sha256(expected_source):
             issues.append("rvm_source_sha256_mismatch")
+    if expected_render_options is not None:
+        supported_options = set(RVM_RENDER_DEFAULTS) | {"model_path", "runtime_path"}
+        for option_name in sorted(set(expected_render_options) - supported_options):
+            issues.append(f"rvm_render_option_unsupported:{option_name}")
+        effective_options = dict(RVM_RENDER_DEFAULTS)
+        effective_options.update(
+            {
+                name: expected_render_options[name]
+                for name in RVM_RENDER_DEFAULTS
+                if name in expected_render_options
+            }
+        )
+        for option_name, receipt_field in RVM_RENDER_RECEIPT_FIELDS.items():
+            if receipt_field not in payload:
+                issues.append(f"rvm_render_parameter_missing:{receipt_field}")
+                continue
+            actual = payload.get(receipt_field)
+            expected = effective_options[option_name]
+            if expected is None:
+                matches = actual is None
+            elif option_name in {"width", "height", "fps"}:
+                matches = (
+                    isinstance(actual, int)
+                    and not isinstance(actual, bool)
+                    and isinstance(expected, int)
+                    and not isinstance(expected, bool)
+                    and actual == expected
+                )
+            else:
+                matches = (
+                    isinstance(actual, (int, float))
+                    and not isinstance(actual, bool)
+                    and float(actual) == float(expected)
+                )
+            if not matches:
+                issues.append(f"rvm_render_parameter_mismatch:{receipt_field}")
+        requested_model = expected_render_options.get("model_path")
+        if requested_model is None:
+            issues.append("rvm_requested_model_missing")
+        else:
+            try:
+                requested_model_sha256 = validate_rvm_model(Path(requested_model))
+            except (FileNotFoundError, ValueError):
+                issues.append("rvm_requested_model_invalid")
+            else:
+                if payload.get("model_sha256") != requested_model_sha256:
+                    issues.append("rvm_requested_model_sha256_mismatch")
     return issues
 
 
@@ -395,6 +460,7 @@ def ensure_rvm_foreground_video(
         receipt_path,
         expected_source=source_video,
         expected_output=output_path,
+        expected_render_options=render_options,
     )
     if not issues:
         return output_path
